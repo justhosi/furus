@@ -23,7 +23,6 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8" }
 thiserror = { version = "2" }
-memmap2 = { version = "0.9" }
 # Dev-only: scratch directories for unit tests.
 tempfile = { version = "3" }
 

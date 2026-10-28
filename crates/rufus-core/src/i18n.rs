@@ -60,16 +60,17 @@
 //! # Performance
 //!
 //! Single pass over the bytes, one arena `String` for all translations plus
-//! offset tables — no per-string `format!` on the hot path. The mapping
-//! itself is confined to [`Catalog::from_path`]/[`from_bytes`]; a parsed
-//! catalog owns plain Rust data (the memory map is dropped after parsing).
+//! offset tables — no per-string `format!` on the hot path. Parsing is
+//! eager: the file is read fully into memory and indexed up front (measured
+//! ~11 ms in release for the 1.36 MB `RCDATA_500.bin` at 38 languages, `v
+//! 4.14`). That is a deliberate deviation from PLAN.md §5's "memory-mapped
+//! and lazily indexed" wording: on Linux the asset cannot be proven
+//! immutable for a safe `memmap2` mapping (only sealed memfds/fs-verity
+//! qualify), so a bounded plain read keeps `#![forbid(unsafe_code)]`.
 
 use std::collections::HashMap;
 use std::fs;
-use std::fs::File;
 use std::path::Path;
-
-use memmap2::MmapOptions;
 
 use crate::error::CoreError;
 use crate::error::Result;
@@ -103,28 +104,13 @@ impl Catalog {
 
     /// Parse the catalog from a file.
     ///
-    /// The file is memory-mapped with memmap2 when the platform can prove
-    /// the mapping safe ([`MmapOptions::map_if_safe`], i.e. sealed memfds
-    /// and fs-verity files on Linux); ordinary files cannot be proven
-    /// immutable, so they take a plain-read fallback through the same
-    /// single-pass parser. Either way the mapping (if any) is dropped
-    /// before returning — the catalog owns its data.
-    ///
-    /// Rationale: memmap2 marks every file-backed constructor `unsafe`
-    /// (a concurrent truncation could raise SIGBUS), and this crate forbids
-    /// `unsafe_code`, so the safe API is attempted first and reading covers
-    /// the rest. The 1.3 MB asset parses in a few milliseconds either way.
+    /// The file is read fully into memory (bounded at 64 MiB) and parsed
+    /// with the same single-pass parser as [`Catalog::from_bytes`]; a
+    /// parsed catalog owns plain Rust data.
     pub fn from_path(path: &Path) -> Result<Self> {
         let label = path.display().to_string();
-        let file = File::open(path).map_err(|err| CoreError::io(path, err))?;
-        match MmapOptions::new().map_if_safe(&file) {
-            Ok(mapping) => Self::parse(&mapping, &label),
-            Err(err) if err.not_safe() || err.not_supported() => {
-                let bytes = fs::read(path).map_err(|err| CoreError::io(path, err))?;
-                Self::parse(&bytes, &label)
-            }
-            Err(err) => Err(CoreError::io(path, std::io::Error::from(err))),
-        }
+        let bytes = read_bounded(path, &label)?;
+        Self::parse(&bytes, &label)
     }
 
     /// Language tags in file order.
@@ -137,6 +123,16 @@ impl Catalog {
     /// is translated.
     pub fn get(&self, lang: &str, msgid: &str) -> Option<&str> {
         self.get_normalized(&normalize_locale(lang), msgid)
+    }
+
+    /// Direct translation for `lang` with **no** fallback: only the exact
+    /// (normalised) language block counts. Returns `None` when `lang` is
+    /// unknown or the block has no entry for `msgid` — even when English
+    /// would have one. Use this (not [`Catalog::get`]) when a test must
+    /// prove a language block itself is populated.
+    pub fn lookup_direct(&self, lang: &str, msgid: &str) -> Option<&str> {
+        let &index = self.lang_by_norm.get(&normalize_locale(lang))?;
+        self.lookup(index, msgid)
     }
 
     fn get_normalized(&self, norm: &str, msgid: &str) -> Option<&str> {
@@ -408,6 +404,26 @@ fn strip_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
         .and_then(|rest| rest.strip_prefix(' '))
 }
 
+/// Maximum `.loc` file size accepted by [`Catalog::from_path`] (64 MiB;
+/// the shipped `RCDATA_500.bin` is ~1.36 MB).
+const MAX_LOC_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read `path` bounded by [`MAX_LOC_BYTES`]; larger files fail with a
+/// [`CoreError::LocaleParse`] instead of allocating unbounded memory.
+fn read_bounded(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let len = fs::metadata(path)
+        .map_err(|err| CoreError::io(path, err))?
+        .len();
+    if len > MAX_LOC_BYTES {
+        return Err(CoreError::LocaleParse {
+            path: label.to_string(),
+            line: 0,
+            message: format!("file too large: {len} bytes exceeds {MAX_LOC_BYTES} byte limit"),
+        });
+    }
+    fs::read(path).map_err(|err| CoreError::io(path, err))
+}
+
 /// `de_DE.UTF-8` → `de-de`; `de_DE` → `de-de`; ASCII case-insensitive.
 /// Everything from the first `.`/`@` (encoding, modifier) is stripped.
 fn normalize_locale(input: &str) -> String {
@@ -481,7 +497,8 @@ mod tests {
     fn parses_real_file_with_all_languages() {
         let catalog = real_catalog();
         let languages = catalog.languages();
-        assert!(languages.len() >= 30, "{}", languages.len());
+        // Shipped asset: `RCDATA_500.bin` (`v 4.14`) ships 38 languages.
+        assert_eq!(languages.len(), 38, "{}", languages.len());
         assert!(languages.contains(&"en-US"));
         assert!(languages.contains(&"de-DE"));
         assert!(languages.contains(&"ar-SA"));
@@ -514,13 +531,15 @@ mod tests {
             .find(|lang| **lang != "en-US")
             .expect("non-English language");
         // Candidate msgids come from the catalog itself — nothing hardcoded.
+        // `lookup_direct` (no English fallback) proves the language block
+        // itself holds the text; `get` would pass on an empty block.
         let found: Vec<(&str, &str)> = catalog
             .msgs
             .iter()
             .map(String::as_str)
             .filter_map(|msgid| {
                 catalog
-                    .get(other, msgid)
+                    .lookup_direct(other, msgid)
                     .filter(|text| !text.is_empty())
                     .map(|text| (msgid, text))
             })
@@ -530,7 +549,35 @@ mod tests {
         for (msgid, text) in found {
             assert!(!text.is_empty(), "{msgid}");
             assert_ne!(text, msgid, "{msgid} fell back to the id");
+            // The translation must differ from the English source text.
+            if let Some(english) = catalog.lookup_direct("en-US", msgid) {
+                assert_ne!(text, english, "{msgid} matches English source");
+            }
         }
+    }
+
+    #[test]
+    fn direct_lookup_finds_zero_in_empty_block() {
+        // An empty `de-DE` block: the `lookup_direct` logic used above
+        // finds 0 translations, while `get` would fall back to English
+        // and misleadingly report 2.
+        let catalog = Catalog::from_bytes(
+            b"l \"en-US\" \"English\"\nt HELLO \"hi\"\nt BYE \"bye\"\nl \"de-DE\" \"German\"\n",
+        )
+        .expect("parse");
+        let found: Vec<(&str, &str)> = catalog
+            .msgs
+            .iter()
+            .map(String::as_str)
+            .filter_map(|msgid| {
+                catalog
+                    .lookup_direct("de-DE", msgid)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| (msgid, text))
+            })
+            .collect();
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(catalog.get("de-DE", "HELLO"), Some("hi"));
     }
 
     #[test]
@@ -599,6 +646,18 @@ mod tests {
             catalog.get("en-US", "MSG_002"),
             Some("First.\nSecond \"quoted\" \\ done.")
         );
+    }
+
+    #[test]
+    fn from_path_rejects_oversize_file() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let path = scratch.path().join("big.loc");
+        let file = std::fs::File::create(&path).expect("create sparse file");
+        file.set_len(super::MAX_LOC_BYTES + 1)
+            .expect("extend sparse file");
+        drop(file);
+        let err = Catalog::from_path(&path).expect_err("oversize must fail");
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 
     #[test]

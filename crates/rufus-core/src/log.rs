@@ -149,12 +149,18 @@ impl Logger {
             target: target.to_string(),
             message: message.to_string(),
         };
-        let line = format_record(&record);
+        // The file line is only formatted when a sink exists; the in-memory
+        // ring (the replay consumer) keeps the structured `Record`.
+        let line = if inner.file.is_some() {
+            Some(format_record(&record))
+        } else {
+            None
+        };
         inner.records.push_back(record);
         if inner.records.len() > MAX_RECORDS {
             inner.records.pop_front();
         }
-        if let Some(file) = inner.file.as_mut() {
+        if let (Some(file), Some(line)) = (inner.file.as_mut(), line) {
             let _ = writeln!(file, "{line}");
             let _ = file.flush();
         }
@@ -202,9 +208,22 @@ impl Logger {
 pub fn format_timestamp(time: SystemTime) -> String {
     let secs = match time.duration_since(UNIX_EPOCH) {
         Ok(elapsed) => i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
-        Err(before) => i64::try_from(before.duration().as_secs())
-            .map(|ago| -ago)
-            .unwrap_or(i64::MIN),
+        // Floor toward negative infinity: a sub-second part before the
+        // epoch belongs to the previous whole second (`UNIX_EPOCH - 1ms`
+        // is `1969-12-31T23:59:59Z`, not the epoch itself).
+        Err(before) => {
+            let ago = before.duration();
+            match i64::try_from(ago.as_secs()) {
+                Ok(whole) => {
+                    if ago.subsec_nanos() == 0 {
+                        whole.saturating_neg()
+                    } else {
+                        whole.saturating_neg().saturating_sub(1)
+                    }
+                }
+                Err(_) => i64::MIN,
+            }
+        }
     };
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
@@ -276,6 +295,24 @@ mod tests {
         assert_eq!(
             format_timestamp(UNIX_EPOCH - Duration::from_secs(86_400)),
             "1969-12-31T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn sub_second_before_epoch_floors_to_previous_second() {
+        // Truncation would print the epoch itself; flooring prints the
+        // previous second.
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH - Duration::from_millis(1)),
+            "1969-12-31T23:59:59Z"
+        );
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH - Duration::from_millis(1_000)),
+            "1969-12-31T23:59:59Z"
+        );
+        assert_eq!(
+            format_timestamp(UNIX_EPOCH - Duration::from_millis(1_500)),
+            "1969-12-31T23:59:58Z"
         );
     }
 

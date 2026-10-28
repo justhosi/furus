@@ -18,13 +18,13 @@
 //!   resolution (`$RUFUS_ASSETS`, AppImage `$APPDIR`, FHS install), and
 //!   portable-mode (`./rufus.toml`) discovery.
 //! * [`i18n`] — [`Catalog`](i18n::Catalog): the Rufus `.loc`
-//!   (pollock-format) catalog, memory-mapped from disk, with locale
+//!   (pollock-format) catalog, parsed eagerly from disk, with locale
 //!   normalisation, an English fallback chain and a [`Translator`](i18n::Translator).
 //! * [`units`] — checked sector math, human-readable sizes, durations.
 //! * [`version`] — crate version, compile-time git hash, user-agent string.
 //!
 //! The crate is dependency-light by design (serde, toml, thiserror,
-//! memmap2, plus tempfile for tests): no async runtime, no logging
+//! plus tempfile for tests): no async runtime, no logging
 //! framework, no regex — see PLAN.md §5.
 
 #![forbid(unsafe_code)]

@@ -157,10 +157,16 @@ pub struct LoadedConfig {
     pub warning: Option<String>,
 }
 
-/// `<name>.bad-<unix_secs>` next to `path`.
+/// Counter distinguishing concurrent corrupt-file backups.
+static BACKUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `<name>.bad-<unix_secs>-<pid>-<n>` next to `path`.
 ///
 /// `unix_secs` uses `0` when the clock is before the epoch rather than
-/// failing.
+/// failing. The pid plus per-process counter keep two corrupt loads in the
+/// same second from sharing a name; a final existence loop covers the
+/// (near-impossible) case of a stale file with the same generated name, so
+/// no backup is ever overwritten.
 fn backup_path(path: &Path) -> PathBuf {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -170,11 +176,25 @@ fn backup_path(path: &Path) -> PathBuf {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| CONFIG_FILE_NAME.to_string());
-    let backup_name = format!("{file_name}.bad-{secs}");
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(backup_name),
-        _ => PathBuf::from(backup_name),
+    let pid = std::process::id();
+    loop {
+        let tag = BACKUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let backup_name = format!("{file_name}.bad-{secs}-{pid}-{tag}");
+        let candidate = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(backup_name),
+            _ => PathBuf::from(backup_name),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
     }
+}
+
+/// Wrap a temp-file I/O failure so the reported [`CoreError`] names the
+/// config `path` while the temp path stays in the source chain.
+fn tmp_io_error(tmp: &Path, err: std::io::Error) -> std::io::Error {
+    let kind = err.kind();
+    std::io::Error::new(kind, format!("temp file '{}': {err}", tmp.display()))
 }
 
 impl Config {
@@ -182,7 +202,7 @@ impl Config {
     ///
     /// * Missing file → defaults, no error, no warning.
     /// * Invalid TOML → the bad file is renamed to
-    ///   `<name>.bad-<unix_secs>` and defaults are returned with
+    ///   `<name>.bad-<unix_secs>-<pid>-<n>` and defaults are returned with
     ///   [`LoadedConfig::warning`] set.
     pub fn load(path: &Path) -> Result<LoadedConfig> {
         let text = match fs::read_to_string(path) {
@@ -243,10 +263,12 @@ impl Config {
         let tmp = dir.join(format!(".{file_name}.tmp-{}-{tag}", std::process::id()));
 
         let write_result = (|| {
-            let mut file = fs::File::create(&tmp).map_err(|err| CoreError::io(&tmp, err))?;
+            let mut file = fs::File::create(&tmp)
+                .map_err(|err| CoreError::io(path, tmp_io_error(&tmp, err)))?;
             file.write_all(text.as_bytes())
-                .map_err(|err| CoreError::io(&tmp, err))?;
-            file.sync_all().map_err(|err| CoreError::io(&tmp, err))?;
+                .map_err(|err| CoreError::io(path, tmp_io_error(&tmp, err)))?;
+            file.sync_all()
+                .map_err(|err| CoreError::io(path, tmp_io_error(&tmp, err)))?;
             drop(file);
             fs::rename(&tmp, path).map_err(|err| CoreError::io(path, err))?;
             Ok::<(), CoreError>(())
@@ -328,6 +350,67 @@ mod tests {
         let backup = backups.into_iter().next().expect("one backup");
         let backup = backup.to_string_lossy();
         assert!(backup.starts_with("rufus.toml.bad-"), "{backup}");
+    }
+
+    #[test]
+    fn two_corrupt_loads_leave_two_distinct_backups() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let path = scratch.path().join("rufus.toml");
+        for _ in 0..2 {
+            std::fs::write(&path, "[[[ this is not toml\n").expect("seed corrupt file");
+            let loaded = Config::load(&path).expect("load");
+            assert!(loaded.warning.is_some());
+        }
+
+        // Original is gone; two distinct `.bad-*` backups remain.
+        assert!(!path.exists());
+        let mut backups: Vec<_> = std::fs::read_dir(scratch.path())
+            .expect("list dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        backups.sort();
+        assert_eq!(backups.len(), 2, "{backups:?}");
+        assert_ne!(backups[0], backups[1], "{backups:?}");
+        for backup in &backups {
+            assert!(backup.starts_with("rufus.toml.bad-"), "{backup}");
+        }
+    }
+
+    #[test]
+    fn save_io_failure_names_config_path() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let dir = scratch.path().join("ro");
+        std::fs::create_dir(&dir).expect("seed dir");
+        set_read_only(&dir, true);
+
+        let path = dir.join("rufus.toml");
+        let err = example().save(&path).expect_err("save must fail");
+        let text = err.to_string();
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("temp file"), "{text}");
+
+        // Restore write access so the scratch dir cleans up.
+        set_read_only(&dir, false);
+    }
+
+    #[cfg(unix)]
+    fn set_read_only(dir: &std::path::Path, read_only: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if read_only { 0o555 } else { 0o755 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod dir");
+    }
+
+    #[cfg(not(unix))]
+    fn set_read_only(dir: &std::path::Path, read_only: bool) {
+        let mut perms = std::fs::metadata(dir).expect("stat dir").permissions();
+        perms.set_readonly(read_only);
+        std::fs::set_permissions(dir, perms).expect("chmod dir");
     }
 
     #[test]

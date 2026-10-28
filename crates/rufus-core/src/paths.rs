@@ -19,6 +19,7 @@
 //! existence (see [`asset_path`]) so unit tests stay filesystem-free.
 
 use std::env;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -169,6 +170,59 @@ impl Env {
         }
         self.config_dir().join(PORTABLE_FILE_NAME)
     }
+
+    fn asset_path(&self, name: &str) -> Result<PathBuf> {
+        validate_asset_name(name)?;
+        let dir = self.assets_dir().ok_or_else(|| {
+            CoreError::asset(
+                name,
+                "no asset directory candidate ($RUFUS_ASSETS, $APPDIR and executable path are all unset)",
+            )
+        })?;
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            Ok(candidate)
+        } else {
+            Err(CoreError::asset(
+                name,
+                format!("not found under '{}'", dir.display()),
+            ))
+        }
+    }
+}
+
+/// Fail closed unless `name` is exactly one [`Component::Normal`].
+///
+/// String checks alone (`contains("..")` and friends) miss separator and
+/// encoding edge cases, so the component walk is the authority. The extra
+/// `/`/`\` scan additionally rejects trailing slashes (`"ok.bin/"` walks
+/// as a single `Normal`) and Windows separators on Unix, where `\` would
+/// otherwise be a legal (but never legitimate for assets) file character.
+fn validate_asset_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(CoreError::asset(
+            name,
+            "invalid asset name: must be a single file name",
+        ));
+    }
+    if name.contains('\0') {
+        return Err(CoreError::asset(
+            name,
+            "invalid asset name: must be a single file name",
+        ));
+    }
+    let mut components = Path::new(name).components();
+    let confined = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    if !confined || name.contains('/') || name.contains('\\') {
+        return Err(CoreError::asset(
+            name,
+            "invalid asset name: must be a single file name",
+        ));
+    }
+    Ok(())
 }
 
 /// User configuration directory: `$XDG_CONFIG_HOME/rufus-linux`, else
@@ -209,24 +263,16 @@ pub fn default_config_path() -> PathBuf {
 
 /// Resolve `name` inside the preferred asset directory.
 ///
-/// Returns [`CoreError::AssetResolution`] when no asset directory is known
-/// or the file does not exist there.
+/// `name` must be exactly one normal path component (a bare file name).
+/// Absolute paths, `..`, `.`, nested separators, empty names and embedded
+/// NUL bytes are rejected fail-closed with [`CoreError::AssetResolution`]
+/// before any filesystem access, so a hostile name can never escape the
+/// asset directory (this primitive will be used by the root helper).
+///
+/// Returns [`CoreError::AssetResolution`] when the name is unsafe, when no
+/// asset directory is known, or when the file does not exist there.
 pub fn asset_path(name: &str) -> Result<PathBuf> {
-    let dir = Env::live().assets_dir().ok_or_else(|| {
-        CoreError::asset(
-            name,
-            "no asset directory candidate ($RUFUS_ASSETS, $APPDIR and executable path are all unset)",
-        )
-    })?;
-    let candidate = dir.join(name);
-    if candidate.is_file() {
-        Ok(candidate)
-    } else {
-        Err(CoreError::asset(
-            name,
-            format!("not found under '{}'", dir.display()),
-        ))
-    }
+    Env::live().asset_path(name)
 }
 
 #[cfg(test)]
@@ -415,5 +461,59 @@ mod tests {
         assert_eq!(assets_dir(), live.assets_dir());
         assert_eq!(portable_config_path(), live.portable_config_path());
         assert_eq!(default_config_path(), live.default_config_path());
+    }
+
+    fn asset_env(scratch: &Path) -> Env {
+        Env::for_tests(None, None, None, None, scratch.to_str(), None, None, None)
+    }
+
+    #[test]
+    fn asset_path_resolves_plain_file_name() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        std::fs::write(scratch.path().join("RCDATA_500.bin"), b"payload").expect("seed asset");
+        let env = asset_env(scratch.path());
+        assert_eq!(
+            env.asset_path("RCDATA_500.bin").expect("valid name"),
+            scratch.path().join("RCDATA_500.bin")
+        );
+    }
+
+    #[test]
+    fn asset_path_rejects_traversal_absolute_and_nested() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let env = asset_env(scratch.path());
+        for evil in [
+            "../../../../etc/hostname",
+            "../outside.bin",
+            "/etc/hostname",
+            "/abs/path.bin",
+            "sub/dir.bin",
+            "a/b",
+            "..",
+            ".",
+            "",
+            "trailing/",
+            "back\\slash",
+        ] {
+            assert!(env.asset_path(evil).is_err(), "{evil:?} should be rejected");
+        }
+        // Embedded NUL can never be a real file name.
+        assert!(env.asset_path("ok\0.bin").is_err());
+    }
+
+    #[test]
+    fn public_asset_path_validates_before_filesystem() {
+        // Validation runs before any asset-dir lookup, so these fail even
+        // without `$RUFUS_ASSETS` set and without touching the filesystem.
+        for evil in [
+            "../../../../etc/hostname",
+            "/etc/hostname",
+            "..",
+            ".",
+            "",
+            "a/b",
+        ] {
+            assert!(super::asset_path(evil).is_err(), "{evil:?}");
+        }
     }
 }
