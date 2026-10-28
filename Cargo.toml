@@ -17,6 +17,16 @@ edition = "2024"
 # Unpublished: the public name/licence (A1, A2) are still proposed.
 publish = false
 
+[workspace.dependencies]
+# S02 core-runtime dependencies (kept minimal: no async, no logging
+# framework, no chrono/time, no regex — see PLAN.md section 5).
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8" }
+thiserror = { version = "2" }
+memmap2 = { version = "0.9" }
+# Dev-only: scratch directories for unit tests.
+tempfile = { version = "3" }
+
 [profile.release]
 opt-level = "z"
 lto = "fat"
