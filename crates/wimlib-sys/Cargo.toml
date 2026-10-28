@@ -1,0 +1,6 @@
+[package]
+name = "wimlib-sys"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+links = "wim"

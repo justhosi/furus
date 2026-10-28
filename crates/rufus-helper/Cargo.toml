@@ -1,0 +1,9 @@
+[package]
+name = "rufus-helper"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rufus-helper"
+path = "src/main.rs"

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rufus-core",
+    "crates/rufus-linux",
+    "crates/rufus-proto",
+    "crates/rufus-helper",
+    "crates/rufus-cli",
+    "crates/rufus-gui",
+    "crates/wimlib-sys",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Unpublished: the public name/licence (A1, A2) are still proposed.
+publish = false
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

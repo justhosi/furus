@@ -1,0 +1,25 @@
+# deny.toml — cargo-deny configuration (S01).
+#
+# The workspace crates are unpublished (`publish = false` in Cargo.toml) and
+# therefore ignored via `private.ignore` below. A1 (GPL-3.0-or-later) is still
+# proposed, so no licence field is asserted anywhere yet.
+#
+# The allow-list covers every licence in Cargo.lock. If a new dependency
+# introduces a licence outside this list, `cargo deny check` fails and the
+# list must be reviewed deliberately — do not just append.
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+private = { ignore = true }

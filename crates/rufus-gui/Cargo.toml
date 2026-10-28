@@ -1,0 +1,9 @@
+[package]
+name = "rufus-gui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rufus-gui"
+path = "src/main.rs"

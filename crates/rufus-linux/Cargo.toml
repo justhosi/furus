@@ -1,0 +1,5 @@
+[package]
+name = "rufus-linux"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true

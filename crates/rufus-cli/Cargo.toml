@@ -1,0 +1,9 @@
+[package]
+name = "rufus-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rufus"
+path = "src/main.rs"
