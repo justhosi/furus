@@ -25,6 +25,17 @@ toml = { version = "0.8" }
 thiserror = { version = "2" }
 # Dev-only: scratch directories for unit tests.
 tempfile = { version = "3" }
+# S03 plan-JSON / CLI / checksum dependencies (PLAN.md §4: clap (derive)
+# for the command surface, serde_json for the versioned plan contract,
+# RustCrypto digests for hashing — no other new crates are allowed by §5).
+serde_json = { version = "1" }
+clap = { version = "4", features = ["derive"] }
+sha2 = { version = "0.10" }
+sha1 = { version = "0.10" }
+md-5 = { version = "0.10" }
+# Internal crates (path form, so workspaces can share them exactly).
+rufus-core = { path = "crates/rufus-core" }
+rufus-proto = { path = "crates/rufus-proto" }
 
 [profile.release]
 opt-level = "z"

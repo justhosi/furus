@@ -8,6 +8,10 @@ publish.workspace = true
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+# S03: streaming digests (checksum command, plan confirm support).
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+md-5 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

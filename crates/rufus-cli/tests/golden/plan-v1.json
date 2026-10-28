@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "created_by": "<created_by>",
+  "device": {
+    "path": "/dev/null",
+    "block_device": false,
+    "size_bytes": null,
+    "serial": null,
+    "model": null,
+    "sysfs": null
+  },
+  "image": {
+    "path": "fixture.iso",
+    "size_bytes": 32780,
+    "sha256": "a92aff4686534129ee3a8edcfe10e9288938c15a632a0f331f61e8b4790dc06a",
+    "kind": "iso"
+  },
+  "options": {
+    "scheme": "mbr",
+    "target": "bios",
+    "filesystem": "fat32",
+    "label": null,
+    "cluster_bytes": null,
+    "quick_format": false,
+    "bad_blocks": false,
+    "verify": false,
+    "persistence": false,
+    "show_all": false
+  },
+  "steps": [
+    {
+      "op": "wipe"
+    },
+    {
+      "op": "mklabel",
+      "scheme": "mbr"
+    },
+    {
+      "op": "mkpart",
+      "scheme": "mbr"
+    },
+    {
+      "op": "mkfs",
+      "filesystem": "fat32",
+      "label": null,
+      "cluster_bytes": null,
+      "quick": false
+    },
+    {
+      "op": "write",
+      "mode": "dd"
+    },
+    {
+      "op": "bootloader",
+      "mode": "auto"
+    },
+    {
+      "op": "finalize"
+    }
+  ],
+  "confirm": "sha256:4fb3993e94f8fd240280ca3b7d61c4ece332db7090e8e0e93101cde12f9d9119"
+}

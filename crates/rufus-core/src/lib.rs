@@ -20,17 +20,21 @@
 //! * [`i18n`] — [`Catalog`](i18n::Catalog): the Rufus `.loc`
 //!   (pollock-format) catalog, parsed eagerly from disk, with locale
 //!   normalisation, an English fallback chain and a [`Translator`](i18n::Translator).
+//! * [`hash`] — [`Algo`](hash::Algo) selection plus streaming
+//!   [`hash_reader`](hash::hash_reader) / [`hash_file`](hash::hash_file)
+//!   digests (MD5/SHA-1/SHA-256/SHA-512) over a 1 MiB buffer.
 //! * [`units`] — checked sector math, human-readable sizes, durations.
 //! * [`version`] — crate version, compile-time git hash, user-agent string.
 //!
-//! The crate is dependency-light by design (serde, toml, thiserror,
-//! plus tempfile for tests): no async runtime, no logging
-//! framework, no regex — see PLAN.md §5.
+//! The crate is dependency-light by design (serde, toml, thiserror, the
+//! S03 RustCrypto digests, plus tempfile for tests): no async runtime, no
+//! logging framework, no regex — see PLAN.md §5.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod error;
+pub mod hash;
 pub mod i18n;
 pub mod log;
 pub mod paths;
@@ -44,6 +48,10 @@ pub use config::UpdateChannel;
 pub use config::WindowConfig;
 pub use error::CoreError;
 pub use error::Result;
+pub use hash::Algo;
+pub use hash::hash_file;
+pub use hash::hash_file_with;
+pub use hash::hash_reader;
 pub use i18n::Catalog;
 pub use i18n::Translator;
 pub use log::Level;
