@@ -23,21 +23,42 @@
 //! * [`hash`] — [`Algo`](hash::Algo) selection plus streaming
 //!   [`hash_reader`](hash::hash_reader) / [`hash_file`](hash::hash_file)
 //!   digests (MD5/SHA-1/SHA-256/SHA-512) over a 1 MiB buffer.
+//! * [`partition`] — read-side MBR and GPT table parsing
+//!   ([`Layout`](partition::Layout), [`TablePartition`](partition::TablePartition)):
+//!   the authoritative table behind a device, with CRC-32 implemented
+//!   in-crate and rotted metadata reported as warnings rather than
+//!   errors.
+//! * [`fsprobe`] — [`FsKind`](fsprobe::FsKind) superblock recognition
+//!   from raw byte windows ([`probe`](fsprobe::probe)); four kinds
+//!   (lvm2, btrfs, xfs, zfs) exist only so the write path can refuse to
+//!   erase them.
+//! * [`safety`] — the PLAN §6 verdict ([`judge`](safety::judge),
+//!   [`SafetyVerdict`](safety::SafetyVerdict) / [`Reason`](safety::Reason)):
+//!   one fail-closed rule chain, enforced identically at preview and
+//!   helper, with the builtin-name list shared with discovery.
+//! * [`text`] — [`device_text`](text::device_text), the one sanitiser
+//!   for untrusted device text (trim, then control/non-ASCII → `?`).
 //! * [`units`] — checked sector math, human-readable sizes, durations.
 //! * [`version`] — crate version, compile-time git hash, user-agent string.
 //!
 //! The crate is dependency-light by design (serde, toml, thiserror, the
 //! S03 RustCrypto digests, plus tempfile for tests): no async runtime, no
-//! logging framework, no regex — see PLAN.md §5.
+//! logging framework, no regex — see PLAN.md §5. The S05 modules push
+//! that further: CRC-32, GUID formatting, table parsing and superblock
+//! recognition are implemented in-crate rather than pulled from crates.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod error;
+pub mod fsprobe;
 pub mod hash;
 pub mod i18n;
 pub mod log;
+pub mod partition;
 pub mod paths;
+pub mod safety;
+pub mod text;
 pub mod units;
 pub mod version;
 
@@ -48,6 +69,7 @@ pub use config::UpdateChannel;
 pub use config::WindowConfig;
 pub use error::CoreError;
 pub use error::Result;
+pub use fsprobe::FsKind;
 pub use hash::Algo;
 pub use hash::hash_file;
 pub use hash::hash_file_with;
@@ -57,6 +79,9 @@ pub use i18n::Translator;
 pub use log::Level;
 pub use log::Logger;
 pub use log::Record;
+pub use partition::Layout;
+pub use partition::TableKind;
+pub use partition::TablePartition;
 pub use paths::asset_path;
 pub use paths::assets_dir;
 pub use paths::cache_dir;
@@ -64,6 +89,11 @@ pub use paths::config_dir;
 pub use paths::default_config_path;
 pub use paths::portable_config_path;
 pub use paths::state_dir;
+pub use safety::Reason;
+pub use safety::SafetyVerdict;
+pub use safety::Target;
+pub use safety::judge;
+pub use text::device_text;
 pub use units::bytes_to_sectors_ceil;
 pub use units::format_duration;
 pub use units::human_bytes;

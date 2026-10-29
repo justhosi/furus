@@ -31,6 +31,7 @@ use std::path::PathBuf;
 
 use rufus_core::error::CoreError;
 use rufus_core::error::Result;
+use rufus_core::text::device_text;
 
 use crate::model::Device;
 use crate::model::Partition;
@@ -154,34 +155,15 @@ fn list_directories(dir: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Neutralise an untrusted device string: trim, then map control and
-/// non-ASCII characters to `?`.
-///
-/// Device strings are untrusted on *both* sources: a USB descriptor's
-/// vendor/model/serial can embed `\n` (which would break the one-line
-/// human format) or an ESC sequence (terminal injection), and so can the
-/// udev record values that the merge assigns after the sysfs read. Every
-/// string that can reach a `Device` or `Partition` goes through this
-/// helper so JSON and human output stay clean.
-fn sanitize_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii() && !c.is_control() {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect()
-}
-
 /// Read an attribute file as trimmed, sanitised text (`None` when
 /// missing, empty or unreadable — a real `device/serial` may hold odd
-/// bytes, hence lossy; see [`sanitize_text`] for the neutralisation rule).
+/// bytes, hence lossy; the trim + neutralisation rule lives in
+/// [`rufus_core::text::device_text`], the one sanitiser every module
+/// shares). Device strings are untrusted from *both* sources, so the
+/// sanitiser applied here is the same one the udev merge applies below.
 fn attr_text(path: &Path) -> Option<String> {
     let raw = fs::read(path).ok()?;
-    let clean = sanitize_text(String::from_utf8_lossy(&raw).trim());
+    let clean = device_text(&String::from_utf8_lossy(&raw));
     if clean.is_empty() { None } else { Some(clean) }
 }
 
@@ -199,14 +181,14 @@ fn attr_block_size(path: &Path) -> Option<u32> {
 /// `KEY` from a record as an owned string; see [`udev_db::read_record`].
 ///
 /// Record values are as untrusted as sysfs attribute bytes and go
-/// through the same sanitiser ([`sanitize_text`]): the merge *overwrites*
-/// the cleaned sysfs facts, so a raw record value here would bypass the
-/// rule that the attribute path already applied.
+/// through the same sanitiser, [`rufus_core::text::device_text`]: the
+/// merge *overwrites* the cleaned sysfs facts, so a raw record value here
+/// would bypass the rule that the attribute path already applied.
 fn lookup(record: &Option<udev_db::UdevRecord>, key: &str) -> Option<String> {
     record
         .as_ref()
         .and_then(|known| known.get(key))
-        .map(sanitize_text)
+        .map(device_text)
 }
 
 /// The partition suffix of `child` under the disk named `base`.
@@ -254,7 +236,7 @@ fn partitions_of(sysfs: &SysfsRoot, dir: &Path, name: &str) -> Vec<Partition> {
                 .unwrap_or(0);
             let fstype = attr_text(&directory.join("dev"))
                 .and_then(|major_minor| udev_db::read_record(&sysfs.udev_data, &major_minor))
-                .and_then(|record| record.get("ID_FS_TYPE").map(sanitize_text));
+                .and_then(|record| record.get("ID_FS_TYPE").map(device_text));
             Some(Partition {
                 name: child,
                 number,
@@ -436,13 +418,13 @@ pub fn filter(mut devices: Vec<Device>, filter: Filter) -> Vec<Device> {
 }
 
 /// Kernel names that never name real, writable media (see [`filter`]).
+///
+/// The prefix list lives in `rufus_core::safety::is_builtin_name`, the
+/// same rule the final safety verdict applies: a thin wrapper here on
+/// purpose, so the S04 discovery filter and the S05 verdict can never
+/// drift apart (they must drop the same devices for the same reason).
 fn is_builtin_name(name: &str) -> bool {
-    name.starts_with("loop") || // loopback mounts
-        name.starts_with("ram") || // in-kernel RAM disks
-        name.starts_with("zram") || // compressed RAM disks
-        name.starts_with("dm-") || // device-mapper (LVM layers)
-        name.starts_with("md") || // md RAID sets
-        name.starts_with("sr") // optical drives
+    rufus_core::safety::is_builtin_name(name)
 }
 
 #[cfg(test)]

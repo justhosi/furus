@@ -16,6 +16,15 @@
 //!   the udev data records) and [`filter`](sysfs::filter) (the
 //!   Rufus-visible candidate rule), all fixture-friendly and testable
 //!   without hardware.
+//! * [`mounts`] — the running system's view of a device:
+//!   [`MountTable`](mounts::MountTable) (parsed from
+//!   `/proc/self/mountinfo`), swap entries (from `/proc/swaps`, see
+//!   [`SwapEntry`](mounts::SwapEntry)) and [`holders`](mounts::holders)
+//!   — the dm/md/bcache stack on top of a device.
+//! * [`inspect`] — [`inspect`](inspect::inspect): the read-only device
+//!   sampling that produces the reports and the [`Target`] the PLAN §6
+//!   verdict consumes, with [`Inspected`](inspect::Inspected) carrying
+//!   both. Never fails: an unreadable device is a verdict, not an error.
 //! * [`udev_db`] — [`read_record`](udev_db::read_record): the flat
 //!   `/run/udev/data/b<major>:<minor>` records without libudev.
 //! * [`watch`] — [`DeviceWatcher`](watch::DeviceWatcher): inotify fast
@@ -27,14 +36,21 @@
 
 #![forbid(unsafe_code)]
 
+pub mod inspect;
 pub mod model;
+pub mod mounts;
 pub mod sysfs;
 pub mod udev_db;
 pub mod watch;
 
+pub use inspect::Inspected;
+pub use inspect::inspect;
 pub use model::Device;
 pub use model::Partition;
 pub use model::Transport;
+pub use mounts::MountEntry;
+pub use mounts::MountTable;
+pub use mounts::SwapEntry;
 pub use sysfs::Filter;
 pub use sysfs::SysfsRoot;
 pub use sysfs::enumerate;

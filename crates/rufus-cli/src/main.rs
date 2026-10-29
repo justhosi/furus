@@ -1,10 +1,15 @@
-//! `rufus`: command-line front end (S03/S04).
+//! `rufus`: command-line front end (S03–S05).
 //!
 //! Full command surface per PLAN §9-S03, driving the building blocks:
 //!
 //! * `version` — version, git hash, plan schema version;
 //! * `checksum` — MD5/SHA-1/SHA-256/SHA-512 via `rufus-core::hash`;
-//! * `analyze` — size, SHA-256, magic-only container detection;
+//! * `analyze` — size, SHA-256, magic-only container detection (S03),
+//!   with the S05 `--device` report: partition table, probed
+//!   filesystems, mounts, swap, holders and the PLAN §6 safety verdict
+//!   — *reported*, exit 0 even when the verdict refuses (enforcement
+//!   is the S06 helper's job, see [`cmd_analyze`]; the sampling test
+//!   hook is `--device-file`);
 //! * `plan` — provisional plan JSON (the S06 helper contract), with
 //!   `--dry-run` device-check relaxation and S04 device enrichment;
 //! * `list` — S04 device discovery (sysfs + udev data), with the
@@ -23,7 +28,13 @@ use clap::Parser;
 use clap::Subcommand;
 use rufus_core::error::CoreError;
 use rufus_core::hash::Algo;
+use rufus_core::partition::TableKind;
+use rufus_core::safety::SafetyVerdict;
+use rufus_core::text::device_text;
+use rufus_linux::MountTable;
+use rufus_linux::SwapEntry;
 use rufus_linux::SysfsRoot;
+use rufus_linux::mounts::read_swaps;
 use rufus_proto::PLAN_VERSION;
 use rufus_proto::Plan;
 use rufus_proto::Scheme;
@@ -139,20 +150,132 @@ struct ListOutput<'a> {
     show_all: bool,
 }
 
+/// `analyze --json` output: owned-field structs instead of a hand-built
+/// `json!` value (the same panic-free, declaration-stable spelling as
+/// [`ListOutput`]). The image part keeps the pre-S05 four-key shape
+/// byte for byte; the `device` member only serialises with `--device`.
+#[derive(Serialize)]
+struct AnalyzeOutput {
+    /// Image path as given on the command line.
+    path: String,
+    /// Regular-file length in bytes.
+    size_bytes: u64,
+    /// SHA-256 over the whole image, lowercase hex.
+    sha256: String,
+    /// Container kind (magic-only detection in this slice).
+    kind: String,
+    /// The S05 device report; skipped without `--device` so the
+    /// pre-S05 JSON contract stays exactly four keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<AnalyzeDevice>,
+}
+
+/// One probed partition filesystem of the table-order list.
+#[derive(Serialize)]
+struct AnalyzePartitionFs {
+    /// Kernel name of the partition (`sdb1`), derived from the table.
+    partition: String,
+    /// Recognised filesystem kind tag (`fat32`, ...).
+    filesystem: &'static str,
+}
+
+/// One mount of the device or of one of its partitions.
+#[derive(Serialize)]
+struct AnalyzeMount {
+    /// Device number as the kernel spells it (`8:17`).
+    dev: String,
+    /// Mountpoint (octal-unescaped, sanitised).
+    mountpoint: String,
+    /// Filesystem of the mount.
+    fstype: String,
+    /// Kernel-reported mount source.
+    source: String,
+}
+
+/// The PLAN §6 verdict as one flat JSON object. A refusal carries the
+/// reason tag plus the one-sentence `Display` text; the all-clear is
+/// only `{ "safe": true }`, so scripts can truth-test on the presence
+/// of a `reason` key.
+#[derive(Serialize)]
+struct AnalyzeVerdict {
+    /// Whether the device may be written.
+    safe: bool,
+    /// The [`rufus_core::safety::Reason`] tag (`"mounted"`, `"swap"`,
+    /// ...), absent when safe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// The human refusal sentence, absent when safe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// The device half of `analyze --device` (S05). Field order is the
+/// publish-facing JSON order — keep it when adding fields.
+#[derive(Serialize)]
+struct AnalyzeDevice {
+    /// Device node that was sampled: the discovered `/dev/<name>` node,
+    /// or the `--device-file` fixture when the S05 test hook redirects
+    /// the sampling.
+    path: String,
+    /// Kernel name (`sdb`).
+    name: String,
+    /// Capacity in bytes.
+    size_bytes: u64,
+    /// Stable serial, when the device states one.
+    serial: Option<String>,
+    /// Model, when the device states one.
+    model: Option<String>,
+    /// sysfs card-removable flag.
+    removable: bool,
+    /// sysfs write-protect flag.
+    read_only: bool,
+    /// Transport tag (`usb`, `sata`, ...).
+    transport: &'static str,
+    /// The partition table as read from the device; `null` when LBA0
+    /// holds no readable table (normal for a blank stick).
+    table: Option<rufus_core::partition::Layout>,
+    /// Recognised whole-device filesystem, `null` when none matches.
+    filesystem: Option<&'static str>,
+    /// `(kernel partition name, kind)` per probed partition.
+    partition_filesystems: Vec<AnalyzePartitionFs>,
+    /// Mounts of the disk or of its partitions.
+    mounts: Vec<AnalyzeMount>,
+    /// Active swap sources covering the device.
+    swaps: Vec<String>,
+    /// Kernel names of everything stacked on top.
+    holders: Vec<String>,
+    /// ASCII notes about rot and skipped work; never aborting.
+    warnings: Vec<String>,
+    /// The PLAN §6 verdict (see [`AnalyzeVerdict`]).
+    verdict: AnalyzeVerdict,
+}
+
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
 
-/// Filesystem paths the CLI should read host data from (PLAN §9-S04 test
-/// hooks). The defaults are the live system: `/sys` with `/run/udev/data`
-/// records for discovery and the current-process `mountinfo` for the S05
-/// mount checks.
+/// Filesystem paths the CLI should read host data from (PLAN §9-S04
+/// test hooks). The defaults are the live system: `/sys` with
+/// `/run/udev/data` records for discovery, the current-process
+/// `/proc/self/mountinfo` for the mount table and `/proc/swaps` for
+/// swap state. Discovery reads sysfs for every command; the two table
+/// files are parsed by `analyze --device` (S05), which also honours
+/// `--device-file`, with `--sysfs-root`, `--mountinfo`, `--swaps` and
+/// `--device-file` pointing at fixture files instead.
 struct HostPaths {
     /// sysfs root override from `--sysfs-root` (`None` = live `/sys`).
     sysfs_root: Option<PathBuf>,
     /// mountinfo file override from `--mountinfo` (`None` = current
-    /// process). Parsed by S05.
+    /// process). Parsed by `analyze --device`.
     mountinfo: Option<PathBuf>,
+    /// swaps file override from `--swaps` (`None` = live `/proc/swaps`).
+    /// Parsed by `analyze --device`.
+    swaps: Option<PathBuf>,
+    /// Device file override from `--device-file` (`None` = sample the
+    /// discovered device node). The `analyze --device` sampling test
+    /// hook: it replaces only the file the inspection half opens; the
+    /// graded device stays the discovered one.
+    device_file: Option<PathBuf>,
 }
 
 impl HostPaths {
@@ -163,6 +286,29 @@ impl HostPaths {
     fn sysfs(&self) -> SysfsRoot {
         SysfsRoot::new(self.sysfs_root.clone().unwrap_or(PathBuf::from("/sys")))
     }
+
+    /// The mount table the S05 inspection matches device numbers
+    /// against: the `--mountinfo` fixture file or the live `/proc`.
+    ///
+    /// A failure here is host state, not bad input: the file cannot be
+    /// read or is rot. Device class, exit 2, never [`Fail::from_core`].
+    fn mount_table(&self) -> Result<MountTable, Fail> {
+        MountTable::read(self.mountinfo.as_deref()).map_err(|err| Fail {
+            exit: Exit::Device,
+            kind: "device",
+            message: err.to_string(),
+        })
+    }
+
+    /// The parsed `/proc/swaps` rows: the `--swaps` fixture file or the
+    /// live one. Same failure etiquette as [`HostPaths::mount_table`].
+    fn swaps(&self) -> Result<Vec<SwapEntry>, Fail> {
+        read_swaps(self.swaps.as_deref()).map_err(|err| Fail {
+            exit: Exit::Device,
+            kind: "device",
+            message: err.to_string(),
+        })
+    }
 }
 
 /// Native Linux USB/ISO writer — command line (slice S03 by the schema,
@@ -171,7 +317,7 @@ impl HostPaths {
 #[command(
     name = "rufus",
     version,
-    about = "Native Linux USB/ISO writer — command line rewrite (slice S04)"
+    about = "Native Linux USB/ISO writer — command line rewrite (slice S05)"
 )]
 struct Cli {
     /// Emit machine-readable JSON for results and errors.
@@ -199,24 +345,39 @@ struct Cli {
     dry_run: bool,
 
     // S04/S05 test hooks (PLAN §9-S04): the defaults are the live system
-    // (`/sys` with `/run/udev/data` records, current-process mountinfo);
-    // the flags point at small fixture trees so tests and containers
-    // never touch real state.
+    // (`/sys` with `/run/udev/data` records, the current-process
+    // `/proc/self/mountinfo` and `/proc/swaps`); the flags point at small
+    // fixture files so tests and containers never touch real state.
+    // Discovery reads sysfs for every command; the two table files and
+    // the sampled node (`--device-file`) are `analyze --device` hooks.
     /// Root of a (possibly synthetic) sysfs tree for device discovery
     /// (S04 test hook; default: the live `/sys`).
     #[arg(long, value_name = "DIR", global = true)]
     sysfs_root: Option<PathBuf>,
-    /// Path to a `/proc/self/mountinfo`-shaped file (S05 test hook; the
-    /// mount-detection slices parse it, accepted now so the CLI surface
-    /// is final).
+    /// Path to a `/proc/self/mountinfo`-shaped file (S05 test hook;
+    /// default: the live `/proc/self/mountinfo`, parsed by `analyze
+    /// --device`).
     #[arg(long, value_name = "FILE", global = true)]
     mountinfo: Option<PathBuf>,
+    /// Path to a `/proc/swaps`-shaped file (S05 test hook; default: the
+    /// live `/proc/swaps`, parsed by `analyze --device`).
+    #[arg(long, value_name = "FILE", global = true)]
+    swaps: Option<PathBuf>,
+    /// Regular file to sample instead of the discovered device node
+    /// (S05 test hook for `analyze --device`; default: the discovered
+    /// `/dev/<name>` node). Only meaningful once `--device` resolved to
+    /// an enumerated device; tests point it at their sparse fixture
+    /// bytes, while on a real run it stays unset so the graded device
+    /// and the sampled bytes are one and the same.
+    #[arg(long, value_name = "FILE", global = true)]
+    device_file: Option<PathBuf>,
 
     // Rufus legacy parity switches — parsed and documented; the S04
-    // discovery switch is live in `list`, the rest land with S06/S24.
-    /// Show all devices, including fixed disks (S04: `list` honours it
-    /// and turns on the destruction warning; the exact rule is stated
-    /// once on the `cmd_list` function).
+    // discovery switch is live in `list` (and `analyze --device`
+    // show-all confirmation since S05), the rest land with S06/S24.
+    /// Show all devices, including fixed disks (the destruction-warning
+    /// rule lives on the `cmd_list` implementation; with `analyze
+    /// --device` it flips PLAN §6 rule 4's serial gate).
     #[arg(short = 'x', long = "extra-devs", global = true)]
     extra_devs: bool,
     /// Launch the graphical front end instead of the CLI (no effect yet:
@@ -253,9 +414,33 @@ enum Command {
     ///
     /// Detection is by magic bytes only in this slice; full container
     /// readers (ISO9660, WIM, VHD, ...) arrive with S14–S16.
+    ///
+    /// With `--device`, the named block device is inspected alongside
+    /// the image (S05): partition table, probed filesystems, mounts,
+    /// swap, holders — and the PLAN §6 verdict is *reported*. `analyze`
+    /// never enforces: it exits 0 even when the verdict refuses the
+    /// device, so scripts can read the report; enforcement of a refusal
+    /// is the S06 preview/helper's job. The graded device is always the
+    /// discovered one and its own node is sampled; tests redirect the
+    /// reading with the `--device-file` hook.
     Analyze {
         /// Image file to inspect (a regular file).
         image: PathBuf,
+        /// Block device to inspect alongside the image (S05): partition
+        /// table, filesystem and the PLAN §6 safety verdict.
+        ///
+        /// The discovered node path (`/dev/sdb`), the sysfs path, or the
+        /// bare kernel name (`sdb`) is accepted; a partition path is
+        /// refused with a pointer at its whole disk. Tests redirect the
+        /// sampling to fixture bytes with `--device-file` (S05 test
+        /// hook).
+        #[arg(long, value_name = "DEVICE")]
+        device: Option<PathBuf>,
+        /// Serial the user typed to confirm a fixed disk (PLAN §6 rule 4;
+        /// only meaningful together with `-x/--extra-devs`). Compared
+        /// trimmed: surrounding whitespace does not hide a match.
+        #[arg(long, value_name = "SERIAL")]
+        confirm_serial: Option<String>,
     },
 
     /// List candidate USB devices from sysfs + udev data (S04).
@@ -446,16 +631,195 @@ fn cmd_checksum(json: bool, path: &Path, algo: Algo) -> Result<Exit, Fail> {
     Ok(Exit::Ok)
 }
 
-fn cmd_analyze(json: bool, path: &Path) -> Result<Exit, Fail> {
-    let inspected = image::inspect(path).map_err(Fail::from_core)?;
-    if json {
-        let object = serde_json::json!({
-            "path": inspected.path,
-            "size_bytes": inspected.size_bytes,
-            "sha256": inspected.sha256,
-            "kind": inspected.kind.to_string(),
+/// S03 image analysis, with the S05 PLAN §6 device report on top when
+/// `--device` is given.
+///
+/// `analyze` is a *reporting* command: it samples the device honestly,
+/// prints the verdict — and exits 0 even when the verdict refuses.
+/// Enforcing a refusal is the S06 preview/helper's job (PLAN §6 wants
+/// two enforcement points over one judging implementation, and a report
+/// must be readable by scripts in both states).
+///
+/// Device-fact failures (a discovery root that cannot be enumerated, a
+/// mount/swap table that cannot be read, no device matching the
+/// requested path, a partition path) are device-class errors: exit 2,
+/// kind "device", with the `{"error","message"}` object in `--json`
+/// mode. A partition path names its whole disk in the refusal.
+fn cmd_analyze(
+    json: bool,
+    image_path: &Path,
+    device: Option<&Path>,
+    confirm_serial: Option<&str>,
+    extra_devs: bool,
+    paths: &HostPaths,
+) -> Result<Exit, Fail> {
+    let inspected = image::inspect(image_path).map_err(Fail::from_core)?;
+    let Some(requested) = device else {
+        // The pre-S05 surface, unchanged in every byte: four image facts
+        // in both output modes and no `device` key in JSON.
+        if json {
+            let output = AnalyzeOutput {
+                path: inspected.path,
+                size_bytes: inspected.size_bytes,
+                sha256: inspected.sha256,
+                kind: inspected.kind.to_string(),
+                device: None,
+            };
+            println!("{}", to_pretty(&output)?);
+        } else {
+            println!("image:  {}", inspected.path);
+            println!(
+                "size:   {} ({})",
+                inspected.size_bytes,
+                rufus_core::human_bytes(inspected.size_bytes)
+            );
+            println!("kind:   {}", inspected.kind);
+            println!("sha256: {}", inspected.sha256);
+        }
+        return Ok(Exit::Ok);
+    };
+
+    // Discovery is deliberately unfiltered: PLAN §6 wants the fixed disk
+    // the user named to be analyzable — its refusal comes from the
+    // verdict, not from hiding the disk.
+    let sysfs = paths.sysfs();
+    let devices = rufus_linux::enumerate(&sysfs).map_err(|core| Fail {
+        // Not bad input and not ordinary I/O: the device tree the CLI
+        // was pointed at cannot be listed. Device class, exit 2 (same
+        // mapping as `list`).
+        exit: Exit::Device,
+        kind: "device",
+        message: core.to_string(),
+    })?;
+
+    // Selection: first match in the name-sorted enumeration order, by
+    // the discovered node path, the sysfs path, one shared canonical
+    // path (both sides must exist — two failed lookups never mean "the
+    // same path") or the bare kernel name. The graded device is always
+    // the discovered one, and the node that gets sampled is always its
+    // own `/dev/<name>` (fixture tests redirect that with
+    // `--device-file`); nothing infers a device from a file's name.
+    let selected = devices.iter().find(|candidate| {
+        Path::new(&candidate.dev_path) == requested
+            || Path::new(&candidate.sysfs) == requested
+            || Path::new(&candidate.name) == requested
+            || {
+                match (
+                    std::fs::canonicalize(Path::new(&candidate.dev_path)),
+                    std::fs::canonicalize(requested),
+                ) {
+                    (Ok(real), Ok(given)) => real == given,
+                    _ => false,
+                }
+            }
+    });
+    let Some(selected) = selected else {
+        // A partition path is the common miss worth naming: tables are
+        // read from the whole disk, so say which disk owns the name.
+        // Unknown paths keep the plain message.
+        let base = requested.file_name();
+        let owner = base.and_then(|base| {
+            devices.iter().find(|disk| {
+                disk.partitions
+                    .iter()
+                    .any(|part| std::ffi::OsStr::new(&part.name) == base)
+            })
         });
-        println!("{}", to_pretty(&object)?);
+        return Err(match owner {
+            Some(disk) => Fail {
+                exit: Exit::Device,
+                kind: "device",
+                message: format!(
+                    "{} is a partition of {} - select the whole disk",
+                    requested.display(),
+                    disk.dev_path
+                ),
+            },
+            None => Fail {
+                exit: Exit::Device,
+                kind: "device",
+                message: format!("no block device found for {}", requested.display()),
+            },
+        });
+    };
+
+    // S05 test hook: `--device-file` redirects only the file the
+    // sampling half opens. The graded device (name, size, serial,
+    // mounts, holders — every verdict fact) stays the discovered one,
+    // and without the flag the discovered `/dev/<name>` node is
+    // sampled, so the graded device and the read bytes never diverge.
+    let mut selected = selected.clone();
+    if let Some(file) = paths.device_file.as_deref() {
+        selected.dev_path = file.display().to_string();
+    }
+
+    // The tables the inspection half matches device numbers against:
+    // fixture files in tests, the live /proc files on a real run. Host
+    // state failing here is device class (exit 2).
+    let mounts = paths.mount_table()?;
+    let swaps = paths.swaps()?;
+    let rufus_linux::inspect::Inspected { report, target } = rufus_linux::inspect(
+        &sysfs,
+        &selected,
+        &rufus_linux::inspect::Options {
+            mount_table: &mounts,
+            swaps: &swaps,
+            image_bytes: Some(inspected.size_bytes),
+            allow_fixed: extra_devs,
+            confirmed_serial: confirm_serial,
+        },
+    );
+    let verdict = rufus_core::safety::judge(&target);
+
+    if json {
+        let mounts_output: Vec<AnalyzeMount> = report
+            .mounts
+            .iter()
+            .map(|entry| AnalyzeMount {
+                dev: format!("{}:{}", entry.major, entry.minor),
+                mountpoint: entry.mountpoint.clone(),
+                fstype: entry.fstype.clone(),
+                source: entry.source.clone(),
+            })
+            .collect();
+        let partition_filesystems: Vec<AnalyzePartitionFs> = report
+            .partition_filesystems
+            .iter()
+            .map(|(name, kind)| AnalyzePartitionFs {
+                partition: name.clone(),
+                filesystem: kind.as_str(),
+            })
+            .collect();
+        let device_output = AnalyzeDevice {
+            path: device_text(&report.device.dev_path),
+            name: device_text(&report.device.name),
+            size_bytes: report.device.size_bytes,
+            serial: report.device.serial.clone(),
+            model: report.device.model.clone(),
+            removable: report.device.removable,
+            read_only: report.device.read_only,
+            transport: report.device.transport.as_str(),
+            table: report.layout,
+            filesystem: report.filesystem.map(|fs| fs.as_str()),
+            partition_filesystems,
+            mounts: mounts_output,
+            swaps: report
+                .swaps
+                .iter()
+                .map(|entry| entry.filename.clone())
+                .collect(),
+            holders: report.holders,
+            warnings: report.warnings,
+            verdict: verdict_json(&verdict),
+        };
+        let output = AnalyzeOutput {
+            path: inspected.path,
+            size_bytes: inspected.size_bytes,
+            sha256: inspected.sha256,
+            kind: inspected.kind.to_string(),
+            device: Some(device_output),
+        };
+        println!("{}", to_pretty(&output)?);
     } else {
         println!("image:  {}", inspected.path);
         println!(
@@ -465,8 +829,93 @@ fn cmd_analyze(json: bool, path: &Path) -> Result<Exit, Fail> {
         );
         println!("kind:   {}", inspected.kind);
         println!("sha256: {}", inspected.sha256);
+
+        // The device half (S05). Every device/kernel-supplied string
+        // reaches these lines through its sanitiser — `device_text` at
+        // this boundary here, at the parse boundary for the fields the
+        // inspection half gathered — so the whole report stays ASCII by
+        // construction.
+        println!(
+            "device:   {} ({})  {}  {}",
+            device_text(&report.device.dev_path),
+            device_text(&report.device.name),
+            rufus_core::human_bytes(report.device.size_bytes),
+            report.device.transport.as_str(),
+        );
+        if let Some(serial) = &report.device.serial {
+            println!("serial:   {serial}");
+        }
+        // An unreadable device must not read as a blank disk: the
+        // table line says so explicitly, and the refuse verdict below
+        // carries the reason. Layout `None` (no readable table rule
+        // matched) keeps the plain "none" for the blank-stick case.
+        if report.unreadable.is_some() {
+            println!("table:    unreadable");
+        } else {
+            match &report.layout {
+                Some(layout) => {
+                    println!(
+                        "table:    {}, {} partition(s), backup gpt: {}",
+                        human_table(&layout.kind),
+                        layout.partitions.len(),
+                        human_lead(layout.backup_gpt),
+                    );
+                    for part in &layout.partitions {
+                        println!(
+                            "  #{}  start {}  sectors {}  {}  {}",
+                            part.index,
+                            part.start_lba,
+                            part.sectors,
+                            rufus_core::human_bytes(part.size_bytes),
+                            part.kind,
+                        );
+                    }
+                }
+                None => println!("table:    none"),
+            }
+        }
+        if let Some(fs) = &report.filesystem {
+            println!("filesystem: {}", fs.as_str());
+        }
+        for (name, fs) in &report.partition_filesystems {
+            println!("partition {name}: {}", fs.as_str());
+        }
+        for mount in &report.mounts {
+            println!("mounted:  {} ({})", mount.mountpoint, mount.fstype);
+        }
+        for swap in &report.swaps {
+            println!("swap:     {}", swap.filename);
+        }
+        for holder in &report.holders {
+            println!("holder:   {holder}");
+        }
+        for warning in &report.warnings {
+            println!("warning:  {warning}");
+        }
+        match &verdict {
+            SafetyVerdict::Safe => println!("verdict:  safe"),
+            SafetyVerdict::Refuse(reason) => println!("verdict:  refuse: {reason}"),
+        }
     }
     Ok(Exit::Ok)
+}
+
+/// The verdict half of the `analyze --json` device object: the reason
+/// slug and the Display sentence are refusal payloads, omitted when the
+/// verdict is [`SafetyVerdict::Safe`].
+fn verdict_json(verdict: &SafetyVerdict) -> AnalyzeVerdict {
+    match verdict {
+        SafetyVerdict::Safe => AnalyzeVerdict {
+            safe: true,
+            reason: None,
+            message: None,
+        },
+        SafetyVerdict::Refuse(reason) => AnalyzeVerdict {
+            safe: false,
+            reason: Some(reason.code().to_owned()),
+            message: Some(reason.to_string()),
+        },
+    }
 }
 
 /// S04 discovery: enumerate candidates through sysfs + udev data and
@@ -714,6 +1163,15 @@ fn human_lead(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+/// Human tag of a partition-table kind, mirroring the JSON tags of
+/// [`rufus_core::partition::TableKind`] (`"mbr"`/`"gpt"`).
+fn human_table(kind: &TableKind) -> &'static str {
+    match kind {
+        TableKind::Mbr => "mbr",
+        TableKind::Gpt => "gpt",
+    }
+}
+
 fn human_optional(value: &Option<String>) -> String {
     value.clone().unwrap_or_else(|| "<none>".to_string())
 }
@@ -800,7 +1258,33 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
     match &cli.command {
         Command::Version => cmd_version(json),
         Command::Checksum { image, algo } => cmd_checksum(json, image, *algo),
-        Command::Analyze { image } => cmd_analyze(json, image),
+        Command::Analyze {
+            image,
+            device,
+            confirm_serial,
+        } => {
+            // PLAN §6 rule 4 needs a *typed* serial comparable to the
+            // device's own: trim once, here at acceptance, so the
+            // non-empty check below and the exact comparison inside
+            // `judge` see the same value. Refused before any inspection
+            // work, in both output modes.
+            let confirm_serial = confirm_serial.as_deref().map(str::trim);
+            if confirm_serial.is_some_and(|serial| serial.is_empty()) {
+                return Err(Fail {
+                    exit: Exit::Usage,
+                    kind: "usage",
+                    message: "confirmation serial must not be empty".to_owned(),
+                });
+            }
+            cmd_analyze(
+                json,
+                image,
+                device.as_deref(),
+                confirm_serial,
+                cli.extra_devs,
+                paths,
+            )
+        }
         // S04 hook note: `-x/--extra-devs` is the Rufus-legacy spelling
         // of `--all`; `list` picks up whichever is set.
         Command::List { all } => cmd_list(json, *all, cli.extra_devs, &paths.sysfs()),
@@ -875,18 +1359,18 @@ fn main() {
     // Flags inert in this slice are accepted (their wiring lands with S06
     // wait/yes/progress verbosity, S24 locale/GUI). They are consumed here
     // so the inertness is visible in code — and so the unused-field lint
-    // stays quiet. `extra_devs` left the list: `list` consumes it now.
+    // stays quiet. `extra_devs` left the list: `list` consumes it since
+    // S04, and `analyze --device` uses it as the PLAN §6 rule-4 gate
+    // since S05.
     let _ = (cli.verbose, cli.quiet, cli.yes, cli.gui, cli.iso, cli.wait);
     let _ = cli.locale.as_deref();
 
     let paths = HostPaths {
         sysfs_root: cli.sysfs_root.clone(),
         mountinfo: cli.mountinfo.clone(),
+        swaps: cli.swaps.clone(),
+        device_file: cli.device_file.clone(),
     };
-    // Accepted now, wired later: S05 parses this mountinfo file (the flag
-    // is its PLAN §9-S04 test hook). Binding it keeps the surface final
-    // without pretending the file was read.
-    let _ = &paths.mountinfo;
 
     match dispatch(&cli, &paths) {
         Ok(exit) => std::process::exit(exit.code()),

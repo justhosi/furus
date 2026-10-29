@@ -9,6 +9,7 @@
 //! `sha256sum`/`md5sum` come from coreutils and are used as the cross-check
 //! for `checksum` on Linux (PLAN §1 A3 targets Linux distros only).
 
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -164,8 +165,16 @@ fn help_lists_commands_and_documented_flags() {
         // S04/S05 test hooks.
         "--sysfs-root",
         "--mountinfo",
+        // S05 swaps hook.
+        "--swaps",
     ] {
         assert!(out.stdout.contains(flag), "missing global flag {flag}");
+    }
+
+    let out = run(&["analyze", "--help"]);
+    assert_eq!(out.code, 0);
+    for flag in ["--device", "--device-file", "--confirm-serial"] {
+        assert!(out.stdout.contains(flag), "missing analyze flag {flag}");
     }
 
     let out = run(&["plan", "--help"]);
@@ -967,6 +976,711 @@ fn plan_dry_run_enriches_the_device_ref_without_breaking_the_stub_shape() {
     assert_eq!(value["device"]["size_bytes"], serde_json::Value::Null);
     assert_eq!(value["device"]["sysfs"], serde_json::Value::Null);
     assert_eq!(value["device"]["serial"], serde_json::Value::Null);
+}
+
+// ---------------------------------------------------------------------------
+// analyze --device (S05 device inspection + PLAN §6 verdict)
+// ---------------------------------------------------------------------------
+
+/// The S05 stick fixture in `scratch`: a synthetic sysfs tree (fixed
+/// `sda`, 1 GiB, plus removable `sdb`, 512 MiB, carrying one `sdb1`
+/// partition in the live-kernel sibling-symlink layout with the
+/// `device/{vendor,model,serial}` identity fields and a udev record
+/// dir), an 8 MiB sparse device buffer (MBR + FAT32 surface, the bytes
+/// the tests sample through the `--device-file` hook) and a mountinfo
+/// file with a `/` mount on 8:1 — nothing mounts the fixture disk by
+/// default. Tests enrich the tree or rewrite the mountinfo in place.
+/// Nothing binary is committed (see `tests/fixtures/README.md`).
+fn stick_fixture(scratch: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+    let sysfs = scratch.join("sys");
+    for (name, units, removable, dev) in [
+        ("sda", "2097152", "0", "8:0"),
+        ("sdb", "1048576", "1", "8:16"),
+    ] {
+        let dir = sysfs.join("class/block").join(name);
+        std::fs::create_dir_all(&dir).expect("create device dir");
+        std::fs::write(dir.join("size"), units).expect("seed size");
+        std::fs::write(dir.join("removable"), removable).expect("seed removable");
+        std::fs::write(dir.join("ro"), "0").expect("seed ro");
+        std::fs::write(dir.join("dev"), dev).expect("seed dev");
+    }
+    // The stick's identity fields live on its `device` node (a plain
+    // directory inside the class entry here; discovery ignores it as
+    // junk when walking partitions).
+    let device_dir = sysfs.join("class/block/sdb/device");
+    std::fs::create_dir_all(&device_dir).expect("device dir");
+    std::fs::write(device_dir.join("vendor"), "SanDisk").expect("seed vendor");
+    std::fs::write(device_dir.join("model"), "Extreme").expect("seed model");
+    std::fs::write(device_dir.join("serial"), "ABCD1234").expect("seed serial");
+    // Inner partition + the partition sibling link + its udev record:
+    // the exact pattern of `list_skips_partition_siblings…` (S04).
+    let inner = sysfs.join("class/block/sdb/sdb1");
+    std::fs::create_dir_all(&inner).expect("inner partition dir");
+    std::fs::write(inner.join("size"), "524288").expect("seed size");
+    std::fs::write(inner.join("dev"), "8:17").expect("seed dev");
+    std::fs::write(inner.join("partition"), "1").expect("seed partition");
+    std::fs::create_dir_all(sysfs.join("run/udev/data")).expect("record dir");
+    std::fs::write(
+        sysfs.join("run/udev/data/b8:17"),
+        "I:56732\nE:ID_FS_TYPE=vfat\nE:ID_BUS=usb\n",
+    )
+    .expect("seed partition record");
+    std::os::unix::fs::symlink(&inner, sysfs.join("class/block/sdb1"))
+        .expect("link partition sibling");
+
+    let dev_file = stick_device_file(&scratch.join("sdb"), 8 * 1024 * 1024);
+
+    // The default table: only `/` on 8:1, which is not the fixture
+    // disk. Tests rewrite the file for the mounted/system-disk cases.
+    let mountinfo = scratch.join("mountinfo");
+    std::fs::write(&mountinfo, "1 0 8:1 / / rw,relatime - ext4 /dev/root rw\n")
+        .expect("seed mountinfo");
+    (sysfs, dev_file, mountinfo)
+}
+
+/// A sparse device file of `len` bytes holding the stick surface an
+/// `analyze --device` run reads: an MBR in LBA0 (0x55AA at 510; entry 1
+/// at 446 with type 0x0c, start LBA 2048, 4096 sectors) and a FAT32
+/// BPB at byte 2048×512 (bytes-per-sector 512 at offset 11, `FAT32   `
+/// at 82, 0x55AA at 510). Sparse via `set_len`, so an 8 MiB fixture
+/// costs no bulk zeroing.
+fn stick_device_file(path: &std::path::Path, len: u64) -> PathBuf {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .expect("create device file");
+    file.set_len(len).expect("device file length");
+
+    let mut mbr = [0u8; 512];
+    mbr[510..512].copy_from_slice(&rufus_core::partition::MBR_SIGNATURE);
+    mbr[446 + 4] = 0x0c;
+    mbr[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+    mbr[446 + 12..446 + 16].copy_from_slice(&4096u32.to_le_bytes());
+
+    let mut bpb = [0u8; 512];
+    bpb[11..13].copy_from_slice(&512u16.to_le_bytes());
+    bpb[82..90].copy_from_slice(b"FAT32   ");
+    bpb[510..512].copy_from_slice(&rufus_core::partition::MBR_SIGNATURE);
+
+    file.write_at(&mbr, 0).expect("write MBR");
+    file.write_at(&bpb, 2048 * 512).expect("write FAT32 BPB");
+    path.to_path_buf()
+}
+
+/// A blank sparse device file of `len` bytes (no table, no content) —
+/// the fixed-disk fixture.
+fn blank_device_file(path: &std::path::Path, len: u64) -> PathBuf {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .expect("create device file");
+    file.set_len(len).expect("device file length");
+    path.to_path_buf()
+}
+
+/// Stamp `bytes` at `offset` of a device file (S05 tests enrich the
+/// [`stick_device_file`] surface in place: whole-disk LVM2 labels).
+fn patch_file(path: &std::path::Path, offset: u64, bytes: &[u8]) {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open file to patch");
+    file.write_at(bytes, offset).expect("patch bytes");
+}
+
+/// Base `analyze --device` invocation over the fixture paths. `node`
+/// is the discovered device node spelling (always `/dev/<name>` in
+/// these fixtures), `device_file` the fixture buffer handed to the
+/// S05 `--device-file` hook; tests push `--json` and their own extra
+/// switches themselves.
+fn analyze_device_args(
+    image: &std::path::Path,
+    sysfs: &std::path::Path,
+    mountinfo: &std::path::Path,
+    node: &str,
+    device_file: &std::path::Path,
+) -> Vec<String> {
+    vec![
+        "analyze".to_string(),
+        image.display().to_string(),
+        "--sysfs-root".to_string(),
+        sysfs.display().to_string(),
+        "--mountinfo".to_string(),
+        mountinfo.display().to_string(),
+        "--device".to_string(),
+        node.to_string(),
+        "--device-file".to_string(),
+        device_file.display().to_string(),
+    ]
+}
+
+#[test]
+fn analyze_device_reports_a_clean_usb_as_safe() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.is_empty(), "{}", out.stderr);
+
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    // The S03 image facts ride on top unchanged.
+    assert_eq!(value["path"], iso.display().to_string());
+    assert_eq!(value["size_bytes"], 32_780u64);
+    assert_eq!(value["sha256"], FIXTURE_SHA256);
+    assert_eq!(value["kind"], "iso");
+
+    let device = &value["device"];
+    assert_eq!(device["name"], "sdb");
+    assert_eq!(
+        device["path"],
+        dev_file.display().to_string(),
+        "the report names the sampled file (--device-file hook)"
+    );
+    assert_eq!(device["size_bytes"], 536_870_912u64);
+    assert_eq!(device["serial"], "ABCD1234");
+    assert_eq!(device["model"], "Extreme");
+    assert_eq!(device["verdict"], serde_json::json!({ "safe": true }));
+    assert!(
+        device["verdict"].get("reason").is_none(),
+        "a safe verdict carries no reason key: {device}"
+    );
+    assert_eq!(device["table"]["kind"], "mbr");
+    assert_eq!(device["table"]["backup_gpt"], false);
+    let parts = device["table"]["partitions"]
+        .as_array()
+        .expect("table partitions");
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["kind"], "fat32");
+    assert_eq!(
+        device["partition_filesystems"],
+        serde_json::json!([{ "partition": "sdb1", "filesystem": "fat32" }]),
+    );
+    assert!(
+        device["mounts"]
+            .as_array()
+            .expect("mounts array")
+            .is_empty()
+    );
+    assert!(device["swaps"].as_array().expect("swaps array").is_empty());
+    assert!(
+        device["holders"]
+            .as_array()
+            .expect("holders array")
+            .is_empty(),
+    );
+    assert!(
+        device["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .is_empty(),
+        "{device}"
+    );
+}
+
+#[test]
+fn analyze_device_refuses_a_mounted_stick() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    // The desktop mounted sdb1; `\040` is the kernel's escaped space.
+    std::fs::write(
+        &mountinfo,
+        "1 0 8:17 / /media/user/my\\040stick rw,relatime - vfat /dev/sdb1 rw\n",
+    )
+    .expect("rewrite mountinfo");
+
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    // analyze *reports* the verdict and exits 0; S06 enforces refusals.
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    let device = &value["device"];
+    assert_eq!(device["verdict"]["reason"], "mounted");
+    assert_eq!(
+        device["verdict"]["message"],
+        "device is mounted at /media/user/my stick - unmount it first",
+    );
+    assert_eq!(
+        device["mounts"],
+        serde_json::json!([{
+            "dev": "8:17",
+            "mountpoint": "/media/user/my stick",
+            "fstype": "vfat",
+            "source": "/dev/sdb1",
+        }]),
+        "the mountpoint arrives octal-unescaped",
+    );
+
+    // The human spelling stays ASCII and unmangled.
+    let out = run_args(
+        &analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("verdict:"), "{}", out.stdout);
+    assert!(out.stdout.contains("refuse:"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("mounted:  /media/user/my stick (vfat)"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.is_ascii(), "{}", out.stdout);
+}
+
+#[test]
+fn analyze_device_refuses_the_system_disk() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    // The machine boots from sdb1: its devnum mounts `/`.
+    std::fs::write(&mountinfo, "1 0 8:17 / / rw,relatime - ext4 /dev/root rw\n")
+        .expect("rewrite mountinfo");
+
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    assert_eq!(value["device"]["verdict"]["reason"], "system_disk");
+    assert_eq!(
+        value["device"]["verdict"]["message"],
+        "device backs the running system",
+    );
+}
+
+#[test]
+fn analyze_device_refuses_active_swap() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    let swaps = dir.path().join("swaps");
+    std::fs::write(
+        &swaps,
+        "Filename\t\tType\t\tSize\t\tUsed\t\tPriority\n\
+         /dev/sdb1                       partition\t3000\t0\t-2\n",
+    )
+    .expect("seed swaps");
+
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("--swaps".to_string());
+    args.push(swaps.display().to_string());
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    let device = &value["device"];
+    assert_eq!(device["verdict"]["reason"], "swap");
+    assert_eq!(
+        device["verdict"]["message"],
+        "device is active swap on /dev/sdb1 - disable swap first",
+    );
+    assert_eq!(device["swaps"], serde_json::json!(["/dev/sdb1"]),);
+}
+
+#[test]
+fn analyze_device_refuses_an_lvm_pv() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    // A whole-disk LVM2 label around the existing MBR: the label is the
+    // refusal, the table keeps parsing as rot-free metadata.
+    patch_file(&dev_file, 512, b"LABELONE");
+    patch_file(&dev_file, 536, b"LVM2 001");
+
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    let device = &value["device"];
+    assert_eq!(device["verdict"]["reason"], "refused_filesystem");
+    let message = device["verdict"]["message"].as_str().expect("message");
+    assert!(message.contains("lvm2"), "{message}");
+    assert_eq!(device["filesystem"], "lvm2");
+}
+
+#[test]
+fn analyze_device_reports_a_holder() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    // dm-crypt/LVM stacked on top of the disk itself.
+    std::fs::create_dir_all(sysfs.join("class/block/sdb/holders/dm-0")).expect("holder dir");
+
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    let device = &value["device"];
+    assert_eq!(device["verdict"]["reason"], "holder");
+    assert_eq!(device["verdict"]["message"], "device is held by dm-0");
+    assert_eq!(device["holders"], serde_json::json!(["dm-0"]));
+}
+
+#[test]
+fn analyze_device_extended_container_warns_in_human_and_json() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // Two-slot MBR: slot 0 becomes an extended container (type 0x0F),
+    // slot 1 keeps the FAT32 primary at the geometry the stick
+    // fixture's BPB already sits at (LBA 2048, 4096 sectors). The
+    // container drops out of the listed partitions with one warning.
+    let mut mbr = [0u8; 512];
+    mbr[510..512].copy_from_slice(&rufus_core::partition::MBR_SIGNATURE);
+    mbr[446 + 4] = 0x0f;
+    mbr[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+    mbr[446 + 12..446 + 16].copy_from_slice(&4096u32.to_le_bytes());
+    mbr[446 + 16 + 4] = 0x0c;
+    mbr[446 + 16 + 8..446 + 16 + 12].copy_from_slice(&2048u32.to_le_bytes());
+    mbr[446 + 16 + 12..446 + 16 + 16].copy_from_slice(&4096u32.to_le_bytes());
+    patch_file(&dev_file, 0, &mbr);
+
+    // Human mode: one `warning:` line, and the note is report-only —
+    // the verdict stays safe.
+    let out = run_args(
+        &analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.is_empty(), "{}", out.stderr);
+    assert!(
+        out.stdout.contains(
+            "warning:  extended partition (type 0x0f): logical partitions are not listed"
+        ),
+        "human output carries the table note:\n{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("verdict:  safe"), "{}", out.stdout);
+
+    // JSON mode: the same string in the report's `warnings` array —
+    // exactly once — and the layout's own `table.warnings` copy intact.
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    let device = &value["device"];
+    let text = "extended partition (type 0x0f): logical partitions are not listed";
+    let reported = device["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .map(|warning| warning.as_str().expect("plain-text warning"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reported.iter().filter(|warning| **warning == text).count(),
+        1,
+        "exactly one report warning: {device}"
+    );
+    let table = device["table"]["warnings"]
+        .as_array()
+        .expect("table warnings array")
+        .iter()
+        .map(|warning| warning.as_str().expect("plain-text warning"))
+        .collect::<Vec<_>>();
+    assert!(table.contains(&text), "{device}");
+    assert_eq!(device["verdict"], serde_json::json!({ "safe": true }));
+}
+
+#[test]
+fn analyze_device_without_a_device_key_keeps_the_s03_shape() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    let out = run(&["analyze", "--json", iso.to_str().expect("path")]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    // Exactly the S03 four keys (the parsed `Value` sorts them; the
+    // declaration order on the wire is pinned by the leading `path`).
+    let keys = value
+        .as_object()
+        .expect("analyze object")
+        .keys()
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 4, "exactly the S03 keys: {keys:?}");
+    assert_eq!(
+        keys,
+        ["kind", "path", "sha256", "size_bytes"],
+        "the four image keys, no more"
+    );
+    assert!(value.get("device").is_none(), "no device key");
+    assert!(
+        out.stdout.starts_with("{\n  \"path\":"),
+        "declaration order puts path first: {}",
+        out.stdout
+    );
+
+    // And the human rendering stays byte-identical to the S03
+    // contract: exactly the four image lines.
+    let out = run(&["analyze", iso.to_str().expect("path")]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "image:  {}\nsize:   {} ({})\nkind:   {}\nsha256: {}\n",
+            iso.display(),
+            32_780,
+            rufus_core::human_bytes(32_780),
+            "iso",
+            FIXTURE_SHA256,
+        ),
+    );
+}
+
+#[test]
+fn analyze_device_unknown_path_exits_2() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // Nothing resolves a path that merely *ends* in a device name
+    // (that inference was removed; the `--device-file` hook is the
+    // explicit way to sample fixture bytes).
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/no/such/sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 2, "{:?}", out);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("error json");
+    assert_eq!(value["error"], "device");
+    assert!(
+        value["message"]
+            .as_str()
+            .expect("msg")
+            .contains("no/such/sdb"),
+        "{}",
+        value["message"]
+    );
+}
+
+#[test]
+fn analyze_device_empty_confirm_serial_is_usage() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("-x".to_string());
+    args.push("--confirm-serial".to_string());
+    args.push("  ".to_string());
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 1, "{:?}", out);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("error json");
+    assert_eq!(value["error"], "usage");
+    assert_eq!(value["message"], "confirmation serial must not be empty",);
+}
+
+#[test]
+fn analyze_device_needs_show_all_and_serial_for_a_fixed_disk() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, _dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    // A blank 1 GiB fixed disk, known by its serial (udev record).
+    let sda_file = blank_device_file(&dir.path().join("sda"), 1024 * 1024 * 1024);
+    std::fs::write(
+        sysfs.join("run/udev/data/b8:0"),
+        "I:5\nE:ID_SERIAL_SHORT=SER0001\n",
+    )
+    .expect("seed fixed-disk serial record");
+
+    // Each row: the extra flags and whether the verdict may be safe.
+    let variants: Vec<(Vec<&str>, bool)> = vec![
+        (vec![], false),     // no -x: hidden unless shown
+        (vec!["-x"], false), // show-all alone does not confirm
+        (vec!["-x", "--confirm-serial", "WRONG"], false),
+        (vec!["-x", "--confirm-serial", "SER0001"], true),
+    ];
+    for (extra, want_safe) in &variants {
+        let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sda", &sda_file);
+        args.extend(extra.iter().map(|flag| flag.to_string()));
+        args.push("--json".to_string());
+        let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(out.code, 0, "extras {extra:?}: {}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+        let device = &value["device"];
+        assert_eq!(device["name"], "sda", "extras {extra:?}");
+        assert_eq!(device["verdict"]["safe"], *want_safe, "extras {extra:?}");
+        if *want_safe {
+            assert!(
+                device["verdict"].get("reason").is_none(),
+                "extras {extra:?}"
+            );
+        } else {
+            assert_eq!(
+                device["verdict"]["reason"], "not_removable",
+                "extras {extra:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn analyze_device_partition_path_names_the_disk() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // A partition path is the common miss: the refusal says which disk
+    // owns the name. Spellings that share the basename behave the same.
+    for requested in ["/dev/sdb1", "sdb1"] {
+        let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, requested, &dev_file);
+        args.push("--json".to_string());
+        let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(out.code, 2, "requested {requested}: {:?}", out);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("error json");
+        assert_eq!(value["error"], "device");
+        assert_eq!(
+            value["message"],
+            format!("{requested} is a partition of /dev/sdb - select the whole disk"),
+            "requested {requested}"
+        );
+    }
+}
+
+#[test]
+fn analyze_device_regular_file_no_longer_resolves_a_disk() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // No basename inference: the fixture buffer itself is not a device
+    // spelling. Sampling fixture bytes needs the explicit S05 hook.
+    let args = vec![
+        "analyze".to_string(),
+        iso.display().to_string(),
+        "--sysfs-root".to_string(),
+        sysfs.display().to_string(),
+        "--mountinfo".to_string(),
+        mountinfo.display().to_string(),
+        "--device".to_string(),
+        dev_file.display().to_string(),
+        "--json".to_string(),
+    ];
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 2, "{:?}", out);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("error json");
+    assert_eq!(value["error"], "device");
+    assert_eq!(
+        value["message"],
+        format!("no block device found for {}", dev_file.display()),
+    );
+}
+
+#[test]
+fn analyze_device_bare_kernel_name_resolves() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // The bare kernel name is a device spelling: it resolves the sdb
+    // device (fixture root) while `--device-file` redirects the bytes.
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    let device = &value["device"];
+    assert_eq!(device["name"], "sdb");
+    assert_eq!(device["path"], dev_file.display().to_string());
+    assert_eq!(device["verdict"], serde_json::json!({ "safe": true }));
+}
+
+#[test]
+fn analyze_device_unreadable_says_so_in_the_table_line() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, _dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    // The hook points at a path that cannot be opened at all (as a
+    // real dead USB bridge or a permission problem would): the report
+    // must still be answerable, and the table line must not claim a
+    // blank disk.
+    let gone = dir.path().join("no-such-device-file");
+
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &gone);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    let device = &value["device"];
+    assert_eq!(device["verdict"]["reason"], "unreadable");
+    let message = device["verdict"]["message"].as_str().expect("message");
+    assert!(message.contains("/no-such-device-file"), "{message}");
+    assert_eq!(device["table"], serde_json::Value::Null, "nothing read");
+
+    // The human spelling: the table line admits the unreadable state.
+    let out = run_args(
+        &analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sdb", &gone)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stdout.contains("table:    unreadable"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("table:    none"),
+        "unreadable must not read as blank: {}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("verdict:"), "{}", out.stdout);
+    assert!(out.stdout.contains("refuse:"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("device is unreadable:"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.is_ascii(), "{}", out.stdout);
+}
+
+#[test]
+fn analyze_device_trims_the_confirm_serial() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, _dev_file, mountinfo) = stick_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    // The same fixed-disk shape as the show-all test: serial SER0001.
+    let sda_file = blank_device_file(&dir.path().join("sda"), 1024 * 1024 * 1024);
+    std::fs::write(
+        sysfs.join("run/udev/data/b8:0"),
+        "I:5\nE:ID_SERIAL_SHORT=SER0001\n",
+    )
+    .expect("seed fixed-disk serial record");
+
+    // Surrounding whitespace does not hide a match: the typed serial
+    // is trimmed once, where it is accepted, before the comparison.
+    let mut args = analyze_device_args(&iso, &sysfs, &mountinfo, "/dev/sda", &sda_file);
+    args.push("-x".to_string());
+    args.push("--confirm-serial".to_string());
+    args.push("  SER0001\t".to_string());
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    assert_eq!(
+        value["device"]["verdict"],
+        serde_json::json!({ "safe": true })
+    );
+    assert!(value["device"]["verdict"].get("reason").is_none());
 }
 
 // ---------------------------------------------------------------------------
