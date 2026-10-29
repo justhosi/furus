@@ -642,7 +642,6 @@ version = "0.1.0"
 name = "rufus-helper"
 version = "0.1.0"
 dependencies = [
- "async-io",
  "rufus-core",
  "rufus-linux",
  "rufus-proto",

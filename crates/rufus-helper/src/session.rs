@@ -196,6 +196,10 @@ impl Session {
         // it touches any filesystem state.
         let id = SessionId::generate()?;
         fs::create_dir_all(root).map_err(|source| SessionError::io(root, "create", source))?;
+        // The root itself is where live session ids are listed, so it is
+        // owner-only too — a session id is a cancellation handle, and
+        // nobody but root has business enumerating them.
+        ensure_owner_only(root)?;
         // Dead-run leftovers go away before the lock is claimed.
         sweep(root);
 
@@ -324,6 +328,20 @@ fn lock_write_new(lock: &Path) -> io::Result<fs::File> {
         .open(lock)
 }
 
+/// Make the session root owner-only, tolerating a directory that is
+/// already 0700 (the common case after the first run).
+fn ensure_owner_only(root: &Path) -> Result<(), SessionError> {
+    match fs::set_permissions(root, fs::Permissions::from_mode(0o700)) {
+        Ok(()) => Ok(()),
+        // A root we do not own cannot be re-moded; that is fine as long
+        // as it is already closed.
+        Err(err) => match fs::metadata(root) {
+            Ok(meta) if meta.permissions().mode() & 0o777 == 0o700 => Ok(()),
+            _ => Err(SessionError::io(root, "set the 0700 mode on", err)),
+        },
+    }
+}
+
 /// Build the session directory: the box, its mode, the pid record and
 /// the canonical plan copy. Everything it does is per-session state
 /// under `dir`; on failure `create` removes the partial directory.
@@ -358,7 +376,10 @@ pub fn sweep(root: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            continue; // not an id we minted (32 hex); leave it alone
+            // Not a name we can reason about; only UTF-8 names below
+            // are ever considered, and only a dead pid makes one
+            // removable.
+            continue;
         };
         if name == LOCK_NAME {
             continue;
@@ -500,6 +521,22 @@ mod tests {
             second.as_str(),
             "two draws must never collide"
         );
+    }
+
+    #[test]
+    fn the_session_root_is_owner_only() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let root = scratch.path().join("run");
+        let plan = sample_plan();
+
+        let session = Session::create(&root, &plan).expect("a fresh root claims the lock");
+        let meta = fs::metadata(&root).expect("root exists");
+        assert_eq!(
+            meta.mode() & 0o777,
+            0o700,
+            "live session ids are a cancellation handle: root only"
+        );
+        drop(session);
     }
 
     // -- Session::create -------------------------------------------------

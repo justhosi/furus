@@ -67,8 +67,8 @@ impl Cancel {
     }
 
     /// Cancel from now on; never un-sets (a mid-write cancel may not be
-    /// walked back by a second command arriving late).
-    #[allow(dead_code)] // wired to the D-Bus Cancel handler in S06 part 4; tests exercise it
+    /// walked back by a second command arriving late). Called by the
+    /// D-Bus `Cancel` handler and by the process watcher.
     pub fn set(&self) {
         self.0.store(true, Ordering::SeqCst);
     }

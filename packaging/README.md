@@ -46,6 +46,15 @@ busctl --system call org.rufuslinux.Helper1 /org/rufuslinux/Helper1 \
   org.rufuslinux.Helper1 Cancel s "<session id>"
 ```
 
+`Cancel` is scoped to the connection that started the run: the helper records
+the caller's unique bus name at `Execute` time and answers `Cancel` from any
+other connection (including a fresh `busctl` invocation) exactly as it answers
+an unknown id, so it neither aborts the run nor confirms that the session
+exists. A client that owns the run must keep its single connection open (the
+desktop application does; a shell cannot, so use `pkexec` with the MVP
+`--plan/--progress` interface when you need to interrupt a run by hand).
+
 A caller polkit denies gets `org.freedesktop.DBus.Error.AccessDenied`; every
 other refusal is `org.freedesktop.DBus.Error.Failed` prefixed with the
-stable code (`busy: …`, `invalid_plan: …`).
+stable error name (`org.rufuslinux.Error.Busy: …`,
+`org.rufuslinux.Error.InvalidPlan: <validator code>: …`).

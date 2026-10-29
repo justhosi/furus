@@ -32,6 +32,7 @@
 //! which are human sentences.
 
 use std::fs;
+use std::io::Read as _;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -55,12 +56,6 @@ use rufus_proto::Plan;
 use rufus_proto::Scheme;
 use rufus_proto::Step;
 use rufus_proto::WriteMode;
-
-/// Reject code for a run request whose session directory carries no
-/// plan. The request path (D-Bus `Execute`, S06 part 4) raises it; the
-/// code is pinned here so front ends key a stable string from day one.
-#[allow(dead_code)] // wired by S06 part 4; pinned regardless
-pub const NO_SESSION_PLAN: &str = "no_session_plan";
 
 /// One refusal of one rule: a stable code for the machines, one ASCII
 /// sentence for the human. Codes are pinned in tests.
@@ -143,20 +138,60 @@ pub struct Validated {
     pub target: Target,
 }
 
+/// The plan-file read cap (bytes): the plan schema is a small document
+/// (one device reference, one image reference, a step list), so
+/// anything past 1 MiB is hostile input or the wrong file, and a root
+/// process must never buffer it (`--plan /dev/zero` would otherwise
+/// grow without bound). The cap is enforced *during* the read, not
+/// after it — `fs::read` alone would still OOM on a cap check.
+pub const MAX_PLAN_BYTES: usize = 1_048_576; // 1 MiB
+
 /// Load a plan file from disk, refusing anything that is not one.
 ///
 /// I/O and parse failures refuse with separate codes
 /// (`"unreadable_plan"` vs `"malformed_plan"`) so a front end can say
-/// "path wrong / no permissions" vs "file is rot". Both messages carry
-/// the sanitised path (the plan file path is user input) and stay one
-/// ASCII line.
+/// "path wrong / no permissions" vs "file is rot"; a read hitting the
+/// [`MAX_PLAN_BYTES`] ceiling refuses as `"plan_too_large"`. Both
+/// messages carry the sanitised path (the plan file path is user
+/// input) and stay one ASCII line.
 pub fn load(path: &Path) -> Result<Plan, Reject> {
-    let bytes = fs::read(path).map_err(|source| {
+    // The read itself is capped: read (up to) the cap, then probe one
+    // more byte — any probe read means the file has content beyond the
+    // cap, so it is not a plan.
+    let mut file = fs::File::open(path).map_err(|source| {
         reject(
             "unreadable_plan",
             format!("cannot read the plan file {}: {source}", path.display()),
         )
     })?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_PLAN_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| {
+            reject(
+                "unreadable_plan",
+                format!("cannot read the plan file {}: {source}", path.display()),
+            )
+        })?;
+    let mut probe = [0u8; 1];
+    let overrun = file.read(&mut probe).map_err(|source| {
+        reject(
+            "unreadable_plan",
+            format!("cannot read the plan file {}: {source}", path.display()),
+        )
+    })? > 0;
+    if overrun {
+        return Err(reject(
+            "plan_too_large",
+            format!(
+                "the plan file {} is larger than {} - a plan is a small \
+                 document; rebuild the plan",
+                path.display(),
+                human_bytes(MAX_PLAN_BYTES as u64)
+            ),
+        ));
+    }
     serde_json::from_slice::<Plan>(&bytes).map_err(|source| {
         reject(
             "malformed_plan",
@@ -225,8 +260,9 @@ pub fn validate(plan: &Plan, env: &Env) -> Result<Validated, Reject> {
     }
 
     // 4. The device: a real block device node under /dev, resolved on
-    //    this system's device list (node facts first: they are the
-    //    cheap TOCTOU guard, before any content is read).
+    //    this system's device list (node facts first: the pre-open
+    //    shape check on every path the helper would touch, before any
+    //    content is read).
     device_node_checks(&plan.device.path, env.device_file.as_deref())?;
     let devices = collect_candidates(env)?;
     let Some(device) = resolve_device(&devices, &plan.device.path) else {
@@ -245,7 +281,9 @@ pub fn validate(plan: &Plan, env: &Env) -> Result<Validated, Reject> {
     check_size(plan, &device)?;
 
     // 6. The image: a regular, non-world-writable file whose size and
-    //    SHA-256 are exactly what the plan recorded (the TOCTOU guard).
+    //    SHA-256 are exactly what the plan recorded (the contents
+    //    re-read — see `check_image` for the narrow guarantee it
+    //    provides and the S17 obligations it leaves).
     check_image(plan)?;
 
     // 7. Step semantics: table/format arguments legal for this plan.
@@ -383,7 +421,22 @@ fn check_size(plan: &Plan, device: &Device) -> Result<(), Reject> {
 
 /// Rule 6: image regularity, permissions, size and digest — the helper
 /// re-reads the whole image once here so the bytes S17 will stream have
-/// just been seen (the TOCTOU guard; the digest cost is the point).
+/// just been seen (the digest cost is the point).
+///
+/// # What this narrows, and what it does not
+///
+/// The re-read confirms the image contents against the plan's hash at
+/// *check* time; it cannot make the file immutable. [`fs::metadata`]
+/// follows symlinks (rule 6 is about the file the path resolves to),
+/// and the device node is equally re-checked by `lstat` rather than
+/// held. Both the image and the node are re-opened **by path** when
+/// S17 streams, so the bytes may still change between this check and
+/// the write (PLAN §6's "image passed as an open fd" is not
+/// implemented). The S17 obligations close that gap: open with
+/// `O_NOFOLLOW`, re-verify the size (and ideally the digest) against
+/// the plan after the open, or take the image fd from the front end so
+/// the path is never resolved a second time. Until then the truth is:
+/// this rule narrows the window, it does not close it.
 fn check_image(plan: &Plan) -> Result<(), Reject> {
     let path = Path::new(&plan.image.path);
     let displayed = device_text(&plan.image.path);
@@ -596,7 +649,7 @@ mod tests {
     use rufus_proto::WriteMode;
 
     use super::Env;
-    use super::NO_SESSION_PLAN;
+    use super::MAX_PLAN_BYTES;
     use super::Validated;
     use super::load;
     use super::scheme_tag;
@@ -1573,6 +1626,33 @@ mod tests {
     }
 
     #[test]
+    fn load_refuses_a_plan_file_beyond_the_size_cap() {
+        let fixture = Fixture::new();
+        // One byte past the cap is enough; the reader never parses it.
+        let oversized = " ".repeat(MAX_PLAN_BYTES + 1);
+        let path = fixture.write_text("huge.json", &oversized);
+        let err = load(&path).expect_err("a plan larger than the cap refuses");
+        assert_eq!(err.code, "plan_too_large");
+        assert!(err.message.contains("plan file"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_image_larger_than_the_device_is_refused_as_too_small() {
+        let fixture = Fixture::new();
+        fixture.seed_stick(true);
+        let device = fixture.sparse("device.img", STICK_BYTES);
+        // Two sectors past the device, which is beyond the plan's own
+        // size slack and therefore a `TooSmall` refusal, not a mismatch.
+        let oversize = STICK_BYTES + 2 * SECTOR;
+        let (image, sha) = fixture.image("image.img", oversize);
+        let plan = signed(fixture.plan_for(&image, oversize, &sha));
+        let env = fixture.env(Some(&device));
+
+        let reject = validate(&plan, &env).expect_err("an image bigger than the device refuses");
+        assert_eq!(reject.code, "too_small", "{}", reject.message);
+    }
+
+    #[test]
     fn load_refuses_rot() {
         let fixture = Fixture::new();
         let path = fixture.write_text("plan.json", "{");
@@ -1586,11 +1666,6 @@ mod tests {
     // ----------------------------------------------------------------------
     // Pinned machine-facing strings
     // ----------------------------------------------------------------------
-
-    #[test]
-    fn no_session_plan_code_is_pinned() {
-        assert_eq!(NO_SESSION_PLAN, "no_session_plan");
-    }
 
     #[test]
     fn scheme_tags_match_the_serde_wire_tags() {

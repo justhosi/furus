@@ -8,26 +8,28 @@
 //! still runs, and the front end follows the run through the event
 //! stream ([`Event`]s) plus `Cancel(session_id)`.
 //!
-//! This module is the pure service layer of that contract — the busy
-//! claim, the worker thread, the authorisation seam and the event seam
-//! — with **no bus in it**: everything left over (opening
-//! `zbus::blocking::Connection`, exposing the object with
-//! `#[zbus::interface]`, the polkit-backed [`Authorizer`] and the
-//! signal-backed [`EventEmitter`]) is S06 part 5b, which needs none of
-//! this code's internals. Neither `zbus` nor `async-io` appears in this
-//! file: they are workspace dependencies compiled in so 5b solves no
-//! resolution of its own.
+//! This module is the whole service in two halves: the pure service
+//! layer (the busy claim, the worker thread, the authorisation seam
+//! and the event seam) and, since part 5b landed, the bus half right
+//! after it — the polkit-backed [`PolkitAuthorizer`], the
+//! signal-backed [`EventEmitter`] and the exported [`Helper1`] object.
+//! The split inside this file keeps the service logic bus-free: only
+//! the second half reaches for `zbus` (`zbus::blocking::Connection`
+//! supplies both the polkit proxy and the signal channel; no direct
+//! `async-io` is needed — zbus pulls its own async-io runtime).
 //!
 //! # The life of a session
 //!
 //! ```text
-//! Execute(caller, plan_json)                         Cancel(session_id)
+//! Execute(caller, plan_json)                      Cancel(caller, session_id)
 //!    │ 1. authorization.authorize(caller)                │ the claim's Cancel is
-//!    │ 2. claim the busy slot (one lock acquisition)     │ set; the worker sees
-//!    │    (Busy when one is running)                     │ it before its first
-//!    │ 3. parse + validate (synchronous, claim held)     │ step and warns
-//!    │ 4. spawn the `rufus-session` thread
+//!    │ 2. claim the busy slot (one lock acquisition)     │ set — by the caller
+//!    │    (Busy when one is running)                     │ that `execute`
+//!    │ 3. parse + validate (synchronous, claim held)     │ recorded — and the
+//!    │ 4. spawn the `rufus-session` thread               │ worker sees it
 //!    │    ↕ the worker creates the session and publishes its id
+//!    │                                                   │ before its first
+//!    │                                                   │ step and warns
 //!    ├──► return Ok(session_id)   — the plan keeps running on the thread
 //! ```
 //!
@@ -68,6 +70,7 @@ use rufus_proto::Completion;
 use rufus_proto::EVENT_STREAM_VERSION;
 use rufus_proto::Event;
 use rufus_proto::Outcome;
+use rufus_proto::Progress;
 
 use crate::exec;
 use crate::namespace;
@@ -231,6 +234,12 @@ struct Claim {
     cancel: exec::Cancel,
     /// The session id once [`session::Session::create`] returned.
     id: Option<String>,
+    /// The unique bus name of the caller [`Registry::execute`]
+    /// accepted. `Cancel` acts only for this caller: any local user
+    /// can enumerate the session ids under the sessions root, so a
+    /// cancel scoped by id alone would let one user abort another
+    /// user's disk write.
+    owner: String,
 }
 
 /// Releases the busy claim whenever the worker's frame ends — normal
@@ -534,6 +543,9 @@ impl Registry {
             let claim = Claim {
                 cancel: exec::Cancel::new(),
                 id: None,
+                // The authorisation above succeeded for exactly this
+                // caller, so it is the one recorded owner of the run.
+                owner: caller.to_string(),
             };
             let cancel = claim.cancel.clone();
             *state = Some(claim);
@@ -600,7 +612,16 @@ impl Registry {
         }
     }
 
-    /// Cancel the run named by `session_id`. Its first stopping point
+    /// Cancel the run named by `session_id` — **for `caller` only**.
+    /// The caller recorded at `execute` time is the run's owner: the
+    /// session ids under the sessions root are enumerable by every
+    /// local user, so a cancel scoped by id alone would hand anyone
+    /// the power to abort another user's write. When `caller` does
+    /// not match the owner, the refusal is exactly the
+    /// unknown-session one below — a foreign caller must not even
+    /// learn that the run exists.
+    ///
+    /// Its first stopping point
     /// — the check before each step of the loop (S06 part 3), and from
     /// S07/S17 the step executors between bytes — reports
     /// [`Outcome::Cancelled`].
@@ -610,7 +631,7 @@ impl Registry {
     /// finished — the claim then no longer names anything. Blank ids
     /// refuse the same way, with their own sentence, for there is
     /// nothing they could name.
-    pub fn cancel(&self, session_id: &str) -> Result<(), ServiceError> {
+    pub fn cancel(&self, caller: &str, session_id: &str) -> Result<(), ServiceError> {
         let id = session_id.trim();
         if id.is_empty() {
             return Err(ServiceError::unknown_session(
@@ -619,11 +640,14 @@ impl Registry {
         }
         let state = self.lock_state();
         if let Some(claim) = state.as_ref()
+            && claim.owner == caller
             && claim.id.as_deref() == Some(id)
         {
             claim.cancel.set();
             return Ok(());
         }
+        // One refusal for every miss: wrong id, wrong caller, no run
+        // at all — the external answer must not distinguish them.
         Err(ServiceError::unknown_session(device_text(&format!(
             "no session {id} is running (it never started or has already finished)"
         ))))
@@ -731,6 +755,20 @@ pub fn polkit_subject(caller: &str) -> zbus::zvariant::Value<'static> {
     zbus::zvariant::Value::from(("system-bus-name", fields))
 }
 
+/// The verdict of a polkit `CheckAuthorization` reply
+/// `(is_authorized, is_challenge, details)`: only an explicit `true`
+/// authorises a disk write. This is the gate between a local bus
+/// caller and a disk write, so it deliberately reads nothing else —
+/// a challenge that was not answered is polkit's business (the S06
+/// action is `auth_admin_keep`) and stays a denial, and the details
+/// map is advisory text that can never upgrade a `false` into a
+/// grant. Kept a free function so the gate is unit-testable without
+/// a bus or running polkit.
+fn polkit_disk_write_verdict(reply: (bool, bool, HashMap<String, String>)) -> bool {
+    let (authorized, _challenge, _details) = reply;
+    authorized
+}
+
 /// The real [`Authorizer`]: ask polkit's authority whether `caller` may
 /// run [`POLKIT_ACTION`] (S06: `auth_admin_keep`).
 ///
@@ -772,14 +810,13 @@ impl Authorizer for PolkitAuthorizer {
                 ),
             )
             .map_err(|err| device_text(&format!("the polkit check failed: {err}")))?;
-        // `(is_authorized, is_challenge, details)` — only the verdict
-        // matters: `auth_admin_keep` is polkit's business, and a
-        // challenge that was not answered is simply not authorized.
-        let (authorized, _challenge, _details): (bool, bool, HashMap<String, String>) = reply
+        // `(is_authorized, is_challenge, details)` — the gate reads
+        // only the verdict (see [`polkit_disk_write_verdict`]).
+        let reply: (bool, bool, HashMap<String, String>) = reply
             .body()
             .deserialize()
             .map_err(|err| device_text(&format!("cannot read the polkit answer: {err}")))?;
-        Ok(authorized)
+        Ok(polkit_disk_write_verdict(reply))
     }
 }
 
@@ -789,6 +826,49 @@ impl Authorizer for PolkitAuthorizer {
 pub fn outcome_json(outcome: &Outcome) -> String {
     serde_json::to_string(outcome)
         .unwrap_or_else(|_| "{\"outcome\":\"failed\",\"code\":\"json\",\"message\":\"the outcome could not be encoded\"}".to_string())
+}
+
+/// The `total` argument's "no known size" sentinel (zvariant has no
+/// `Option<u64>`; see [`progress_args`]).
+pub const UNKNOWN_TOTAL: i64 = -1;
+
+/// The `percent` argument's "unknown" sentinel.
+pub const UNKNOWN_PERCENT: i16 = -1;
+
+/// The flat argument list of one `Progress` signal, extracted from an
+/// [`Progress`] event by [`progress_args`].
+struct ProgressArgs {
+    session: String,
+    step: u32,
+    op: String,
+    done: u64,
+    total: i64,
+    percent: i16,
+}
+
+/// Collapse a [`Progress`] event onto the flat `Progress` signal
+/// argument list (the pure half of [`EventEmitter`]'s `Progress` arm,
+/// split out so the mapping is unit-testable without a bus).
+///
+/// Absent sizes ride the bus as the documented `-1` sentinels
+/// (zvariant has no `Option<u64>` type, and a separate "known" boolean
+/// would be noise). A total too large for the `i64` wire saturates to
+/// `i64::MAX` instead of collapsing into the sentinel: an honest huge
+/// total must stay positive and distinct from "size unknown".
+/// Similarly `step` is a `usize` on the event and a `u32` on the wire;
+/// an index beyond that range saturates rather than panicking the
+/// worker thread.
+fn progress_args(progress: &Progress) -> ProgressArgs {
+    ProgressArgs {
+        session: device_text(&progress.session),
+        step: u32::try_from(progress.step).unwrap_or(u32::MAX),
+        op: device_text(&progress.op),
+        done: progress.done,
+        total: progress.total.map_or(UNKNOWN_TOTAL, |value| {
+            i64::try_from(value).unwrap_or(i64::MAX)
+        }),
+        percent: progress.percent.map_or(UNKNOWN_PERCENT, i16::from),
+    }
 }
 
 /// The real [`EventEmitter`]: every run event becomes one signal on
@@ -822,26 +902,18 @@ impl EventEmitter for SignalEmitter {
     fn emit(&self, event: &Event) -> Result<(), String> {
         match event {
             Event::Progress(progress) => {
-                let session = device_text(&progress.session);
-                let op = device_text(&progress.op);
-                let step = u32::try_from(progress.step).unwrap_or(u32::MAX);
-                // Absent sizes ride the bus as the documented `-1`
-                // sentinel: zvariant has no `Option<u64>` type, and a
-                // separate "known" boolean would be noise.
-                let total = progress
-                    .total
-                    .and_then(|value| i64::try_from(value).ok())
-                    .unwrap_or(UNKNOWN_TOTAL);
-                let percent = progress.percent.map_or(UNKNOWN_PERCENT, i16::from);
+                // The mapping is pure (see [`progress_args`]); this
+                // arm only serialises its result.
+                let args = progress_args(progress);
                 self.send(
                     "Progress",
                     &(
-                        session.as_str(),
-                        step,
-                        op.as_str(),
-                        progress.done,
-                        total,
-                        percent,
+                        args.session.as_str(),
+                        args.step,
+                        args.op.as_str(),
+                        args.done,
+                        args.total,
+                        args.percent,
                     ),
                 )
             }
@@ -929,10 +1001,24 @@ impl Helper1 {
         }
     }
 
-    /// Ask the run named by `session_id` to stop.
-    fn cancel(&self, session_id: String) -> zbus::fdo::Result<()> {
+    /// Ask the run named by `session_id` to stop. Only the connection
+    /// that started the run may stop it (the sender recorded at
+    /// `execute` time; see [`Registry::cancel`]).
+    fn cancel(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        session_id: String,
+    ) -> zbus::fdo::Result<()> {
+        // The same no-sender rule as `execute`: without a sender there
+        // is no identity that could own a run, so the call is not
+        // authored at all.
+        let Some(caller) = header.sender() else {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "the call carries no sender to authorize".to_string(),
+            ));
+        };
         self.registry
-            .cancel(&session_id)
+            .cancel(&caller.to_string(), &session_id)
             .map_err(|error| to_dbus_error(&error))
     }
 
@@ -967,19 +1053,13 @@ impl Helper1 {
     ) -> zbus::Result<()>;
 }
 
-/// The `total` argument's "no known size" sentinel (zvariant has no
-/// `Option<u64>`; see [`SignalEmitter::emit`]).
-pub const UNKNOWN_TOTAL: i64 = -1;
-
-/// The `percent` argument's "unknown" sentinel.
-pub const UNKNOWN_PERCENT: i16 = -1;
-
 /// Name of the short-lived thread `Execute` waits on (pinned for
 /// reporting; it lives for one accept).
 const ACCEPT_THREAD_NAME: &str = "rufus-accept";
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
@@ -1017,8 +1097,12 @@ mod tests {
     use super::POLKIT_ACTION;
     use super::Registry;
     use super::ServiceError;
+    use super::UNKNOWN_PERCENT;
+    use super::UNKNOWN_TOTAL;
     use super::outcome_json;
+    use super::polkit_disk_write_verdict;
     use super::polkit_subject;
+    use super::progress_args;
     use super::to_dbus_error;
 
     // ----------------------------------------------------------------------
@@ -1076,6 +1160,81 @@ mod tests {
             matches!(&invalid, zbus::fdo::Error::Failed(message) if message.starts_with("org.rufuslinux.Error.InvalidPlan: confirm_mismatch")),
             "{invalid:?}"
         );
+    }
+
+    // -- the polkit verdict: the gate between a local bus caller and
+    //    a disk write -----------------------------------------------------
+
+    #[test]
+    fn polkit_disk_write_verdict_pins_the_grant_table() {
+        // The rule, and nothing more: only an explicit `true` in the
+        // first field authorises a write. The challenge flag stays
+        // read-only for the verdict (a prompt nobody answered is
+        // polkit's `auth_admin_keep` business) and the details map can
+        // never upgrade a `false` into a grant.
+        let answered: HashMap<String, String> = HashMap::from([(
+            "polkitDetails".to_string(),
+            "present-but-advisory".to_string(),
+        )]);
+        assert!(
+            polkit_disk_write_verdict((true, false, HashMap::new())),
+            "an explicit yes authorises"
+        );
+        assert!(
+            polkit_disk_write_verdict((true, true, answered.clone())),
+            "the challenge flag must not veto a granted verdict"
+        );
+        assert!(
+            !polkit_disk_write_verdict((false, false, HashMap::new())),
+            "a plain no denies"
+        );
+        assert!(
+            !polkit_disk_write_verdict((false, true, answered.clone())),
+            "a no stays a no with a challenge and non-empty details"
+        );
+    }
+
+    // -- the Progress signal mapping (the pure half of the emitter) --------
+
+    #[test]
+    fn progress_args_pass_know_sizes_through_unchanged() {
+        let progress = rufus_proto::Progress::new(":1.7", 3, "write", 10, Some(10));
+        let args = progress_args(&progress);
+        assert_eq!(args.session, ":1.7", "unique bus names are already ASCII");
+        assert_eq!(args.step, 3);
+        assert_eq!(args.op, "write");
+        assert_eq!(args.done, 10);
+        assert_eq!(args.total, 10, "a known total rides the wire as itself");
+        assert_eq!(args.percent, 100, "the derived percent rides verbatim");
+    }
+
+    #[test]
+    fn progress_args_maps_absent_sizes_to_the_negative_one_sentinels() {
+        let progress = rufus_proto::Progress::new(":1.7", 0, "wipe", 0, None);
+        let args = progress_args(&progress);
+        assert_eq!(args.total, UNKNOWN_TOTAL);
+        assert_eq!(args.percent, UNKNOWN_PERCENT);
+    }
+
+    #[test]
+    fn progress_args_saturates_a_u64_max_total_instead_of_collapsing_it() {
+        let progress = rufus_proto::Progress::new(":1.7", 0, "write", 0, Some(u64::MAX));
+        let args = progress_args(&progress);
+        assert!(
+            args.total > 0,
+            "an honest huge total must not read as the unknown sentinel"
+        );
+        assert_ne!(args.total, UNKNOWN_TOTAL);
+        assert_eq!(args.total, i64::MAX, "the saturation target is i64::MAX");
+    }
+
+    #[test]
+    fn progress_args_saturates_a_step_beyond_u32_instead_of_panicking() {
+        // The "a usize-wide plan no real device list can produce" case
+        // (see `progress_args`): saturation, no panic, no wrap.
+        let progress = rufus_proto::Progress::new(":1.7", u32::MAX as usize + 1, "wipe", 0, None);
+        let args = progress_args(&progress);
+        assert_eq!(args.step, u32::MAX);
     }
 
     // ----------------------------------------------------------------------
@@ -1602,7 +1761,9 @@ mod tests {
         let (registry, _emitter) = registry_with(env, Arc::new(FixedAuthorizer(true)), &sessions);
 
         for id in ["deadbeefdeadbeefdeadbeefdeadbeef", "", "   \t"] {
-            let refused = registry.cancel(id).expect_err("nothing under this id runs");
+            let refused = registry
+                .cancel("com.example.gui", id)
+                .expect_err("nothing under this id runs");
             assert_eq!(
                 refused.code(),
                 ERROR_UNKNOWN_SESSION,
@@ -1610,6 +1771,56 @@ mod tests {
             );
         }
         assert!(registry.is_idle());
+    }
+
+    #[test]
+    fn a_foreign_caller_cannot_cancel_and_learns_nothing_of_the_run() {
+        let fixture = Fixture::new();
+        let (good, env, _device) = fixture.good(true);
+        let plan = finalize_only(good);
+        let sessions = tempfile::tempdir().expect("sessions root");
+        let (registry, emitter) = registry_with(env, Arc::new(FixedAuthorizer(true)), &sessions);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let parked = barrier.clone();
+        registry.install_run_pause(Some(Arc::new(move || {
+            parked.wait();
+        })));
+
+        let id = registry
+            .execute("com.example.gui", &execute_json(&plan))
+            .expect("a valid plan is accepted immediately");
+
+        // A second bus connection (or plain local user) knows the id
+        // from /run and tries to abort: refused, with the same
+        // sentence a wrong id would draw — nothing leaks about whose
+        // run it is.
+        let refused = registry
+            .cancel("com.example.other", &id)
+            .expect_err("another caller cannot cancel the run");
+        assert_eq!(refused.code(), ERROR_UNKNOWN_SESSION);
+        assert_eq!(
+            refused.to_string(),
+            format!("no session {id} is running (it never started or has already finished)"),
+            "the refusal is indistinguishable from a wrong id"
+        );
+        assert!(
+            registry.running().as_deref() == Some(id.as_str()),
+            "the run kept its claim and owner"
+        );
+
+        // The run was untouched by the foreign cancel: released
+        // unchecked, it reaches Ok, not Cancelled.
+        barrier.wait();
+        wait_idle(&registry);
+        let completions = wait_completions(&emitter);
+        assert_eq!(completions.len(), 1, "exactly one Done");
+        assert_eq!(completions[0].session, id);
+        assert_eq!(
+            completions[0].outcome,
+            rufus_proto::Outcome::Ok,
+            "the foreign cancel never reached the run"
+        );
     }
 
     // -- the run's own stream ----------------------------------------------
@@ -1693,7 +1904,7 @@ mod tests {
         // earliest real stop, and it keeps the same `Cancelled`
         // contract).
         registry
-            .cancel(&id)
+            .cancel("com.example.gui", &id)
             .expect("the claimed run is cancellable");
         barrier.wait(); // release the worker; the loop's cancel check fires
         wait_idle(&registry);
@@ -1709,7 +1920,10 @@ mod tests {
 
         // A cancel for a session that already finished refuses now.
         assert_eq!(
-            registry.cancel(&id).expect_err("the run is over").code(),
+            registry
+                .cancel("com.example.gui", &id)
+                .expect_err("the run is over")
+                .code(),
             ERROR_UNKNOWN_SESSION
         );
 

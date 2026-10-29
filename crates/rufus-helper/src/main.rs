@@ -55,8 +55,8 @@ use rufus_proto::Outcome;
 
 use exec::CurrentExecutor;
 use progress::JsonlSink;
+use progress::NullSink;
 use progress::ProgressSink;
-use progress::VecSink;
 
 /// Parsed surface of the privileged run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,7 +277,7 @@ fn run(args: &RunArgs) -> i32 {
     let env = validate::Env::live();
     let mut sink: Option<JsonlSink<io::Stdout>> =
         args.progress.then(|| JsonlSink::new(io::stdout()));
-    let mut discard = VecSink::new();
+    let mut discard = NullSink::new();
     // Empty until the session exists; pre-session failures stream no
     // events but still end their stream on exactly one `Done`.
     let mut session_id = String::new();
@@ -384,10 +384,10 @@ fn run(args: &RunArgs) -> i32 {
 }
 
 /// Choose the sink the run talks to: the JSONL transport, or the
-/// in-memory discard sink when no `--progress` was given.
+/// discarding sink when no `--progress` was given.
 fn sink_for<'a>(
     sink: &'a mut Option<JsonlSink<io::Stdout>>,
-    discard: &'a mut VecSink,
+    discard: &'a mut NullSink,
 ) -> &'a mut dyn ProgressSink {
     match sink {
         Some(sink) => sink,
@@ -396,7 +396,7 @@ fn sink_for<'a>(
 }
 
 /// One event out through whichever sink exists.
-fn emit(sink: Option<&mut JsonlSink<io::Stdout>>, discard: &mut VecSink, event: &Event) {
+fn emit(sink: Option<&mut JsonlSink<io::Stdout>>, discard: &mut NullSink, event: &Event) {
     match sink {
         Some(sink) => ProgressSink::event(sink, event),
         None => ProgressSink::event(discard, event),

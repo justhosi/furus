@@ -9,8 +9,10 @@ publish.workspace = true
 # error), proto (plan + event stream), linux (sysfs/inspect) and rustix
 # for the geteuid root check. No clap (three flags are hand-parsed), no
 # libc.
-# S06 part 5a adds zbus/async-io (workspace entries above): compile-time
-# only here — src/dbus.rs is the pure service layer; 5b wires the bus.
+# S06 part 5b: src/dbus.rs uses zbus directly now — the polkit-backed
+# authorizer and the signal emitter both talk to
+# `zbus::blocking::Connection`. No direct `async-io`: nothing here
+# names the crate, and zbus pulls the runtime it needs itself.
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,7 +20,6 @@ rufus-core = { workspace = true }
 rufus-proto = { workspace = true }
 rufus-linux = { workspace = true }
 zbus = { workspace = true }
-async-io = { workspace = true }
 
 [dev-dependencies]
 # S06: scratch directories for the session/validate fixtures.

@@ -439,6 +439,10 @@ enum Command {
         /// Serial the user typed to confirm a fixed disk (PLAN §6 rule 4;
         /// only meaningful together with `-x/--extra-devs`). Compared
         /// trimmed: surrounding whitespace does not hide a match.
+        ///
+        /// Unlike `plan --confirm-serial`, this accepts the flag without
+        /// `-x`: `analyze` only reports, and the verdict then refuses a
+        /// fixed disk as not removable, which is the honest answer.
         #[arg(long, value_name = "SERIAL")]
         confirm_serial: Option<String>,
     },

@@ -54,14 +54,13 @@ md-5 = { version = "0.10" }
 # (unshare(CLONE_NEWNS) + recursive-private /) and the mount/unmount seam
 # behind it (`mount(2)`/`umount2(2)` with the MNT_DETACH fallback).
 rustix = { version = "1", features = ["fs", "event", "std", "process", "thread", "mount"] }
-# S06 part 5a: the privileged D-Bus service. zbus 5's default features
-# ("async-io" + "blocking-api") are exactly what part 5b wires
-# (`zbus::blocking::Connection` over the async-io worker runtime); no
-# version below 5 has "blocking-api". Compile-time-only in 5a: the pure
-# service layer (src/dbus.rs) uses neither crate yet, so the resolution
-# is settled before the bus wiring lands.
+# S06 part 5b: the privileged D-Bus service. zbus 5's default features
+# ("async-io" + "blocking-api") are what the helper's src/dbus.rs uses
+# (`zbus::blocking::Connection`, whose proxy layer runs on zbus's own
+# async-io worker runtime); no version below 5 has "blocking-api".
+# No direct `async-io` dependency exists anywhere in the workspace now:
+# no crate names the crate, and zbus brings the runtime transitively.
 zbus = { version = "5" }
-async-io = { version = "2" }
 # Internal crates (path form, so workspaces can share them exactly).
 rufus-core = { path = "crates/rufus-core" }
 rufus-proto = { path = "crates/rufus-proto" }

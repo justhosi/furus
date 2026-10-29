@@ -20,8 +20,8 @@ use std::io;
 use rufus_proto::Event;
 
 /// Where run-time events are delivered. Implemented for the JSONL
-/// transport ([`JsonlSink`]), the test buffer ([`VecSink`]) and (since
-/// S06 part 4) the D-Bus signalling bridge.
+/// transport ([`JsonlSink`]), the discarding [`NullSink`], the test
+/// buffer ([`VecSink`]) and the D-Bus signalling bridge.
 pub trait ProgressSink {
     /// Deliver one event. Implementations that cannot deliver (a dead
     /// reader behind a pipe) record that their own way
@@ -80,18 +80,39 @@ impl<W: io::Write> ProgressSink for JsonlSink<W> {
     }
 }
 
+/// Sink that drops every event.
+///
+/// Used by `main` when the caller passed no `--progress`: the run still
+/// produces its events (and the terminal `Done`), but nothing is kept,
+/// so per-block progress in S17 cannot grow memory without a reader.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullSink;
+
+impl NullSink {
+    /// A sink that keeps nothing.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl ProgressSink for NullSink {
+    fn event(&mut self, _event: &Event) {}
+}
+
 /// In-memory sink: collects every event it receives, in order.
 ///
-/// Test-side companion (also used by `main` as the discard sink when the
-/// caller passed no `--progress`): cheap, order-preserving, and usable
-/// to *assert* on the event stream itself.
+/// Test-side companion: cheap, order-preserving, and usable to *assert*
+/// on the event stream itself.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // test-side only since `main` uses NullSink
 pub struct VecSink {
     events: Vec<Event>,
 }
 
 impl VecSink {
     /// An empty sink.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
