@@ -7,3 +7,7 @@ publish.workspace = true
 [[bin]]
 name = "rufus-gui"
 path = "src/main.rs"
+
+[lints]
+# Enforce the workspace-wide `unsafe_code = "forbid"` (S04 review).
+workspace = true

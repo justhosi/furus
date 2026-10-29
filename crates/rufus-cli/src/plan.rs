@@ -14,10 +14,19 @@
 //!   anywhere. Never a reason to fail.
 //! * otherwise — a missing device is a device error (exit 2) and an
 //!   existing non-block device is refused outright (exit 3, safety).
+//!
+//! After grading, the mapper fields are filled from S04 discovery when
+//! the target resolves on the given sysfs root (a `dev_path` match):
+//! `size_bytes`, `serial`, `model`, `sysfs`, and `block_device`. The
+//! enrichment is deliberately non-fatal — a missing root, a vanished
+//! class directory or an unmatched path (e.g. `/dev/null`, which is what
+//! the plan golden uses) keeps the fields `None`, exactly the S03 plan
+//! shape.
 
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
+use rufus_linux::SysfsRoot;
 use rufus_proto::BootloaderMode;
 use rufus_proto::DeviceRef;
 use rufus_proto::ImageKind;
@@ -55,12 +64,9 @@ pub struct Options {
     pub show_all: bool,
 }
 
-/// Grade the target device path into a [`DeviceRef`].
-///
-/// All mapper fields (`size_bytes`, `serial`, `model`, `sysfs`) stay `None`
-/// in S03 — device identity comes from S04/S05; S06's helper will refuse
-/// plans that lack it.
-pub fn device_ref(path: &Path, dry_run: bool) -> Result<DeviceRef, Fail> {
+/// Grade the target device path into a [`DeviceRef`], enriched from S04
+/// discovery where possible.
+pub fn device_ref(path: &Path, dry_run: bool, sysfs: &SysfsRoot) -> Result<DeviceRef, Fail> {
     let block_device = match std::fs::metadata(path) {
         Ok(meta) => {
             // unix only: the workspace targets Linux (PLAN §1 A3).
@@ -91,30 +97,80 @@ pub fn device_ref(path: &Path, dry_run: bool) -> Result<DeviceRef, Fail> {
             ),
         });
     }
-    Ok(DeviceRef {
+    let mut device = DeviceRef {
         path: path.display().to_string(),
         block_device,
-        // DELIBERATE (see module header): no BLKGETSIZE64 in this slice.
         size_bytes: None,
         serial: None,
         model: None,
         sysfs: None,
-    })
+    };
+
+    // S04 enrichment: discovery is best-effort. A sysfs root that cannot
+    // be enumerated (missing on a dry-run box, unreadable in a fixture)
+    // is simply ignored — the plan keeps the all-`None` mapper fields
+    // and the CLI/golden tests stay deterministic.
+    let discovered = rufus_linux::enumerate(sysfs).ok().and_then(|devices| {
+        devices
+            .into_iter()
+            .find(|known| known.dev_path == device.path)
+    });
+    if let Some(found) = discovered {
+        // A discoverable device *is* a block device on its root, so the
+        // fact rides into the plan (S06's helper re-checks it anyway).
+        device.block_device = true;
+        device.size_bytes = Some(found.size_bytes);
+        device.serial = found.serial;
+        device.model = found.model;
+        device.sysfs = Some(found.sysfs);
+    }
+    Ok(device)
 }
 
 /// How the image transfers: raw streams by dd, structured containers by
-/// copy. `*.iso` files and magic-`raw`/`iso` content are dd-ed; everything
-/// else copies (WIMs through wimlib in S21, trees through the S18 copier).
-/// Provisional for this schema generation: the executor decides finally.
+/// copy. Detection is authoritative: a sniffed ISO or raw stream is
+/// dd-ed whatever the name, and a sniffed container (WIM, gzip, ...) is
+/// *copied* even when named `.iso` — a Windows `.iso` whose bytes sniff
+/// as WIM must not go to the raw writer. The extension is only a
+/// tiebreaker when the content could not be identified at all
+/// ([`ImageKind::Unknown`]): `iso`/`img`/`raw` names conventionally mean
+/// sector images worth dd-ing, anything else is a job for a later-slice
+/// reader (WIM: wimlib in S21, compressed raws: S15). Provisional for
+/// this schema generation: the executor decides finally.
 fn write_mode(image: &Path, kind: &ImageKind) -> WriteMode {
-    let iso_by_name = image
-        .extension()
-        .map(|ext| ext.eq_ignore_ascii_case("iso"))
-        .unwrap_or(false);
-    if iso_by_name || matches!(kind, ImageKind::Iso | ImageKind::Raw) {
-        WriteMode::Dd
-    } else {
-        WriteMode::Copy
+    match kind {
+        // Content is authoritative for the streamable kinds.
+        ImageKind::Iso | ImageKind::Raw => WriteMode::Dd,
+        // Unidentified content: fall back to the extension as the
+        // user-declared hint about the byte layout.
+        ImageKind::Unknown => {
+            let ddable = image
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("iso")
+                        || ext.eq_ignore_ascii_case("img")
+                        || ext.eq_ignore_ascii_case("raw")
+                });
+            if ddable {
+                WriteMode::Dd
+            } else {
+                WriteMode::Copy
+            }
+        }
+        // Every other sniffed container needs its reader/copier (WIM
+        // through wimlib in S21, VHD/VHDX/FFU through their parsers, a
+        // gzip/xz/bzip2 stream decompressed first in S15, PE files as
+        // payload parts).
+        ImageKind::Wim
+        | ImageKind::Vhd
+        | ImageKind::Vhdx
+        | ImageKind::Ffu
+        | ImageKind::Gzip
+        | ImageKind::Xz
+        | ImageKind::Bzip2
+        | ImageKind::Zstd
+        | ImageKind::Pe => WriteMode::Copy,
     }
 }
 
@@ -183,4 +239,42 @@ pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Resu
         .confirm()
         .map_err(|err| Fail::json(format!("failed to compute plan confirm hash: {err}",)))?;
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use rufus_proto::ImageKind;
+    use rufus_proto::WriteMode;
+
+    use super::write_mode;
+
+    #[test]
+    fn write_mode_lets_content_win_with_extension_as_tiebreaker() {
+        for (name, kind, want) in [
+            // Content wins regardless of the name…
+            ("image.iso", ImageKind::Iso, WriteMode::Dd),
+            ("image", ImageKind::Iso, WriteMode::Dd),
+            ("image.bin", ImageKind::Raw, WriteMode::Dd),
+            // …even when a .iso name would have said dd.
+            ("image.iso", ImageKind::Wim, WriteMode::Copy),
+            ("image.iso", ImageKind::Pe, WriteMode::Copy),
+            ("image.iso", ImageKind::Xz, WriteMode::Copy),
+            ("archive.gz", ImageKind::Gzip, WriteMode::Copy),
+            ("disk.vhd", ImageKind::Vhd, WriteMode::Copy),
+            // Unknown content: the extension is the only hint.
+            ("FIXED.ISO", ImageKind::Unknown, WriteMode::Dd),
+            ("image.img", ImageKind::Unknown, WriteMode::Dd),
+            ("image.raw", ImageKind::Unknown, WriteMode::Dd),
+            ("image.bin", ImageKind::Unknown, WriteMode::Copy),
+            ("image", ImageKind::Unknown, WriteMode::Copy),
+        ] {
+            let got = write_mode(Path::new(name), &kind);
+            assert_eq!(
+                got, want,
+                "'{name}' sniffed as {kind:?} must transfer with {want:?}"
+            );
+        }
+    }
 }

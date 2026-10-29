@@ -161,6 +161,9 @@ fn help_lists_commands_and_documented_flags() {
         "--iso",
         "--wait",
         "--version",
+        // S04/S05 test hooks.
+        "--sysfs-root",
+        "--mountinfo",
     ] {
         assert!(out.stdout.contains(flag), "missing global flag {flag}");
     }
@@ -352,6 +355,51 @@ fn plan_dry_run_matches_golden_v1() {
 
     let raw: serde_json::Value = serde_json::from_str(&out.stdout).expect("plan json");
 
+    // Independent single-field assertions (S03 review): the whole-blob
+    // equality below does not name the fields that matter, so a one-line
+    // drift deserves a one-field failure message. The expected values
+    // mirror tests/golden/plan-v1.json unmodified — change the golden by
+    // hand after a deliberate PLAN_VERSION bump, then update these.
+    assert_eq!(raw["version"], 1, "schema version");
+    // device (graded): a non-block dry-run device keeps the facts null.
+    assert_eq!(raw["device"]["path"], "/dev/null");
+    assert_eq!(raw["device"]["block_device"], false);
+    for fact in ["size_bytes", "serial", "model", "sysfs"] {
+        assert_eq!(
+            raw["device"][fact],
+            serde_json::Value::Null,
+            "{fact} stays null"
+        );
+    }
+    // image (detected + hashed).
+    assert_eq!(raw["image"]["kind"], "iso");
+    assert_eq!(raw["image"]["size_bytes"], 32_780u64);
+    assert_eq!(
+        raw["image"]["sha256"], FIXTURE_SHA256,
+        "fixture digest drift"
+    );
+    // options (the exact ten CLI switches, in the plan's spelling).
+    let options: [(&str, serde_json::Value); 10] = [
+        ("scheme", serde_json::json!("mbr")),
+        ("target", serde_json::json!("bios")),
+        ("filesystem", serde_json::json!("fat32")),
+        ("label", serde_json::Value::Null),
+        ("cluster_bytes", serde_json::Value::Null),
+        ("quick_format", serde_json::json!(false)),
+        ("bad_blocks", serde_json::json!(false)),
+        ("verify", serde_json::json!(false)),
+        ("persistence", serde_json::json!(false)),
+        ("show_all", serde_json::json!(false)),
+    ];
+    for (key, want) in options {
+        assert_eq!(raw["options"][key], want, "options.{key} drift");
+    }
+    // steps: non-empty, wipe first, finalize last.
+    let steps = raw["steps"].as_array().expect("steps array");
+    assert!(!steps.is_empty(), "steps must never be empty");
+    assert_eq!(steps[0]["op"], "wipe", "first step");
+    assert_eq!(steps[steps.len() - 1]["op"], "finalize", "last step");
+
     // The CLI's own sealing is real: confirm must equal Plan::confirm()
     // over the *unnormalised* plan (the actual temp paths).
     let original: Plan = serde_json::from_value(raw.clone()).expect("plan struct");
@@ -371,6 +419,61 @@ fn plan_dry_run_matches_golden_v1() {
     let golden: serde_json::Value =
         serde_json::from_str(include_str!("golden/plan-v1.json")).expect("golden");
     assert_eq!(value, golden, "plan output drifted from the golden");
+}
+
+#[test]
+fn plan_rejects_unusable_cluster_sizes_before_anything_else() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // Not a power of two, zero, and above the gate: exit 1 with the
+    // exact message, in human mode (stderr) and JSON mode (the standard
+    // error object on stdout).
+    for bad in ["0", "3000", "1000000"] {
+        let mut args = plan_args(&iso, "/dev/null", true, false);
+        args.push("--cluster".to_string());
+        args.push(bad.to_string());
+        let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(out.code, 1, "cluster {bad}: {:?}", out);
+        assert!(
+            out.stderr.contains(&format!(
+                "invalid cluster size '{bad}' (expected a power of two between 512 and 1048576 bytes)"
+            )),
+            "{:?}",
+            out.stderr
+        );
+
+        let mut args = plan_args(&iso, "/dev/null", true, true);
+        args.push("--cluster".to_string());
+        args.push(bad.to_string());
+        let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(out.code, 1);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("error json");
+        assert_eq!(value["error"], "usage");
+        assert!(
+            value["message"]
+                .as_str()
+                .expect("msg")
+                .contains("expected a power of two"),
+            "{}",
+            value["message"]
+        );
+    }
+
+    // The usable gate edges: exit 0 and the cluster lands in the plan.
+    for good in ["512", "4096", "1048576"] {
+        let mut args = plan_args(&iso, "/dev/null", true, true);
+        args.push("--cluster".to_string());
+        args.push(good.to_string());
+        let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(out.code, 0, "cluster {good}: {}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("plan json");
+        assert_eq!(
+            value["options"]["cluster_bytes"],
+            good.parse::<u64>().expect("cluster number"),
+            "cluster {good} must be planned exactly"
+        );
+    }
 }
 
 #[test]
@@ -498,20 +601,372 @@ fn write_refuses_tampered_plans() {
 }
 
 // ---------------------------------------------------------------------------
-// list
+// list (S04 device discovery)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn list_is_an_honest_stub() {
-    let out = run(&["list"]);
-    assert_eq!(out.code, 7, "list must exit 7 until S04: {:?}", out);
-    assert!(out.stderr.contains("S04"), "{}", out.stderr);
+/// Minimal synthetic sysfs fixture for the `list`/`plan` CLI tests, built
+/// programmatically so nothing binary is committed (see
+/// `tests/fixtures/README.md`): a removable 512 MiB stick (`sdb`,
+/// 1_048_576 units of 512 bytes) and a fixed 1 GiB disk (`sda`,
+/// 2_097_152 units). The udev record directory exists but stays empty —
+/// udev may not run in a container, which is normal, not an error.
+fn sysfs_fixture(scratch: &std::path::Path) -> PathBuf {
+    let root = scratch.join("sys");
+    for (name, units, removable, dev) in [
+        ("sda", "2097152", "0", "8:0"),
+        ("sdb", "1048576", "1", "8:16"),
+    ] {
+        let dir = root.join("class/block").join(name);
+        std::fs::create_dir_all(&dir).expect("create device dir");
+        std::fs::write(dir.join("size"), units).expect("seed size");
+        std::fs::write(dir.join("removable"), removable).expect("seed removable");
+        std::fs::write(dir.join("dev"), dev).expect("seed dev");
+    }
+    std::fs::create_dir_all(root.join("run/udev/data")).expect("create record dir");
+    root
+}
 
-    let out = run(&["list", "--json"]);
-    assert_eq!(out.code, 7);
-    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
-    assert_eq!(value["error"], "not_implemented");
-    assert_eq!(value["slice"], "S04");
+#[test]
+fn list_json_matches_the_default_filter() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let sysfs = sysfs_fixture(dir.path());
+
+    let out = run(&[
+        "list",
+        "--json",
+        "--sysfs-root",
+        sysfs.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("list json");
+    assert_eq!(value["show_all"], false);
+    let devices = value["devices"].as_array().expect("devices array");
+    assert_eq!(
+        devices.len(),
+        1,
+        "only the removable stick is a default candidate: {value}"
+    );
+    assert_eq!(devices[0]["name"], "sdb");
+    assert_eq!(devices[0]["dev_path"], "/dev/sdb");
+    // 1_048_576 sysfs units of 512 bytes == 512 MiB (the unit-based
+    // kernel contract, independent of the logical block size).
+    assert_eq!(devices[0]["size_bytes"], 536_870_912u64);
+    assert_eq!(devices[0]["removable"], true);
+    // Transport wire tag pinned here (the `Transport` unit test leans on
+    // this CLI assertion for the JSON spelling): the fixture's class
+    // entries carry no device link, so they classify as Unknown.
+    assert_eq!(devices[0]["transport"], "unknown");
+    assert_eq!(
+        devices[0]["usb"], false,
+        "no device link: not classified USB"
+    );
+    assert_eq!(
+        devices[0]["partitions"]
+            .as_array()
+            .expect("partitions")
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn list_all_and_minus_x_reveal_fixed_disks_with_warning() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let sysfs = sysfs_fixture(dir.path());
+    let root = sysfs.to_str().expect("utf-8");
+
+    // `--all` and the Rufus-legacy `-x/--extra-devs` are synonyms now.
+    for variant in [
+        vec!["list", "--json", "--all", "--sysfs-root", root],
+        vec!["list", "--json", "-x", "--sysfs-root", root],
+    ] {
+        let out = run(&variant);
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("list json");
+        assert_eq!(value["show_all"], true);
+        let devices = value["devices"].as_array().expect("devices array");
+        let names: Vec<&str> = devices
+            .iter()
+            .map(|device| device["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, vec!["sda", "sdb"], "name-sorted output");
+        assert!(
+            out.stderr.contains("destroy the system"),
+            "show-all must warn on stderr: {}",
+            out.stderr
+        );
+    }
+}
+
+#[test]
+fn list_skips_partition_siblings_but_keeps_partitions_inside_the_disk() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let sysfs = sysfs_fixture(dir.path());
+    // Live kernels list partitions as siblings too: add `sdb1` next to
+    // `sdb`, linked at the real partition directory which carries the
+    // `partition` attribute, with a USB udev record so it would be a
+    // write candidate if enumeration did not skip it.
+    let inner = sysfs.join("class/block/sdb/sdb1");
+    std::fs::create_dir_all(&inner).expect("inner partition dir");
+    std::fs::write(inner.join("size"), "59").expect("seed size");
+    std::fs::write(inner.join("dev"), "8:17").expect("seed dev");
+    std::fs::write(inner.join("partition"), "1").expect("seed partition");
+    std::fs::write(
+        sysfs.join("run/udev/data/b8:17"),
+        "I:56732\nE:ID_FS_TYPE=vfat\nE:ID_BUS=usb\n",
+    )
+    .expect("seed partition record");
+    std::os::unix::fs::symlink(&inner, sysfs.join("class/block/sdb1"))
+        .expect("link partition sibling");
+    let root = sysfs.to_str().expect("utf-8");
+
+    for extra in [false, true] {
+        let mut args = vec!["list", "--sysfs-root", root];
+        if extra {
+            args.push("--all");
+        }
+        let out = run(&args);
+        assert_eq!(out.code, 0, "extra={extra}: {}", out.stderr);
+        assert!(
+            !out.stdout.contains("/dev/sdb1"),
+            "extra={extra}: partition sibling must never list: {}",
+            out.stdout
+        );
+        // The disk itself keeps its partition — skipping the *sibling*
+        // must not lose the walk inside the disk ("1 partition(s)" on
+        // the sdb line while sda stays "0 partition(s)").
+        assert!(
+            out.stdout.contains("1 partition(s)"),
+            "extra={extra}: the in-disk partition survives the sibling skip: {}",
+            out.stdout
+        );
+        let disks: Vec<&str> = out
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|first| *first == "/dev/sdb")
+            .collect();
+        assert_eq!(
+            disks.len(),
+            1,
+            "extra={extra}: /dev/sdb exactly once: {}",
+            out.stdout
+        );
+    }
+}
+
+#[test]
+fn list_show_all_warns_even_without_fixed_disks() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    // Removable-only fixture: no fixed disks at all.
+    let root = dir.path().join("sys");
+    let disk = root.join("class/block/sdb");
+    std::fs::create_dir_all(&disk).expect("create device dir");
+    std::fs::write(disk.join("size"), "1048576").expect("seed size");
+    std::fs::write(disk.join("removable"), "1").expect("seed removable");
+    std::fs::write(disk.join("dev"), "8:16").expect("seed dev");
+    std::fs::create_dir_all(root.join("run/udev/data")).expect("record dir");
+    let root_str = root.to_str().expect("utf-8");
+
+    // `--all` still warns exactly once, even with nothing fixed to show.
+    let out = run(&["list", "--all", "--sysfs-root", root_str]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(
+        out.stderr.matches("destroy the system").count(),
+        1,
+        "show-all must warn once on stderr: {:?}",
+        out.stderr
+    );
+
+    // The default path stays silent.
+    let out = run(&["list", "--sysfs-root", root_str]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("destroy"),
+        "default list must not warn: {:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn list_missing_sysfs_root_exits_2() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let missing = dir.path().join("no/such/sysfs");
+    let missing = missing.to_str().expect("utf-8");
+
+    // Human mode: the refusal names the unreadable class directory.
+    let out = run(&["list", "--sysfs-root", missing]);
+    assert_eq!(out.code, 2, "{:?}", out);
+    assert!(out.stderr.contains("class/block"), "{}", out.stderr);
+
+    // --json keeps the standard {"error","message"} object on stdout.
+    let out = run(&["list", "--json", "--sysfs-root", missing]);
+    assert_eq!(out.code, 2);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("error json");
+    assert_eq!(value["error"], "device");
+    assert!(
+        value["message"]
+            .as_str()
+            .expect("msg")
+            .contains("class/block"),
+        "{}",
+        value["message"]
+    );
+}
+
+#[test]
+fn list_human_is_plain_ascii_one_line_per_device() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let sysfs = sysfs_fixture(dir.path());
+    // Untrusted USB strings: a vendor descriptor embedding a newline
+    // (would break the one-line format) and an ESC sequence (terminal
+    // injection). Discovery must neutralise both before printing.
+    std::fs::create_dir_all(sysfs.join("class/block/sdb/device")).expect("device dir");
+    std::fs::write(
+        sysfs.join("class/block/sdb/device/vendor"),
+        "EVIL\n\u{1b}[2Jcaf\u{e9}INJECTED",
+    )
+    .expect("seed evil vendor");
+    // And the record side: udev values overwrite the cleaned sysfs
+    // facts, so their bytes must pass the same sanitiser (reviewer's
+    // repro: ESC sequences inside ID_MODEL).
+    std::fs::write(
+        sysfs.join("run/udev/data/b8:16"),
+        "I:5\nE:ID_MODEL=EVIL\u{1b}[2Judev-model\n",
+    )
+    .expect("seed evil record");
+
+    let out = run(&[
+        "list",
+        "--all",
+        "--sysfs-root",
+        sysfs.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    // One header plus one line per device, plain ASCII throughout.
+    assert!(!out.stdout.contains('{'), "{}", out.stdout);
+    assert!(out.stdout.is_ascii(), "{}", out.stdout);
+    assert!(
+        !out.stdout.contains('\u{1b}'),
+        "ESC must be neutralised: {:?}",
+        out.stdout
+    );
+    assert_eq!(
+        out.stdout.lines().count(),
+        3,
+        "header + 2 devices, no embedded newline: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("EVIL??[2Jcaf?INJECTED"),
+        "sanitised vendor must print: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("EVIL?[2Judev-model"),
+        "sanitised udev model must print: {:?}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("EVIL\n"),
+        "raw newline must not leak: {:?}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("sdb"), "{}", out.stdout);
+    assert!(out.stdout.contains("sda"), "{}", out.stdout);
+    assert!(out.stdout.contains("512.00 MiB"), "{}", out.stdout);
+    assert!(out.stdout.contains("1.00 GiB"), "{}", out.stdout);
+    assert!(out.stdout.contains("<no serial>"), "{}", out.stdout);
+    assert!(out.stdout.contains("0 partition(s)"), "{}", out.stdout);
+    assert_eq!(
+        out.stdout
+            .lines()
+            .filter(|line| line.contains("partition(s)"))
+            .count(),
+        2,
+        "one line per device: {:?}",
+        out.stdout
+    );
+    assert!(out.stderr.contains("destroy the system"));
+
+    // The same fixture through `--json` must parse cleanly and carry the
+    // sanitised record strings too (both sources checked here: sysfs
+    // vendor above, udev model below).
+    let out = run(&[
+        "list",
+        "--json",
+        "--all",
+        "--sysfs-root",
+        sysfs.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("list json parses");
+    let stick = value["devices"]
+        .as_array()
+        .expect("devices array")
+        .iter()
+        .find(|device| device["name"] == "sdb")
+        .expect("the stick is listed");
+    assert_eq!(stick["model"], "EVIL?[2Judev-model");
+    assert_eq!(stick["vendor"], "EVIL??[2Jcaf?INJECTED");
+    let text = format!(
+        "{}|{}",
+        stick["model"].as_str().expect("model"),
+        stick["vendor"].as_str().expect("vendor")
+    );
+    assert!(text.is_ascii(), "json strings must be ASCII: {text:?}");
+    assert!(
+        !text.contains('\u{1b}'),
+        "ESC must not leak into JSON: {text:?}"
+    );
+
+    // Default filter hides the fixed disk again and stays silent.
+    let out = run(&["list", "--sysfs-root", sysfs.to_str().expect("utf-8")]);
+    assert_eq!(out.code, 0);
+    assert!(out.stdout.is_ascii(), "{}", out.stdout);
+    assert_eq!(
+        out.stdout.lines().count(),
+        2,
+        "header + 1 device: {:?}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("sdb"));
+    assert!(!out.stdout.contains("sda"));
+    assert!(!out.stderr.contains("destroy"), "{}", out.stderr);
+}
+
+#[test]
+fn plan_dry_run_enriches_the_device_ref_without_breaking_the_stub_shape() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let sysfs = sysfs_fixture(dir.path());
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // With a sysfs root the graded device picks up the S04 facts (the
+    // local /dev node need not exist: the fixture tree is the truth).
+    let mut args = plan_args(&iso, "/dev/sdb", true, true);
+    args.push("--sysfs-root".to_string());
+    args.push(sysfs.display().to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("plan json");
+    assert_eq!(value["device"]["path"], "/dev/sdb");
+    assert_eq!(value["device"]["block_device"], true);
+    assert_eq!(value["device"]["size_bytes"], 536_870_912u64);
+    assert_eq!(value["device"]["model"], serde_json::Value::Null);
+    assert_eq!(
+        value["device"]["sysfs"],
+        format!("{}/class/block/sdb", sysfs.display())
+    );
+
+    // Without enrichment (no fixture root, /dev/null resolves to no
+    // block device in sysfs) the S03 plan shape is untouched.
+    let out = plan_run(&iso, "/dev/null", true);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("plan json");
+    assert_eq!(value["device"]["block_device"], false);
+    assert_eq!(value["device"]["size_bytes"], serde_json::Value::Null);
+    assert_eq!(value["device"]["sysfs"], serde_json::Value::Null);
+    assert_eq!(value["device"]["serial"], serde_json::Value::Null);
 }
 
 // ---------------------------------------------------------------------------

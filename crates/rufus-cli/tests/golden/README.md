@@ -15,7 +15,8 @@ platform-independent:
 * `confirm` → recomputed over the *normalised* plan's canonical compact
   JSON (serde_json `to_vec` order = struct declaration order).
 
-The test (`crates/rufus-cli/tests/cli.rs::plan_matches_golden_v1`) rebuilds
+The test (`plan_dry_run_matches_golden_v1`, which lives in
+`crates/rufus-cli/tests/cli.rs`) rebuilds
 the same temp image from code (32,780 zero bytes with `CD001` at 0x8001 —
 it must be ≥ 0x8006 bytes or the magic physically does not fit), runs the
 binary with the same flags, applies the same normalisations, recomputes

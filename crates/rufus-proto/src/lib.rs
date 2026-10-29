@@ -106,10 +106,11 @@ impl Plan {
 /// The target device, identified by path and (later slices) enough context
 /// for the helper to re-check it against sysfs before the first write.
 ///
-/// `size_bytes`, `serial`, `model` and `sysfs` are `None` in provisional
-/// plans produced by the S03 CLI (mapper data arrives with S04/S05); the
-/// helper fails a plan whose device lacks sysfs identity once S06 enforces
-/// plan §6.
+/// `size_bytes`, `serial`, `model` and `sysfs` are filled from sysfs
+/// discovery since S04 when the target path is a real device; they stay
+/// `None` for dry-run plans over fixture paths (the S03 shape) and for
+/// devices the kernel does not expose. The helper fails a plan whose
+/// device lacks sysfs identity once S06 enforces plan §6.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRef {
     /// Device path as presented, e.g. `/dev/sdb`.
@@ -117,13 +118,14 @@ pub struct DeviceRef {
     /// `true` only for real block devices (never a file, loop or
     /// character device).
     pub block_device: bool,
-    /// Device capacity in bytes; `None` until S04 reads it.
+    /// Device capacity in bytes; `None` when discovery did not find the
+    /// path (a dry-run over a fixture file, or an unreadable sysfs).
     pub size_bytes: Option<u64>,
-    /// Stable serial (config identity); `None` until S04.
+    /// Stable serial (config identity); `None` when undiscovered.
     pub serial: Option<String>,
-    /// Human-readable model; `None` until S04.
+    /// Human-readable model; `None` when undiscovered.
     pub model: Option<String>,
-    /// `/sys/class/block/<name>` path; `None` until S04.
+    /// `/sys/class/block/<name>` path; `None` when undiscovered.
     pub sysfs: Option<String>,
 }
 

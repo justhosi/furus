@@ -9,6 +9,7 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rufus-core = { workspace = true }
+rufus-linux = { workspace = true }
 rufus-proto = { workspace = true }
 
 [dev-dependencies]
@@ -17,3 +18,7 @@ tempfile = { workspace = true }
 [[bin]]
 name = "rufus"
 path = "src/main.rs"
+
+[lints]
+# Enforce the workspace-wide `unsafe_code = "forbid"` (S04 review).
+workspace = true

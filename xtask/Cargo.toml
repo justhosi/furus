@@ -10,3 +10,7 @@ csv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+
+[lints]
+# Enforce the workspace-wide `unsafe_code = "forbid"` (S04 review).
+workspace = true

@@ -19,3 +19,7 @@ tempfile = { workspace = true }
 [[bench]]
 name = "loc"
 harness = false
+
+[lints]
+# Enforce the workspace-wide `unsafe_code = "forbid"` (S04 review).
+workspace = true

@@ -17,6 +17,14 @@ edition = "2024"
 # Unpublished: the public name/licence (A1, A2) are still proposed.
 publish = false
 
+# S04 review: unsafe-code enforcement lives in the workspace so every
+# member inherits it through `[lints] workspace = true`, instead of
+# trusting each crate to remember its own attribute. Existing
+# crate-level `#![forbid(unsafe_code)]` attributes stay (they document
+# intent at the file where it matters).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 # S02 core-runtime dependencies (kept minimal: no async, no logging
 # framework, no chrono/time, no regex — see PLAN.md section 5).
@@ -28,14 +36,22 @@ tempfile = { version = "3" }
 # S03 plan-JSON / CLI / checksum dependencies (PLAN.md §4: clap (derive)
 # for the command surface, serde_json for the versioned plan contract,
 # RustCrypto digests for hashing — no other new crates are allowed by §5).
+# The S04 review cut clap to its feature budget (PLAN §5): colour and
+# wrap-help are dropped on purpose (the captured CLI output must stay
+# ANSI-free), while suggestions/usage/error-context keep the
+# "did you mean" behaviour the tests rely on.
 serde_json = { version = "1" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
 sha2 = { version = "0.10" }
 sha1 = { version = "0.10" }
 md-5 = { version = "0.10" }
+# S04 (PLAN §4 lists rustix for rufus-linux): safe syscalls for inotify and
+# poll so the device watcher needs no libc and no unsafe code.
+rustix = { version = "1", features = ["fs", "event", "std"] }
 # Internal crates (path form, so workspaces can share them exactly).
 rufus-core = { path = "crates/rufus-core" }
 rufus-proto = { path = "crates/rufus-proto" }
+rufus-linux = { path = "crates/rufus-linux" }
 
 [profile.release]
 opt-level = "z"

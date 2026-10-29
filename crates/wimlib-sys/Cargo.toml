@@ -4,3 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 links = "wim"
+
+[lints]
+# Enforce the workspace-wide `unsafe_code = "forbid"` (S04 review).
+workspace = true

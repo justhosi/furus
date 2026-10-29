@@ -90,20 +90,18 @@ const CHUNK: usize = 1024 * 1024;
 
 /// Digest a [`Read`]-able input with `algo`, returning lowercase hex.
 ///
-/// Input errors are reported as [`CoreError::Io`] with the placeholder
-/// path `"<reader>"` — a reader carries no path of its own; callers that
-/// know one (e.g. [`hash_file_with`]) either map it themselves before
-/// handing the file over, like the CLI does after checking the path, or
-/// rewrite the error path at their own layer.
-fn digest<D: Digest, R: Read>(algo_label: &'static str, mut reader: R) -> Result<String> {
+/// Input errors are reported as [`CoreError::Io`], and the `error_path`
+/// is supplied by the caller so a mid-stream failure names the real
+/// location instead of a generic placeholder: [`hash_file_with`] passes
+/// the actual file, and pathless callers (e.g. buffers over in-memory
+/// data) use a descriptive label like `"<sha256 reader>"`.
+fn digest<D: Digest, R: Read>(error_path: impl AsRef<Path>, mut reader: R) -> Result<String> {
     let mut hasher = D::new();
     let mut buf = vec![0u8; CHUNK];
-    let label = format!("<{algo_label} reader>");
     loop {
-        let n = reader.read(&mut buf).map_err(|source| CoreError::Io {
-            path: label.clone(),
-            source,
-        })?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|source| CoreError::io(error_path.as_ref(), source))?;
         if n == 0 {
             break;
         }
@@ -113,19 +111,31 @@ fn digest<D: Digest, R: Read>(algo_label: &'static str, mut reader: R) -> Result
 }
 
 /// Hash `reader` with `algo`; see the module header for error semantics.
+///
+/// Errors raised *after* the stream started cannot name a file (the
+/// reader carries no path), so they keep the documented
+/// `"<algo> reader"` placeholder in [`CoreError::Io`].
 pub fn hash_reader<R: Read>(algo: Algo, reader: R) -> Result<String> {
+    let placeholder = format!("<{} reader>", algo.as_str());
     match algo {
-        Algo::Md5 => digest::<Md5, _>(algo.as_str(), reader),
-        Algo::Sha1 => digest::<Sha1, _>(algo.as_str(), reader),
-        Algo::Sha256 => digest::<Sha256, _>(algo.as_str(), reader),
-        Algo::Sha512 => digest::<Sha512, _>(algo.as_str(), reader),
+        Algo::Md5 => digest::<Md5, _>(placeholder, reader),
+        Algo::Sha1 => digest::<Sha1, _>(placeholder, reader),
+        Algo::Sha256 => digest::<Sha256, _>(placeholder, reader),
+        Algo::Sha512 => digest::<Sha512, _>(placeholder, reader),
     }
 }
 
-/// Hash the file at `path` with `algo`, keeping `path` in I/O errors.
+/// Hash the file at `path` with `algo`, keeping `path` in I/O errors —
+/// including mid-stream failures after `File::open` already succeeded
+/// (a directory, for example, can be opened but not read).
 pub fn hash_file_with(algo: Algo, path: &Path) -> Result<String> {
     let file = File::open(path).map_err(|source| error::CoreError::io(path, source))?;
-    hash_reader(algo, file)
+    match algo {
+        Algo::Md5 => digest::<Md5, _>(path, file),
+        Algo::Sha1 => digest::<Sha1, _>(path, file),
+        Algo::Sha256 => digest::<Sha256, _>(path, file),
+        Algo::Sha512 => digest::<Sha512, _>(path, file),
+    }
 }
 
 /// Hash the file at `path` with the default algorithm (SHA-256).
@@ -295,5 +305,62 @@ mod tests {
         let path = dir.path().join("empty.bin");
         std::fs::write(&path, b"").expect("seed empty");
         assert_eq!(hash_file(&path).expect("empty file"), stream);
+    }
+
+    /// Test-only reader that serves one full buffer (a 1 MiB chunk in
+    /// the digest loop) and then fails, so the error is raised
+    /// mid-stream — after the first data was consumed.
+    struct OneChunkThenError {
+        served: bool,
+    }
+
+    impl Read for OneChunkThenError {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.served {
+                self.served = true;
+                for (i, byte) in buf.iter_mut().enumerate() {
+                    *byte = (i % 251) as u8; // deterministic pattern
+                }
+                return Ok(buf.len());
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "mid-stream failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn mid_stream_errors_carry_the_callers_error_path() {
+        // `digest` maps the read failure onto the caller-supplied path:
+        // the exact name the caller gave, not a generic placeholder.
+        let fake = Path::new("/scratch/midstream-image.iso");
+        let err = digest::<Sha256, _>(fake, OneChunkThenError { served: false })
+            .expect_err("the second read fails");
+        let CoreError::Io { path, source } = &err else {
+            panic!("expected CoreError::Io, got {err:?}");
+        };
+        assert_eq!(path, "/scratch/midstream-image.iso");
+        assert!(source.to_string().contains("mid-stream failure"), "{err}");
+
+        // Pathless callers keep the documented placeholder label.
+        let err = hash_reader(Algo::Sha256, OneChunkThenError { served: false })
+            .expect_err("the second read fails");
+        let CoreError::Io { path, .. } = &err else {
+            panic!("expected CoreError::Io, got {err:?}");
+        };
+        assert_eq!(path, "<sha256 reader>");
+
+        // And through `hash_file_with`, `File::open` on a directory
+        // succeeds but the first read fails with EISDIR — the error
+        // carries the real directory, proving open-time and mid-stream
+        // failures use the same file identity.
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let err = hash_file_with(Algo::Sha256, dir.path()).expect_err("directory reads fail");
+        let CoreError::Io { path, .. } = &err else {
+            panic!("expected CoreError::Io, got {err:?}");
+        };
+        assert_eq!(path.as_str(), dir.path().display().to_string());
+        assert!(!path.contains("reader"), "{err}");
     }
 }

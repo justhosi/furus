@@ -1,14 +1,16 @@
-//! `rufus`: command-line front end (S03).
+//! `rufus`: command-line front end (S03/S04).
 //!
-//! Full command surface per PLAN §9-S03, driving the S03 building blocks:
+//! Full command surface per PLAN §9-S03, driving the building blocks:
 //!
 //! * `version` — version, git hash, plan schema version;
 //! * `checksum` — MD5/SHA-1/SHA-256/SHA-512 via `rufus-core::hash`;
 //! * `analyze` — size, SHA-256, magic-only container detection;
 //! * `plan` — provisional plan JSON (the S06 helper contract), with
-//!   `--dry-run` device-check relaxation;
-//! * `write` / `list` — arguments validated, then honestly *not
-//!   implemented* (exit 7) until S06/S17 and S04 respectively.
+//!   `--dry-run` device-check relaxation and S04 device enrichment;
+//! * `list` — S04 device discovery (sysfs + udev data), with the
+//!   `--sysfs-root`/`--mountinfo` test hooks of PLAN §9-S04;
+//! * `write` — arguments validated, then honestly *not implemented*
+//!   (exit 7) until S06/S17.
 //!
 //! Exit codes: 0 ok, 1 usage, 2 device, 3 safety, 4 I/O, 5 unsupported
 //! image, 6 cancelled, 7 not implemented — see [`Exit`]. clap errors are
@@ -21,6 +23,7 @@ use clap::Parser;
 use clap::Subcommand;
 use rufus_core::error::CoreError;
 use rufus_core::hash::Algo;
+use rufus_linux::SysfsRoot;
 use rufus_proto::PLAN_VERSION;
 use rufus_proto::Plan;
 use rufus_proto::Scheme;
@@ -123,16 +126,52 @@ fn json_error(kind: &str, message: &str) -> serde_json::Value {
     serde_json::json!({ "error": kind, "message": message })
 }
 
+/// `list --json` output: the filtered device list plus the show-all echo.
+///
+/// One struct instead of a hand-built `json!` value, so serialisation
+/// cannot fail between fields and the key order stays declaration-stable
+/// (the CLI must be panic-free).
+#[derive(Serialize)]
+struct ListOutput<'a> {
+    /// Candidate devices, name-sorted by discovery.
+    devices: &'a [rufus_linux::Device],
+    /// Whether internal fixed disks were included in `devices`.
+    show_all: bool,
+}
+
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
 
-/// Native Linux USB/ISO writer — command line (slice S03).
+/// Filesystem paths the CLI should read host data from (PLAN §9-S04 test
+/// hooks). The defaults are the live system: `/sys` with `/run/udev/data`
+/// records for discovery and the current-process `mountinfo` for the S05
+/// mount checks.
+struct HostPaths {
+    /// sysfs root override from `--sysfs-root` (`None` = live `/sys`).
+    sysfs_root: Option<PathBuf>,
+    /// mountinfo file override from `--mountinfo` (`None` = current
+    /// process). Parsed by S05.
+    mountinfo: Option<PathBuf>,
+}
+
+impl HostPaths {
+    /// The discovery root/records pair to read from.
+    ///
+    /// An override root is self-contained: `SysfsRoot::new` keeps its
+    /// udev record directory inside the tree (`<root>/run/udev/data`).
+    fn sysfs(&self) -> SysfsRoot {
+        SysfsRoot::new(self.sysfs_root.clone().unwrap_or(PathBuf::from("/sys")))
+    }
+}
+
+/// Native Linux USB/ISO writer — command line (slice S03 by the schema,
+/// with the S04 device surface wired on top).
 #[derive(Debug, Parser)]
 #[command(
     name = "rufus",
     version,
-    about = "Native Linux USB/ISO writer — command line rewrite (slice S03)"
+    about = "Native Linux USB/ISO writer — command line rewrite (slice S04)"
 )]
 struct Cli {
     /// Emit machine-readable JSON for results and errors.
@@ -159,9 +198,25 @@ struct Cli {
     #[arg(long, global = true)]
     dry_run: bool,
 
-    // Rufus legacy parity switches — parsed, documented, inert in S03.
-    /// Show all devices, including fixed disks (no effect yet: arrives
-    /// with S04 device discovery).
+    // S04/S05 test hooks (PLAN §9-S04): the defaults are the live system
+    // (`/sys` with `/run/udev/data` records, current-process mountinfo);
+    // the flags point at small fixture trees so tests and containers
+    // never touch real state.
+    /// Root of a (possibly synthetic) sysfs tree for device discovery
+    /// (S04 test hook; default: the live `/sys`).
+    #[arg(long, value_name = "DIR", global = true)]
+    sysfs_root: Option<PathBuf>,
+    /// Path to a `/proc/self/mountinfo`-shaped file (S05 test hook; the
+    /// mount-detection slices parse it, accepted now so the CLI surface
+    /// is final).
+    #[arg(long, value_name = "FILE", global = true)]
+    mountinfo: Option<PathBuf>,
+
+    // Rufus legacy parity switches — parsed and documented; the S04
+    // discovery switch is live in `list`, the rest land with S06/S24.
+    /// Show all devices, including fixed disks (S04: `list` honours it
+    /// and turns on the destruction warning; the exact rule is stated
+    /// once on the `cmd_list` function).
     #[arg(short = 'x', long = "extra-devs", global = true)]
     extra_devs: bool,
     /// Launch the graphical front end instead of the CLI (no effect yet:
@@ -203,12 +258,15 @@ enum Command {
         image: PathBuf,
     },
 
-    /// List candidate USB devices.
+    /// List candidate USB devices from sysfs + udev data (S04).
     ///
-    /// Device discovery ships with S04 (sysfs + udev data); this stub
-    /// prints a not-implemented notice to stderr and exits 7.
+    /// Mirrors Rufus's default: USB-or-removable only, built-in and
+    /// zero-size entries dropped; `--all` (together with the global
+    /// `-x/--extra-devs`) reveals internal fixed disks. The destruction
+    /// warning rule is stated once, on the `cmd_list` implementation.
     List {
-        /// Reveal fixed disks too ("show all devices" parity).
+        /// Reveal fixed disks too ("show all devices" parity; the
+        /// warning rule lives on the `cmd_list` implementation).
         #[arg(long)]
         all: bool,
     },
@@ -246,7 +304,9 @@ enum Command {
         /// Volume label (default: executor derives it from the image).
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
-        /// Cluster size for the data filesystem, in bytes.
+        /// Cluster size for the data filesystem, in bytes (power of two
+        /// between 512 and 1048576; per-filesystem limits land with the
+        /// S09–S13 writers).
         #[arg(long, value_name = "BYTES")]
         cluster: Option<u32>,
         /// Quick format (metadata only) instead of a full surface format.
@@ -327,6 +387,23 @@ fn parse_filesystem(text: &str) -> Result<rufus_proto::Filesystem, String> {
     }
 }
 
+/// Cluster size gate for `plan --cluster` (S03 review): a power of two,
+/// 512..=1_048_576 bytes. Per-filesystem maxima (FAT's cluster count and
+/// friends) are the writers' business in S09–S13, checked against the
+/// real device geometry; this check only refuses sizes no filesystem of
+/// the plan shape can want, keeping the plan schema engine-independent.
+fn validate_cluster(bytes: u32) -> std::result::Result<u32, String> {
+    const MIN: u32 = 512;
+    const MAX: u32 = 1_048_576;
+    if bytes.is_power_of_two() && (MIN..=MAX).contains(&bytes) {
+        Ok(bytes)
+    } else {
+        Err(format!(
+            "invalid cluster size '{bytes}' (expected a power of two between 512 and 1048576 bytes)"
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Subcommand implementations
 // ---------------------------------------------------------------------------
@@ -392,16 +469,89 @@ fn cmd_analyze(json: bool, path: &Path) -> Result<Exit, Fail> {
     Ok(Exit::Ok)
 }
 
-fn cmd_list(json: bool) -> Result<Exit, Fail> {
-    // Honest stub: device enumeration (sysfs + udev data) ships in S04.
-    // The stderr notice prints in both modes; JSON keeps the exact
-    // {"error","slice"} contract shape.
-    eprintln!("list: not implemented yet — device discovery ships in slice S04");
-    if json {
-        let object = serde_json::json!({ "error": "not_implemented", "slice": "S04" });
-        println!("{}", to_pretty(&object)?);
+/// S04 discovery: enumerate candidates through sysfs + udev data and
+/// print the filtered list.
+///
+/// Mirrors Rufus's removable-only default; `--all`/`-x` reveal internal
+/// fixed disks. The destruction warning is the one canonical statement
+/// in this module's surface: **whenever show-all mode is on, the PLAN
+/// §6 rule-4 line prints to stderr exactly once per run — even if that
+/// run lists only removable devices.** Discovery failure (a missing or
+/// unreadable class directory) is a device-class error: exit 2, and the
+/// `--json` error object keeps the standard `{"error","message"}` shape.
+fn cmd_list(
+    json: bool,
+    all: bool,
+    legacy_extra_devs: bool,
+    sysfs: &SysfsRoot,
+) -> Result<Exit, Fail> {
+    let show_all = all || legacy_extra_devs;
+    let filter = rufus_linux::Filter { show_all };
+    let devices = rufus_linux::enumerate(sysfs)
+        .map(|enumerated| rufus_linux::filter(enumerated, filter))
+        .map_err(|core| Fail {
+            // Not bad input and not ordinary I/O: the device tree the CLI
+            // was pointed at cannot be listed. Device class, exit 2.
+            exit: Exit::Device,
+            kind: "device",
+            message: core.to_string(),
+        })?;
+
+    // PLAN §6 rule 4: exactly one warning per run whenever show-all is
+    // on (the canonical rule is documented on `cmd_list`).
+    if show_all {
+        eprintln!("show all: internal disks are listed; writing to them can destroy the system");
     }
-    Ok(Exit::NotImplemented)
+
+    if json {
+        let output = ListOutput {
+            devices: &devices,
+            show_all,
+        };
+        println!("{}", to_pretty(&output)?);
+    } else {
+        println!(
+            "devices from {} ({} shown, show all: {})",
+            sysfs.root.join("class").join("block").display(),
+            devices.len(),
+            human_lead(show_all),
+        );
+        for device in &devices {
+            let mut markers: Vec<&'static str> = Vec::new();
+            if device.removable {
+                markers.push("removable");
+            }
+            if device.read_only {
+                markers.push("read-only");
+            }
+            let markers = if markers.is_empty() {
+                "-".to_string()
+            } else {
+                markers.join(",")
+            };
+            let names = match (&device.vendor, &device.model) {
+                (Some(vendor), Some(model)) => format!("{vendor} {model}"),
+                (Some(vendor), None) => vendor.clone(),
+                (None, Some(model)) => model.clone(),
+                (None, None) => "-".to_string(),
+            };
+            let serial = match &device.serial {
+                Some(serial) => format!("serial={serial}"),
+                None => "<no serial>".to_string(),
+            };
+            println!(
+                "{}  {}  {}  {}  {}  {}  {} partition(s)",
+                device.dev_path,
+                rufus_core::human_bytes(device.size_bytes),
+                device.transport.as_str(),
+                markers,
+                names,
+                serial,
+                device.partitions.len(),
+            );
+        }
+    }
+    Ok(Exit::Ok)
 }
 
 fn cmd_plan(
@@ -409,15 +559,20 @@ fn cmd_plan(
     dry_run: bool,
     image_path: &Path,
     device_path: &Path,
+    sysfs: &SysfsRoot,
     options: &plan::Options,
 ) -> Result<Exit, Fail> {
     // Safety first: grade the device (exit 2/3 without --dry-run), then the
-    // image (exit 4/1), then assemble and seal the plan.
-    let device = plan::device_ref(device_path, dry_run)?;
+    // image (exit 4/1), then assemble and seal the plan. The S04 facts
+    // (size/serial/model/sysfs) ride along when the device is discoverable
+    // on `sysfs`, and stay `None` otherwise.
+    let device = plan::device_ref(device_path, dry_run, sysfs)?;
     let inspected = image::inspect(image_path).map_err(Fail::from_core)?;
     let built = plan::build(device, inspected, options)?;
     if json {
-        print!("{}", to_pretty(&built)?);
+        // `println!` keeps `plan --json` output line-oriented: scripts
+        // and `jq` always see one complete line, never a cut-off value.
+        println!("{}", to_pretty(&built)?);
     } else {
         print_human_plan(&built);
     }
@@ -640,13 +795,15 @@ fn describe_step(step: &Step) -> String {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-fn dispatch(cli: &Cli) -> Result<Exit, Fail> {
+fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
     let json = cli.json;
     match &cli.command {
         Command::Version => cmd_version(json),
         Command::Checksum { image, algo } => cmd_checksum(json, image, *algo),
         Command::Analyze { image } => cmd_analyze(json, image),
-        Command::List { .. } => cmd_list(json),
+        // S04 hook note: `-x/--extra-devs` is the Rufus-legacy spelling
+        // of `--all`; `list` picks up whichever is set.
+        Command::List { all } => cmd_list(json, *all, cli.extra_devs, &paths.sysfs()),
         Command::Plan {
             image,
             device,
@@ -660,24 +817,39 @@ fn dispatch(cli: &Cli) -> Result<Exit, Fail> {
             verify,
             persistence,
             show_all,
-        } => cmd_plan(
-            json,
-            cli.dry_run,
-            image,
-            device,
-            &plan::Options {
-                scheme: scheme.clone(),
-                target: target.clone(),
-                filesystem: filesystem.clone(),
-                label: label.clone(),
-                cluster_bytes: *cluster,
-                quick_format: *quick,
-                bad_blocks: *badblocks,
-                verify: *verify,
-                persistence: *persistence,
-                show_all: *show_all,
-            },
-        ),
+        } => {
+            // Gate first, before grading or image inspection: in every
+            // mode (JSON or human) an invalid cluster must exit 1 and
+            // write nothing — the plan path builds objects only, but the
+            // ask comes before any work regardless.
+            let cluster_bytes = cluster
+                .map(validate_cluster)
+                .transpose()
+                .map_err(|message| Fail {
+                    exit: Exit::Usage,
+                    kind: "usage",
+                    message,
+                })?;
+            cmd_plan(
+                json,
+                cli.dry_run,
+                image,
+                device,
+                &paths.sysfs(),
+                &plan::Options {
+                    scheme: scheme.clone(),
+                    target: target.clone(),
+                    filesystem: filesystem.clone(),
+                    label: label.clone(),
+                    cluster_bytes,
+                    quick_format: *quick,
+                    bad_blocks: *badblocks,
+                    verify: *verify,
+                    persistence: *persistence,
+                    show_all: *show_all,
+                },
+            )
+        }
         Command::Write { plan } => cmd_write(json, plan),
         Command::Log { lines } => cmd_log(json, *lines),
     }
@@ -700,22 +872,23 @@ fn main() {
         }
     };
 
-    // Flags inert in this slice are accepted (their wiring lands with S04
-    // extra-devs, S06 wait/yes/progress verbosity, S24 locale/GUI). They
-    // are consumed here so the inertness is visible in code — and so the
-    // unused-field lint stays quiet.
-    let _ = (
-        cli.verbose,
-        cli.quiet,
-        cli.yes,
-        cli.extra_devs,
-        cli.gui,
-        cli.iso,
-        cli.wait,
-    );
+    // Flags inert in this slice are accepted (their wiring lands with S06
+    // wait/yes/progress verbosity, S24 locale/GUI). They are consumed here
+    // so the inertness is visible in code — and so the unused-field lint
+    // stays quiet. `extra_devs` left the list: `list` consumes it now.
+    let _ = (cli.verbose, cli.quiet, cli.yes, cli.gui, cli.iso, cli.wait);
     let _ = cli.locale.as_deref();
 
-    match dispatch(&cli) {
+    let paths = HostPaths {
+        sysfs_root: cli.sysfs_root.clone(),
+        mountinfo: cli.mountinfo.clone(),
+    };
+    // Accepted now, wired later: S05 parses this mountinfo file (the flag
+    // is its PLAN §9-S04 test hook). Binding it keeps the surface final
+    // without pretending the file was read.
+    let _ = &paths.mountinfo;
+
+    match dispatch(&cli, &paths) {
         Ok(exit) => std::process::exit(exit.code()),
         Err(fail) => {
             // `--json` error objects go to stdout; if even that formatting

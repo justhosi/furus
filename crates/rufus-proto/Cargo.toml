@@ -9,3 +9,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # sha256 of the canonical plan bytes for `Plan::confirm`.
 sha2 = { workspace = true }
+
+[lints]
+# Enforce the workspace-wide `unsafe_code = "forbid"` (S04 review).
+workspace = true
