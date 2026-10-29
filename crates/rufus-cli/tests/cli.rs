@@ -3,7 +3,7 @@
 //! Each test drives the real binary via `std::process::Command` +
 //! `CARGO_BIN_EXE_rufus` (no extra dev-dependency crates): happy paths,
 //! failure paths, the `--json` error-object shapes and the S03 plan
-//! golden (see `tests/golden/README.md` for how `plan-v1.json` is
+//! golden (see `tests/golden/README.md` for how `plan-v2.json` is
 //! regenerated after a deliberate `PLAN_VERSION` bump).
 //!
 //! `sha256sum`/`md5sum` come from coreutils and are used as the cross-check
@@ -133,7 +133,7 @@ fn version_human_and_json() {
     assert_eq!(out.code, 0);
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("version json");
     assert_eq!(value["version"], "0.1.0");
-    assert_eq!(value["plan_version"], 1);
+    assert_eq!(value["plan_version"], 2);
     assert!(!value["git_hash"].as_str().expect("hash").is_empty());
 }
 
@@ -192,6 +192,7 @@ fn help_lists_commands_and_documented_flags() {
         "--verify",
         "--persistence",
         "--show-all",
+        "--confirm-serial",
     ] {
         assert!(out.stdout.contains(flag), "missing plan flag {flag}");
     }
@@ -356,7 +357,7 @@ fn analyze_short_and_empty_files_never_panic() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn plan_dry_run_matches_golden_v1() {
+fn plan_dry_run_matches_golden_v2() {
     let dir = tempfile::tempdir().expect("scratch dir");
     let iso = fixture(&dir.path().join("fixture.iso"));
     let out = plan_run(&iso, "/dev/null", true);
@@ -367,9 +368,9 @@ fn plan_dry_run_matches_golden_v1() {
     // Independent single-field assertions (S03 review): the whole-blob
     // equality below does not name the fields that matter, so a one-line
     // drift deserves a one-field failure message. The expected values
-    // mirror tests/golden/plan-v1.json unmodified — change the golden by
+    // mirror tests/golden/plan-v2.json unmodified — change the golden by
     // hand after a deliberate PLAN_VERSION bump, then update these.
-    assert_eq!(raw["version"], 1, "schema version");
+    assert_eq!(raw["version"], 2, "schema version");
     // device (graded): a non-block dry-run device keeps the facts null.
     assert_eq!(raw["device"]["path"], "/dev/null");
     assert_eq!(raw["device"]["block_device"], false);
@@ -387,8 +388,8 @@ fn plan_dry_run_matches_golden_v1() {
         raw["image"]["sha256"], FIXTURE_SHA256,
         "fixture digest drift"
     );
-    // options (the exact ten CLI switches, in the plan's spelling).
-    let options: [(&str, serde_json::Value); 10] = [
+    // options (the exact eleven CLI switches, in the plan's spelling).
+    let options: [(&str, serde_json::Value); 11] = [
         ("scheme", serde_json::json!("mbr")),
         ("target", serde_json::json!("bios")),
         ("filesystem", serde_json::json!("fat32")),
@@ -399,6 +400,8 @@ fn plan_dry_run_matches_golden_v1() {
         ("verify", serde_json::json!(false)),
         ("persistence", serde_json::json!(false)),
         ("show_all", serde_json::json!(false)),
+        // v2's confirmation: the golden plans /dev/null, never show-all.
+        ("confirmed_serial", serde_json::Value::Null),
     ];
     for (key, want) in options {
         assert_eq!(raw["options"][key], want, "options.{key} drift");
@@ -426,8 +429,83 @@ fn plan_dry_run_matches_golden_v1() {
     value["confirm"] = plan.confirm().expect("normalised serialises").into();
 
     let golden: serde_json::Value =
-        serde_json::from_str(include_str!("golden/plan-v1.json")).expect("golden");
+        serde_json::from_str(include_str!("golden/plan-v2.json")).expect("golden");
     assert_eq!(value, golden, "plan output drifted from the golden");
+}
+
+#[test]
+fn plan_confirmed_serial_requires_show_all() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // A typed serial without --show-all is a usage refusal (PLAN §6 rule
+    // 4 wants both halves of the confirmation), before any device or
+    // image work, in human mode (stderr)...
+    let mut args = plan_args(&iso, "/dev/null", true, false);
+    args.push("--confirm-serial".to_string());
+    args.push("SER0001".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 1, "{:?}", out);
+    assert!(
+        out.stderr
+            .contains("confirmation serial requires --show-all"),
+        "{}",
+        out.stderr
+    );
+
+    // ...and in --json mode (the standard usage object on stdout).
+    let mut args = plan_args(&iso, "/dev/null", true, true);
+    args.push("--confirm-serial".to_string());
+    args.push("SER0001".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 1);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("error json");
+    assert_eq!(value["error"], "usage");
+    assert!(
+        value["message"]
+            .as_str()
+            .expect("msg")
+            .contains("requires --show-all"),
+        "{}",
+        value["message"]
+    );
+}
+
+#[test]
+fn plan_records_the_confirmed_serial_only_with_show_all() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    // With --show-all the typed serial rides into the plan, trimmed
+    // once at acceptance ("  AB C  " -> "AB C").
+    let mut args = plan_args(&iso, "/dev/null", true, true);
+    args.push("--show-all".to_string());
+    args.push("--confirm-serial".to_string());
+    args.push("  AB C  ".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("plan json");
+    assert_eq!(value["options"]["show_all"], true);
+    assert_eq!(
+        value["options"]["confirmed_serial"], "AB C",
+        "the trimmed typed serial lands in the plan JSON"
+    );
+
+    // A whitespace-only confirmation confirms nothing, --show-all or
+    // not: usage refusal in --json mode (and human mode renders the
+    // same message on stderr).
+    let mut args = plan_args(&iso, "/dev/null", true, true);
+    args.push("--show-all".to_string());
+    args.push("--confirm-serial".to_string());
+    args.push("   ".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 1, "{:?}", out);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("error json");
+    assert_eq!(value["error"], "usage");
+    assert_eq!(
+        value["message"].as_str().expect("msg"),
+        "confirmation serial must not be empty",
+    );
 }
 
 #[test]
@@ -585,13 +663,15 @@ fn write_refuses_tampered_plans() {
     assert_eq!(value["error"], "confirm_mismatch");
 
     // 2) version bump on the wire -> unsupported, exit 1 (before confirm).
-    let bumped = plan_out.stdout.replace("\"version\": 1", "\"version\": 2");
+    // The emitted plan carries PLAN_VERSION 2; bumping it to 3 must be
+    // refused as an unsupported version.
+    let bumped = plan_out.stdout.replace("\"version\": 2", "\"version\": 3");
     assert_ne!(bumped, plan_out.stdout, "version field present in plan");
     let file = dir.path().join("bumped.json");
     std::fs::write(&file, bumped).expect("save bumped plan");
     let out = run(&["write", "--plan", file.to_str().expect("path")]);
     assert_eq!(out.code, 1, "{:?}", out);
-    assert!(out.stderr.contains("version 2"), "{}", out.stderr);
+    assert!(out.stderr.contains("version 3"), "{}", out.stderr);
 
     // 3) unparsable JSON -> invalid_plan, exit 1.
     let junk = dir.path().join("junk.json");

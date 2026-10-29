@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Rufus for Linux — the one privileged action (PLAN §6).
+
+  The helper (org.rufuslinux.Helper1) checks this action for the calling
+  user before it validates anything. `auth_admin_keep` means an
+  administrator's password is asked for, and remembered for the rest of
+  the session: a write is one deliberate act, not one per sector.
+
+  Installed as /usr/share/polkit-1/actions/org.rufuslinux.policy.
+-->
+<policyconfig>
+  <vendor>Rufus for Linux</vendor>
+  <vendor_url>https://github.com/rufus-linux</vendor_url>
+
+  <action id="org.rufuslinux.write-device">
+    <description>Write an image to a disk device</description>
+    <message>Authentication is required to write a disk image to a device</message>
+    <icon_name>media-removable</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

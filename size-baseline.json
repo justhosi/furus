@@ -2,7 +2,7 @@
   "binaries": {
     "rufus": {
       "budget": 3000000,
-      "bytes": 812560
+      "bytes": 814912
     },
     "rufus-gui": {
       "budget": 12000000,
@@ -10,7 +10,7 @@
     },
     "rufus-helper": {
       "budget": 2500000,
-      "bytes": 286120
+      "bytes": 1562656
     }
   }
 }

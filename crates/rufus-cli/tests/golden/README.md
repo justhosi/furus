@@ -1,6 +1,6 @@
 # Golden files (S03)
 
-`plan-v1.json` is the exact `--json` output of
+`plan-v2.json` is the exact `--json` output of
 
 ```sh
 rufus plan --dry-run --json --target bios --filesystem fat32 \
@@ -15,7 +15,11 @@ platform-independent:
 * `confirm` → recomputed over the *normalised* plan's canonical compact
   JSON (serde_json `to_vec` order = struct declaration order).
 
-The test (`plan_dry_run_matches_golden_v1`, which lives in
+Schema v2 added `options.confirmed_serial` (the typed show-all
+confirmation, PLAN §6 rule 4); on this golden it is `null` — the plan
+targets `/dev/null` and never enables show-all.
+
+The test (`plan_dry_run_matches_golden_v2`, which lives in
 `crates/rufus-cli/tests/cli.rs`) rebuilds
 the same temp image from code (32,780 zero bytes with `CD001` at 0x8001 —
 it must be ≥ 0x8006 bytes or the magic physically does not fit), runs the
@@ -40,7 +44,7 @@ plan["created_by"] = "<created_by>"
 plan["confirm"] = ""
 plan["confirm"] = "sha256:" + hashlib.sha256(
     json.dumps(plan, separators=(",", ":")).encode()).hexdigest()
-open("crates/rufus-cli/tests/golden/plan-v1.json", "w").write(
+open("crates/rufus-cli/tests/golden/plan-v2.json", "w").write(
     json.dumps(plan, indent=2) + "\n")
 EOF
 ```

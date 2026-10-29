@@ -509,6 +509,10 @@ enum Command {
         /// Record that "show all devices" was enabled.
         #[arg(long)]
         show_all: bool,
+        /// Device serial typed by the user to confirm writing a
+        /// non-removable device; requires --show-all.
+        #[arg(long, value_name = "SERIAL")]
+        confirm_serial: Option<String>,
     },
 
     /// Execute a previously saved plan file.
@@ -1301,6 +1305,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
             verify,
             persistence,
             show_all,
+            confirm_serial,
         } => {
             // Gate first, before grading or image inspection: in every
             // mode (JSON or human) an invalid cluster must exit 1 and
@@ -1314,6 +1319,26 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
                     kind: "usage",
                     message,
                 })?;
+            // PLAN §6 rule 4 needs the typed serial alongside --show-all,
+            // and a blank-typed serial confirms nothing. Trimmed once,
+            // here at acceptance, exactly like `analyze --confirm-serial`;
+            // both refusals fire before any device/image work in both
+            // output modes.
+            let confirm_serial = confirm_serial.as_deref().map(str::trim);
+            if confirm_serial.is_some_and(|serial| serial.is_empty()) {
+                return Err(Fail {
+                    exit: Exit::Usage,
+                    kind: "usage",
+                    message: "confirmation serial must not be empty".to_owned(),
+                });
+            }
+            if confirm_serial.is_some() && !*show_all {
+                return Err(Fail {
+                    exit: Exit::Usage,
+                    kind: "usage",
+                    message: "confirmation serial requires --show-all".to_owned(),
+                });
+            }
             cmd_plan(
                 json,
                 cli.dry_run,
@@ -1331,6 +1356,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
                     verify: *verify,
                     persistence: *persistence,
                     show_all: *show_all,
+                    confirmed_serial: confirm_serial.map(str::to_owned),
                 },
             )
         }

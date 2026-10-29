@@ -62,6 +62,12 @@ pub struct Options {
     pub persistence: bool,
     /// "Show all devices" was on.
     pub show_all: bool,
+    /// Serial the user typed to confirm a non-removable device (`None` =
+    /// no confirmation); accepted only together with `show_all` and
+    /// trimmed once at CLI acceptance. Rides into the plan JSON so the
+    /// S06 helper can tell show-all with a typed serial apart from
+    /// show-all alone (PLAN §6 rule 4).
+    pub confirmed_serial: Option<String>,
 }
 
 /// Grade the target device path into a [`DeviceRef`], enriched from S04
@@ -231,6 +237,7 @@ pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Resu
             verify: options.verify,
             persistence: options.persistence,
             show_all: options.show_all,
+            confirmed_serial: options.confirmed_serial.clone(),
         },
         steps,
         confirm: String::new(),

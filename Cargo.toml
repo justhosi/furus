@@ -47,7 +47,21 @@ sha1 = { version = "0.10" }
 md-5 = { version = "0.10" }
 # S04 (PLAN §4 lists rustix for rufus-linux): safe syscalls for inotify and
 # poll so the device watcher needs no libc and no unsafe code.
-rustix = { version = "1", features = ["fs", "event", "std"] }
+# S06 adds two features for the privileged helper: `process` (geteuid for
+# the root check) and `thread` (the S06 part 4 instrumentation the worker
+# needs — unshare(2)/thread setup for the per-session mount namespace).
+# S06 part 4 adds `mount` on top: the per-run isolation
+# (unshare(CLONE_NEWNS) + recursive-private /) and the mount/unmount seam
+# behind it (`mount(2)`/`umount2(2)` with the MNT_DETACH fallback).
+rustix = { version = "1", features = ["fs", "event", "std", "process", "thread", "mount"] }
+# S06 part 5a: the privileged D-Bus service. zbus 5's default features
+# ("async-io" + "blocking-api") are exactly what part 5b wires
+# (`zbus::blocking::Connection` over the async-io worker runtime); no
+# version below 5 has "blocking-api". Compile-time-only in 5a: the pure
+# service layer (src/dbus.rs) uses neither crate yet, so the resolution
+# is settled before the bus wiring lands.
+zbus = { version = "5" }
+async-io = { version = "2" }
 # Internal crates (path form, so workspaces can share them exactly).
 rufus-core = { path = "crates/rufus-core" }
 rufus-proto = { path = "crates/rufus-proto" }

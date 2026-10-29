@@ -1,10 +1,11 @@
 //! `rufus-proto`: versioned plan/progress types shared by the GUI, the CLI
 //! and the privileged helper.
 //!
-//! Slice S03 delivers the real contract: [`Plan`] (device, image, options,
-//! steps, confirm hash) and its enums. The wire-protocol types for helper
-//! progress and log lines arrive with S06; there are no placeholder types
-//! in between.
+//! Slice S03 delivers the plan contract: [`Plan`] (device, image, options,
+//! steps, confirm hash) and its enums. S06 adds the helper event stream
+//! (progress, log lines and completion) — see
+//! [Helper event stream](#helper-event-stream) below; there are no
+//! placeholder types.
 
 #![forbid(unsafe_code)]
 //!
@@ -19,7 +20,18 @@
 //! # Versioning contract
 //!
 //! * [`PLAN_VERSION`] is the whole-schema version, not a per-field one.
-//!   `version` is checked by the helper before anything else.
+//!   `version` is checked by the helper before anything else; a plan
+//!   carrying any other version (v1 included) is refused, fail closed
+//!   (PLAN §2).
+//! * Schema history: v1 was the S03 plan shape; v2 appended
+//!   [`Options::confirmed_serial`] (as the last options field —
+//!   declaration order is append-only, older fields keep their
+//!   relative positions) — the typed device serial PLAN §6 rule 4
+//!   wants as the second half of the show-all confirmation, so the
+//!   helper can tell "user ticked show-all" apart from "user typed the
+//!   serial". A v1 plan must not be blessed by a v2 reader: its
+//!   confirm hash describes the v1 byte layout, so the version check
+//!   refuses it outright.
 //! * `confirm` is the SHA-256 over the canonical JSON bytes of the plan
 //!   with `confirm` set to `""` (see [`Plan::confirm`]). serde_json writes
 //!   struct fields in declaration order, so the byte layout *is* the
@@ -38,9 +50,14 @@
 //!   PLAN §2 "fail closed" — so adding a variant also bumps
 //!   [`PLAN_VERSION`].
 //!
-//! The summary/progress/log line types of the wire protocol are delivered
-//! with the helper slice (S06) as real types; no placeholders are kept
-//! here.
+//! # Helper event stream
+//!
+//! [`Event`] (delivered with S06 in [`events`]) is the JSONL contract the
+//! helper speaks to its front end while a plan runs: one event per line,
+//! no framing bytes, tagged by its `kind` field and echoing the run's
+//! `session` on every event — see the `events` module docs for the full
+//! contract. [`EVENT_STREAM_VERSION`] versions this stream independently
+//! of [`PLAN_VERSION`]; every [`Completion`] carries it.
 
 use std::fmt;
 
@@ -49,10 +66,19 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
-/// Schema version of [`Plan`]. Bump when the canonical field order changes
-/// (see the crate documentation); a plan carrying a higher version must be
+// S06: the helper event stream (progress/log/completion) lives in its own
+// module so the stream schema versions independently of the plan schema.
+// The re-exports below are the names user code references.
+pub mod events;
+
+pub use events::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, LogLine, Outcome, Progress};
+
+/// Schema version of [`Plan`]. v2 appended [`Options::confirmed_serial`]
+/// (the typed serial confirmation of a non-removable target) and refuses
+/// v1 plans, fail closed — see the schema history in the crate
+/// documentation. A plan carrying a higher or older version must be
 /// refused by the helper.
-pub const PLAN_VERSION: u32 = 1;
+pub const PLAN_VERSION: u32 = 2;
 
 /// A write plan: device, image, options, ordered steps and a confirm hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +227,10 @@ pub struct Options {
     pub persistence: bool,
     /// "Show all devices" was enabled for this plan.
     pub show_all: bool,
+    /// Serial the user typed to confirm writing a non-removable ("show all")
+    /// device; `Some` only when `show_all` is true and the serial matched at
+    /// plan time. `None` means no confirmation was given.
+    pub confirmed_serial: Option<String>,
 }
 
 /// Partition table scheme.
@@ -354,9 +384,10 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-// S03 pins the schema version at 1; bumping it must be a deliberate commit
-// that also regenerates every golden file (see the crate documentation
-// about field order and confirm hashes).
+// S06 bumps the schema to v2: `Options.confirmed_serial` is appended
+// (PLAN §6 rule 4's typed serial confirmation). Bumping the version must
+// be a deliberate commit that also regenerates every golden file (see
+// the crate documentation about field order and confirm hashes).
 const _: () = assert!(PLAN_VERSION >= 1, "PLAN_VERSION must stay positive");
 
 #[cfg(test)]
@@ -394,6 +425,7 @@ mod tests {
                 verify: true,
                 persistence: false,
                 show_all: false,
+                confirmed_serial: Some("ABC123".to_string()),
             },
             steps: vec![
                 Step::Wipe,
@@ -422,8 +454,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_one_until_deliberately_bumped() {
-        assert_eq!(PLAN_VERSION, 1);
+    fn schema_version_is_two_until_deliberately_bumped() {
+        assert_eq!(PLAN_VERSION, 2);
         let mut plan = sample();
         plan.confirm = plan.confirm().expect("sample serialises to canonical JSON");
         assert_eq!(plan.version, PLAN_VERSION);
@@ -456,11 +488,26 @@ mod tests {
         let confirm_at = text.find(r#""confirm":""#).expect("confirm key");
         let image_at = text.find(r#""image":{"#).expect("image key");
         assert!(image_at < confirm_at, "confirm must stay last: {text}");
+        // v2 appended `confirmed_serial` inside `options`; pin it after
+        // `show_all` so a reordering cannot slip through a hash-only
+        // equality (the hash would change too, but this names the field).
+        let show_all_at = text.find(r#""show_all":"#).expect("show_all key");
+        let confirmed_at = text
+            .find(r#""confirmed_serial":"#)
+            .expect("confirmed_serial key");
+        assert!(
+            show_all_at < confirmed_at,
+            "confirmed_serial must follow show_all: {text}"
+        );
 
         // 2. Values and tags (order-insensitive via Value).
         let obj: serde_json::Value = serde_json::from_str(&text).expect("value");
-        assert_eq!(obj["version"], 1);
+        assert_eq!(obj["version"], 2);
         assert_eq!(obj["confirm"], plan.confirm);
+        assert_eq!(
+            obj["options"]["confirmed_serial"], "ABC123",
+            "v2's typed serial confirmation rides in options"
+        );
         let steps = obj["steps"].as_array().expect("steps array");
         assert_eq!(steps[0]["op"], "wipe");
         assert_eq!(steps[1]["op"], "mklabel");
@@ -508,7 +555,7 @@ mod tests {
             assert_ne!(fresh, base.confirm, "{label} did not change the hash");
         };
 
-        check("version", &|p| p.version = 2);
+        check("version", &|p| p.version = 3);
         check("created_by", &|p| p.created_by = "x".into());
         check("device.path", &|p| p.device.path = "/dev/sdc".into());
         check("device.block_device", &|p| p.device.block_device = false);
@@ -522,6 +569,9 @@ mod tests {
         check("cluster", &|p| p.options.cluster_bytes = None);
         check("quick_format", &|p| p.options.quick_format = false);
         check("verify", &|p| p.options.verify = false);
+        // v2: dropping the typed confirmation must change the hash, or a
+        // tampered plan could shed its serial and still verify.
+        check("confirmed_serial", &|p| p.options.confirmed_serial = None);
         check("steps", &|p| p.steps.truncate(1));
         check("step payload", &|p| {
             if let Step::Write { mode } = &mut p.steps[4] {
@@ -556,6 +606,7 @@ mod tests {
                           "cluster_bytes": null, "quick_format": false,
                           "bad_blocks": false, "verify": false,
                           "persistence": false, "show_all": false,
+                          "confirmed_serial": null,
                           "future_switch": true},
             "steps": [{"op": "wipe", "future_hint": 1}],
             "confirm": ""
