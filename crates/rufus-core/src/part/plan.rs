@@ -219,8 +219,8 @@ pub struct PlannedPartition {
     /// the Microsoft Reserved pseudo-partition's value, and it is
     /// precisely why `windows-to-go` refuses MBR tables: a `0x00`
     /// entry reads as an unused slot, so a table writer cannot express
-    /// the MSR without pretending (render maps the reserved role to
-    /// `0x07` as the documented stand-in for hand-built plans).
+    /// the MSR without pretending (render maps the reserved/`msr` role
+    /// to `0x07` as the documented stand-in).
     pub mbr_type: u8,
     /// First LBA of the partition, 1 MiB grid-aligned.
     pub start_lba: u64,
@@ -436,9 +436,11 @@ pub fn plan(req: &PlanRequest) -> Result<TablePlan> {
             }
             // The alignment-down rounds the tail window's *start* to
             // the grid, so the persistence partition grows (data pays
-            // the slack) and both ends stay aligned. After the fit
-            // gate the raw start cannot fall below `first + grid`; the
-            // checked path keeps the arithmetic total regardless.
+            // the slack) and its start stays grid-aligned; its end is
+            // the table's usable ceiling, which is not grid-aligned.
+            // After the fit gate the raw start cannot fall below
+            // `first + grid`; the checked path keeps the arithmetic
+            // total regardless.
             let persistence_start = end_limit
                 .checked_add(1)
                 .and_then(|limit| limit.checked_sub(persistence / sector))
@@ -692,8 +694,11 @@ fn render_mbr(plan: &TablePlan, last_lba: u64) -> Result<Rendered> {
             // type of its own; 0x07 (basic data) is the documented
             // stand-in so the entry stays readable rather than
             // looking like an unused slot. Any other 0x00 is a mise.
+            // The planner spells the role `msr`; a hand-built plan may
+            // spell it `reserved` (no in-tree plan does), so both are
+            // accepted as the same slot.
             0 => {
-                if planned.role == "reserved" {
+                if planned.role == "reserved" || planned.role == "msr" {
                     0x07
                 } else {
                     return Err(CoreError::invalid(format!(
@@ -1350,25 +1355,29 @@ mod tests {
         assert!(error.to_string().contains("no mbr type"), "{error}");
 
         // ... but the reserved role is allowed to fall back to 0x07.
-        let reserved = PlannedPartition {
-            role: "reserved",
-            type_guid: MICROSOFT_RESERVED_GUID,
-            unique_guid: [0u8; 16],
-            mbr_type: 0x00,
-            start_lba: 2048,
-            last_lba: 2048 + 32_767,
-            attributes: 0,
-            name: "reserved",
-        };
-        let reserved_plan = TablePlan {
-            kind: TableKind::Mbr,
-            disk_guid: [0x11u8; 16],
-            partitions: vec![reserved],
-        };
-        let rendered = render(&reserved_plan, 512, 2048 * 80)
-            .unwrap_or_else(|error| panic!("reserved falls back: {error}"));
-        let parsed_first = &rendered.writes[0].bytes[446..462];
-        assert_eq!(parsed_first[4], 0x07, "the reserved role renders as 0x07");
+        // The planner spells it `msr`, hand-built plans spell it
+        // `reserved`; both must render the same way.
+        for role in ["reserved", "msr"] {
+            let reserved = PlannedPartition {
+                role,
+                type_guid: MICROSOFT_RESERVED_GUID,
+                unique_guid: [0u8; 16],
+                mbr_type: 0x00,
+                start_lba: 2048,
+                last_lba: 2048 + 32_767,
+                attributes: 0,
+                name: role,
+            };
+            let reserved_plan = TablePlan {
+                kind: TableKind::Mbr,
+                disk_guid: [0x11u8; 16],
+                partitions: vec![reserved],
+            };
+            let rendered = render(&reserved_plan, 512, 2048 * 80)
+                .unwrap_or_else(|error| panic!("{role} falls back: {error}"));
+            let parsed_first = &rendered.writes[0].bytes[446..462];
+            assert_eq!(parsed_first[4], 0x07, "the {role} role renders as 0x07");
+        }
     }
 
     // ------------------------------------------------------------------

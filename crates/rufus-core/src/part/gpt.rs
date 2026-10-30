@@ -623,7 +623,6 @@ fn sealed_header(
         &GPT_ENTRY_MIN_SIZE.to_le_bytes(),
     )?;
     put(&mut fields, header::ENTRIES_CRC, &entries_crc.to_le_bytes())?;
-    put(&mut fields, header::ENTRIES_CRC, &entries_crc.to_le_bytes())?;
     let header_crc = crc32_ieee(&fields); // spec: computed with the CRC field zeroed
     put(&mut fields, header::HEADER_CRC, &header_crc.to_le_bytes())?;
 

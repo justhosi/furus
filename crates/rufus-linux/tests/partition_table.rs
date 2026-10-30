@@ -280,6 +280,45 @@ fn skip_without_tool(run: &ToolRun, tool: &str, what: &str) -> bool {
     true
 }
 
+/// Assert the backup GPT header really sits in the final LBA, with the
+/// swapped `my_lba`/`alternate_lba` pair, by reading the raw bytes back
+/// from the image.
+///
+/// The external tools are lenient here: all three exit 0 with a
+/// corrupt or missing backup, `sfdisk --verify` even prints "No
+/// errors detected" for a zeroed backup sector, and fdisk/parted only
+/// print "the backup GPT table is corrupt, but the primary appears
+/// OK". So the backup's placement and its swapped link are pinned
+/// against the image bytes instead. `sector_size` is the logical sector
+/// of the rendered table; `last_lba` is the disk's final LBA.
+fn assert_backup_header(path: &Path, last_lba: u64, sector_size: u64) {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let offset = last_lba.saturating_mul(sector_size);
+    let mut header = [0u8; 92];
+    let mut file = File::open(path).expect("open the stamped image for the backup header");
+    file.seek(SeekFrom::Start(offset))
+        .expect("seek to the backup header");
+    file.read_exact(&mut header)
+        .expect("read the backup header sector");
+
+    assert_eq!(
+        &header[..8],
+        b"EFI PART",
+        "no GPT signature at the last LBA {last_lba}"
+    );
+    let my_lba = u64::from_le_bytes(header[24..32].try_into().expect("my_lba field"));
+    let alternate_lba = u64::from_le_bytes(header[32..40].try_into().expect("alternate_lba field"));
+    assert_eq!(
+        my_lba, last_lba,
+        "the backup header claims to live at LBA {my_lba}, not {last_lba}"
+    );
+    assert_eq!(
+        alternate_lba, 1,
+        "the backup header's alternate must be the primary at LBA 1, got {alternate_lba}"
+    );
+}
+
 /// Assert the tool process ran *and* exited 0; on failure, the tool's
 /// captured stdout and stderr are in the message.
 fn assert_exit_zero(run: &ToolRun, what: &str) {
@@ -342,8 +381,18 @@ fn gpt_single_table_is_accepted_by_the_real_tools() {
     let output = rendered(&table, LAST_LBA);
     stamp_table(&sink, &output, DISK_BYTES);
 
-    // sfdisk verifies the whole thing (header CRCs, entry array
-    // redundancy, alignment): exit 0 and nothing fatal.
+    // The backup header must live in the final LBA with the swapped
+    // link, which the external tools below do not check.
+    assert_backup_header(&image_path, LAST_LBA, SECTOR);
+
+    // sfdisk is the first opinion, but its exit status is
+    // unconditional: this util-linux inspects both headers, prints
+    // warnings — "the primary/backup GPT table is corrupt" — and still
+    // exits 0. A backup whose `alternate_lba` merely disagrees with the
+    // primary's `my_lba` gets one step further: "Primary and backup
+    // header mismatch." plus "1 error detected.", also with exit 0. So
+    // the real evidence is the fdisk output below, and the backup
+    // itself is pinned against the image bytes above.
     let path = image_path.display().to_string();
     let verify = run_tool("sfdisk", ["--verify", path.as_str()].as_slice());
     if skip_without_tool(&verify, "sfdisk", "the GPT single-table acceptance test") {
@@ -354,6 +403,9 @@ fn gpt_single_table_is_accepted_by_the_real_tools() {
 
     // fdisk lists the disk with a GPT label and *the planned numbers*.
     let listing = run_tool("fdisk", ["-l", path.as_str()].as_slice());
+    if skip_without_tool(&listing, "fdisk", "the GPT single-table acceptance test") {
+        return;
+    }
     assert_exit_zero(&listing, "fdisk -l on the stamped GPT image");
     let lowered = listing.text().to_lowercase();
     assert!(
@@ -419,6 +471,9 @@ fn mbr_single_table_is_accepted_by_the_real_tools() {
     println!("sfdisk --verify (MBR single):\n{}", verify.text());
 
     let listing = run_tool("fdisk", ["-l", path.as_str()].as_slice());
+    if skip_without_tool(&listing, "fdisk", "the MBR single-table acceptance test") {
+        return;
+    }
     assert_exit_zero(&listing, "fdisk -l on the stamped MBR image");
     let lowered = listing.text().to_lowercase();
     assert!(
@@ -453,11 +508,18 @@ fn gpt_windows_to_go_layout_is_accepted() {
     stamp_table(&sink, &output, WTG_DISK_BYTES);
 
     let path = image_path.display().to_string();
+    assert_backup_header(&image_path, WTG_LAST_LBA, SECTOR);
     let verify = run_tool("sfdisk", ["--verify", path.as_str()].as_slice());
+    if skip_without_tool(&verify, "sfdisk", "the windows-to-go acceptance test") {
+        return;
+    }
     assert_exit_zero(&verify, "sfdisk --verify on the windows-to-go image");
     println!("sfdisk --verify (windows-to-go):\n{}", verify.text());
 
     let listing = run_tool("fdisk", ["-l", path.as_str()].as_slice());
+    if skip_without_tool(&listing, "fdisk", "the windows-to-go acceptance test") {
+        return;
+    }
     assert_exit_zero(&listing, "fdisk -l on the windows-to-go image");
     assert!(
         listing
@@ -546,7 +608,9 @@ fn wipe_removes_the_table() {
     // either shape is printed, never swallowed.
     let path = image_path.display().to_string();
     let verify = run_tool("sfdisk", ["--verify", path.as_str()].as_slice());
-    if verify.ran.is_some_and(|status| status.success()) {
+    if skip_without_tool(&verify, "sfdisk", "the wipe acceptance test") {
+        // Reported as a skip above; the fdisk verdict below still runs.
+    } else if verify.ran.is_some_and(|status| status.success()) {
         assert!(
             !mentions_gpt(&verify.text()),
             "sfdisk --verify still sees a GPT label on the wiped image:\n{}",
@@ -558,6 +622,9 @@ fn wipe_removes_the_table() {
     // fdisk's blank disk shows no disklabel line at all: the second
     // "nothing behind" verdict.
     let listing = run_tool("fdisk", ["-l", path.as_str()].as_slice());
+    if skip_without_tool(&listing, "fdisk", "the wipe acceptance test") {
+        return;
+    }
     assert_exit_zero(&listing, "fdisk -l on the wiped image");
     assert!(
         !listing.text().to_lowercase().contains("disklabel type"),

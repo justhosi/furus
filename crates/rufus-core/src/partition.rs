@@ -1,10 +1,10 @@
 //! Thin compatibility facade over the `part` module tree.
 //!
 //! Slice S08 split the former monolithic `partition.rs` into
-//! [`crate::part::{mbr, gpt}`] (the read side plus the new writers);
-//! `plan` — the layout builder that fills a disk image — lands there
-//! later. Every public path under `partition` keeps working through the
-//! re-exports below, so `rufus-cli`, `rufus-linux::inspect`,
+//! [`crate::part::{mbr, gpt}`] (the read side plus the new writers) and
+//! [`crate::part::plan`] (the layout builder and the metadata-sector
+//! renderer). Every public path under `partition` keeps working through
+//! the re-exports below, so `rufus-cli`, `rufus-linux::inspect`,
 //! `rufus-helper::validate` and `fsprobe` compile unchanged.
 
 // The shared types live directly in `part`; the parse helpers live in

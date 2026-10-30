@@ -14,7 +14,7 @@
 //! Rules the tests pin:
 //!
 //! * **Zero-size is a no-op** — nothing is touched, the flush/reread
-//!   step runs on nothing, the call is `Ok`.
+//!   step is skipped too, the call is `Ok`.
 //! * **Below `2 * WIPE_WINDOW_BYTES` the whole device is zeroed once**
 //!   — no double-write through overlapping front/last windows, no
 //!   underflow wrapping `size - MIB` around zero.
@@ -499,6 +499,38 @@ mod tests {
             started.elapsed() < Duration::from_millis(50),
             "the first check runs before any sleep ({:?})",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_poll_waits_a_full_interval_before_checking_again() {
+        // The node appears 40 ms in, well inside the 200 ms interval: a
+        // poll that re-checks continuously would answer at ~40 ms, so
+        // this pins the pacing rather than only the eventual success.
+        let fixture = Fixture::new();
+        let late_node = fixture.sysfs.root.join("class/block/sdb/sdb2");
+        let seeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            fs::create_dir_all(&late_node).expect("seed the late node");
+        });
+        let started = Instant::now();
+        wait_for_partitions(
+            &fixture.sysfs,
+            "sdb",
+            &["sdb2".to_owned()],
+            Duration::from_millis(900),
+            Duration::from_millis(200),
+        )
+        .unwrap_or_else(|error| panic!("the late node must be found: {error}"));
+        let elapsed = started.elapsed();
+        seeder.join().expect("the seeder thread");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "the poll slept its interval before the second check ({elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "and answered as soon as the node existed ({elapsed:?})"
         );
     }
 
