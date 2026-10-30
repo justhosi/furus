@@ -387,8 +387,9 @@ fn gpt_single_table_is_accepted_by_the_real_tools() {
 
     // sfdisk is the first opinion, but its exit status is
     // unconditional: this util-linux inspects both headers, prints
-    // warnings — "the primary/backup GPT table is corrupt" — and still
-    // exits 0. A backup whose `alternate_lba` merely disagrees with the
+    // "The backup GPT table is corrupt, but the primary appears OK, so
+    // that will be used." (or the primary variant) and still exits 0.
+    // A backup whose `alternate_lba` merely disagrees with the
     // primary's `my_lba` gets one step further: "Primary and backup
     // header mismatch." plus "1 error detected.", also with exit 0. So
     // the real evidence is the fdisk output below, and the backup
@@ -608,9 +609,9 @@ fn wipe_removes_the_table() {
     // either shape is printed, never swallowed.
     let path = image_path.display().to_string();
     let verify = run_tool("sfdisk", ["--verify", path.as_str()].as_slice());
-    if skip_without_tool(&verify, "sfdisk", "the wipe acceptance test") {
-        // Reported as a skip above; the fdisk verdict below still runs.
-    } else if verify.ran.is_some_and(|status| status.success()) {
+    if !skip_without_tool(&verify, "sfdisk", "the wipe acceptance test")
+        && verify.ran.is_some_and(|status| status.success())
+    {
         assert!(
             !mentions_gpt(&verify.text()),
             "sfdisk --verify still sees a GPT label on the wiped image:\n{}",
