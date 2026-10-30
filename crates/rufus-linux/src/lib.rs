@@ -37,6 +37,12 @@
 //! * [`ioctl`] — the kernel ioctl shim (`BLKZEROOUT`, `BLKDISCARD`,
 //!   `BLKRRPART`, `BLKFLSBUF`): the only module of the workspace that
 //!   may compile unsafe code, and exactly what it may call.
+//! * [`wipe`] — the S08 wipe sequence on the PLAN §6 rule-6 seam:
+//!   [`wipe_device`](wipe::wipe_device) clears the first/last 1 MiB
+//!   (optional whole-device discard hint first) and re-reads the
+//!   table, [`wait_for_partitions`](wipe::wait_for_partitions) polls
+//!   sysfs for the expected partition nodes within
+//!   [`PARTITION_POLL_TIMEOUT`](wipe::PARTITION_POLL_TIMEOUT).
 //!
 //! The crate is dependency-light by design (rustix for syscalls, serde
 //! for the model, `rufus-core` for errors): no libudev, no async, no
@@ -59,6 +65,7 @@ pub mod mounts;
 pub mod sysfs;
 pub mod udev_db;
 pub mod watch;
+pub mod wipe;
 
 pub use block::{AlignedBuf, BlockDevice, MemorySink, Sink, SparseFile};
 pub use inspect::Inspected;
@@ -76,3 +83,8 @@ pub use sysfs::filter;
 pub use udev_db::UdevRecord;
 pub use udev_db::read_record;
 pub use watch::DeviceWatcher;
+pub use wipe::PARTITION_POLL_INTERVAL;
+pub use wipe::PARTITION_POLL_TIMEOUT;
+pub use wipe::WIPE_WINDOW_BYTES;
+pub use wipe::wait_for_partitions;
+pub use wipe::wipe_device;

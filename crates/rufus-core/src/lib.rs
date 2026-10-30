@@ -23,11 +23,15 @@
 //! * [`hash`] — [`Algo`](hash::Algo) selection plus streaming
 //!   [`hash_reader`](hash::hash_reader) / [`hash_file`](hash::hash_file)
 //!   digests (MD5/SHA-1/SHA-256/SHA-512) over a 1 MiB buffer.
+//! * [`part`] — write-side MBR and GPT table builders (S08): the
+//!   sector-0 MBR image and the full protective-MBR/primary/backup GPT
+//!   image, next to their parsers (which moved here from
+//!   `partition.rs`).
 //! * [`partition`] — read-side MBR and GPT table parsing
 //!   ([`Layout`](partition::Layout), [`TablePartition`](partition::TablePartition)):
 //!   the authoritative table behind a device, with CRC-32 implemented
 //!   in-crate and rotted metadata reported as warnings rather than
-//!   errors.
+//!   errors. Since S08 this module name is a thin facade over [`part`].
 //! * [`fsprobe`] — [`FsKind`](fsprobe::FsKind) superblock recognition
 //!   from raw byte windows ([`probe`](fsprobe::probe)); four kinds
 //!   (lvm2, btrfs, xfs, zfs) exist only so the write path can refuse to
@@ -55,6 +59,7 @@ pub mod fsprobe;
 pub mod hash;
 pub mod i18n;
 pub mod log;
+pub mod part;
 pub mod partition;
 pub mod paths;
 pub mod safety;

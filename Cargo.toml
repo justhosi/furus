@@ -62,6 +62,10 @@ rustix = { version = "1", features = ["fs", "event", "std", "process", "thread",
 # the four block ioctls (BLKZEROOUT/BLKDISCARD/BLKRRPART/BLKFLSBUF) that
 # rustix does not wrap; see crates/rufus-linux/src/ioctl.rs.
 libc = "0.2"
+# S08 (PLAN §9-S08): GUIDs for the written GPT tables — the layout
+# planner draws fresh per-partition unique GUIDs with `Uuid::new_v4()`
+# (feature "v4").
+uuid = { version = "1", features = ["v4"] }
 # S06 part 5b: the privileged D-Bus service. zbus 5's default features
 # ("async-io" + "blocking-api") are what the helper's src/dbus.rs uses
 # (`zbus::blocking::Connection`, whose proxy layer runs on zbus's own

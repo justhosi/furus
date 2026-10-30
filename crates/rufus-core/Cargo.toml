@@ -12,6 +12,10 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 md-5 = { workspace = true }
+# S08: the table writers consume raw on-disk GUID bytes; the layout
+# planner (S08-B) generates the per-partition unique GUIDs with
+# `Uuid::new_v4()`.
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
