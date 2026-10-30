@@ -16,6 +16,8 @@
 //! (`cargo xtask ...`); all paths are anchored at the workspace root derived
 //! from `CARGO_MANIFEST_DIR`, never at the current directory.
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Read;

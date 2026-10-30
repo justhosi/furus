@@ -656,6 +656,7 @@ dependencies = [
 name = "rufus-linux"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rufus-core",
  "rustix",
  "serde",

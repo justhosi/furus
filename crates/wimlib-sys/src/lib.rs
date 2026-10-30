@@ -5,6 +5,8 @@
 //! in S21. The `links = "wim"` key is already declared so downstream crates
 //! can depend on this crate name from day one.
 
+#![forbid(unsafe_code)]
+
 /// Returns `false` until S21 links the real library.
 pub fn linked() -> bool {
     false

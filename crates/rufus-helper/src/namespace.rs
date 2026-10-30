@@ -20,14 +20,13 @@
 //! # Why the deprecated wrapper
 //!
 //! `rustix::thread::unshare` is deprecated in favour of
-//! `unshare_unsafe`, which this workspace cannot call
-//! (`unsafe_code = "forbid"` is workspace-wide, with no exception
-//! wanted here). The deprecation's *stated* hazard is the
-//! `CLONE_FILES` misuse of the safe-looking wrapper; the sole flag
-//! requested here is `UnshareFlags::NEWNS`, which shares no file
-//! descriptor table, so the safe wrapper is the right call under the
-//! forbid — `main` runs it single-threaded, before any reader threads
-//! exist.
+//! `unshare_unsafe`, which this crate cannot call (it carries
+//! `#![forbid(unsafe_code)]`, with no exception wanted here). The
+//! deprecation's *stated* hazard is the `CLONE_FILES` misuse of the
+//! safe-looking wrapper; the sole flag requested here is
+//! `UnshareFlags::NEWNS`, which shares no file descriptor table, so
+//! the safe wrapper is the right call — `main` runs it
+//! single-threaded, before any reader threads exist.
 
 use rufus_core::error::CoreError;
 use rufus_core::text::device_text;

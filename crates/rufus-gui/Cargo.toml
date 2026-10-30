@@ -9,5 +9,7 @@ name = "rufus-gui"
 path = "src/main.rs"
 
 [lints]
-# Enforce the workspace-wide `unsafe_code = "forbid"` (S04 review).
+# Inherit the workspace-wide `unsafe_code = "deny"`; the crate-level
+# `#![forbid(unsafe_code)]` is the stricter statement of the same
+# policy in source.
 workspace = true

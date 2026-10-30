@@ -21,6 +21,8 @@
 //! image, 6 cancelled, 7 not implemented — see [`Exit`]. clap errors are
 //! mapped to 1 deliberately (clap's own default is 2).
 
+#![forbid(unsafe_code)]
+
 use std::path::Path;
 use std::path::PathBuf;
 

@@ -12,5 +12,7 @@ serde_json = "1"
 sha2 = "0.10"
 
 [lints]
-# Enforce the workspace-wide `unsafe_code = "forbid"` (S04 review).
+# Inherit the workspace-wide `unsafe_code = "deny"`; the crate-level
+# `#![forbid(unsafe_code)]` is the stricter statement of the same
+# policy in source.
 workspace = true

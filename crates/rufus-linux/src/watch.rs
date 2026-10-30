@@ -231,8 +231,8 @@ impl DeviceWatcher {
     /// `EINTR` (or a stream of them) can only ever consume the caller's
     /// budget, never *add* to it — the deadline genuinely holds. The
     /// retry path itself is left untested on purpose: driving it needs a
-    /// signal handler, and installing one requires `unsafe`, which the
-    /// workspace forbids everywhere.
+    /// signal handler, and installing one requires `unsafe`, which this
+    /// crate only opens for its kernel ioctl shim.
     fn wakeup(&self, fd: &OwnedFd, at_most: Duration) -> Result<bool> {
         // An unrepresentable budget behaves like "no wait possible",
         // matching a poll timeout's immediate answer.

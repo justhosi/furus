@@ -17,8 +17,9 @@
 //! # Termination
 //!
 //! There is no SIGTERM handler: `signal-hook-registry`'s `register` is
-//! `unsafe` and the workspace forbids `unsafe`, so the process takes the
-//! default action (immediate exit). Cleanup still happens: every mount
+//! `unsafe` and this crate carries `#![forbid(unsafe_code)]`, so the
+//! process takes the default action (immediate exit). Cleanup still
+//! happens: every mount
 //! lives in the run's private mount namespace, which the kernel tears
 //! down with the process, and the next helper start sweeps the session
 //! directories of dead pids (`session::sweep`). A cancel that must not
@@ -31,6 +32,8 @@
 //! root helper must look at the genuine system, so validation always
 //! runs on [`validate::Env::live`]. Unit tests inject fixtures through
 //! `Env`, never via argv - see the module docs of `crate::validate`.
+
+#![forbid(unsafe_code)]
 
 mod dbus;
 mod exec;

@@ -29,20 +29,38 @@
 //!   `/run/udev/data/b<major>:<minor>` records without libudev.
 //! * [`watch`] — [`DeviceWatcher`](watch::DeviceWatcher): inotify fast
 //!   path with debounce, 2 s poll fallback, reports only real change.
+//! * [`block`] — S07 block I/O: [`Sink`](block::Sink) (the write
+//!   surface), [`BlockDevice`](block::BlockDevice) (a device node or a
+//!   stand-in file), the [`AlignedBuf`](block::AlignedBuf) direct
+//!   requests require plus the [`MemorySink`](block::MemorySink) and
+//!   [`SparseFile`](block::SparseFile) test doubles.
+//! * [`ioctl`] — the kernel ioctl shim (`BLKZEROOUT`, `BLKDISCARD`,
+//!   `BLKRRPART`, `BLKFLSBUF`): the only module of the workspace that
+//!   may compile unsafe code, and exactly what it may call.
 //!
 //! The crate is dependency-light by design (rustix for syscalls, serde
 //! for the model, `rufus-core` for errors): no libudev, no async, no
-//! libc, no subprocesses — see PLAN §4/§5.
+//! subprocesses — see PLAN §4/§5. The single exception is `libc`, and
+//! only for the S07 ioctl shim above (rustix wraps nothing else the
+//! block layer needs).
 
-#![forbid(unsafe_code)]
+// Unsafe policy (S07): the workspace lint is `deny` and this crate
+// inherits it; the single `#[allow(unsafe_code)]` of the whole tree
+// lives on the `ioctl_raw` shim inside `crate::ioctl` (see that module
+// header for what is allowed and why). There must be no second unsafe
+// use anywhere — the other crates still carry crate-level
+// `#![forbid(unsafe_code)]`.
 
+pub mod block;
 pub mod inspect;
+mod ioctl;
 pub mod model;
 pub mod mounts;
 pub mod sysfs;
 pub mod udev_db;
 pub mod watch;
 
+pub use block::{AlignedBuf, BlockDevice, MemorySink, Sink, SparseFile};
 pub use inspect::Inspected;
 pub use inspect::inspect;
 pub use model::Device;

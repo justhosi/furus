@@ -3,6 +3,8 @@
 //! Slice S01 only: a stub so the workspace builds and `xtask size` has a
 //! GUI binary to measure.
 
+#![forbid(unsafe_code)]
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {

@@ -19,11 +19,15 @@ publish = false
 
 # S04 review: unsafe-code enforcement lives in the workspace so every
 # member inherits it through `[lints] workspace = true`, instead of
-# trusting each crate to remember its own attribute. Existing
-# crate-level `#![forbid(unsafe_code)]` attributes stay (they document
-# intent at the file where it matters).
+# trusting each crate to remember its own attribute.
+# S07: "deny" now instead of "forbid" — exactly one module needs unsafe,
+# the kernel ioctl shim in rufus-linux (four block ioctls rustix does
+# not wrap), and it carries the one `#[allow(unsafe_code)]` of the
+# workspace. Every other crate still carries an explicit
+# `#![forbid(unsafe_code)]` at its root, so the shim remains the single
+# place in the tree that compiles unsafe code at all.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.dependencies]
 # S02 core-runtime dependencies (kept minimal: no async, no logging
@@ -54,6 +58,10 @@ md-5 = { version = "0.10" }
 # (unshare(CLONE_NEWNS) + recursive-private /) and the mount/unmount seam
 # behind it (`mount(2)`/`umount2(2)` with the MNT_DETACH fallback).
 rustix = { version = "1", features = ["fs", "event", "std", "process", "thread", "mount"] }
+# S07 (PLAN §4): only the kernel ioctl shim in rufus-linux uses `libc` —
+# the four block ioctls (BLKZEROOUT/BLKDISCARD/BLKRRPART/BLKFLSBUF) that
+# rustix does not wrap; see crates/rufus-linux/src/ioctl.rs.
+libc = "0.2"
 # S06 part 5b: the privileged D-Bus service. zbus 5's default features
 # ("async-io" + "blocking-api") are what the helper's src/dbus.rs uses
 # (`zbus::blocking::Connection`, whose proxy layer runs on zbus's own

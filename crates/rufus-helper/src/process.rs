@@ -34,7 +34,7 @@
 //! * A child that forks a descendant which inherits and holds the
 //!   output pipes can delay EOF past the child's own exit; the final
 //!   drain + join waits for it. Supervised tools (mkfs, dd, losetup,
-//!   …) do not do that, and with the workspace's
+//!   …) do not do that, and with this crate's
 //!   `#![forbid(unsafe_code)]` there is no libc escape hatch to harden
 //!   against it — the boundary is documented, not hidden. `sh -c`
 //!   shells have long exec'd a single simple command (no descendant
