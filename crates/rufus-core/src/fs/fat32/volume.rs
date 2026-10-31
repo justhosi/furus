@@ -23,8 +23,9 @@
 //!   and no two allocations inside one flush window can ever claim the
 //!   same clusters. Directory and file content are written straight
 //!   through the store; a caller that cares about crash consistency
-//!   flushes at the end of its write pass (the CLI does, and the fsck
-//!   acceptance of this slice runs on a flushed image).
+//!   flushes at the end of its write pass. The fsck acceptance of this
+//!   slice runs on a flushed image, and the pipeline that will call this
+//!   API (S17) is where the flush belongs in production.
 //! * **Names.** [`bpb`](crate::fs::fat32::bpb) keeps the volume-label
 //!   rules; [`dirent`] keeps the file-name rules ([`dirent::validate_name`])
 //!   and the 8.3 rendering with the `~n` collision tails. Lookups are
@@ -32,13 +33,13 @@
 //!   stores the caller's case, the short field is always uppercase.
 //! * **Paths.** Component paths name directories and leaves with
 //!   `/` separators; an optional single leading slash is tolerated (the
-//!   spelling this slice's acceptance tests and CLI carry), a trailing
+//!   spelling this slice's acceptance tests use), a trailing
 //!   slash or any empty component refuses, and `.`/`..` are generated
 //!   entry linkage, never user paths.
 //! * **Timestamps.** `create_file` and `mkdir` stamp the volume's
 //!   "now" — an injectable clock ([`Fat32::set_now`]) defaulting to the
-//!   DOS epoch so tests stay deterministic; a later slice's CLI will pass
-//!   the real time through the same seam. `write_at` deliberately never
+//!   DOS epoch so tests stay deterministic; a later slice's pipeline
+//!   passes the real time through the same seam. `write_at` deliberately never
 //!   touches timestamps.
 //! * **No panics anywhere.** All cluster and byte math goes through
 //!   checked or saturating helpers reporting [`CoreError::invalid`]; a
@@ -338,9 +339,10 @@ impl Fat32 {
     }
 
     /// Set the stamp `create_file`/`mkdir` carry into their new
-    /// entries. Tests inject a fixed value; the CLI passes the real
-    /// time through the same seam. Existing entries change through
-    /// [`Fat32::set_times`] only.
+    /// entries. Tests inject a fixed value; a caller writing real files
+    /// passes the wall clock through the same seam
+    /// ([`FatTime::from_ymdhms`] is the constructor). Existing entries
+    /// change through [`Fat32::set_times`] only.
     pub fn set_now(&mut self, times: FatTime) {
         self.now = times;
     }
