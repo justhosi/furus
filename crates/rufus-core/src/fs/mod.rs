@@ -1,5 +1,5 @@
-//! The filesystem write side's storage abstraction plus the FAT32
-//! formatter that drives it (S09).
+//! The filesystem write side's storage abstraction plus the formatters
+//! that drive it: FAT32 (S09) and exFAT (S10).
 //!
 //! The crate layering puts privileged I/O in `rufus-linux` and the
 //! formatter logic in `rufus-core`; the two meet here in [`Volume`], the
@@ -34,6 +34,7 @@
 use crate::error::CoreError;
 use crate::error::Result;
 
+pub mod exfat;
 pub mod fat32;
 
 /// The byte-store surface the write side of `rufus-core` drives.
