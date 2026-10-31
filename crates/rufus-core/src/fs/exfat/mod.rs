@@ -13,7 +13,16 @@
 //!   checksum and the backup copy;
 //! * [`upcase`] — the canonical up-case table the volume carries;
 //! * [`format`] — the write step: boot region, FAT, allocation bitmap,
-//!   up-case table, root directory and label (a mountable empty volume).
+//!   up-case table and root directory (a mountable empty volume);
+//! * [`dirent`] — the 0x85/0xC0/0xC1 entry sets a file or directory is
+//!   made of: the images, the set checksum, the name hash and name
+//!   rules, and the directory walker that reads them back;
+//! * [`bitmap`] — the allocation bitmap in memory: bits, free count,
+//!   contiguous first-fit, mark/clear and write-back;
+//! * [`volume`] — the live volume type (`Exfat`): format/open on top
+//!   of the writer, then `mkdir`, `create_file`, `list_dir`,
+//!   `free_bytes` and `flush` over the byte store (part B1; `write_at`,
+//!   `read_file`, `set_times` and `set_label` are part B2).
 //!
 //! The field writes below share the FAT32 side's rule: every byte goes
 //! into a fixed-size buffer at a checked offset, there is no slice
@@ -23,15 +32,22 @@
 use crate::error::CoreError;
 use crate::error::Result;
 
+pub mod bitmap;
 pub mod boot;
+pub mod dirent;
 pub mod format;
 pub mod geometry;
 pub mod upcase;
+pub mod volume;
 
+pub use bitmap::Bitmap;
 pub use boot::ParsedBoot;
+pub use dirent::DirEntry;
 pub use format::FormatOptions;
 pub use format::format;
 pub use geometry::Geometry;
+pub use volume::DirInfo;
+pub use volume::Exfat;
 
 /// Checked byte copy at a fixed offset inside a byte-exact image.
 ///

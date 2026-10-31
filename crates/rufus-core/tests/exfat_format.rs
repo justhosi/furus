@@ -15,19 +15,23 @@
 //! 0.001 s + fsck 0.003 s; 2 GiB format 0.003 s + fsck 0.010 s; 2 TiB
 //! format 0.027 s + fsck 0.002 s (the sparse file is never materialised).
 
+use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitStatus;
+use std::rc::Rc;
 use std::time::Instant;
 
 use rufus_core::error::CoreError;
 use rufus_core::error::Result;
 use rufus_core::fs::Volume;
+use rufus_core::fs::exfat::Exfat;
 use rufus_core::fs::exfat::FormatOptions;
 use rufus_core::fs::exfat::Geometry;
+use rufus_core::fs::exfat::dirent::Stamps;
 use rufus_core::fs::exfat::format;
 use rufus_core::fs::exfat::upcase;
 
@@ -373,4 +377,197 @@ fn the_fsck_guard_rejects_a_damaged_boot_checksum() {
         !run.status.success() || text.contains("checksum"),
         "a corrupt boot checksum must not pass fsck:\n{text}"
     );
+}
+
+#[test]
+fn a_written_tree_stays_fsck_clean() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = FileVolume::path(dir.path());
+    let store = FileVolume::create(&path, 64 * MIB, 512).expect("the image is created");
+    let mut volume =
+        Exfat::format(store, &FormatOptions::new(0x5EED_1234)).expect("the image formats");
+
+    let stamp = Stamps::epoch();
+    volume.mkdir("/a", stamp).expect("the first level");
+    volume.mkdir("/a/b", stamp).expect("the second level");
+    volume
+        .create_file("/a/b/x.txt", 0, stamp)
+        .expect("a file at the bottom");
+    volume
+        .create_file("/a/notes.txt", 0, stamp)
+        .expect("a file beside the directory");
+    volume.flush().expect("the volume flushes");
+
+    assert_eq!(
+        volume
+            .list_dir("/a")
+            .expect("the directory lists")
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "notes.txt"]
+    );
+    assert_eq!(
+        volume
+            .list_dir("/a/b")
+            .expect("the leaf directory lists")
+            .len(),
+        1
+    );
+    drop(volume);
+
+    if skip_without_tool("fsck.exfat", "the written-tree acceptance test") {
+        return;
+    }
+    assert_fsck_clean(&path);
+}
+
+/// Reopen an image that was written before, for a fresh [`Exfat::open`].
+fn reopened(path: &Path) -> FileVolume {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("the image opens again");
+    let total_bytes = file.metadata().expect("the image is statable").len();
+    FileVolume {
+        file,
+        total_bytes,
+        sector_size: 512,
+    }
+}
+
+/// A [`FileVolume`] that fails exactly one chosen write, the way a torn
+/// write behaves on real media: everything written before the failure is
+/// on disk, nothing after it is, and the failure is one-shot so the
+/// rollback that follows can still write.
+struct OneShotFail {
+    inner: FileVolume,
+    fail_at: Rc<Cell<Option<u64>>>,
+    writes: Rc<Cell<u64>>,
+}
+
+impl OneShotFail {
+    fn create(path: &Path, total_bytes: u64, sector_size: u32) -> Result<Self> {
+        Ok(Self {
+            inner: FileVolume::create(path, total_bytes, sector_size)?,
+            fail_at: Rc::new(Cell::new(None)),
+            writes: Rc::new(Cell::new(0u64)),
+        })
+    }
+
+    /// The switch that arms the next failure (`Some(index)`).
+    fn fail_at(&self) -> Rc<Cell<Option<u64>>> {
+        Rc::clone(&self.fail_at)
+    }
+
+    /// How many writes have reached the image so far.
+    fn writes(&self) -> Rc<Cell<u64>> {
+        Rc::clone(&self.writes)
+    }
+}
+
+impl Volume for OneShotFail {
+    fn total_bytes(&self) -> u64 {
+        self.inner.total_bytes()
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_exact_at(offset, buf)
+    }
+
+    fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+        let seen = self.writes.get();
+        if self.fail_at.get() == Some(seen) {
+            self.fail_at.set(None);
+            return Err(CoreError::invalid("injected write failure"));
+        }
+        self.writes.set(seen + 1);
+        self.inner.write_all_at(offset, buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.inner.flush()
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+}
+
+/// A create that tears at any of its first writes must leave a directory
+/// the exchange can still read, not a set whose checksum never matches.
+#[test]
+fn every_torn_point_of_a_create_leaves_an_image_fsck_can_read() {
+    if skip_without_tool("fsck.exfat", "the torn-write acceptance test") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    for offset in 0..6u64 {
+        let path = dir.path().join(format!("torn-{offset}.img"));
+        let store = OneShotFail::create(&path, 64 * MIB, 512).expect("the image is created");
+        let fail_at = store.fail_at();
+        let writes = store.writes();
+        let mut volume =
+            Exfat::format(store, &FormatOptions::new(0x5EED_7001)).expect("the image formats");
+        volume
+            .mkdir("/a", Stamps::epoch())
+            .expect("the directory is created");
+        let armed = writes.get() + offset;
+        fail_at.set(Some(armed));
+        let outcome = volume.create_file("/a/torn.txt", 4096, Stamps::epoch());
+        fail_at.set(None);
+        volume.flush().expect("the rolled-back state flushes");
+        drop(volume);
+        assert_fsck_clean(&path);
+        let reopened = Exfat::open(reopened(&path)).expect("the volume reopens");
+        let listing = reopened.list_dir("/a").expect("the directory still parses");
+        if outcome.is_err() {
+            assert!(listing.is_empty(), "torn at write {armed} left {listing:?}");
+        } else {
+            assert_eq!(listing.len(), 1, "an untorn create lists its file");
+        }
+    }
+}
+
+/// A create refused after the root had to grow must leave the root chain
+/// pointing at the end of the chain again: a linked-but-freed cluster
+/// lets the next directory duplicate the namespace, which `fsck` rejects.
+#[test]
+fn a_refused_create_after_a_root_growth_keeps_the_image_fsck_clean() {
+    if skip_without_tool("fsck.exfat", "the root-growth rollback test") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut saw_failure = false;
+    for offset in 0..4u64 {
+        let path = dir.path().join(format!("growth-{offset}.img"));
+        let store = OneShotFail::create(&path, 64 * MIB, 512).expect("the image is created");
+        let fail_at = store.fail_at();
+        let writes = store.writes();
+        let mut volume =
+            Exfat::format(store, &FormatOptions::new(0x5EED_7002)).expect("the image formats");
+        for index in 0..42 {
+            volume
+                .create_file(&format!("/f{index:03}.bin"), 0, Stamps::epoch())
+                .expect("a filler file fits");
+        }
+        let armed = writes.get() + offset;
+        fail_at.set(Some(armed));
+        let outcome = volume.create_file("/grow.bin", 0, Stamps::epoch());
+        fail_at.set(None);
+        if outcome.is_err() {
+            saw_failure = true;
+            volume
+                .mkdir("/phantom", Stamps::epoch())
+                .expect("a directory created after the rollback works");
+            volume
+                .create_file("/phantom/lost.bin", 0, Stamps::epoch())
+                .expect("a file created after the rollback works");
+        }
+        volume.flush().expect("the volume flushes");
+        drop(volume);
+        assert_fsck_clean(&path);
+    }
+    assert!(saw_failure, "the run must actually tear a root growth");
 }
