@@ -8,6 +8,14 @@
 //!   (I/O with path, config/serialise failures, `.loc` parse errors,
 //!   invalid input, asset resolution). [`Result`](error::Result) is the
 //!   crate-wide result alias.
+//! * [`fs`] — the filesystem write side (S09): the [`Volume`](fs::Volume)
+//!   byte-store surface (total extent, exact positional I/O, sector
+//!   size, flush) that keeps the formatters independent of
+//!   `rufus-linux`, and under [`fs::fat32`] the no-mount, no-external
+//!   tool FAT32 formatter — [`geometry`](fs::fat32::geometry) (large
+//!   FAT32 included), the [`bpb`](fs::fat32::bpb) byte images and
+//!   [`format`](fs::fat32::format) (superblocks, both FATs, root
+//!   directory).
 //! * [`log`] — [`Logger`](log::Logger): an `Arc`-shared in-memory ring
 //!   (10,000 records) with level filtering and an optional append-only
 //!   file sink; UTC timestamps without a date/time dependency.
@@ -55,6 +63,7 @@
 
 pub mod config;
 pub mod error;
+pub mod fs;
 pub mod fsprobe;
 pub mod hash;
 pub mod i18n;
