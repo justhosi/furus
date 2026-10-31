@@ -1,6 +1,6 @@
 //! The GPT side of the partition module: header and entry decoding
 //! ([`parse_gpt`], [`gpt_entry_range`]) plus the S08 writer
-//! ([`write_gpt`]) that assembles the protective MBR, the primary
+//! (`write_gpt`) that assembles the protective MBR, the primary
 //! header/entry array and their backup copies.
 //!
 //! Nothing here opens a device — the caller hands in the sectors it
@@ -434,7 +434,7 @@ pub(crate) fn verified_backup(
 // Write side (S08)
 // ---------------------------------------------------------------------------
 
-/// One GPT table entry, the input shape of [`write_gpt`].
+/// One GPT table entry, the input shape of `write_gpt`.
 ///
 /// Both GUIDs are on-disk (mixed-endian) bytes, exactly the byte order
 /// [`guid_to_string`] interprets — a `uuid::Uuid` value converts by
@@ -461,7 +461,7 @@ pub struct GptPartition {
     pub name: &'static str,
 }
 
-/// Everything [`write_gpt`] produced, in the order it belongs on the
+/// Everything `write_gpt` produced, in the order it belongs on the
 /// device.
 ///
 /// Placement map (512-byte sectors): the MBR at LBA 0, the primary
@@ -492,7 +492,7 @@ pub struct GptImage {
     /// swapped to their mirrored values, both CRCs freshly computed.
     pub backup_header: Vec<u8>,
     /// LBA of the backup header — the `last_lba` argument of
-    /// [`write_gpt`], i.e. the device's final sector.
+    /// `write_gpt`, i.e. the device's final sector.
     pub backup_lba: u64,
     /// First LBA an ordinary partition may start at: 2 + the entry
     /// array's sector count (34 on 512-byte-sector disks, 6 on
@@ -502,7 +502,7 @@ pub struct GptImage {
     /// Last LBA an ordinary partition may end at: one below the backup
     /// entry array (`last_lba - 33` on 512-byte-sector disks,
     /// `last_lba - 5` on 4096-byte-sector disks). At the minimum disk
-    /// size ([`write_gpt`]'s headroom floor) the range between
+    /// size (`write_gpt`'s headroom floor) the range between
     /// [`GptImage::first_usable`] and here degenerates to empty.
     pub last_usable: u64,
 }
@@ -674,7 +674,16 @@ fn sealed_header(
 ///
 /// The caller picks the LBAs; partitions are written into the table in
 /// the order given, one per entry slot with no renumbering.
-pub fn write_gpt(
+///
+/// **Not public, and not a validation boundary.** This writer checks the
+/// geometry it stamps itself — headroom, reversed spans, overlaps, name
+/// shape — but it does not bound the caller's partitions against
+/// [`GptImage::first_usable`]/[`GptImage::last_usable`]. That check lives
+/// in `plan::render`, which is the only supported way to turn a layout
+/// into bytes; the S17 pipeline consumes `plan::Rendered` rather than
+/// calling this directly, and `pub(in crate::part)` makes the shortcut
+/// unavailable everywhere else.
+pub(in crate::part) fn write_gpt(
     sector_size: u32,
     last_lba: u64,
     disk_guid: [u8; 16],

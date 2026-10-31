@@ -1,6 +1,6 @@
 //! The MBR side of the partition module: the entry decoder
 //! ([`parse_mbr`]) moved from the former monolithic `partition.rs`, plus
-//! the S08 writer ([`write_mbr`]) that assembles sector 0.
+//! the S08 writer (`write_mbr`) that assembles sector 0.
 //!
 //! Nothing here opens a device: the caller hands in LBA0 bytes it read
 //! and takes the sector 0 the writer builds. The module-wide rules the
@@ -25,7 +25,7 @@ pub(crate) const MBR_ENTRY_AREA: usize = 446;
 /// One MBR entry is exactly 16 bytes, four entries back-to-back.
 pub(crate) const MBR_ENTRY_SIZE: usize = 16;
 /// Offset of the 4 disk-signature bytes within sector 0. They sit in
-/// the boot area's tail, so [`write_mbr`] stamps them *over* whatever
+/// the boot area's tail, so `write_mbr` stamps them *over* whatever
 /// `boot_area` holds at that spot — the parameter wins.
 const DISK_SIGNATURE_OFFSET: usize = 440;
 
@@ -143,7 +143,7 @@ pub(crate) fn extended_container_warnings(lba0: &[u8]) -> Vec<String> {
 // Write side (S08)
 // ---------------------------------------------------------------------------
 
-/// One MBR primary entry, the input shape of [`write_mbr`].
+/// One MBR primary entry, the input shape of `write_mbr`.
 ///
 /// `type_id` is the raw partition-type byte (`0x0b` FAT32, `0x83`
 /// Linux, `0xee` protective marker — the reader's slug table lives in
@@ -220,7 +220,14 @@ fn chs_tuple(lba: u32) -> [u8; 3] {
 /// * more than four partitions is an error — sector 0 has four primary
 ///   slots and silently dropping entries would produce a table that
 ///   disagrees with the caller's plan.
-pub fn write_mbr(
+///
+/// **Not public, and not a validation boundary.** Entries are taken as
+/// given: this writer has no opinion on whether the disk is big enough
+/// or whether the spans fit the table's usable range. `plan::render` is
+/// the only supported producer of table bytes and does that bounding
+/// once; the S17 pipeline consumes `plan::Rendered`, and
+/// `pub(in crate::part)` keeps the shortcut out of reach elsewhere.
+pub(in crate::part) fn write_mbr(
     boot_area: &[u8; 446],
     disk_signature: [u8; 4],
     partitions: &[MbrPartition],

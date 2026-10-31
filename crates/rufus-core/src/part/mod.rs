@@ -3,10 +3,22 @@
 //! The table formats live in [`gpt`] and [`mbr`]; this module holds the
 //! shared types, the byte-reading helpers, and [`detect_layout`], the
 //! read-side assembly the preview and the safety verdict consume. The
-//! S08 writers live next to their parsers ([`mbr::write_mbr`] builds
-//! sector 0, [`gpt::write_gpt`] builds the protective MBR plus both GPT
+//! S08 writers live next to their parsers (`mbr::write_mbr` builds
+//! sector 0, `gpt::write_gpt` builds the protective MBR plus both GPT
 //! copies), and [`plan`] turns the PLAN §9-S08 layouts into
 //! [`plan::TablePlan`]s rendered to absolute sector writes.
+//!
+//! **The writers are `pub(in crate::part)` on purpose.** `plan::render`
+//! is the only supported way to turn a layout into bytes: it is where a
+//! caller's spans are bounded against the table's own usable range,
+//! which the writers deliberately do not re-check. The S17 pipeline must
+//! consume [`plan::Rendered`] (a list of absolute [`plan::SectorWrite`]s)
+//! rather than reach for `write_gpt`/`write_mbr`. They were public API
+//! until this slice — `rufus_core::part::gpt::write_gpt` was reachable
+//! from every dependent crate, though nothing outside `rufus-core`
+//! called it — and narrowing them to `crate::part` is what stops a later
+//! in-crate `pipeline` module from taking the shortcut: it would not
+//! compile.
 //!
 //! S04 trusts the udev record's single `ID_PART_TABLE_TYPE` label; the
 //! read side re-derives the *authoritative* table from the device bytes

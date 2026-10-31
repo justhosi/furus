@@ -5,10 +5,20 @@
 //! layouts over a table kind and a sector size — into a
 //! [`TablePlan`]: the partition list with 1-MiB-aligned, checked
 //! geometry plus fresh `uuid` v4 GUIDs. [`render`] then visits the
-//! real table writers ([`mbr::write_mbr`], [`gpt::write_gpt`]) and
+//! real table writers (`mbr::write_mbr`, `gpt::write_gpt`) and
 //! emits only the sectors that actually carry data — LBA0, the GPT
 //! entry sectors, the two headers and the backup copies — never the
 //! whole disk.
+//!
+//! **`render` is the only supported producer of table bytes.** The two
+//! writers behind it are `pub(in crate::part)` and check only the
+//! geometry they own (headroom, reversed spans, overlaps, the four-slot
+//! MBR limit); bounding a caller's partition spans against
+//! `first_usable`/`last_usable` is this module's job, done once in
+//! `render_gpt`/`render_mbr`. The S17 write pipeline therefore consumes
+//! [`Rendered`] and writes its [`SectorWrite`]s in order — it must not
+//! reach past this module for the writers, which the module privacy
+//! makes impossible outside `crate::part`.
 //!
 //! The four layouts (PLAN §9-S08): `single` (one data partition,
 //! default for Linux ISOs), `uefi-ntfs` (a small FAT `UEFI_NTFS`
