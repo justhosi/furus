@@ -244,8 +244,7 @@ fn chunked_write(volume: &mut dyn Volume, start: u64, length: u64, prefix: &[u8]
     let mut done = 0_u64;
     while done < length {
         let piece = usize::try_from((length - done).min(FILL_CHUNK_BYTES as u64))
-            .ok()
-            .ok_or_else(|| CoreError::invalid("a chunk piece does not fit usize"))?;
+            .map_err(|_| CoreError::invalid("a chunk piece does not fit usize"))?;
         let offset = start
             .checked_add(done)
             .ok_or_else(|| CoreError::invalid("a chunk piece's byte offset overflows a u64"))?;

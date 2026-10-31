@@ -6,7 +6,7 @@
 //! byte-store surface (total size, exact positional reads/writes, sector
 //! size, flush) that is *all* the formatter ever needs. There is no
 //! [`crate::paths`]-style exception in the other direction — `rufus-core`
-//! never depends on `rufus-linux` — so part C of this slice wires an
+//! never depends on `rufus-linux` — so a later slice has to wire an
 //! adapter from `rufus_linux::Sink` (a device or scratch file) to
 //! [`Volume`]; anyone could do the same for `std::fs::File`, which is
 //! exactly what the integration tests of this slice do over sparse

@@ -37,9 +37,9 @@
 //!   entry linkage, never user paths.
 //! * **Timestamps.** `create_file` and `mkdir` stamp the volume's
 //!   "now" — an injectable clock ([`Fat32::set_now`]) defaulting to the
-//!   DOS epoch so tests stay deterministic; the CLI passes the real
-//!   time through the same seam. `write_at` deliberately never touches
-//!   timestamps.
+//!   DOS epoch so tests stay deterministic; a later slice's CLI will pass
+//!   the real time through the same seam. `write_at` deliberately never
+//!   touches timestamps.
 //! * **No panics anywhere.** All cluster and byte math goes through
 //!   checked or saturating helpers reporting [`CoreError::invalid`]; a
 //!   hostile path string or a corrupt FAT table only produces errors,

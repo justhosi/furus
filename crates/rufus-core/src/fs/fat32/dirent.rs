@@ -101,8 +101,8 @@ pub struct FatTime {
 
 impl Default for FatTime {
     /// The DOS epoch itself (`1980-01-01 00:00`): the volume's default
-    /// "now" so every stamp is deterministic until a caller (the CLI in
-    /// part C of the slice, the tests here) injects the real time.
+    /// "now" so every stamp is deterministic until a caller (a later
+    /// slice's CLI, the tests here) injects the real time.
     fn default() -> Self {
         Self {
             date: (1 << 5) | 1,
