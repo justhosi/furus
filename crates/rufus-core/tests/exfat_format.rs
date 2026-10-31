@@ -195,6 +195,8 @@ fn assert_fsck_clean(path: &Path) {
         }
     }
     assert!(problems.is_empty(), "{}:\n{text}", problems.join("; "));
+    // The measured verdict line, for the record (visible with --nocapture).
+    eprintln!("fsck verdict: {}", text.trim());
 }
 
 #[test]
@@ -417,6 +419,107 @@ fn a_written_tree_stays_fsck_clean() {
     drop(volume);
 
     if skip_without_tool("fsck.exfat", "the written-tree acceptance test") {
+        return;
+    }
+    assert_fsck_clean(&path);
+}
+
+/// A deterministic byte pattern, so a mismatch points at the exact offset.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
+}
+
+#[test]
+fn written_files_keep_their_bytes_and_stay_fsck_clean() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = FileVolume::path(dir.path());
+    let store = FileVolume::create(&path, 64 * MIB, 512).expect("the image is created");
+    let mut volume =
+        Exfat::format(store, &FormatOptions::new(0x5EED_1235)).expect("the image formats");
+    let stamp = Stamps::epoch();
+
+    let big = pattern(300 * 1024);
+    let notes = pattern(4096);
+    let long_name = format!("{}.txt", "long-name".repeat(20));
+    let long_bytes = pattern(1000);
+
+    volume.mkdir("/a", stamp).expect("the first level");
+    volume.mkdir("/a/b", stamp).expect("the second level");
+    volume
+        .create_file("/a/b/file.bin", 0, stamp)
+        .expect("the big file");
+    volume
+        .write_at("/a/b/file.bin", 0, &big[..150 * 1024])
+        .expect("the first half");
+    volume
+        .write_at("/a/b/file.bin", 150 * 1024, &big[150 * 1024..])
+        .expect("the second half");
+    volume
+        .create_file("/a/notes.txt", 0, stamp)
+        .expect("the notes file");
+    volume
+        .write_at("/a/notes.txt", 0, &notes)
+        .expect("the notes content");
+    volume
+        .create_file(&format!("/a/{long_name}"), 0, stamp)
+        .expect("the long-named file");
+    volume
+        .write_at(&format!("/a/{long_name}"), 0, &long_bytes)
+        .expect("the long-named content");
+    volume.flush().expect("the volume flushes");
+
+    let listed = volume.list_dir("/a").expect("the directory lists");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "notes.txt", long_name.as_str()]
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .find(|entry| entry.name == "notes.txt")
+            .expect("the notes entry")
+            .size,
+        4096
+    );
+    // A size that is not a whole cluster: the listing has to report the
+    // write's end, not the allocation's byte size (the kernel driver reads
+    // DataLength as the file size).
+    assert_eq!(
+        listed
+            .iter()
+            .find(|entry| entry.name == long_name)
+            .expect("the long-named entry")
+            .size,
+        1000
+    );
+    assert_eq!(
+        volume.list_dir("/a/b").expect("the leaf lists")[0].size,
+        300 * 1024
+    );
+    drop(volume);
+
+    let reopened = Exfat::open(reopened(&path)).expect("the volume opens again");
+    assert_eq!(
+        reopened
+            .read_file("/a/b/file.bin")
+            .expect("the big file reads"),
+        big
+    );
+    assert_eq!(
+        reopened.read_file("/a/notes.txt").expect("the notes read"),
+        notes
+    );
+    assert_eq!(
+        reopened
+            .read_file(&format!("/a/{long_name}"))
+            .expect("the long-named file reads"),
+        long_bytes
+    );
+
+    if skip_without_tool("fsck.exfat", "the written-content acceptance test") {
         return;
     }
     assert_fsck_clean(&path);

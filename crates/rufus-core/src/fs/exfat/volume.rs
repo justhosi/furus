@@ -2,8 +2,9 @@
 //! over the formatter substrate from part A: [`Exfat::format`] and
 //! [`Exfat::open`] build (or adopt) a volume, and every operation this
 //! slice owns is a method on it: `mkdir`, `create_file`, `list_dir`,
-//! `free_bytes`, `flush` plus the geometry handle. `write_at`,
-//! `read_file`, `set_times` and `set_label` join in part B2.
+//! `free_bytes`, `flush` plus the geometry handle. `write_at` and
+//! `read_file` joined in part B2's content half; `set_times` and
+//! `set_label` follow it.
 //!
 //! Design notes, the ones the implementations lean on:
 //!
@@ -70,6 +71,21 @@
 //!     the boot checksum. It grows by one cluster appended to its FAT
 //!     chain instead — the one directory whose description *is* a
 //!     chain, and the only place this slice touches the FAT.
+//! * **File data** is written through `write_at` into the file's own
+//!   contiguous run, and growing it follows the same shape directory
+//!   growth does: adopt the run's free neighbours in place when the
+//!   bitmap shows them inside the heap, or relocate the whole run — a
+//!   fresh contiguous allocation, the `ValidDataLength` bytes copied
+//!   over, the old clusters freed, the stream entry rewritten with the
+//!   set checksum recomputed. Both live under the same
+//!   snapshot/rollback ledger and never touch the FAT (file clusters
+//!   are bitmap-only; `fat_writes` stays empty there). Bytes a growing
+//!   `ValidDataLength` makes readable that sit between the old valid
+//!   length and the write's offset are zeroed first — the zero region
+//!   the format promises there — while the allocation tail beyond
+//!   `ValidDataLength` is never read back. `DataLength` ends at the
+//!   write's own end, so a listing reports the bytes written. The entry's stamps
+//!   never move in these paths; `set_times` owns them.
 //! * **Paths** are absolute, `/`-separated component paths naming
 //!   directories and leaves; a leading slash is tolerated, a trailing
 //!   or doubled slash (an empty component) refuses, `.` and `..`
@@ -104,6 +120,7 @@ use crate::fs::exfat::geometry::FIRST_HEAP_CLUSTER;
 use crate::fs::exfat::geometry::Geometry;
 use crate::fs::exfat::get_u32;
 use crate::fs::exfat::get_u64;
+use crate::fs::exfat::put_bytes;
 use crate::fs::exfat::put_u16;
 use crate::fs::exfat::put_u32;
 use crate::fs::exfat::put_u64;
@@ -117,8 +134,9 @@ pub struct DirInfo {
     pub name: String,
     /// Directory flag.
     pub is_dir: bool,
-    /// The allocation's byte size (the file's size, or a directory's
-    /// whole allocation).
+    /// The file's size in bytes, straight from its stream entry's
+    /// `DataLength` (byte-exact, even when the allocation rounds up);
+    /// for a directory, its whole allocation.
     pub size: u64,
 }
 
@@ -132,6 +150,13 @@ const FAT_FREE: u32 = 0;
 /// (spec 3.1.18, Table 4); the backup copy is a byte copy 12 sectors
 /// later, so both carry the same offset inside their 512-byte image.
 const PERCENT_IN_USE_AT: usize = 112;
+
+/// How much of a zero gap or a relocation copy moves per write.
+///
+/// Both spans are bounded by the heap's own byte size (up to 2 TiB) or
+/// by a file's valid length, so they are streamed through a fixed
+/// buffer instead of being materialised.
+const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// The allocation bitmap's own stream entry, in the root's first
 /// cluster: its FirstCluster (offset 20) and DataLength (offset 24)
@@ -224,6 +249,51 @@ struct Level {
     /// the root, which has no parent-side entry) — file first, then
     /// stream, then names.
     own_set_slots: Option<Vec<usize>>,
+}
+
+/// A path resolved to a *file*: what the content read and write paths
+/// need — the parent chain's live directory content, the file's own
+/// slot window inside its parent, and the stream entry's allocation
+/// facts. [`Exfat::resolve_file`] builds one; [`Exfat::write_at`] and
+/// [`Exfat::read_file`] consume it.
+#[derive(Debug, Clone)]
+struct FileTarget {
+    /// The resolved walk: the last level is the directory holding the
+    /// file's set (the root for a top-level file).
+    levels: Vec<Level>,
+    /// Slot indices of the file's own set inside its parent — file
+    /// entry, stream entry, then names.
+    set_slots: Vec<usize>,
+    /// First cluster of the file's allocation (`0` for the empty-file
+    /// shape, which claims no cluster at all).
+    first_cluster: u32,
+    /// The stream entry's `DataLength`: the file's size in bytes,
+    /// byte-exact even when the allocation rounds up to whole clusters
+    /// (the on-disk size a listing reports).
+    data_length: u64,
+    /// The stream entry's `ValidDataLength`: how far user data has
+    /// actually been written; everything past it is the zero region
+    /// the format defines there.
+    valid_data_length: u64,
+}
+
+/// The allocation shape one [`Exfat::grow_file`] call decided before
+/// its first bitmap change: how many clusters the file holds, how many
+/// the grown write needs, the `DataLength` that shape records, and —
+/// for the in-place flavour — the first free neighbour to adopt from.
+#[derive(Debug, Clone, Copy)]
+struct GrowthPlan {
+    /// Clusters the file's allocation currently spans.
+    alloc_clusters: u32,
+    /// Clusters the grown allocation spans.
+    new_clusters: u32,
+    /// The grown `DataLength`: the write's end.
+    data_length: u64,
+    /// Clusters the growth adds (`new_clusters - alloc_clusters`).
+    needed: u32,
+    /// First cluster of the free neighbours to adopt in place, or
+    /// `None` for the relocation flavour.
+    adopt_first: Option<u32>,
 }
 
 /// The allocation state one mutating call snapshotted before its first
@@ -794,6 +864,505 @@ impl<V: Volume> Exfat<V> {
     }
 
     // ------------------------------------------------------------------
+    // Files: content writes and reads
+    // ------------------------------------------------------------------
+
+    /// Write `data` into the file at `path` starting at byte `offset`,
+    /// and update the entry so the write's shape is what every later
+    /// reader sees.
+    ///
+    /// The file's clusters are one contiguous run and its stream entry
+    /// sets NoFatChain; `DataLength` is the write's end (the
+    /// allocation spans whole clusters past it) and `ValidDataLength` is the range a reader may
+    /// return. A write whose end fits `DataLength` goes straight
+    /// through; one that runs past grows the allocation first — the
+    /// run's own free neighbours inside the heap when the bitmap shows
+    /// them (in place, so the first cluster keeps its number), or a
+    /// relocate-to-fresh-run: a contiguous allocation of the grown
+    /// size, the `ValidDataLength` bytes copied over, the old clusters
+    /// freed, the stream entry rewritten. Both shapes sit under the
+    /// [`Snapshot`] ledger and never touch the FAT (file clusters are
+    /// bitmap-only, so `fat_writes` stays empty): a refused allocation
+    /// leaves `free_bytes` and the listing unchanged, and the
+    /// allocation happens only after the volume-end refusal, which
+    /// names the write's end and the heap's byte capacity
+    /// (`cluster_count` clusters).
+    ///
+    /// Every refusal names its subject: a missing leaf, a leaf that is
+    /// a directory, a fragmented allocation, and a stream entry whose
+    /// valid length claims past its data length (all through
+    /// [`Exfat::resolve_file`]). A zero-length write is a no-op once
+    /// the path resolved: nothing is allocated, nothing is written
+    /// and no checksum churns — `ValidDataLength` never grows past
+    /// the bytes the entry can prove were written.
+    ///
+    /// Bytes between the old `ValidDataLength` and a growing write's
+    /// offset are zeroed before the stream entry publishes the new
+    /// valid length — the zero region the format promises there — and
+    /// the grown `DataLength` ends at the write. The
+    /// entry's stamps never move in this call: the separate
+    /// `set_times` owns them.
+    pub fn write_at(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<()> {
+        let target = self.resolve_file(path, "write_at")?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let bytes = u64::try_from(data.len())
+            .map_err(|_| CoreError::invalid("a write longer than a u64".to_string()))?;
+        let end = offset.checked_add(bytes).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "a write of {bytes} bytes at offset {offset} overflows a u64"
+            ))
+        })?;
+        if end <= target.data_length {
+            return self.write_through(target, offset, data, end);
+        }
+        self.grow_file(target, offset, data, end)
+    }
+
+    /// Read back the file at `path`: exactly `ValidDataLength` bytes,
+    /// read through the file's own contiguous run — never the
+    /// allocation's tail beyond the valid length, which is the zero
+    /// region the format defines there.
+    ///
+    /// A missing path refuses with the path named, a directory refuses
+    /// with the path named, a fragmented allocation (a stream entry
+    /// without NoFatChain) refuses, and a stream entry whose valid
+    /// length claims more than its data length refuses with both
+    /// numbers (all [`Exfat::resolve_file`]'s refusals). The data
+    /// length is additionally bounded by the volume's own data
+    /// capacity before anything is read — see the comment in the body.
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let target = self.resolve_file(path, "read_file")?;
+        if target.valid_data_length == 0 {
+            return Ok(Vec::new());
+        }
+        // The allocation is bounded by the volume's own data capacity
+        // (`cluster_count` clusters of `cluster_bytes` bytes) before
+        // the read buffer is built — the same discipline
+        // [`Exfat::read_dir_content`] applies to a directory's data
+        // length: a host-damaged claim of tebibytes refuses here, not
+        // on the caller's back as a volume-sized allocation.
+        let capacity = u64::from(self.geometry.cluster_count)
+            .checked_mul(self.geometry.cluster_bytes())
+            .ok_or_else(|| {
+                CoreError::invalid("the heap's byte capacity overflows a u64".to_string())
+            })?;
+        if target.data_length > capacity {
+            return Err(CoreError::invalid(format!(
+                "the file at {path} claims {data_length} data bytes, beyond this heap's \
+                 {capacity} data bytes",
+                data_length = target.data_length
+            )));
+        }
+        let last = self.geometry.cluster_count.saturating_add(1);
+        if !(FIRST_HEAP_CLUSTER..=last).contains(&target.first_cluster) {
+            return Err(CoreError::invalid(format!(
+                "the file at {path} claims first cluster {}, not a cluster of this heap",
+                target.first_cluster
+            )));
+        }
+        let cluster_bytes = self.geometry.cluster_bytes();
+        let clusters =
+            u32::try_from(target.valid_data_length.div_ceil(cluster_bytes)).map_err(|_| {
+                CoreError::invalid(format!(
+                    "the file's valid length of {} bytes spans more clusters than u32",
+                    target.valid_data_length
+                ))
+            })?;
+        let end_cluster = target
+            .first_cluster
+            .checked_add(clusters.saturating_sub(1))
+            .ok_or_else(|| CoreError::invalid("a data run overflows a u32".to_string()))?;
+        if end_cluster > last {
+            return Err(CoreError::invalid(format!(
+                "the file at {path} reads to cluster {end_cluster}, past this heap's last \
+                 cluster {last}"
+            )));
+        }
+        let size = usize::try_from(target.valid_data_length).map_err(|_| {
+            CoreError::invalid("the file's valid length does not fit memory".to_string())
+        })?;
+        let mut bytes = vec![0_u8; size];
+        self.volume.read_exact_at(
+            self.geometry.cluster_offset(target.first_cluster)?,
+            &mut bytes,
+        )?;
+        Ok(bytes)
+    }
+
+    /// Resolve `path` to one *file* entry set: the walk resolves the
+    /// parent chain (component-shaped refusals, the offending component
+    /// named), the leaf is looked up in its parent's live listing, and
+    /// a hit is reduced to the facts the content calls need — the
+    /// parent chain itself, the leaf's own slot window, and the stream
+    /// entry's allocation numbers.
+    ///
+    /// Every refusal names the path or the component that produced it:
+    /// a leaf that is not on the volume, a leaf that is a directory
+    /// (`op` names which operation wanted a file), a stream entry that
+    /// does not mark the allocation NoFatChain (a fragmented file is a
+    /// FAT chain, which nothing here reads or extends), and a stream
+    /// entry whose valid length claims past its data length (host
+    /// damage, both numbers named).
+    fn resolve_file(&self, path: &str, op: &str) -> Result<FileTarget> {
+        let Some(components) = Self::split_path(path)? else {
+            return Err(CoreError::invalid(format!(
+                "path {path:?} names a directory, and {op} works on a file's content"
+            )));
+        };
+        let leaf = components
+            .last()
+            .cloned()
+            .ok_or_else(|| CoreError::invalid("a path without a final component".to_string()))?;
+        let parents: Vec<String> = components
+            .iter()
+            .take(components.len().saturating_sub(1))
+            .cloned()
+            .collect();
+        let levels = self.walk(&parents)?;
+        let parent = levels.last().ok_or_else(|| {
+            CoreError::invalid("a path's last directory vanished from the walk".to_string())
+        })?;
+        let listing = dirent::parse_dir_listing(&parent.content.bytes)?;
+        let upcased = dirent::upcase_name(&leaf);
+        for (index, (entry, start)) in listing
+            .entries
+            .iter()
+            .cloned()
+            .zip(listing.set_starts.iter().copied())
+            .enumerate()
+        {
+            if dirent::upcase_name(&entry.name) != upcased {
+                continue;
+            }
+            if entry.is_dir {
+                return Err(CoreError::invalid(format!(
+                    "path {path:?} names a directory, and {op} works on a file's content"
+                )));
+            }
+            // The set's second slot is its stream entry; byte 1
+            // carries the flags whose NoFatChain bit decides the
+            // allocation shape. (The flags sit outside dirent's
+            // read-back type on purpose: the volume layer owns the
+            // allocation facts.)
+            let stream_flags = parent
+                .content
+                .bytes
+                .get(
+                    start
+                        .checked_add(1)
+                        .and_then(|slot| slot.checked_mul(format::ENTRY_BYTES))
+                        .and_then(|at| at.checked_add(1))
+                        .ok_or_else(|| {
+                            CoreError::invalid("a stream slot address overflows".to_string())
+                        })?,
+                )
+                .copied()
+                .unwrap_or(0);
+            if entry.first_cluster != 0 && stream_flags & dirent::STREAM_NO_FAT_CHAIN == 0 {
+                return Err(CoreError::invalid(format!(
+                    "the file at {path} has a fragmented allocation (its stream entry does not \
+                     set NoFatChain), which no content read or write here can address"
+                )));
+            }
+            if entry.valid_data_length > entry.size {
+                return Err(CoreError::invalid(format!(
+                    "the file at {path} claims {valid} valid data bytes beyond its {size} data \
+                     length",
+                    valid = entry.valid_data_length,
+                    size = entry.size
+                )));
+            }
+            let set_end =
+                listing
+                    .set_starts
+                    .get(index.checked_add(1).ok_or_else(|| {
+                        CoreError::invalid("an entry index overflows".to_string())
+                    })?)
+                    .copied()
+                    .unwrap_or(listing.terminator_slot);
+            return Ok(FileTarget {
+                levels,
+                set_slots: (start..set_end).collect(),
+                first_cluster: entry.first_cluster,
+                data_length: entry.size,
+                valid_data_length: entry.valid_data_length,
+            });
+        }
+        Err(CoreError::invalid(format!(
+            "path {path:?} does not exist on the volume"
+        )))
+    }
+
+    /// The in-allocation half of [`Exfat::write_at`]: the write's end
+    /// fits `DataLength`, so no cluster moves or is claimed. The gap
+    /// the write jumps over (if `ValidDataLength` grows past it) is
+    /// zeroed first, then the data goes down, then the stream slot is
+    /// rewritten only when its contents really change — the valid
+    /// length, or `DataLength` moving out to the write's own end. Both
+    /// rewrites keep the two-phase order and the recomputed set
+    /// checksum ([`Exfat::rewrite_stream_slot`]).
+    fn write_through(
+        &mut self,
+        mut target: FileTarget,
+        offset: u64,
+        data: &[u8],
+        end: u64,
+    ) -> Result<()> {
+        // `DataLength` is the write's own end, not the allocation's
+        // byte size: the kernel keeps it byte-exact for `NoFatChain`
+        // files (measured: a 5000-byte file reads `data=5000`) and a
+        // listing reports it as the file size, so padding it to whole
+        // clusters would make every written file longer than its
+        // payload.
+        let record = end.max(target.data_length);
+        let base = self.geometry.cluster_offset(target.first_cluster)?;
+        self.write_gap_and_data(base, target.valid_data_length, offset, data)?;
+        if end <= target.valid_data_length && record == target.data_length {
+            return Ok(());
+        }
+        let parent = target
+            .levels
+            .last_mut()
+            .ok_or_else(|| CoreError::invalid("the file's directory vanished".to_string()))?;
+        let valid = end.max(target.valid_data_length);
+        self.rewrite_stream_slot(
+            parent,
+            &target.set_slots,
+            target.first_cluster,
+            record,
+            valid,
+            false,
+        )
+    }
+
+    /// The growth half of [`Exfat::write_at`]: the write's `end` runs
+    /// past `DataLength`, so the allocation moves. The volume-end
+    /// refusal comes first, before any state moves. If the grown size
+    /// still fits the existing clusters, no cluster is claimed and
+    /// [`Exfat::write_through`] finishes the call, publishing
+    /// `DataLength` as the write's end; otherwise the free
+    /// neighbours are surveyed and the growth is committed in place or
+    /// by relocation, under the [`Snapshot`] ledger.
+    fn grow_file(&mut self, target: FileTarget, offset: u64, data: &[u8], end: u64) -> Result<()> {
+        let cluster_bytes = self.geometry.cluster_bytes();
+        let capacity = u64::from(self.geometry.cluster_count)
+            .checked_mul(cluster_bytes)
+            .ok_or_else(|| {
+                CoreError::invalid("the heap's byte capacity overflows a u64".to_string())
+            })?;
+        if end > capacity {
+            return Err(CoreError::invalid(format!(
+                "the write ends at {end} bytes, past this volume's {cluster_count} clusters of \
+                 {cluster_bytes} bytes ({capacity} bytes of data)",
+                cluster_count = self.geometry.cluster_count
+            )));
+        }
+        let alloc_clusters =
+            u32::try_from(target.data_length.div_ceil(cluster_bytes)).map_err(|_| {
+                CoreError::invalid("the file's allocation is longer than u32 clusters".to_string())
+            })?;
+        let new_clusters = u32::try_from(end.div_ceil(cluster_bytes)).map_err(|_| {
+            CoreError::invalid("the grown allocation is longer than u32 clusters".to_string())
+        })?;
+        // `end <= capacity` above bounds both divisions: the grown
+        // cluster count cannot exceed the heap's own count, so the
+        // checked conversions are the belt for that reasoning.
+        if new_clusters == alloc_clusters {
+            // The write fits the clusters already claimed, so nothing
+            // moves but `DataLength` (out to the write's end) and
+            // `ValidDataLength`; no cluster is claimed, so no snapshot
+            // is taken either.
+            return self.write_through(target, offset, data, end);
+        }
+        let needed = new_clusters.checked_sub(alloc_clusters).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "the grown allocation of {new_clusters} clusters cannot shrink below the \
+                 current {alloc_clusters}"
+            ))
+        })?;
+        // The adoption survey, read-only: the growth stays in place
+        // when the run's own following clusters are free and still
+        // inside the heap — the same rule the directory growth
+        // applies. An empty allocation (first cluster 0) has no
+        // neighbours to adopt from.
+        let last = self.geometry.cluster_count.saturating_add(1);
+        let mut adopt_first: Option<u32> = None;
+        if target.first_cluster != 0
+            && let Some(start) = target.first_cluster.checked_add(alloc_clusters)
+        {
+            let free = (0..needed).all(|step| {
+                start.checked_add(step).is_some_and(|cluster| {
+                    cluster <= last && self.bitmap.is_free(cluster).unwrap_or(false)
+                })
+            });
+            if free {
+                adopt_first = Some(start);
+            }
+        }
+        // From here on, any failure rolls the ledger back: the adopted
+        // neighbours, or the fresh relocation run plus the released
+        // old clusters, all return to the snapshot state. File
+        // clusters are bitmap-only, so the ledger's `fat_writes` stays
+        // empty and the restore replays no FAT words.
+        let snapshot = self.snapshot();
+        let plan = GrowthPlan {
+            alloc_clusters,
+            new_clusters,
+            data_length: end.max(target.data_length),
+            adopt_first,
+            needed,
+        };
+        let result = self.grow_committed(target, plan, offset, data, end);
+        if result.is_err() {
+            // The commit error is the one worth reporting; a failed
+            // undo would only mask it, and the next open recounts the
+            // bitmap anyway.
+            self.restore(snapshot).ok();
+        }
+        result
+    }
+
+    /// The committed half of [`Exfat::grow_file`], transaction-shaped:
+    /// the caller took the [`Snapshot`] and restores it if this errs.
+    /// The shape follows the directory growth's orders — adopt the
+    /// surveyed free neighbours and keep the first cluster, or
+    /// allocate a fresh contiguous run while the old one still exists,
+    /// copy it, rewrite the stream entry, and release the old clusters
+    /// last.
+    fn grow_committed(
+        &mut self,
+        mut target: FileTarget,
+        plan: GrowthPlan,
+        offset: u64,
+        data: &[u8],
+        end: u64,
+    ) -> Result<()> {
+        let valid = end.max(target.valid_data_length);
+        let relocated = plan.adopt_first.is_none();
+        let (first, base) = match plan.adopt_first {
+            Some(first_free) => {
+                // The surveyed neighbours come in as specific free
+                // clusters, so the allocation is a mark
+                // ([`Exfat::allocate_in_place`]) rather than a scan.
+                self.allocate_in_place(plan.needed, first_free)?;
+                (
+                    target.first_cluster,
+                    self.geometry.cluster_offset(target.first_cluster)?,
+                )
+            }
+            None => {
+                // A refusal here names the count and the free-cluster
+                // count; the snapshot is already on the ledger, and
+                // with no allocation yet made the restore keeps
+                // `free_bytes` and the listing exactly as they were.
+                let run = self.allocate(plan.new_clusters, "a file growth relocation needs")?;
+                let base = self.geometry.cluster_offset(run)?;
+                // The old run still exists while the copy reads it,
+                // so the fresh run cannot collide with the bytes it
+                // replaces.
+                if target.valid_data_length > 0 {
+                    // Copied in fixed-size pieces: the source range is
+                    // a file's valid length, which can be gigabytes on
+                    // a large volume, so a single buffer would tie the
+                    // allocation to the file size.
+                    let source = self.geometry.cluster_offset(target.first_cluster)?;
+                    let mut moved = 0_u64;
+                    let mut piece = vec![0_u8; COPY_CHUNK_BYTES];
+                    while moved < target.valid_data_length {
+                        let left = target.valid_data_length - moved;
+                        let take =
+                            usize::try_from(left.min(COPY_CHUNK_BYTES as u64)).map_err(|_| {
+                                CoreError::invalid(
+                                    "the file's valid length does not fit memory".to_string(),
+                                )
+                            })?;
+                        let buffer = piece.get_mut(..take).ok_or_else(|| {
+                            CoreError::invalid("the copy piece fits its buffer".to_string())
+                        })?;
+                        let at = source.checked_add(moved).ok_or_else(|| {
+                            CoreError::invalid("the copy's address overflows a u64".to_string())
+                        })?;
+                        self.volume.read_exact_at(at, buffer)?;
+                        let to = base.checked_add(moved).ok_or_else(|| {
+                            CoreError::invalid("the copy's address overflows a u64".to_string())
+                        })?;
+                        self.volume.write_all_at(to, buffer)?;
+                        moved += take as u64;
+                    }
+                }
+                (run, base)
+            }
+        };
+        self.write_gap_and_data(base, target.valid_data_length, offset, data)?;
+        let parent = target
+            .levels
+            .last_mut()
+            .ok_or_else(|| CoreError::invalid("the file's directory vanished".to_string()))?;
+        self.rewrite_stream_slot(
+            parent,
+            &target.set_slots,
+            first,
+            plan.data_length,
+            valid,
+            true,
+        )?;
+        if relocated && plan.alloc_clusters > 0 {
+            // The stream entry now names the fresh run: the old
+            // allocation's clusters are unreferenced, and return to
+            // the pool the same way a directory relocation frees its
+            // run. A file that had no allocation at all (the empty
+            // file every `create_file` starts as, first cluster 0)
+            // releases nothing -- `Bitmap::clear` refuses an empty
+            // run, and there is no old run to give back.
+            self.release(plan.alloc_clusters, target.first_cluster)?;
+        }
+        Ok(())
+    }
+
+    /// Put a write's bytes down at `base + offset`, zeroing the gap
+    /// from `valid` first when the write starts past it: the range the
+    /// growing valid length makes readable is the zero region, so the
+    /// bytes between the old reader limit and the write's own offset
+    /// are zeros, not whatever the run held before.
+    fn write_gap_and_data(
+        &mut self,
+        base: u64,
+        valid: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        if offset > valid {
+            // Streamed in fixed-size pieces: a sparse write far past
+            // the old end may ask for a zero region many gigabytes
+            // wide, which no single buffer should have to hold.
+            let mut filled = valid;
+            let zeros = vec![0_u8; COPY_CHUNK_BYTES];
+            while filled < offset {
+                let take = usize::try_from((offset - filled).min(COPY_CHUNK_BYTES as u64))
+                    .map_err(|_| {
+                        CoreError::invalid(
+                            "the write's zero region does not fit memory".to_string(),
+                        )
+                    })?;
+                let buffer = zeros.get(..take).ok_or_else(|| {
+                    CoreError::invalid("the zero piece fits its buffer".to_string())
+                })?;
+                let at = base.checked_add(filled).ok_or_else(|| {
+                    CoreError::invalid("the zero region's address overflows a u64".to_string())
+                })?;
+                self.volume.write_all_at(at, buffer)?;
+                filled += take as u64;
+            }
+        }
+        let at = base
+            .checked_add(offset)
+            .ok_or_else(|| CoreError::invalid("the write's address overflows a u64".to_string()))?;
+        self.volume.write_all_at(at, data)
+    }
+
+    // ------------------------------------------------------------------
     // Directory views
     // ------------------------------------------------------------------
 
@@ -1232,7 +1801,7 @@ impl<V: Volume> Exfat<V> {
             let new = next.ok_or_else(|| {
                 CoreError::invalid("the in-place extension lost its cluster".to_string())
             })?;
-            self.allocate_in_place(new)?;
+            self.allocate_in_place(1, new)?;
             zero_cluster(&mut self.volume, &self.geometry, new)?;
             let zeros = vec![0_u8; usize::try_from(cluster_bytes).unwrap_or(0)];
             let new_chain_len = old_chain_len.checked_add(1).ok_or_else(|| {
@@ -1295,13 +1864,17 @@ impl<V: Volume> Exfat<V> {
         Ok(())
     }
 
-    /// The in-place flavour of [`Exfat::allocate`]: one *specific*
-    /// cluster (the allocation run's next neighbour) instead of a
-    /// first-fit scan.
-    fn allocate_in_place(&mut self, cluster: u32) -> Result<()> {
-        self.bitmap.mark(1, cluster)?;
-        self.free_clusters = self.free_clusters.checked_sub(1).ok_or_else(|| {
-            CoreError::invalid("marking the neighbour would go negative".to_string())
+    /// The in-place flavour of [`Exfat::allocate`]: `count` *specific*
+    /// clusters (an allocation run's surveyed free neighbours) instead
+    /// of a first-fit scan. The caller validated the whole run free
+    /// and inside the heap; the bitmap's own `mark` refuses otherwise,
+    /// so the cached free count never drifts from the bit image.
+    fn allocate_in_place(&mut self, count: u32, cluster: u32) -> Result<()> {
+        self.bitmap.mark(count, cluster)?;
+        self.free_clusters = self.free_clusters.checked_sub(count).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "marking {count} neighbouring clusters would go negative"
+            ))
         })?;
         self.bitmap_dirty = true;
         Ok(())
@@ -1309,10 +1882,9 @@ impl<V: Volume> Exfat<V> {
 
     /// Rewrite a subdirectory's own stream entry inside its parent's
     /// set — first cluster, data length and (a directory's) valid-data
-    /// length equal to it — recompute the parent's set checksum from
-    /// the patched set, and write both changed images back. This is
-    /// what makes a directory relocation (or an in-place extension)
-    /// visible to every reader at the parent.
+    /// length equal to it — through [`Exfat::rewrite_stream_slot`].
+    /// This is what makes a directory relocation (or an in-place
+    /// extension) visible to every reader at the parent.
     fn rewrite_stream_entry(
         &mut self,
         levels: &mut [Level],
@@ -1321,41 +1893,80 @@ impl<V: Volume> Exfat<V> {
         clusters: usize,
     ) -> Result<()> {
         let cluster_bytes = self.geometry.cluster_bytes();
-        let data_length = u64::from(u32::try_from(clusters).map_err(|_| {
+        let count = u32::try_from(clusters).map_err(|_| {
             CoreError::invalid("a directory longer than u32 clusters is corrupt".to_string())
-        })?)
-        .checked_mul(cluster_bytes)
-        .ok_or_else(|| CoreError::invalid("a directory's data length overflows a u64"))?;
+        })?;
+        let data_length = u64::from(count).checked_mul(cluster_bytes).ok_or_else(|| {
+            CoreError::invalid("a directory's data length overflows a u64".to_string())
+        })?;
         let set_slots = levels
             .get(level_index)
             .and_then(|level| level.own_set_slots.clone())
             .ok_or_else(|| {
                 CoreError::invalid("a relocated directory has no parent set".to_string())
             })?;
-        let cluster_bytes_usize = usize::try_from(cluster_bytes)
+        let parent = levels
+            .get_mut(level_index.checked_sub(1).ok_or_else(|| {
+                CoreError::invalid("a relocated directory has no parent".to_string())
+            })?)
+            .ok_or_else(|| CoreError::invalid("the parent directory vanished".to_string()))?;
+        self.rewrite_stream_slot(
+            parent,
+            &set_slots,
+            first_cluster,
+            data_length,
+            data_length,
+            true,
+        )
+    }
+
+    /// Rewrite the stream slot of one entry set that lives in
+    /// `parent`: FirstCluster, DataLength and ValidDataLength take the
+    /// given numbers (a directory hands equal length values, a file's
+    /// valid length trails its allocation), the parent set checksum is
+    /// recomputed over the patched images, and the two changed images
+    /// go back down in the two-phase order. The stream slot is where
+    /// [`Exfat::rewrite_stream_entry`] and the file content paths in
+    /// [`Exfat::write_at`] meet: one helper, one convention.
+    fn rewrite_stream_slot(
+        &mut self,
+        parent: &mut Level,
+        set_slots: &[usize],
+        first_cluster: u32,
+        data_length: u64,
+        valid_data_length: u64,
+        contiguous: bool,
+    ) -> Result<()> {
+        let cluster_bytes = usize::try_from(self.geometry.cluster_bytes())
             .map_err(|_| CoreError::invalid("a cluster longer than this machine's usize"))?;
         let mut images = Vec::with_capacity(set_slots.len());
-        for slot in &set_slots {
-            images.push(
-                levels
-                    .get(level_index - 1)
-                    .ok_or_else(|| CoreError::invalid("the parent directory vanished".to_string()))
-                    .and_then(|parent| slot_image(&parent.content, cluster_bytes_usize, *slot))?,
-            );
+        for slot in set_slots {
+            images.push(slot_image(&parent.content, cluster_bytes, *slot)?);
         }
         // Patch the stream entry: for a directory the whole allocation
-        // is valid data (the spec's rule), so valid == data; the flag
-        // bytes stay (NoFatChain held both before and after).
+        // is valid data (the spec's rule), so its callers hand equal
+        // lengths; a file's valid length trails its allocation.
         let Some(stream_image) = images.get_mut(1) else {
             return Err(CoreError::invalid(
                 "a parent set lost its stream slot".to_string(),
             ));
         };
-        put_u64(stream_image, 8, data_length)?; // ValidDataLength
+        put_u64(stream_image, 8, valid_data_length)?; // ValidDataLength
         put_u32(stream_image, 20, first_cluster)?; // FirstCluster
         put_u64(stream_image, 24, data_length)?; // DataLength
+        if contiguous {
+            // The allocation this rewrite publishes is one
+            // uninterrupted run, so the stream must say so: a file
+            // grown from nothing starts with flags `0x01` (the
+            // measured empty-file shape) and would otherwise be read
+            // back as a fragmented chain the format never wrote.
+            let flags = stream_image.get(1).copied().unwrap_or(0) | dirent::STREAM_NO_FAT_CHAIN;
+            put_bytes(stream_image, 1, &[flags])?;
+        }
         // The set checksum binds the whole set: recompute it over the
-        // patched images and store it in the file entry.
+        // patched images and store it in the file entry (bytes 2..=3
+        // of the lead, the bytes [`dirent::set_checksum`] itself
+        // skips).
         let checksum = dirent::set_checksum(&images);
         let Some(file_image) = images.first_mut() else {
             return Err(CoreError::invalid(
@@ -1372,15 +1983,10 @@ impl<V: Volume> Exfat<V> {
             .get(1)
             .copied()
             .ok_or_else(|| CoreError::invalid("a parent set lost its stream slot".to_string()))?;
-        let (file_at, stream_at) = {
-            let parent = levels
-                .get(level_index - 1)
-                .ok_or_else(|| CoreError::invalid("the parent directory vanished".to_string()))?;
-            (
-                parent.content.slot_address(&self.geometry, file_slot)?,
-                parent.content.slot_address(&self.geometry, stream_slot)?,
-            )
-        };
+        let (file_at, stream_at) = (
+            parent.content.slot_address(&self.geometry, file_slot)?,
+            parent.content.slot_address(&self.geometry, stream_slot)?,
+        );
         let file_image = *images.first().unwrap_or(&[0_u8; format::ENTRY_BYTES]);
         let stream_image = *images.get(1).unwrap_or(&[0_u8; format::ENTRY_BYTES]);
         // Same two-phase discipline as a fresh set: the lead goes down
@@ -1479,6 +2085,101 @@ mod tests {
 
     fn names(listing: &[DirInfo]) -> Vec<&str> {
         listing.iter().map(|entry| entry.name.as_str()).collect()
+    }
+
+    /// The stream entry of the file at `path`, read out of its
+    /// parent's live directory content: `(first cluster, data length,
+    /// valid data length)` — the three on-disk facts `write_at` owns
+    /// and the tests pin.
+    #[track_caller]
+    fn stream_entry(volume: &Exfat<VecVolume>, path: &str) -> (u32, u64, u64) {
+        let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let leaf = parts.last().copied().expect("the path has a leaf");
+        let parents: Vec<String> = parts
+            .iter()
+            .take(parts.len().saturating_sub(1))
+            .map(|part| (*part).to_owned())
+            .collect();
+        let levels = volume.walk(&parents).expect("the parent directory walks");
+        let parent = levels.last().expect("the parent is in the walk");
+        let listing = dirent::parse_dir_listing(&parent.content.bytes).expect("the listing parses");
+        let cluster_bytes = usize::try_from(volume.geometry().cluster_bytes())
+            .expect("a cluster fits this machine's usize");
+        for (entry, start) in listing.entries.iter().zip(listing.set_starts.iter()) {
+            if dirent::upcase_name(&entry.name) != dirent::upcase_name(leaf) {
+                continue;
+            }
+            let image = slot_image(&parent.content, cluster_bytes, start + 1)
+                .expect("the stream slot reads");
+            return (
+                get_u32(&image, 20).unwrap_or(0),
+                get_u64(&image, 24).unwrap_or(0),
+                get_u64(&image, 8).unwrap_or(0),
+            );
+        }
+        panic!("the file {path} is not in its parent's listing");
+    }
+
+    /// Overwrite the `ValidDataLength` of the file at `path` directly
+    /// on the image (set checksum recomputed) — the corruption-shaped
+    /// entry the refusal tests drive against, which the volume API
+    /// would never write itself.
+    #[track_caller]
+    fn patch_valid_length(volume: &mut Exfat<VecVolume>, path: &str, valid: u64) {
+        let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let leaf = parts.last().copied().expect("the path has a leaf");
+        let parents: Vec<String> = parts
+            .iter()
+            .take(parts.len().saturating_sub(1))
+            .map(|part| (*part).to_owned())
+            .collect();
+        let levels = volume.walk(&parents).expect("the parent directory walks");
+        let parent = levels.last().expect("the parent is in the walk");
+        let listing = dirent::parse_dir_listing(&parent.content.bytes).expect("the listing parses");
+        let cluster_bytes = usize::try_from(volume.geometry().cluster_bytes())
+            .expect("a cluster fits this machine's usize");
+        let mut start = None;
+        for (entry, found) in listing.entries.iter().zip(listing.set_starts.iter()) {
+            if dirent::upcase_name(&entry.name) == dirent::upcase_name(leaf) {
+                start = Some(*found);
+            }
+        }
+        let start = start.expect("the file is in the listing");
+        let set_end = listing
+            .set_starts
+            .iter()
+            .copied()
+            .find(|found| *found > start)
+            .unwrap_or(listing.terminator_slot);
+        let mut images: Vec<[u8; 32]> = (start..set_end)
+            .map(|slot| slot_image(&parent.content, cluster_bytes, slot).expect("the slot reads"))
+            .collect();
+        put_u64(
+            images.get_mut(1).expect("the set has a stream slot"),
+            8,
+            valid,
+        )
+        .expect("the valid field fits");
+        let checksum = dirent::set_checksum(&images);
+        let mut lead = images.first().copied().expect("the set has a lead");
+        put_u16(&mut lead, 2, checksum).expect("the checksum field fits");
+        let stream_image = images.get(1).copied().expect("the set has a stream slot");
+        let file_at = parent
+            .content
+            .slot_address(volume.geometry(), start)
+            .expect("the file slot has an address");
+        let stream_at = parent
+            .content
+            .slot_address(volume.geometry(), start + 1)
+            .expect("the stream slot has an address");
+        volume
+            .volume
+            .write_all_at(file_at, &lead)
+            .expect("the patched file slot writes");
+        volume
+            .volume
+            .write_all_at(stream_at, &stream_image)
+            .expect("the patched stream slot writes");
     }
 
     #[test]
@@ -1725,6 +2426,134 @@ mod tests {
             solo.size,
             2 * cluster_bytes,
             "the on-disk stream length moved with the in-place extension"
+        );
+    }
+
+    #[test]
+    fn a_relocation_copy_and_a_sparse_gap_survive_the_chunk_loop() {
+        // Both spans here are larger than `COPY_CHUNK_BYTES`, so the copy
+        // and the zero fill each iterate more than once. The single-chunk
+        // sizes the other tests use cannot tell the loop body from a
+        // whole-span `vec!`.
+        // A larger heap than the default fixture: the sparse gap, the
+        // payload and the relocation copy all have to fit at once.
+        let store = VecVolume::new(32 * MIB, 512).expect("a thirty-two mebibyte store");
+        let options = format::FormatOptions::new(SERIAL);
+        let mut volume = Exfat::format(store, &options).expect("the formatter accepts this store");
+        let cluster = volume.geometry().cluster_bytes() as usize;
+
+        // A write that jumps three megabytes over untouched heap: the gap
+        // is zero filled through the loop. This runs first, while the heap
+        // still has one contiguous run that long.
+        volume
+            .create_file("/sparse.bin", 0, dirent::Stamps::epoch())
+            .expect("the sparse file is created");
+        volume
+            .write_at("/sparse.bin", 0, b"head")
+            .expect("the near write lands");
+        let far = 3 * 1024 * 1024u64;
+        volume
+            .write_at("/sparse.bin", far, b"tail")
+            .expect("the far write lands");
+        let bytes = volume.read_file("/sparse.bin").expect("read back");
+        assert_eq!(bytes.len() as u64, far + 4, "the size is the write's end");
+        assert_eq!(&bytes[..4], b"head");
+        assert_eq!(
+            &bytes[4..far as usize],
+            vec![0u8; far as usize - 4],
+            "the jumped gap is zero"
+        );
+        assert_eq!(&bytes[far as usize..], b"tail");
+
+        // A 2 MiB file followed by a gate: growing it cannot adopt the
+        // next cluster, so the relocation copies the whole payload.
+        let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        volume
+            .create_file("/big.bin", payload.len() as u64, dirent::Stamps::epoch())
+            .expect("the file is created");
+        let half = payload.len() / 2;
+        volume
+            .write_at("/big.bin", 0, &payload[..half])
+            .expect("the first half goes down");
+        volume
+            .write_at("/big.bin", half as u64, &payload[half..])
+            .expect("the second half goes down");
+        volume
+            .create_file("/gate.bin", cluster as u64, dirent::Stamps::epoch())
+            .expect("the gate is created");
+        volume
+            .write_at("/gate.bin", 0, &[0x00; 512])
+            .expect("the gate is filled");
+        let tail = [0xA5u8; 64];
+        volume
+            .write_at("/big.bin", payload.len() as u64, &tail)
+            .expect("the relocating write lands");
+        let mut expected = payload.clone();
+        expected.extend_from_slice(&tail);
+        assert_eq!(
+            volume.read_file("/big.bin").expect("read back"),
+            expected,
+            "the relocated copy keeps every byte"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_reads_as_no_bytes() {
+        let mut volume = formatted();
+        volume
+            .create_file("/empty.bin", 0, dirent::Stamps::epoch())
+            .expect("the empty file is created");
+        assert_eq!(
+            stream_entry(&volume, "/empty.bin").0,
+            0,
+            "an empty file owns no cluster"
+        );
+        let bytes = volume
+            .read_file("/empty.bin")
+            .expect("the empty file reads");
+        assert!(
+            bytes.is_empty(),
+            "an empty file has no bytes, got {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn a_write_failure_during_growth_rolls_the_ledger_back() {
+        let store = VecVolume::new(8 * MIB, 512).expect("an eight mebibyte store");
+        let mut volume = Exfat::format(Flaky::new(store), &format::FormatOptions::new(SERIAL))
+            .expect("the formatter accepts this store");
+        volume
+            .create_file("/grow.bin", 0, dirent::Stamps::epoch())
+            .expect("the empty file is created");
+        let before_free = volume.free_bytes();
+        let cluster_bytes = volume.geometry().cluster_bytes();
+
+        volume.volume.fail_after.set(Some(0));
+        let payload = vec![0x5A_u8; usize::try_from(2 * cluster_bytes).expect("two clusters")];
+        let error = volume
+            .write_at("/grow.bin", 0, &payload)
+            .expect_err("the injected write failure refuses the growth");
+        assert!(error.to_string().contains("injected"), "{error}");
+        volume.volume.fail_after.set(None);
+
+        assert_eq!(volume.free_bytes(), before_free, "the ledger is restored");
+        let listed = volume.list_dir("/").expect("the root lists");
+        assert_eq!(listed.len(), 1, "the file entry survives");
+        assert_eq!(listed[0].size, 0, "the refused growth publishes no length");
+        assert!(
+            volume
+                .read_file("/grow.bin")
+                .expect("the empty file reads")
+                .is_empty(),
+            "the refused growth leaves no data behind"
+        );
+
+        volume
+            .write_at("/grow.bin", 0, &payload)
+            .expect("the retry succeeds");
+        assert_eq!(
+            volume.read_file("/grow.bin").expect("the retry reads"),
+            payload
         );
     }
 
@@ -2056,5 +2885,357 @@ mod tests {
             .mkdir("/", dirent::Stamps::epoch())
             .expect_err("the root cannot be created");
         assert!(error.to_string().contains("root"), "{error}");
+    }
+
+    #[test]
+    fn a_written_file_round_trips_through_a_zero_gap() {
+        let mut volume = formatted();
+        let cluster_bytes = volume.geometry().cluster_bytes();
+        volume
+            .mkdir("/docs", dirent::Stamps::epoch())
+            .expect("the directory is created");
+        volume
+            .create_file("/docs/pattern.bin", cluster_bytes, dirent::Stamps::epoch())
+            .expect("the file claims exactly one cluster");
+        // Garble the allocated run and its two neighbours before any
+        // byte of content exists: a fresh store reads zeros everywhere,
+        // so only bytes write_at itself puts down can explain a zero
+        // readback below.
+        let (first, data_length, valid) = stream_entry(&volume, "/docs/pattern.bin");
+        assert_eq!(
+            data_length, cluster_bytes,
+            "the size hint is the DataLength"
+        );
+        assert_eq!(valid, 0, "a fresh file carries no valid data");
+        let garble = vec![0xAA_u8; usize::try_from(3 * cluster_bytes).expect("fits")];
+        let at = volume
+            .geometry()
+            .cluster_offset(first)
+            .expect("the run's offset reads");
+        volume
+            .volume
+            .write_all_at(at, &garble)
+            .expect("the garble lands");
+
+        // Write at 0, then one further past the allocation with a gap
+        // between the two writes: the gap must read back zeros.
+        let head: Vec<u8> = (0..cluster_bytes / 2)
+            .map(|step| (step % 251) as u8)
+            .collect();
+        volume
+            .write_at("/docs/pattern.bin", 0, &head)
+            .expect("the head lands inside the allocation");
+        let tail_offset = 3 * cluster_bytes + 123;
+        let tail: Vec<u8> = (0..50u64).map(|step| ((step % 97) + 7) as u8).collect();
+        volume
+            .write_at("/docs/pattern.bin", tail_offset, &tail)
+            .expect("the tail grows the allocation");
+
+        let read = volume
+            .read_file("/docs/pattern.bin")
+            .expect("the file reads back");
+        assert_eq!(
+            read.len() as u64,
+            tail_offset + tail.len() as u64,
+            "exactly the valid bytes come back"
+        );
+        assert_eq!(&read[..head.len()], &head[..], "the head survives");
+        let tail_at = usize::try_from(tail_offset).expect("fits");
+        assert!(
+            read[head.len()..tail_at].iter().all(|&byte| byte == 0),
+            "the gap the write jumped over reads back as zeros"
+        );
+        assert_eq!(&read[tail_at..], &tail[..], "the tail lands at its offset");
+
+        // The listing reports the new size, and the stream entry kept
+        // its first cluster: the growth adopted free neighbours.
+        let (first_after, data_after, valid_after) = stream_entry(&volume, "/docs/pattern.bin");
+        assert_eq!(
+            first_after, first,
+            "the growth adopted the neighbours in place"
+        );
+        assert_eq!(
+            data_after,
+            tail_offset + tail.len() as u64,
+            "DataLength ends at the write, not at the allocation"
+        );
+        assert_eq!(valid_after, tail_offset + tail.len() as u64);
+        let docs = volume.list_dir("/docs").expect("the directory lists");
+        assert_eq!(
+            docs.first().expect("the file lists").size,
+            tail_offset + tail.len() as u64,
+            "the listing reports the bytes written"
+        );
+    }
+
+    #[test]
+    fn a_write_past_the_allocation_grows_in_place_with_free_neighbours() {
+        let mut volume = formatted();
+        let cluster_bytes = volume.geometry().cluster_bytes();
+        // Filler allocations come first, so the target sits mid-heap
+        // with the clusters behind it free deliberately, not by
+        // low-address luck.
+        for index in 0..10 {
+            volume
+                .create_file(
+                    &format!("/filler{index:02}.bin"),
+                    3 * cluster_bytes,
+                    dirent::Stamps::epoch(),
+                )
+                .expect("a filler claims three clusters");
+        }
+        volume
+            .create_file("/target.bin", cluster_bytes, dirent::Stamps::epoch())
+            .expect("the target claims exactly one cluster");
+        let (first, data_length, valid) = stream_entry(&volume, "/target.bin");
+        assert_eq!(data_length, cluster_bytes);
+        assert_eq!(valid, 0);
+        assert_ne!(first, 0, "the fixture needs a real run to grow");
+        assert!(
+            volume
+                .bitmap
+                .is_free(first.checked_add(1).expect("fits"))
+                .expect("the neighbour is inside the heap"),
+            "the fixture must leave the next cluster free for adoption"
+        );
+
+        let free_before = volume.free_bytes();
+        // Two clusters of content one allocation-past the end: the
+        // growth adopts both neighbours in place.
+        let added = vec![0x5E_u8; usize::try_from(2 * cluster_bytes).expect("fits")];
+        volume
+            .write_at("/target.bin", cluster_bytes, &added)
+            .expect("the writer adopted the free neighbours");
+
+        let (first_after, data_after, valid_after) = stream_entry(&volume, "/target.bin");
+        assert_eq!(
+            first_after, first,
+            "in-place growth keeps the first cluster"
+        );
+        assert_eq!(data_after, 3 * cluster_bytes);
+        assert_eq!(valid_after, 3 * cluster_bytes);
+        assert_eq!(
+            free_before - volume.free_bytes(),
+            2 * cluster_bytes,
+            "the free count dropped by exactly the adopted clusters"
+        );
+        let read = volume
+            .read_file("/target.bin")
+            .expect("the file reads back");
+        assert_eq!(read.len() as u64, 3 * cluster_bytes);
+        assert!(
+            read[..cluster_bytes as usize].iter().all(|&byte| byte == 0),
+            "the adopted-gap bytes read back as zeros"
+        );
+        assert_eq!(&read[cluster_bytes as usize..], &added[..]);
+        assert_eq!(
+            volume.list_dir("/").expect("the root lists").len(),
+            11,
+            "the fillers and the target all survive the growth"
+        );
+    }
+
+    #[test]
+    fn a_write_past_taken_neighbours_relocates_the_run_and_frees_the_old() {
+        let mut volume = formatted();
+        let cluster_bytes = volume.geometry().cluster_bytes();
+        volume
+            .create_file("/owner.bin", cluster_bytes, dirent::Stamps::epoch())
+            .expect("the owner claims one cluster");
+        // The gate sits exactly behind the owner: the owners free
+        // neighbours are taken, so the growth must relocate.
+        volume
+            .create_file("/gate.bin", 2 * cluster_bytes, dirent::Stamps::epoch())
+            .expect("the gate claims two clusters");
+        let (first, _, _) = stream_entry(&volume, "/owner.bin");
+        let (gate, _, _) = stream_entry(&volume, "/gate.bin");
+        assert_eq!(
+            gate,
+            first.checked_add(1).expect("fits"),
+            "the fixture pins the gate right behind the owner"
+        );
+        // The owner gets real content first, so the relocation has
+        // existing ValidDataLength bytes to move.
+        let head: Vec<u8> = (0..100u64)
+            .map(|step| ((step * 7 + 3) % 251) as u8)
+            .collect();
+        volume
+            .write_at("/owner.bin", 0, &head)
+            .expect("the head lands inside the allocation");
+
+        let free_before = volume.free_bytes();
+        // Two clusters one allocation-past the end: with the
+        // neighbours taken, the whole run relocates.
+        let body = vec![0x3C_u8; usize::try_from(2 * cluster_bytes).expect("fits")];
+        volume
+            .write_at("/owner.bin", cluster_bytes, &body)
+            .expect("the writer relocated the run");
+
+        let (first_after, data_after, valid_after) = stream_entry(&volume, "/owner.bin");
+        assert_ne!(
+            first_after, first,
+            "the stream entry moved to the fresh run"
+        );
+        assert_eq!(data_after, 3 * cluster_bytes);
+        assert_eq!(valid_after, 3 * cluster_bytes);
+        let read = volume
+            .read_file("/owner.bin")
+            .expect("the relocated data reads back");
+        assert_eq!(read.len() as u64, 3 * cluster_bytes);
+        assert_eq!(
+            &read[..head.len()],
+            &head[..],
+            "the copied valid bytes survive the move"
+        );
+        assert!(
+            read[head.len()..cluster_bytes as usize]
+                .iter()
+                .all(|&byte| byte == 0),
+            "the zero region inside the fresh run reads back as zeros"
+        );
+        assert_eq!(
+            &read[cluster_bytes as usize..],
+            &body[..],
+            "the written tail lands at its offset in the fresh run"
+        );
+        // The old cluster is free again, and the free count moved by
+        // exactly the growth: three clusters claimed, one released.
+        assert!(
+            volume
+                .bitmap
+                .is_free(first)
+                .expect("the old cluster is inside the heap"),
+            "the released old run returns to the pool"
+        );
+        assert_eq!(
+            free_before - volume.free_bytes(),
+            (3 - 1) * cluster_bytes,
+            "the free count reflects three claimed and one released clusters"
+        );
+        // And the gate kept both its clusters untouched.
+        let (gate_after, gate_data, gate_valid) = stream_entry(&volume, "/gate.bin");
+        assert_eq!(gate_after, gate, "a relocation does not move other files");
+        assert_eq!(gate_data, 2 * cluster_bytes);
+        assert_eq!(gate_valid, 0);
+    }
+
+    #[test]
+    fn write_and_read_refusals_name_their_paths_and_numbers() {
+        let mut volume = formatted();
+        volume
+            .mkdir("/adir", dirent::Stamps::epoch())
+            .expect("the directory is created");
+
+        // A directory refuses for both directions, with the path named.
+        let error = volume
+            .write_at("/adir", 0, b"x")
+            .expect_err("a directory cannot be written");
+        let text = error.to_string();
+        assert!(
+            text.contains("/adir") && text.contains("directory"),
+            "{text}"
+        );
+        let error = volume
+            .read_file("/adir")
+            .expect_err("a directory cannot be read");
+        let text = error.to_string();
+        assert!(
+            text.contains("/adir") && text.contains("directory"),
+            "{text}"
+        );
+
+        // A missing path refuses, path named, for both directions.
+        let error = volume
+            .write_at("/ghost.txt", 0, b"x")
+            .expect_err("there is nothing to write into");
+        assert!(error.to_string().contains("ghost.txt"), "{error}");
+        let error = volume
+            .read_file("/ghost.txt")
+            .expect_err("there is nothing to read");
+        assert!(error.to_string().contains("ghost.txt"), "{error}");
+
+        // A write past the volume end refuses, naming the write's end
+        // and the heap's byte capacity, and leaves nothing behind.
+        // The file must exist first: a missing path refuses before
+        // the growth math even runs.
+        let cluster_bytes = volume.geometry().cluster_bytes();
+        let capacity = u64::from(volume.geometry().cluster_count) * cluster_bytes;
+        volume
+            .create_file("/end.bin", 0, dirent::Stamps::epoch())
+            .expect("the empty end-marker file is created");
+        let free_before = volume.free_bytes();
+        let error = volume
+            .write_at("/end.bin", capacity, b"!")
+            .expect_err("the write would end past the volume");
+        let text = error.to_string();
+        assert!(
+            text.contains(&(capacity + 1).to_string()) && text.contains(&capacity.to_string()),
+            "the refusal names the write's end and the capacity: {text}"
+        );
+        assert_eq!(
+            volume.free_bytes(),
+            free_before,
+            "the refused write moved no allocation"
+        );
+        assert_eq!(
+            names(&volume.list_dir("/").expect("the root lists")),
+            ["adir", "end.bin"],
+            "the refused write left exactly what was there"
+        );
+
+        // A stream entry whose valid length claims past its data
+        // length (hand-made damage) refuses, both numbers named.
+        volume
+            .create_file("/liar.bin", cluster_bytes, dirent::Stamps::epoch())
+            .expect("the file is created");
+        patch_valid_length(&mut volume, "/liar.bin", cluster_bytes + 1);
+        let error = volume
+            .read_file("/liar.bin")
+            .expect_err("valid cannot claim past data");
+        let text = error.to_string();
+        assert!(
+            text.contains(&(cluster_bytes + 1).to_string())
+                && text.contains(&cluster_bytes.to_string()),
+            "the refusal names both lengths: {text}"
+        );
+    }
+
+    #[test]
+    fn a_zero_length_write_is_a_no_op_down_to_the_stored_bytes() {
+        let mut volume = formatted();
+        volume
+            .create_file(
+                "/still.bin",
+                volume.geometry().cluster_bytes(),
+                dirent::Stamps::epoch(),
+            )
+            .expect("the sized file is created");
+        volume
+            .create_file("/empty.bin", 0, dirent::Stamps::epoch())
+            .expect("the empty file is created");
+        let listing = volume.list_dir("/").expect("the root lists");
+        let before = volume.volume.bytes().to_vec();
+
+        // A zero-length write at any offset (even far past the
+        // allocation) neither allocates, writes, nor rewrites an entry
+        // — and a zero-length write to a missing path still resolves
+        // first, so it refuses rather than silently succeeding.
+        volume
+            .write_at("/still.bin", 1 << 30, b"")
+            .expect("the no-op write succeeds");
+        volume
+            .write_at("/empty.bin", 0, b"")
+            .expect("the no-op write into the empty file succeeds");
+        let error = volume
+            .write_at("/ghost.txt", 0, b"")
+            .expect_err("resolution comes before the no-op");
+        assert!(error.to_string().contains("ghost.txt"), "{error}");
+
+        assert_eq!(volume.volume.bytes(), &before[..], "not one byte moved");
+        assert_eq!(
+            volume.list_dir("/").expect("the root lists"),
+            listing,
+            "the listing is untouched"
+        );
     }
 }
