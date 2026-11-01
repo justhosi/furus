@@ -1389,6 +1389,159 @@ impl<V: Volume> Exfat<V> {
     }
 
     // ------------------------------------------------------------------
+    // Stamps: set_times
+    // ------------------------------------------------------------------
+
+    /// Stamp the entry at `path` (a file or a directory, found
+    /// case-insensitively) with `times`. The set's lead File entry is
+    /// the only slot that carries stamp fields, so it is the only one
+    /// rewritten — the stream and name slots are left byte-for-byte
+    /// untouched. All three stamp triples replace what the set
+    /// carried, minus one thing: the format defines no 10 ms field
+    /// for the access stamp, so only its date-time and UTC offset
+    /// reach the disk.
+    ///
+    /// Nothing is allocated, so no [`Snapshot`] ledger is involved —
+    /// the same no-ledger shape [`Exfat::rewrite_stream_slot`] has —
+    /// yet the lead still goes down in the two-phase order, dormant
+    /// first and live second: a torn stamp rewrite leaves a skipped
+    /// set rather than a checksum failure at every later walk (see
+    /// the module docs).
+    ///
+    /// Every refusal names its subject and happens before any byte
+    /// moves: the root is not nameable here, a missing leaf refuses
+    /// with the path named, and a mid-path component that is missing
+    /// or a file surfaces [`Exfat::walk`]'s own refusal.
+    pub fn set_times(&mut self, path: &str, times: dirent::Stamps) -> Result<()> {
+        let Some(components) = Self::split_path(path)? else {
+            return Err(CoreError::invalid(format!(
+                "path {path:?} names the root directory, set_times needs an entry inside the volume"
+            )));
+        };
+        let leaf = components
+            .last()
+            .cloned()
+            .ok_or_else(|| CoreError::invalid("a path without a final component".to_string()))?;
+        let parents: Vec<String> = components
+            .iter()
+            .take(components.len().saturating_sub(1))
+            .cloned()
+            .collect();
+        let mut levels = self.walk(&parents)?;
+        let parent = levels.last().ok_or_else(|| {
+            CoreError::invalid("a path's last directory vanished from the walk".to_string())
+        })?;
+        let listing = dirent::parse_dir_listing(&parent.content.bytes)?;
+        let upcased = dirent::upcase_name(&leaf);
+        for (index, (entry, start)) in listing
+            .entries
+            .iter()
+            .cloned()
+            .zip(listing.set_starts.iter().copied())
+            .enumerate()
+        {
+            if dirent::upcase_name(&entry.name) != upcased {
+                continue;
+            }
+            // The set's slots end where the next set begins (or at the
+            // terminator), the same window every other leaf
+            // resolution here reduces a hit to.
+            let set_end =
+                listing
+                    .set_starts
+                    .get(index.checked_add(1).ok_or_else(|| {
+                        CoreError::invalid("an entry index overflows".to_string())
+                    })?)
+                    .copied()
+                    .unwrap_or(listing.terminator_slot);
+            let set_slots: Vec<usize> = (start..set_end).collect();
+            let parent = levels.last_mut().ok_or_else(|| {
+                CoreError::invalid("a path's last directory vanished from the walk".to_string())
+            })?;
+            return self.rewrite_lead_stamps(parent, &set_slots, times);
+        }
+        Err(CoreError::invalid(format!(
+            "path {path:?} does not exist on the volume"
+        )))
+    }
+
+    /// Rewrite the stamp fields of one entry set living in `parent`:
+    /// only the set's lead File slot changes — the patch, the
+    /// recomputed set checksum and the two-phase write. The stream
+    /// side's sibling is [`Exfat::rewrite_stream_slot`]: one slot
+    /// kind, one helper, one convention.
+    fn rewrite_lead_stamps(
+        &mut self,
+        parent: &mut Level,
+        set_slots: &[usize],
+        times: dirent::Stamps,
+    ) -> Result<()> {
+        let cluster_bytes = usize::try_from(self.geometry.cluster_bytes())
+            .map_err(|_| CoreError::invalid("a cluster longer than this machine's usize"))?;
+        let mut images = Vec::with_capacity(set_slots.len());
+        for slot in set_slots {
+            images.push(slot_image(&parent.content, cluster_bytes, *slot)?);
+        }
+        // The lead must be the File entry for a stamp rewrite to be
+        // meaningful — [`dirent::parse_dir_listing`] only opens 0x85
+        // sets, so this pins the same invariant on the very image the
+        // patch below tampers with.
+        let lead_type = images
+            .first()
+            .and_then(|image| image.first().copied())
+            .unwrap_or(0);
+        if lead_type != dirent::ENTRY_FILE {
+            return Err(CoreError::invalid(format!(
+                "an entry set starts with type byte {lead_type:#04x}, not the 0x85 file entry"
+            )));
+        }
+        // The volume layer owns the field facts (they would sit in
+        // dirent's private tables): the three DOS date-time words at
+        // 8, 12 and 16, the 10 ms bytes at 20 (create) and 21 (modify)
+        // — the format defines no 10 ms field for access — and the
+        // three UTC-offset bytes at 22, 23 and 24.
+        let Some(lead) = images.first_mut() else {
+            return Err(CoreError::invalid(
+                "a parent set lost its file slot".to_string(),
+            ));
+        };
+        put_u32(lead, 8, times.create.date_time)?; // create date-time
+        put_u32(lead, 12, times.modify.date_time)?; // modify date-time
+        put_u32(lead, 16, times.access.date_time)?; // access date-time
+        put_bytes(lead, 20, &[times.create.tenths])?; // create 10 ms
+        put_bytes(lead, 21, &[times.modify.tenths])?; // modify 10 ms
+        put_bytes(lead, 22, &[times.create.utc_offset])?; // create utc
+        put_bytes(lead, 23, &[times.modify.utc_offset])?; // modify utc
+        put_bytes(lead, 24, &[times.access.utc_offset])?; // access utc
+        // The set checksum binds the whole set: recompute it over the
+        // patched images and store it in the lead (bytes 2..=3, the
+        // bytes [`dirent::set_checksum`] itself skips).
+        let checksum = dirent::set_checksum(&images);
+        let Some(lead) = images.first_mut() else {
+            return Err(CoreError::invalid(
+                "a parent set lost its file slot".to_string(),
+            ));
+        };
+        put_u16(lead, 2, checksum)?;
+        // Only the lead is written back — the secondaries are unchanged,
+        // so rewriting them would only widen the torn window. Same
+        // two-phase discipline as every other lead rewrite: the lead
+        // goes down deactivated, then live, a torn rewrite leaving a
+        // skipped set instead of a checksum failure.
+        let lead_slot = set_slots
+            .first()
+            .copied()
+            .ok_or_else(|| CoreError::invalid("a parent set lost its file slot".to_string()))?;
+        let lead_at = parent.content.slot_address(&self.geometry, lead_slot)?;
+        let lead_image = *images.first().unwrap_or(&[0_u8; format::ENTRY_BYTES]);
+        let mut dormant = lead_image;
+        dirent::deactivate(&mut dormant);
+        self.volume.write_all_at(lead_at, &dormant)?;
+        self.volume.write_all_at(lead_at, &lead_image)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Internal: path resolution
     // ------------------------------------------------------------------
 
@@ -3237,5 +3390,324 @@ mod tests {
             listing,
             "the listing is untouched"
         );
+    }
+
+    /// A stamp set distinct from the epoch fixture: three different
+    /// moments, each with its own tenth-of-second and UTC-offset byte
+    /// — so a test can tell one swapped field from a dropped one, and
+    /// tell either from "nothing changed".
+    fn later_stamps() -> dirent::Stamps {
+        dirent::Stamps {
+            create: dirent::Stamp {
+                tenths: 7,
+                utc_offset: 0x80,
+                ..dirent::Stamp::from_ymdhms(2026, 11, 1, 9, 0, 0).expect("valid ymdhms")
+            },
+            modify: dirent::Stamp {
+                tenths: 148,
+                utc_offset: 0x40,
+                ..dirent::Stamp::from_ymdhms(2026, 11, 1, 10, 30, 2).expect("valid ymdhms")
+            },
+            access: dirent::Stamp {
+                // A tenth byte deliberately left unrepresentable on
+                // disk: the format defines no access 10 ms field, so
+                // storing 199 there must change nothing a reader sees.
+                tenths: 199,
+                utc_offset: 0x15,
+                ..dirent::Stamp::from_ymdhms(2026, 11, 1, 23, 59, 58).expect("valid ymdhms")
+            },
+        }
+    }
+
+    /// The stamps from `times` as the on-disk reader
+    /// ([`dirent::parse_dir_listing`] over the set's slots) reports
+    /// them back: everything round-trips except the access stamp's
+    /// tenth byte, which the format gives no field to — readers
+    /// always see zero there.
+    fn as_stored(times: dirent::Stamps) -> dirent::Stamps {
+        dirent::Stamps {
+            create: times.create,
+            modify: times.modify,
+            access: dirent::Stamp {
+                tenths: 0,
+                ..times.access
+            },
+        }
+    }
+
+    /// The entry set of the leaf at `path`, read back from its
+    /// parent's live directory content: the parsed entry (stamps
+    /// included) plus the raw 32 bytes of its lead slot, which the
+    /// stamp tests pin field-by-field.
+    #[track_caller]
+    fn set_entry(volume: &Exfat<VecVolume>, path: &str) -> (dirent::DirEntry, [u8; 32]) {
+        let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        let leaf = parts.last().copied().expect("the path has a leaf");
+        let parents: Vec<String> = parts
+            .iter()
+            .take(parts.len().saturating_sub(1))
+            .map(|part| (*part).to_owned())
+            .collect();
+        let levels = volume.walk(&parents).expect("the parent directory walks");
+        let parent = levels.last().expect("the parent is in the walk");
+        let listing = dirent::parse_dir_listing(&parent.content.bytes).expect("the listing parses");
+        let cluster_bytes = usize::try_from(volume.geometry().cluster_bytes())
+            .expect("a cluster fits this machine's usize");
+        for (entry, start) in listing.entries.iter().zip(listing.set_starts.iter()) {
+            if dirent::upcase_name(&entry.name) != dirent::upcase_name(leaf) {
+                continue;
+            }
+            let lead =
+                slot_image(&parent.content, cluster_bytes, *start).expect("the lead slot reads");
+            return (entry.clone(), lead);
+        }
+        panic!("the entry {path} is not in its parent's listing");
+    }
+
+    #[test]
+    fn set_times_stamps_a_file_set() {
+        let mut volume = formatted();
+        volume
+            .create_file("/file.bin", 0, dirent::Stamps::epoch())
+            .expect("the file is created");
+        let times = later_stamps();
+
+        volume
+            .set_times("/file.bin", times)
+            .expect("the stamp rewrite lands");
+
+        let (entry, lead) = set_entry(&volume, "/file.bin");
+        assert_eq!(
+            entry.stamps.create, times.create,
+            "the create stamp round-trips"
+        );
+        assert_eq!(
+            entry.stamps.modify, times.modify,
+            "the modify stamp round-trips"
+        );
+        assert_eq!(
+            entry.stamps.access,
+            as_stored(times).access,
+            "the access stamp keeps its date-time and offset; its tenth byte has no field on disk"
+        );
+        // Pin the raw tenth bytes too: exactly create at 20 and modify
+        // at 21 — the offsets the reader derives the stamps from.
+        assert_eq!(
+            lead[20], times.create.tenths,
+            "the create tenth lives at byte 20"
+        );
+        assert_eq!(
+            lead[21], times.modify.tenths,
+            "the modify tenth lives at byte 21"
+        );
+        assert_eq!(
+            [lead[22], lead[23], lead[24]],
+            [
+                times.create.utc_offset,
+                times.modify.utc_offset,
+                times.access.utc_offset
+            ],
+            "all three utc offsets live at bytes 22, 23 and 24"
+        );
+    }
+
+    #[test]
+    fn set_times_stamps_a_directory_set() {
+        let mut volume = formatted();
+        volume
+            .mkdir("/docs", dirent::Stamps::epoch())
+            .expect("the directory is created");
+        let times = later_stamps();
+
+        volume
+            .set_times("/docs", times)
+            .expect("the stamp rewrite lands");
+
+        let (entry, lead) = set_entry(&volume, "/docs");
+        assert!(entry.is_dir, "the stamped set is still a directory");
+        assert_eq!(
+            entry.stamps.create, times.create,
+            "the create stamp round-trips"
+        );
+        assert_eq!(
+            entry.stamps.modify, times.modify,
+            "the modify stamp round-trips"
+        );
+        assert_eq!(
+            entry.stamps.access,
+            as_stored(times).access,
+            "the access stamp keeps its date-time and offset"
+        );
+        assert_eq!(lead[20], times.create.tenths, "the create tenth survives");
+        assert_eq!(lead[21], times.modify.tenths, "the modify tenth survives");
+        assert_eq!(
+            lead[24], times.access.utc_offset,
+            "the access offset survives"
+        );
+    }
+
+    #[test]
+    fn set_times_survives_a_reopen_round_trip() {
+        let mut volume = formatted();
+        volume
+            .mkdir("/docs", dirent::Stamps::epoch())
+            .expect("the directory is created");
+        volume
+            .create_file("/docs/notes.txt", 0, dirent::Stamps::epoch())
+            .expect("the file is created");
+        let times = later_stamps();
+        volume
+            .set_times("/docs", times)
+            .expect("the directory's stamps land");
+        volume
+            .set_times("/docs/notes.txt", times)
+            .expect("the file's stamps land");
+
+        // The listings still report name, size and shape exactly as
+        // before: stamps are not part of what a listing shows.
+        let root = volume.list_dir("/").expect("the root lists");
+        assert_eq!(names(&root), ["docs"]);
+        assert!(root[0].is_dir, "the root's entry is still a directory");
+        assert_eq!(
+            root[0].size,
+            volume.geometry().cluster_bytes(),
+            "the directory reports its whole allocation"
+        );
+        assert_eq!(
+            names(&volume.list_dir("/docs").expect("the directory lists")),
+            ["notes.txt"]
+        );
+
+        volume.flush().expect("the volume flushes");
+        let bytes = volume.volume.bytes().to_vec();
+        let mut store = VecVolume::new(8 * MIB, 512).expect("an eight mebibyte store");
+        store
+            .write_all_at(0, &bytes)
+            .expect("the image copies back");
+        let reopened = Exfat::open(store).expect("the stamped image opens");
+        for path in ["/docs", "/docs/notes.txt"] {
+            let (entry, _) = set_entry(&reopened, path);
+            assert_eq!(
+                entry.stamps.create, times.create,
+                "the create stamp survives at {path}"
+            );
+            assert_eq!(
+                entry.stamps.modify, times.modify,
+                "the modify stamp survives at {path}"
+            );
+            assert_eq!(
+                entry.stamps.access,
+                as_stored(times).access,
+                "the access stamp survives at {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_times_moves_only_the_stamp_fields() {
+        let mut volume = formatted();
+        volume
+            .create_file(
+                "/target.bin",
+                volume.geometry().cluster_bytes(),
+                dirent::Stamps::epoch(),
+            )
+            .expect("the file claims exactly one cluster");
+        let stream_before = stream_entry(&volume, "/target.bin");
+        let free_before = volume.free_clusters;
+
+        let times = later_stamps();
+        volume
+            .set_times("/target.bin", times)
+            .expect("the stamp rewrite lands");
+
+        assert_eq!(
+            stream_entry(&volume, "/target.bin"),
+            stream_before,
+            "the stream entry's cluster and lengths are untouched"
+        );
+        assert_eq!(
+            volume.free_clusters, free_before,
+            "no cluster moved for a stamp rewrite"
+        );
+        assert_eq!(
+            names(&volume.list_dir("/").expect("the root lists")),
+            ["target.bin"],
+            "the entry still lists with its name"
+        );
+    }
+
+    #[test]
+    fn set_times_refuses_the_root_and_a_missing_leaf() {
+        let mut volume = formatted();
+        volume
+            .create_file("/kept.bin", 0, dirent::Stamps::epoch())
+            .expect("the file is created");
+        let times = later_stamps();
+
+        let error = volume
+            .set_times("/", times)
+            .expect_err("the root cannot be stamped");
+        let text = error.to_string();
+        assert!(text.contains("root"), "the refusal names the root: {text}");
+        assert!(text.contains("set_times"), "{text}");
+        assert!(text.is_ascii(), "refusals stay ascii: {text}");
+
+        let error = volume
+            .set_times("/nope", times)
+            .expect_err("a missing leaf cannot be stamped");
+        let text = error.to_string();
+        assert!(text.contains("/nope"), "the refusal names the path: {text}");
+        assert!(text.is_ascii(), "refusals stay ascii: {text}");
+
+        assert_eq!(
+            names(&volume.list_dir("/").expect("the root lists")),
+            ["kept.bin"],
+            "the refused calls left exactly what was there"
+        );
+    }
+
+    #[test]
+    fn a_write_at_never_moves_the_set_times() {
+        let mut volume = formatted();
+        volume
+            .create_file("/doc.bin", 0, dirent::Stamps::epoch())
+            .expect("the file is created");
+        let times = later_stamps();
+        volume
+            .set_times("/doc.bin", times)
+            .expect("the stamp rewrite lands");
+
+        volume
+            .write_at("/doc.bin", 0, b"payload")
+            .expect("the write lands");
+        assert_eq!(
+            volume.read_file("/doc.bin").expect("the file reads"),
+            b"payload",
+            "the write reached the file"
+        );
+
+        let (entry, _) = set_entry(&volume, "/doc.bin");
+        assert_eq!(
+            entry.stamps.create, times.create,
+            "the create stamp survived the write"
+        );
+        assert_eq!(
+            entry.stamps.modify, times.modify,
+            "the modify stamp survived the write"
+        );
+        assert_eq!(
+            entry.stamps.access,
+            as_stored(times).access,
+            "the access stamp survived the write"
+        );
+        let (first, data, valid) = stream_entry(&volume, "/doc.bin");
+        assert_ne!(first, 0, "the write allocated a run");
+        assert_eq!(
+            data,
+            b"payload".len() as u64,
+            "DataLength ends at the write"
+        );
+        assert_eq!(valid, b"payload".len() as u64, "ValidDataLength covers it");
     }
 }
