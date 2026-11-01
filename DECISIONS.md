@@ -55,3 +55,30 @@ next slice (S01 — workspace, CI, size gates, parity tool) is gated on:
 1. the user's explicit go-ahead, and
 2. the status of A1–A3 and A5–A12 (proposed here; a rejection of any of them
    means stop and revise the plan before S01).
+
+## 4. Amendments after S00
+
+### 2026-11-01 - A4 tool inventory
+
+The S00 text above records A4 as settled with three formatters. The shipped
+code now probes and runs more tools; each is behind a runtime presence
+check with a package hint. Measured against the tree at `618821c`:
+
+| Tool | Used for | Where |
+|---|---|---|
+| `mke2fs`, `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` | ext2/3/4 format | `crates/rufus-core/src/fs/ext.rs` |
+| `e2fsck` | ext verification (`-f -n`) | same |
+| `debugfs` | ext persistence file write (`-w -R`) and read-back (`-R`) | same |
+| `mkntfs`, `mkfs.ntfs` | NTFS format | `crates/rufus-core/src/fs/ntfs.rs` |
+| `mkudffs`, `mkfs.udf` | UDF format | `crates/rufus-core/src/fs/udf.rs` |
+
+The runtime tools above are also driven directly by the suites. The other
+external programs (`fsck.fat`, `fsck.exfat`, `dump.exfat`, `exfatlabel`,
+`mdir`, `mcopy`, `dumpe2fs`, `e2label`, `blkid`, `ntfslabel`, `ntfsfix`,
+`udfinfo`, plus `mount`, `losetup` and `sfdisk` in the device suites) are
+driven only by tests under `crates/*/tests`, so they are test
+prerequisites, not runtime dependencies.
+
+The header's "No implementation has started" sentence describes S00 at the
+time it was written; slices S01 onward are implemented and are described in
+`README.md`.

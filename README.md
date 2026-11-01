@@ -147,7 +147,7 @@ package split).
 ## Docs
 
 * `DECISIONS.md` - frozen S00 planning decisions; implementation has
-  since advanced.
+  since advanced (its section 4 records the post-S00 tool amendment).
 * `LICENSES.md` - asset licence audit for the Rufus 4.15 resources the
   implementation reuses; the code licence is GPL-3.0-or-later (decision
   A1, still proposed).
