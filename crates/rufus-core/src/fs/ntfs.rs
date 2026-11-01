@@ -24,12 +24,15 @@
 //! behaviour.
 
 use std::env;
+use std::io;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 use std::process::Stdio;
+use std::time::Duration;
 
 use crate::error::CoreError;
 use crate::error::Result;
@@ -116,11 +119,18 @@ fn find_tool_in(dirs: &[PathBuf]) -> Result<(&'static str, PathBuf)> {
             if !is_executable_file(&candidate) {
                 continue;
             }
-            if probe_tool(&candidate) {
-                return Ok((name, candidate));
+            match probe_tool(&candidate) {
+                Ok(true) => return Ok((name, candidate)),
+                Ok(false) => {
+                    // A candidate whose `--version` probe runs and fails is
+                    // treated as absent, and the scan moves on.
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // A candidate that vanished between the executable
+                    // check and the spawn is absent too.
+                }
+                Err(error) => return Err(CoreError::io(&candidate, error)),
             }
-            // A candidate whose `--version` probe fails is treated as
-            // absent, and the scan moves on to the next candidate.
         }
     }
     Err(missing_tool_error())
@@ -137,17 +147,47 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// Run `candidate --version` and report whether it exits successfully.
 /// Output is captured and dropped — the probe only asks "are you there".
-fn probe_tool(candidate: &Path) -> bool {
-    Command::new(candidate)
-        .arg("--version")
-        .env("LC_ALL", "C")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+///
+/// A spawn failure is returned, never swallowed: `NotFound` means the
+/// candidate vanished between the executable check and the spawn (the scan
+/// treats it as absent), while any other error — including a busy exec that
+/// survives [`output_retrying`] — becomes [`CoreError::io`] at the scan.
+fn probe_tool(candidate: &Path) -> std::result::Result<bool, io::Error> {
+    let mut command = Command::new(candidate);
+    command.arg("--version").env("LC_ALL", "C");
+    output_retrying(&mut command).map(|output| output.status.success())
 }
 
-/// The shared refusal: spawn failures map onto this text too, so every
-/// "the toolchain is missing" path names the same package.
+/// Run `cmd` as a bounded capture, retrying a busy exec — and only a busy
+/// exec.
+///
+/// A script or executable file that another thread still holds open for
+/// writing fails `execve` with `ETXTBSY` (errno 26, mapped to
+/// [`io::ErrorKind::ExecutableFileBusy`] — measured on this host with rustc
+/// 1.99.0: holding a write descriptor open makes `Command::output` fail with
+/// `Text file busy (os error 26)`, and the same command succeeds after the
+/// descriptor closes). The failure means the child never started, so
+/// retrying is safe: at most three attempts with 10 ms sleeps between busy
+/// failures (at most about 20 ms of added delay), and every other error
+/// returns immediately.
+fn output_retrying(cmd: &mut Command) -> io::Result<Output> {
+    let mut attempt = 0;
+    loop {
+        match cmd.output() {
+            Ok(output) => return Ok(output),
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 2 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The shared refusal for an absent formatter: nothing found, nothing
+/// executable, or a probe that ran and failed. Spawn failures refuse as I/O
+/// errors instead, so every "the toolchain is missing" path names the same
+/// package without hiding an honest spawn error.
 fn missing_tool_error() -> CoreError {
     CoreError::invalid(MISSING_TOOL_HINT)
 }
@@ -420,7 +460,7 @@ fn format_with(
     // Bounded capture: the tool is this slice's external mandate
     // (PLAN lines 661-679), and `output` drains both pipes so a chatty
     // tool cannot block on a full buffer.
-    let output = command.output().map_err(|_| missing_tool_error())?;
+    let output = output_retrying(&mut command).map_err(|error| CoreError::io(tool_path, error))?;
 
     let stdout_lines = captured_lines(&output.stdout);
     let stderr_lines = captured_lines(&output.stderr);
@@ -1203,6 +1243,53 @@ mod tests {
             error.to_string(),
             format!("invalid input: {MISSING_TOOL_HINT}"),
         );
+    }
+
+    #[test]
+    fn probe_reports_a_busy_executable_as_an_io_refusal() {
+        // Holding the stub open for writing makes every exec fail with
+        // ETXTBSY (measured on this host with rustc 1.99.0), so the scan
+        // must refuse as I/O naming the path — never the package hint. The
+        // held descriptor stays open across the whole scan, so the bounded
+        // retry budget cannot recover: no timing dependency. Stub behaviour
+        // only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let stub = write_stub(scratch.path(), "mkntfs", "#!/bin/sh\nexit 0\n");
+        let _held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stub)
+            .expect("the write descriptor holds");
+        let error = find_tool_in(&probe_dirs(scratch.path())).expect_err("a busy stub refuses");
+        let text = error.to_string();
+        assert!(matches!(error, CoreError::Io { .. }), "{text}");
+        assert!(text.contains(&stub.display().to_string()), "{text}");
+        let CoreError::Io { source, .. } = &error else {
+            panic!("the error is the house io variant: {text}")
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::ExecutableFileBusy);
+        assert!(!text.contains(MISSING_TOOL_HINT), "{text}");
+        assert!(!text.contains("ntfs-3g"), "{text}");
+    }
+
+    #[test]
+    fn probe_retries_a_busy_executable_until_it_executes() {
+        // The held write descriptor drops about 10 ms later, inside the
+        // retry budget, so the scan recovers and finds the stub. Stub
+        // behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let stub = write_stub(scratch.path(), "mkntfs", "#!/bin/sh\nexit 0\n");
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stub)
+            .expect("the write descriptor holds");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            drop(held);
+        });
+        let (name, path) = find_tool_in(&probe_dirs(scratch.path())).expect("the retry probes");
+        assert_eq!(name, "mkntfs");
+        assert_eq!(path, stub);
+        assert!(releaser.join().is_ok());
     }
 
     #[test]
