@@ -11,6 +11,28 @@
 //! to the tool. A missing tool is printed as an explicit skip line; a
 //! failing tool fails the test with its real output in the message.
 //!
+//! One test is `#[ignore]`d: `the_kernel_mounts_the_written_tree` needs
+//! root and a loop device (`mount -t exfat -o ro` over the attached
+//! node), so it runs only on demand:
+//!
+//! ```text
+//! sudo -E $(which cargo) test --offline -p rufus-core --test exfat_format -- --ignored --nocapture
+//! ```
+//!
+//! The privileged-container equivalent (the command this environment
+//! gives for the ignored run inside a bare root container): build the
+//! test binary first, then mount the build tree in; `<test-binary>` is
+//! the `target/debug/deps/exfat_format-<id>` path the build prints:
+//!
+//! ```text
+//! cargo test --offline -p rufus-core --test exfat_format --no-run
+//! docker run --rm --privileged -v /dev:/dev -v /sys:/sys:ro -v "$PWD:$PWD" -w "$PWD" archlinux:latest <test-binary> --ignored --nocapture
+//! ```
+//!
+//! One measured container run (the command above, this machine): the
+//! image mounted read-only, both written payloads read back byte-exact
+//! and the root-level directory list counted two entries.
+//!
 //! Measured on this machine (page-cached sparse images): 64 MiB format
 //! 0.001 s + fsck 0.003 s; 2 GiB format 0.003 s + fsck 0.010 s; 2 TiB
 //! format 0.027 s + fsck 0.002 s (the sparse file is never materialised).
@@ -195,8 +217,17 @@ fn assert_fsck_clean(path: &Path) {
         }
     }
     assert!(problems.is_empty(), "{}:\n{text}", problems.join("; "));
-    // The measured verdict line, for the record (visible with --nocapture).
-    eprintln!("fsck verdict: {}", text.trim());
+    // The measured verdict line ("<image>: clean. directories N, files
+    // M"), for the record with --nocapture: the whole combined output
+    // stays reserved for a failure's panic text, and the fallback keeps
+    // a verdict-less run's print one short line too.
+    let verdict_line = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| line.to_lowercase().contains("clean."))
+        .unwrap_or("fsck.exfat carried no clean. line at all");
+    eprintln!("fsck verdict: {}", verdict_line);
 }
 
 #[test]
@@ -753,4 +784,129 @@ fn a_refused_create_after_a_root_growth_keeps_the_image_fsck_clean() {
         assert_fsck_clean(&path);
     }
     assert!(saw_failure, "the run must actually tear a root growth");
+}
+
+// ---------------------------------------------------------------------------
+// The kernel-mount acceptance: the real `mount -t exfat -o ro` over a
+// loop device reads the written tree back. Mirrors the FAT32 sibling
+// `fat32_format.rs::the_kernel_mounts_the_written_tree` in shape.
+// ---------------------------------------------------------------------------
+
+/// The loop-device guard: attach the image, hand out the node, and
+/// detach it on every exit path.
+struct Mounted {
+    device: String,
+    mountpoint: PathBuf,
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.mountpoint).status();
+        let _ = Command::new("losetup").args(["-d", &self.device]).status();
+    }
+}
+
+fn is_root() -> bool {
+    // euid 0 is the only thing that can mount; a non-root run reports a
+    // skip rather than pretending the check passed.
+    std::fs::metadata("/proc/self").is_ok()
+        && Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+}
+
+/// The kernel acceptance: a real exfat mount of the tree this crate
+/// wrote, read back through the mounted path. Needs root and a loop
+/// device, so it is `#[ignore]`d; the module docs carry the sudo and the
+/// privileged-container run commands.
+///
+/// The run only asserts what it itself does: the image mounts read-only
+/// and `read`/`read_dir` on the mountpoint return the bytes and the
+/// names this test wrote beforehand.
+#[test]
+#[ignore = "needs root and a loop device: sudo losetup; see the module docs"]
+fn the_kernel_mounts_the_written_tree() {
+    if !is_root() {
+        eprintln!("skip: mounting needs root; run the documented sudo command");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = FileVolume::path(dir.path());
+    let volume = FileVolume::create(&path, 64 * MIB, 512).expect("the sparse image");
+    let options = FormatOptions {
+        label: Some("RUFUSMNT".to_string()),
+        volume_id: 0x5EED_1234,
+        cluster_bytes: None,
+    };
+    let mut fs = Exfat::format(volume, &options).expect("the image formats");
+    let stamp = Stamps::epoch();
+
+    fs.mkdir("/a", stamp).expect("mkdir a");
+    fs.mkdir("/a/b", stamp).expect("mkdir a/b");
+    fs.mkdir("/a/b/c", stamp).expect("mkdir a/b/c");
+    fs.mkdir("/a/b/c/d", stamp).expect("mkdir a/b/c/d");
+    let payload: &[u8] = b"the kernel reads exFAT too";
+    fs.create_file("/a/b/c/d/file.bin", payload.len() as u64, stamp)
+        .expect("create file.bin");
+    fs.write_at("/a/b/c/d/file.bin", 0, payload)
+        .expect("write the payload");
+    // A name longer than fifteen UTF-16 units: its entry set needs more
+    // than one 0xC1 name slot (the set shape the volume's unit tests
+    // pin), and the mount must still list and read it.
+    let long_text: &[u8] = b"long name reads";
+    fs.create_file(
+        "/a/The Quick Brown Fox Jumps.txt",
+        long_text.len() as u64,
+        stamp,
+    )
+    .expect("create the long name");
+    fs.write_at("/a/The Quick Brown Fox Jumps.txt", 0, long_text)
+        .expect("write the long-named content");
+    fs.flush().expect("the volume flushes");
+    drop(fs);
+
+    let attached = Command::new("losetup")
+        .args(["--find", "--show", "--direct-io=off"])
+        .arg(&path)
+        .output()
+        .expect("losetup runs");
+    assert!(
+        attached.status.success(),
+        "losetup failed: {}",
+        String::from_utf8_lossy(&attached.stderr)
+    );
+    let device = String::from_utf8_lossy(&attached.stdout).trim().to_owned();
+    assert!(!device.is_empty(), "losetup printed no node");
+    let mountpoint = dir.path().join("mnt");
+    std::fs::create_dir(&mountpoint).expect("mountpoint");
+    let mounted = Command::new("mount")
+        .args(["-t", "exfat", "-o", "ro"])
+        .arg(&device)
+        .arg(&mountpoint)
+        .output()
+        .expect("mount runs");
+    // The guard is alive before the first mount assertion, so the
+    // attach detaches on every exit path after it.
+    let guard = Mounted {
+        device: device.clone(),
+        mountpoint: mountpoint.clone(),
+    };
+    assert!(
+        mounted.status.success(),
+        "mounting {device} failed: {}",
+        String::from_utf8_lossy(&mounted.stderr)
+    );
+    let read_back = std::fs::read(mountpoint.join("a/b/c/d/file.bin")).expect("the kernel path");
+    assert_eq!(read_back, payload, "the mount read the payload");
+    let long_bytes =
+        std::fs::read(mountpoint.join("a/The Quick Brown Fox Jumps.txt")).expect("long name path");
+    assert_eq!(long_bytes, long_text, "the mount read the long-named file");
+    let listing = std::fs::read_dir(mountpoint.join("a")).expect("a lists through the mount");
+    assert_eq!(
+        listing.count(),
+        2,
+        "a holds the directory and the long-named file"
+    );
+    drop(guard);
 }

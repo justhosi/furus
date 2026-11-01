@@ -1557,6 +1557,9 @@ impl<V: Volume> Exfat<V> {
     /// boot sector carries no label field, so this call moves no boot
     /// byte, no FAT word, no bitmap bit and no PercentInUse value.
     /// Nothing is allocated, so no [`Snapshot`] ledger is involved.
+    /// A following flush() recomputes the PercentInUse byte when it
+    /// still says unknown (0xff) — the value set_label itself never
+    /// touches.
     ///
     /// Every refusal happens before the first write, so a refused call
     /// leaves the image untouched: the label's length and characters
@@ -3658,6 +3661,79 @@ mod tests {
     }
 
     #[test]
+    fn set_times_matches_case_and_names_a_long_set() {
+        let mut volume = formatted();
+        volume
+            .create_file("/file.bin", 0, dirent::Stamps::epoch())
+            .expect("the file is created");
+        // A name of 29 UTF-16 units: its set needs two 0xC1 name slots
+        // beside the file and stream slots, so the stamp resolution
+        // must find the set's own window in a shape longer than the
+        // minimum three slots.
+        let long_name = "The Quick Brown Fox Jumps.txt";
+        volume
+            .create_file(&format!("/{long_name}"), 0, dirent::Stamps::epoch())
+            .expect("the long-named file is created");
+        let times = later_stamps();
+
+        // Both lookups go through the case-insensitive up-case match
+        // (the leaf given in a different case than the entry carries).
+        volume
+            .set_times("/FILE.BIN", times)
+            .expect("the stamp lands");
+        volume
+            .set_times("/THE QUICK BROWN FOX JUMPS.TXT", times)
+            .expect("the long set's stamp lands");
+
+        for path in ["/file.bin", &format!("/{long_name}")] {
+            let (entry, _) = set_entry(&volume, path);
+            assert_eq!(
+                entry.stamps.create, times.create,
+                "the create stamp round-trips at {path}"
+            );
+            assert_eq!(
+                entry.stamps.modify, times.modify,
+                "the modify stamp round-trips at {path}"
+            );
+            assert_eq!(
+                entry.stamps.access,
+                as_stored(times).access,
+                "the access stamp keeps its date-time and offset at {path}"
+            );
+        }
+
+        // The long name's set really is longer than the minimum: file
+        // + stream + two 0xC1 name slots.
+        let levels = volume.walk(&[]).expect("the root walks");
+        let parent = levels.last().expect("the walk holds the root");
+        let listing = dirent::parse_dir_listing(&parent.content.bytes).expect("the root parses");
+        for (index, start) in listing.set_starts.iter().copied().enumerate() {
+            let entry = listing
+                .entries
+                .get(index)
+                .expect("the set's start has an entry");
+            if entry.name == long_name {
+                let set_end = listing
+                    .set_starts
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(listing.terminator_slot);
+                assert_eq!(
+                    (start..set_end).count(),
+                    4,
+                    "two 0xC1 name slots carry the 29 units"
+                );
+                break;
+            }
+        }
+        assert_eq!(
+            names(&volume.list_dir("/").expect("the root lists")),
+            ["file.bin", long_name],
+            "the case-preserved names still list"
+        );
+    }
+
+    #[test]
     fn set_times_stamps_a_directory_set() {
         let mut volume = formatted();
         volume
@@ -4152,5 +4228,117 @@ mod tests {
             "the relabelled volume reopens"
         );
         assert!(volume.list_dir("/").expect("the root lists").is_empty());
+    }
+
+    /// A foreign root whose end-of-directory marker is its very last
+    /// slot refuses a fresh label with
+    /// [`fresh_label_slot`]'s exact "leaving no slot behind the marker"
+    /// text. The shape cannot come from a crate-created image (this
+    /// crate's format and growth always leave zeros behind the marker),
+    /// so the test builds the foreign copy byte by byte: the old marker
+    /// slot and every slot after it carry the deleted-label shape the
+    /// crate itself writes on a clear (lead 0x03, zeros), leaving the
+    /// root's last slot as the only 0x00 lead. The refusal must move
+    /// not one further byte.
+    #[test]
+    fn set_label_refuses_a_foreign_root_without_a_slot_behind_the_marker() {
+        let mut volume = formatted();
+        let root = volume.root_level().expect("the root reads");
+        let listing = dirent::parse_dir_listing(&root.content.bytes).expect("the listing parses");
+        let total = root.content.bytes.len() / format::ENTRY_BYTES;
+        // One deleted-label slot: lead 0x03 over zeros — the shape
+        // clear_label leaves behind (the crate's own deleted form).
+        let mut filler = [0_u8; format::ENTRY_BYTES];
+        filler[0] = format::ENTRY_VOLUME_LABEL & !dirent::ENTRY_IN_USE;
+        for slot in listing.terminator_slot..total.saturating_sub(1) {
+            let at = root
+                .content
+                .slot_address(volume.geometry(), slot)
+                .expect("the slot has an address");
+            volume
+                .volume
+                .write_all_at(at, &filler)
+                .expect("the deleted-lead slot fills");
+        }
+
+        let mut volume = reopened(&mut volume);
+        let untouched = volume.volume.bytes().to_vec();
+        let root = volume.root_level().expect("the root reads");
+        let listing = dirent::parse_dir_listing(&root.content.bytes).expect("the listing parses");
+        assert_eq!(
+            listing.terminator_slot,
+            listing.total_slots - 1,
+            "the copy's marker sits on the root's last slot"
+        );
+        let expected = format!(
+            "the root directory ends at slot {} of {} slots, leaving no slot behind \
+             the marker for a fresh label",
+            listing.terminator_slot, listing.total_slots
+        );
+        let error = volume
+            .set_label(Some("FRESH"))
+            .expect_err("a marker with no slot behind it refuses a fresh label");
+        let text = error.to_string();
+        assert!(
+            text.contains(&expected),
+            "the refusal quotes fresh_label_slot's exact text: {text}"
+        );
+        assert!(text.is_ascii(), "refusals stay ascii: {text}");
+        assert_eq!(
+            volume.volume.bytes(),
+            &untouched[..],
+            "the refusal moved not a byte"
+        );
+    }
+
+    /// The sibling refusal, the non-zero slot behind the marker: a
+    /// foreign root whose slot behind the first end-of-directory marker
+    /// is filled with 0xFF bytes (never a shape this crate writes)
+    /// refuses a fresh label with
+    /// [`fresh_label_slot`]'s exact "the slot behind the marker is not
+    /// zeroed" text, and again refuses without moving a further byte.
+    #[test]
+    fn set_label_refuses_a_foreign_root_with_a_used_slot_behind_the_marker() {
+        let mut volume = formatted();
+        let root = volume.root_level().expect("the root reads");
+        let listing = dirent::parse_dir_listing(&root.content.bytes).expect("the listing parses");
+        let behind = root
+            .content
+            .slot_address(volume.geometry(), listing.terminator_slot + 1)
+            .expect("the slot behind the marker has an address");
+        let poison = [0xFF_u8; format::ENTRY_BYTES];
+        volume
+            .volume
+            .write_all_at(behind, &poison)
+            .expect("the poison lands behind the marker");
+
+        let mut volume = reopened(&mut volume);
+        let untouched = volume.volume.bytes().to_vec();
+        let root = volume.root_level().expect("the root reads");
+        let listing = dirent::parse_dir_listing(&root.content.bytes).expect("the listing parses");
+        assert_eq!(
+            listing.terminator_slot, 2,
+            "the marker kept its slot behind the bitmap and up-case entries"
+        );
+        let expected = format!(
+            "the root directory ends at slot {} of {} slots, but the slot behind \
+             the marker is not zeroed, so a fresh label would erase the end-of-directory \
+             marker",
+            listing.terminator_slot, listing.total_slots
+        );
+        let error = volume
+            .set_label(Some("FRESH"))
+            .expect_err("a used slot behind the marker refuses a fresh label");
+        let text = error.to_string();
+        assert!(
+            text.contains(&expected),
+            "the refusal quotes fresh_label_slot's exact text: {text}"
+        );
+        assert!(text.is_ascii(), "refusals stay ascii: {text}");
+        assert_eq!(
+            volume.volume.bytes(),
+            &untouched[..],
+            "the refusal moved not a byte"
+        );
     }
 }
