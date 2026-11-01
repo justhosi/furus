@@ -39,10 +39,17 @@ write side is the most complete part:
   `/persistence.conf` through `debugfs`. The QEMU persistence-boot
   acceptance is not measurable on the build host, so it is documented in
   the test module docs rather than claimed.
-* NTFS and ext share one external-tool probe (PATH scan, executable
-  check, version probe, busy-exec retry) in
+* UDF is written by detecting and driving the external `mkudffs` /
+  `mkfs.udf` tool (the `udftools` package), pinning `--udfrev=0x0201`,
+  then verifying the volume recognition sequence (BEA01, one NSR
+  descriptor, TEA01) at byte 32768 of the image; the label is read back
+  with `udfinfo`. A native UDF writer is out of scope (see
+  `crates/rufus-core/src/fs/udf.rs`).
+* NTFS, ext and UDF share one external-tool probe (PATH scan,
+  executable check, version probe, busy-exec retry) in
   `crates/rufus-core/src/fs/tool.rs`; the version flag stays per family
-  (`-V` for ext, `--version` for NTFS), passed at each call site.
+  (`-V` for ext, `--version` for NTFS), UDF is probed by its usage
+  banner instead, and each is passed at its call site.
 * Device discovery, introspection, the safety verdict, partition-table
   writers (MBR + GPT) and the privileged helper are implemented. The
   helper runs each external tool in its own process group and, on
@@ -68,7 +75,7 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
   helper event stream.
 * `rufus-core` - the safe, non-privileged foundation and the filesystem
   write side: error/config/paths/i18n/hash/units, MBR + GPT table
-  readers and writers, the FAT32/exFAT/NTFS/ext2/3/4 formatters,
+  readers and writers, the FAT32/exFAT/NTFS/ext2/3/4/UDF formatters,
   superblock probing and the safety verdict.
 * `wimlib-sys` - FFI bindings to wimlib, for applying WIM/ESD images.
 * `rufus-linux` - the only crate that touches `/sys` and `/run/udev`:
@@ -125,6 +132,10 @@ silent pass) when absent:
 * `crates/rufus-core/tests/ntfs_format.rs` - `mkntfs`, `ntfsfix -n` and
   `ntfslabel` must agree with the written volume; the VBR-declared
   bounds and the `$MFT` record-3 label read are pinned.
+* `crates/rufus-core/tests/udf_format.rs` - `mkudffs`, `udfinfo` and a
+  kernel mount must agree with the written volume across the block-size
+  matrix (512/2048), the label shapes (short, 126-byte ceiling,
+  default) and the pinned `--udfrev=0x0201` revision.
 
 The kernel-mount tests are `#[ignore]`d: they need root and a loop
 device, run on demand with `sudo -E $(which cargo) test --offline
