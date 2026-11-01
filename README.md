@@ -39,8 +39,16 @@ side is the most complete part:
   `/persistence.conf` through `debugfs`. The QEMU persistence-boot
   acceptance is not measurable on the build host, so it is documented in
   the test module docs rather than claimed.
+* NTFS and ext share one external-tool probe (PATH scan, executable
+  check, version probe, busy-exec retry) in
+  `crates/rufus-core/src/fs/tool.rs`; the version flag stays per family
+  (`-V` for ext, `--version` for NTFS), passed at each call site.
 * Device discovery, introspection, the safety verdict, partition-table
-  writers (MBR + GPT) and the privileged helper are implemented.
+  writers (MBR + GPT) and the privileged helper are implemented. The
+  helper runs each external tool in its own process group and, on
+  cancel, SIGKILLs the whole group rather than just the child, so a
+  shell that forks (dash's `sh -c` leaves a `sleep` grandchild) cannot
+  keep the output pipes open and stall the cancel.
 * The end-to-end write path is the least complete part: the CLI's
   `write` command validates its arguments and then honestly reports
   "not implemented" (exit 7), pending the later executor slices.
