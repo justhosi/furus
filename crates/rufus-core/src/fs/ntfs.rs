@@ -38,7 +38,6 @@ use crate::fs::exfat::put_u16;
 use crate::fs::tool;
 use crate::log::Level;
 use crate::log::Logger;
-use crate::text::device_text;
 
 /// Tool names in probe order: `mkntfs` first, then its `mkfs.ntfs` alias.
 const TOOL_NAMES: [&str; 2] = ["mkntfs", "mkfs.ntfs"];
@@ -51,9 +50,6 @@ const MAX_CLUSTER_BYTES: u32 = 65536;
 
 /// Cluster size [`Options::new`] defaults to, in bytes.
 const DEFAULT_CLUSTER_BYTES: u32 = 4096;
-
-/// How many of the tool's trailing stderr lines a failure report carries.
-const MAX_TAIL_LINES: usize = 8;
 
 /// Smallest `$MFT` record size the VBR shaping admits, in bytes (the
 /// negative-exponent encoding 0xF6 = 2^10 shapes exactly this).
@@ -330,10 +326,10 @@ fn shape_mft_record_bytes(vbr: &[u8; 512], cluster_bytes: u32) -> Result<u32> {
 /// drained via `output()`, `LC_ALL=C` in the child environment — then reads
 /// back bytes 0..512 and verifies them with [`boot_sector`], and reads the
 /// volume name of `$MFT` record 3 with [`volume_label`]. Every
-/// non-empty captured line (stdout then stderr, each through
-/// [`device_text`]) is logged verbatim at `Info` under the `ntfs` target;
+/// non-empty captured line (stdout then stderr, each through the one
+/// device-text sanitiser) is logged verbatim at `Info` under the `ntfs` target;
 /// a failing exit becomes a refusal naming the tool, the status and the
-/// last [`MAX_TAIL_LINES`] stderr lines. A label-READ failure after a
+/// last [`tool::MAX_TAIL_LINES`] stderr lines. A label-READ failure after a
 /// successful run is a hard refusal too (an unverified label means the
 /// format is not trusted); it is logged at `Error` before the error is
 /// returned. On success the summary is the snapshot's final line and the
@@ -383,14 +379,11 @@ fn format_with(
     let output =
         tool::output_retrying(&mut command).map_err(|error| CoreError::io(tool_path, error))?;
 
-    let stdout_lines = captured_lines(&output.stdout);
-    let stderr_lines = captured_lines(&output.stderr);
-    for line in stdout_lines.iter().chain(stderr_lines.iter()) {
-        logger.log(Level::Info, "ntfs", line);
-    }
+    let stderr_lines = tool::captured_lines(&output.stderr);
+    tool::log_captured_lines(logger, "ntfs", &output);
 
     if !output.status.success() {
-        return Err(format_failure(
+        return Err(tool::output_failure(
             tool,
             &output.status.to_string(),
             &stderr_lines,
@@ -430,32 +423,6 @@ fn format_with(
         ),
     );
     Ok(NtfsVolume { boot, label })
-}
-
-/// Split captured output into sanitised, non-empty log lines.
-fn captured_lines(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .map(device_text)
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
-/// Refusal for a failing tool exit: the tool name, the status text and the
-/// last [`MAX_TAIL_LINES`] stderr lines (empty when the tool said nothing).
-fn format_failure(tool: &str, status: &str, stderr_lines: &[String]) -> CoreError {
-    let mut tail: Vec<&str> = stderr_lines
-        .iter()
-        .rev()
-        .take(MAX_TAIL_LINES)
-        .map(String::as_str)
-        .collect();
-    tail.reverse();
-    if tail.is_empty() {
-        CoreError::invalid(format!("{tool} failed ({status}) with no error output"))
-    } else {
-        CoreError::invalid(format!("{tool} failed ({status}): {}", tail.join("; ")))
-    }
 }
 
 /// Read bytes 0..512 of `target` — the VBR the tool is expected to have
