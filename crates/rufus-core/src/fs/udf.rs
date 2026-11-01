@@ -3,7 +3,8 @@
 //!
 //! PLAN lines 703-717 mandate UDF volumes built by shelling out to
 //! `mkudffs --utf8 --media-type=hd --udfrev=0x0201 -b 512|2048 -l <label>`
-//! (`--utf8` must come first, measured with udftools 2.3) under PLAN decision A4 (line 37), which keeps a curated set of
+//! (`--utf8` must come first, measured with udftools 2.3) under PLAN
+//! decision A4 (line 37), which keeps a curated set of
 //! filesystems on external-tool formatters (the NTFS formatter of
 //! [`fs::ntfs`] and the ext formatter of [`fs::ext`] ride on the same
 //! decision) because a pure-Rust UDF writer is a multi-year project.
@@ -335,8 +336,8 @@ fn check_nsr(region: &[u8]) -> Result<Nsr> {
     }
     if identifier == Nsr::Nsr02.as_str() {
         return Err(CoreError::invalid(format!(
-            "the UDF recognition sector at byte {start} reads `{}` not `NSR03`: \
-             the fixed --udfrev={UDF_REV_ARG} revision writes NSR03 (NSR02 belongs to \
+            "the UDF recognition sector at byte {start} reads `{}` not `{EXPECTED_NSR}`: \
+             the fixed --udfrev={UDF_REV_ARG} revision writes {EXPECTED_NSR} (NSR02 belongs to \
              --udfrev=0x0150, measured with udftools 2.3), refusing on the revision mismatch",
             Nsr::Nsr02,
         )));
@@ -439,9 +440,10 @@ fn check_target_exists(target: &Path) -> Result<()> {
 /// Every non-empty captured line (stdout then stderr, each through the one
 /// device-text sanitiser) is logged verbatim at `Info` under the `udf`
 /// target; a failing exit becomes a refusal naming the tool, the status
-/// and the last [`tool::MAX_TAIL_LINES`] stderr lines (a small-target warning with exit 0 is a
-/// warning, not a failure). On success the summary is the snapshot's final
-/// line and the verified NSR comes back as a [`Recognition`].
+/// and the last [`tool::MAX_TAIL_LINES`] stderr lines (a small-target
+/// warning with exit 0 is a warning, not a failure). On success the
+/// summary is the snapshot's final line and the verified NSR comes back
+/// as a [`Recognition`].
 pub fn format(target: &Path, options: &Options, logger: &Logger) -> Result<Recognition> {
     // The missing-target rule runs before the probe: a refusal must not
     // even run the banner probe, let alone format anything.
@@ -646,7 +648,7 @@ mod tests {
             "#!/bin/sh\necho 'mkudffs from udftools 9.9' >&2\nexit 0\n",
         );
         let error =
-            find_tool_in(&probe_dirs(scratch.path())).expect_err("a bannerless probe is absent");
+            find_tool_in(&probe_dirs(scratch.path())).expect_err("a zero-exit probe is absent");
         assert_eq!(
             error.to_string(),
             format!("invalid input: {MISSING_TOOL_HINT}"),

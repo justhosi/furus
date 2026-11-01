@@ -183,8 +183,7 @@ const STAGE_NAME_PREFIX: &str = "rufus-persistence-";
 /// candidate whose version probe exits successfully wins; a candidate whose
 /// probe fails is treated as absent. This answers "is there any ext
 /// formatter at all"; [`format`] runs its own scan narrowed to the flavour
-/// it formats (the scan is the shared [`tool::scan_candidates`] — no
-/// TOCTOU).
+/// it formats (the scan is the shared `fs::tool` scan — no TOCTOU).
 pub fn find_tool() -> Result<&'static str> {
     probe_candidates(&tool::path_dirs(), &TOOL_NAMES).map(|(name, _)| name)
 }

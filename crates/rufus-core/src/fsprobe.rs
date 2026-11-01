@@ -45,7 +45,8 @@ const BOOT_SIGNATURE_OFFSET: usize = 510;
 /// block size: the on-disk format fixes it there, so the field offsets
 /// below add the superblock-relative positions to this base. All three
 /// are absolute positions in the 64 KiB `prefix` window, which always
-/// reaches them (the highest field end at 0x464 sits far below 0x10000).
+/// reaches them (even the end of the feature words sits far below the
+/// window end).
 const EXT_SUPERBLOCK_AT: usize = 0x400;
 /// `s_magic` (`u16` 0xEF53): superblock-relative 56.
 const EXT_MAGIC_OFFSET: usize = EXT_SUPERBLOCK_AT + 56;

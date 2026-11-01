@@ -325,10 +325,10 @@ fn shape_mft_record_bytes(vbr: &[u8; 512], cluster_bytes: u32) -> Result<u32> {
 /// always the last argument) as a bounded capture — both streams piped and
 /// drained via `output()`, `LC_ALL=C` in the child environment — then reads
 /// back bytes 0..512 and verifies them with [`boot_sector`], and reads the
-/// volume name of `$MFT` record 3 with [`volume_label`]. Every
-/// non-empty captured line (stdout then stderr, each through the one
-/// device-text sanitiser) is logged verbatim at `Info` under the `ntfs` target;
-/// a failing exit becomes a refusal naming the tool, the status and the
+/// volume name of `$MFT` record 3 with [`volume_label`]. Every non-empty
+/// captured line (stdout then stderr, each through the one device-text
+/// sanitiser) is logged verbatim at `Info` under the `ntfs` target; a
+/// failing exit becomes a refusal naming the tool, the status and the
 /// last [`tool::MAX_TAIL_LINES`] stderr lines. A label-READ failure after a
 /// successful run is a hard refusal too (an unverified label means the
 /// format is not trusted); it is logged at `Error` before the error is
