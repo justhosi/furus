@@ -725,10 +725,17 @@ fn format_refuses_a_file_target_the_way_mkntfs_does() {
 /// sectors times bytes per sector), not against the node's stat size
 /// (which this kernel reports as 0 for loop nodes). ntfslabel through
 /// the same node reads the same label, and the volume stays
-/// ntfsfix-clean.
+/// ntfsfix-clean. Needs root for the losetup step — non-root runs skip;
+/// see the module docs for the privileged-container command.
 #[test]
 fn format_on_a_loop_target_verifies_the_label_read() {
     let what = "the loop-target label-read acceptance";
+    if !is_root() {
+        eprintln!(
+            "skip: {what} needs root for losetup; run inside the privileged container, see the module docs"
+        );
+        return;
+    }
     if skip_without_formatter(what)
         || skip_without_tool("ntfsfix", what)
         || skip_without_tool("ntfslabel", what)
