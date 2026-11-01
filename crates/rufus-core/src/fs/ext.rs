@@ -71,9 +71,6 @@ const TOOL_NAMES: [&str; 4] = ["mke2fs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4"];
 /// (PLAN line 692), whose `mkfs.ext*` aliases are fallbacks only.
 const CANONICAL_TOOL: &str = "mke2fs";
 
-/// How many of the tool's trailing stderr lines a failure report carries.
-const MAX_TAIL_LINES: usize = 8;
-
 /// The superblock's start inside the first block, per the on-disk ext
 /// format: byte 1024. All the `SB_*` offsets below are absolute positions
 /// in the first-block region [`format`] reads back.
@@ -559,7 +556,7 @@ fn effective_label(options: &Options) -> Result<Option<String>> {
 /// non-empty captured line (stdout then stderr, each through the one
 /// device-text sanitiser) is logged verbatim at `Info` under the `ext`
 /// target; a failing exit becomes a refusal naming the tool, the status and
-/// the last [`MAX_TAIL_LINES`] stderr lines. On success the summary is the
+/// the last [`tool::MAX_TAIL_LINES`] stderr lines. On success the summary is the
 /// snapshot's final line and the verified fields come back as a [`Super`].
 ///
 /// With `persistence` set, the label rule is enforced before any tool runs
@@ -642,11 +639,11 @@ fn format_with_in(
     let output =
         tool::output_retrying(&mut command).map_err(|error| CoreError::io(tool_path, error))?;
 
-    let stderr_lines = captured_lines(&output.stderr);
-    log_captured_lines(logger, &output);
+    let stderr_lines = tool::captured_lines(&output.stderr);
+    tool::log_captured_lines(logger, "ext", &output);
 
     if !output.status.success() {
-        return Err(format_failure(
+        return Err(tool::output_failure(
             tool,
             &output.status.to_string(),
             &stderr_lines,
@@ -810,7 +807,7 @@ fn staged_write_request(staged: &Path) -> Result<String> {
 /// exactly equal to the staged bytes (measured with e2fsprogs 1.47.4: the
 /// `cat` run returns exactly those 8 bytes on stdout, the version banner on
 /// stderr). Anything else is a refusal naming `debugfs`, the status (or the
-/// byte mismatch) and the last at most [`MAX_TAIL_LINES`] lines of the
+/// byte mismatch) and the last at most [`tool::MAX_TAIL_LINES`] lines of the
 /// diagnostic streams. Every non-empty captured line of both runs is logged
 /// verbatim at `Info` under the `ext` target; the byte comparison runs on
 /// the raw captured stdout, never on the line-split sanitised view.
@@ -845,9 +842,9 @@ fn activate_persistence(
         }
     };
     let _ = std::fs::remove_file(&staged);
-    log_captured_lines(logger, &write_output);
+    tool::log_captured_lines(logger, "ext", &write_output);
     if !write_output.status.success() {
-        return Err(format_failure(
+        return Err(tool::output_failure(
             writer,
             &write_output.status.to_string(),
             &combined_tail(&write_output),
@@ -861,9 +858,9 @@ fn activate_persistence(
         .env("LC_ALL", "C");
     let cat_output =
         tool::output_retrying(&mut cat).map_err(|error| CoreError::io(writer_path, error))?;
-    log_captured_lines(logger, &cat_output);
+    tool::log_captured_lines(logger, "ext", &cat_output);
     if !cat_output.status.success() {
-        return Err(format_failure(
+        return Err(tool::output_failure(
             writer,
             &cat_output.status.to_string(),
             &combined_tail(&cat_output),
@@ -875,41 +872,29 @@ fn activate_persistence(
     Ok(())
 }
 
-/// Log every non-empty captured line of a tool run (stdout then stderr,
-/// each through the one device-text sanitiser) verbatim at `Info` under the
-/// `ext` target — the shared transcript shape of [`format`], [`verify`] and
-/// the persistence writer.
-fn log_captured_lines(logger: &Logger, output: &std::process::Output) {
-    let stdout_lines = captured_lines(&output.stdout);
-    let stderr_lines = captured_lines(&output.stderr);
-    for line in stdout_lines.iter().chain(stderr_lines.iter()) {
-        logger.log(Level::Info, "ext", line);
-    }
-}
-
 /// Chain a writer run's stderr lines then its stdout lines for a refusal
 /// tail: `debugfs` splits its transcript the way `e2fsck` does (the version
 /// banner and the errors on stderr, request notes like `Allocated inode: N`
 /// on stdout — measured with e2fsprogs 1.47.4), so a stderr-only tail would
-/// drop half the transcript. [`format_failure`] caps the chained sequence
-/// at [`MAX_TAIL_LINES`].
+/// drop half the transcript. [`tool::output_failure`] caps the chained sequence
+/// at [`tool::MAX_TAIL_LINES`].
 fn combined_tail(output: &std::process::Output) -> Vec<String> {
-    captured_lines(&output.stderr)
+    tool::captured_lines(&output.stderr)
         .into_iter()
-        .chain(captured_lines(&output.stdout))
+        .chain(tool::captured_lines(&output.stdout))
         .collect()
 }
 
 /// Refusal for a persistence read-back that is not exactly
 /// [`PERSISTENCE_CONF_BYTES`]: names `debugfs`, the flag file, the expected
 /// and found byte counts with a sanitised preview of what came back, and the
-/// last at most [`MAX_TAIL_LINES`] lines of the diagnostic streams (the
+/// last at most [`tool::MAX_TAIL_LINES`] lines of the diagnostic streams (the
 /// preview runs through the one device-text sanitiser, so the refusal stays
 /// ASCII whatever bytes the tool returned).
 fn persistence_mismatch(writer: &str, output: &std::process::Output) -> CoreError {
     let preview = device_text(&String::from_utf8_lossy(&output.stdout));
     let combined = combined_tail(output);
-    let tail = capped_tail(&combined);
+    let tail = tool::capped_tail(&combined);
     let report = format!(
         "{writer} read-back mismatch on {PERSISTENCE_CONF_PATH}: expected {} bytes \
          `/ union` plus newline but got {} bytes `{preview}`",
@@ -931,7 +916,7 @@ fn persistence_mismatch(writer: &str, output: &std::process::Output) -> CoreErro
 /// non-empty captured line (stdout then stderr, each through the one
 /// device-text sanitiser) is logged verbatim at `Info` under the `ext`
 /// target; a failing exit becomes a refusal naming the tool, the status and
-/// the last [`MAX_TAIL_LINES`] lines of stderr followed by stdout (stderr
+/// the last [`tool::MAX_TAIL_LINES`] lines of stderr followed by stdout (stderr
 /// first, then stdout, capped as one sequence — `e2fsck` reports its
 /// findings on stdout, measured on this host against e2fsprogs 1.47.4
 /// during this slice: a corrupt filesystem's `Pass 1: ...` lines went to
@@ -962,15 +947,15 @@ fn verify_with(target: &Path, logger: &Logger, tool: &'static str, tool_path: &P
     let output =
         tool::output_retrying(&mut command).map_err(|error| CoreError::io(tool_path, error))?;
 
-    log_captured_lines(logger, &output);
+    tool::log_captured_lines(logger, "ext", &output);
 
     if !output.status.success() {
         // The refusal tail chains stderr then stdout: `e2fsck` reports
         // its findings on stdout (measured against e2fsprogs 1.47.4), so
         // a stderr-only tail would read as a bare banner on a real
-        // refusal. `format_failure` caps the chained sequence at
-        // [`MAX_TAIL_LINES`].
-        return Err(format_failure(
+        // refusal. `tool::output_failure` caps the chained sequence at
+        // [`tool::MAX_TAIL_LINES`].
+        return Err(tool::output_failure(
             tool,
             &output.status.to_string(),
             &combined_tail(&output),
@@ -986,42 +971,6 @@ fn verify_with(target: &Path, logger: &Logger, tool: &'static str, tool_path: &P
         ),
     );
     Ok(())
-}
-
-/// Split captured output into sanitised, non-empty log lines.
-fn captured_lines(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .map(device_text)
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
-/// Refusal for a failing tool exit: the tool name, the status text and the
-/// last [`MAX_TAIL_LINES`] lines of the given sequence (empty when the tool
-/// said nothing) — the callers choose the sequence ([`format`] passes
-/// stderr only; [`verify`] and the persistence writer pass stderr followed
-/// by stdout).
-fn format_failure(tool: &str, status: &str, tail_lines: &[String]) -> CoreError {
-    let tail = capped_tail(tail_lines);
-    if tail.is_empty() {
-        CoreError::invalid(format!("{tool} failed ({status}) with no error output"))
-    } else {
-        CoreError::invalid(format!("{tool} failed ({status}): {}", tail.join("; ")))
-    }
-}
-
-/// The last at most [`MAX_TAIL_LINES`] entries of a diagnostic sequence,
-/// oldest first — the shared cap behind every tool refusal tail.
-fn capped_tail(lines: &[String]) -> Vec<&str> {
-    let mut tail: Vec<&str> = lines
-        .iter()
-        .rev()
-        .take(MAX_TAIL_LINES)
-        .map(String::as_str)
-        .collect();
-    tail.reverse();
-    tail
 }
 
 /// Read bytes 0..4096 of `target` — the first-block region where the

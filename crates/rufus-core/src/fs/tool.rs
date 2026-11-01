@@ -1,12 +1,14 @@
-//! The A4 external-tool policy in one place: how the NTFS and ext formatter
-//! families locate and probe their external tools.
+//! The A4 external-tool policy in one place: how the NTFS, ext and UDF
+//! formatter families locate and probe their external tools.
 //!
-//! Every rule here is what both families previously duplicated: the `PATH`
+//! Every rule here is what the families previously duplicated: the `PATH`
 //! directory list, the executable-file check, the names-major/dirs-minor
 //! scan, the version-probe shape (`LC_ALL=C`, capture, drop the output,
 //! read `status.success()`), and the spawn-error rule. The only per-family
 //! inputs are the probe flag (`-V` for the e2fsprogs family, `--version`
-//! for the NTFS family) and the absent-tool refusal each family reports.
+//! for the NTFS family) and the absent-tool refusal each family reports —
+//! except the UDF family, whose tool answers no flag with success and is
+//! probed by its usage banner instead (see [`probe_banner`]).
 //!
 //! The `ETXTBSY` retry and the spawn-error rule are measured facts, kept in
 //! the wording both families carried: a busy exec fails with `ETXTBSY`
@@ -14,6 +16,13 @@
 //! this host with rustc 1.99.0, see [`output_retrying`]), and a spawn
 //! failure is returned, never swallowed (see [`probe_with`] and
 //! [`scan_candidates`]).
+//!
+//! The captured-output transcript shape lives here too: [`captured_lines`]
+//! splits a stream into sanitised log lines, [`log_captured_lines`] logs a
+//! run's transcript under the family's own target, and [`output_failure`]
+//! builds the failing-exit refusal — one implementation for every family,
+//! so the tails cannot drift (the NTFS family still carries its own
+//! copies; moving them is later-slice debt).
 
 use std::env;
 use std::io;
@@ -26,6 +35,12 @@ use std::time::Duration;
 
 use crate::error::CoreError;
 use crate::error::Result;
+use crate::log::Level;
+use crate::log::Logger;
+use crate::text::device_text;
+
+/// How many of the tool's trailing stderr lines a failure report carries.
+pub(crate) const MAX_TAIL_LINES: usize = 8;
 
 /// The `PATH` directories of this process, in order (empty when `PATH` is
 /// unset — the probe below then finds nothing and reports the package).
@@ -107,16 +122,55 @@ pub(crate) fn scan_candidates(
     flag: &'static str,
     missing: fn() -> CoreError,
 ) -> Result<(&'static str, PathBuf)> {
+    scan_with(dirs, names, missing, |candidate| {
+        probe_with(candidate, flag)
+    })
+}
+
+/// Probe `names` in order over `dirs` with a caller-owned banner predicate,
+/// returning the first entry that is an executable file whose probe reports
+/// present; nothing found, nothing executable, or a probe that ran and
+/// reported absent gives the `missing` refusal for this tool family. A
+/// probe that could not be spawned at all (other than a vanishing
+/// `NotFound`) refuses as an I/O error naming the candidate path, never
+/// the package hint.
+///
+/// The scan runs names-major over dirs-minor, exactly like
+/// [`scan_candidates`]: the flag families keep calling that thin wrapper,
+/// and only the banner-probed UDF family calls this seam.
+///
+/// The predicate captures nothing (a `fn` pointer, not a closure): the
+/// UDF banner prefix is a module constant, so no environment needs
+/// capturing.
+pub(crate) fn scan_candidates_with(
+    dirs: &[PathBuf],
+    names: &[&'static str],
+    probe: fn(&Path) -> io::Result<bool>,
+    missing: fn() -> CoreError,
+) -> Result<(&'static str, PathBuf)> {
+    scan_with(dirs, names, missing, probe)
+}
+
+/// The shared scan behind [`scan_candidates`] and [`scan_candidates_with`]:
+/// names-major over dirs-minor, the executable-file check, and the
+/// spawn-error rule live in exactly one loop, so the two entry points
+/// cannot drift.
+fn scan_with(
+    dirs: &[PathBuf],
+    names: &[&'static str],
+    missing: fn() -> CoreError,
+    probe: impl Fn(&Path) -> io::Result<bool>,
+) -> Result<(&'static str, PathBuf)> {
     for name in names.iter().copied() {
         for dir in dirs {
             let candidate = dir.join(name);
             if !is_executable_file(&candidate) {
                 continue;
             }
-            match probe_with(&candidate, flag) {
+            match probe(&candidate) {
                 Ok(true) => return Ok((name, candidate)),
                 Ok(false) => {
-                    // A candidate whose version probe runs and fails is
+                    // A candidate whose probe runs and fails is
                     // treated as absent, and the scan moves on.
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -128,6 +182,80 @@ pub(crate) fn scan_candidates(
         }
     }
     Err(missing())
+}
+
+/// Run `candidate` with no arguments and return its first stderr line.
+///
+/// The UDF family needs this shape because `mkudffs` has no version or
+/// help flag that succeeds: every flag exits non-zero (measured with
+/// udftools 2.3 inside the `archlinux:latest` container — `--version`
+/// reports an unrecognized option, `-V` an invalid option, `--help` and
+/// `-h` exit 1), so the probe reads the usage banner instead, which
+/// `mkudffs` prints to stderr with exit code 1 when run with no
+/// arguments. Returns `Ok(Some(line))` only when the exit code is
+/// `Some(1)` and stderr carries a first line, otherwise `Ok(None)` — the
+/// caller matches the line against its banner prefix. Spawn failures are
+/// returned, never swallowed (the scan maps them like any other probe's),
+/// and the `ETXTBSY` retry of [`output_retrying`] applies.
+pub(crate) fn probe_banner(candidate: &Path) -> io::Result<Option<String>> {
+    let mut command = Command::new(candidate);
+    command.env("LC_ALL", "C");
+    let output = output_retrying(&mut command)?;
+    if output.status.code() != Some(1) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .next()
+        .map(str::to_string))
+}
+
+/// Split captured output into sanitised, non-empty log lines.
+pub(crate) fn captured_lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(device_text)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Log every non-empty captured line of a tool run (stdout then stderr,
+/// each through the one device-text sanitiser) verbatim at `Info` under
+/// `target` — the family's own log target (`"ext"`, `"udf"`), so each
+/// family's transcript keeps its shape while sharing the code.
+pub(crate) fn log_captured_lines(logger: &Logger, target: &str, output: &Output) {
+    let stdout_lines = captured_lines(&output.stdout);
+    let stderr_lines = captured_lines(&output.stderr);
+    for line in stdout_lines.iter().chain(stderr_lines.iter()) {
+        logger.log(Level::Info, target, line);
+    }
+}
+
+/// The last at most [`MAX_TAIL_LINES`] entries of a diagnostic sequence,
+/// oldest first — the shared cap behind every tool refusal tail.
+pub(crate) fn capped_tail(lines: &[String]) -> Vec<&str> {
+    let mut tail: Vec<&str> = lines
+        .iter()
+        .rev()
+        .take(MAX_TAIL_LINES)
+        .map(String::as_str)
+        .collect();
+    tail.reverse();
+    tail
+}
+
+/// Refusal for a failing tool exit: the tool name, the status text and the
+/// last [`MAX_TAIL_LINES`] lines of the given sequence (empty when the tool
+/// said nothing) — the callers choose the sequence (the ext formatter
+/// passes stderr only; its checker and persistence writer pass stderr
+/// followed by stdout; the UDF formatter passes stderr only).
+pub(crate) fn output_failure(tool: &str, status: &str, tail_lines: &[String]) -> CoreError {
+    let tail = capped_tail(tail_lines);
+    if tail.is_empty() {
+        CoreError::invalid(format!("{tool} failed ({status}) with no error output"))
+    } else {
+        CoreError::invalid(format!("{tool} failed ({status}): {}", tail.join("; ")))
+    }
 }
 
 #[cfg(test)]
