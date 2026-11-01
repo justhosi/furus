@@ -41,10 +41,18 @@ const FAT_BPB_BYTES_PER_SECTOR: usize = 11;
 /// Absolute position of the boot-sector signature, shared with MBR
 /// disks ([`MBR_SIGNATURE`]).
 const BOOT_SIGNATURE_OFFSET: usize = 510;
-/// ext magic (`u16` `0xEF53`) and the two feature words, all absolute.
-const EXT_MAGIC_OFFSET: usize = 0x438;
-const EXT_COMPAT_OFFSET: usize = 0x5C;
-const EXT_INCOMPAT_OFFSET: usize = 0x60;
+/// The ext superblock starts at byte 1024 of the volume, independent of
+/// block size: the on-disk format fixes it there, so the field offsets
+/// below add the superblock-relative positions to this base. All three
+/// are absolute positions in the 64 KiB `prefix` window, which always
+/// reaches them (the highest field end at 0x464 sits far below 0x10000).
+const EXT_SUPERBLOCK_AT: usize = 0x400;
+/// `s_magic` (`u16` 0xEF53): superblock-relative 56.
+const EXT_MAGIC_OFFSET: usize = EXT_SUPERBLOCK_AT + 56;
+/// `s_feature_compat` (`u32`): superblock-relative 92.
+const EXT_COMPAT_OFFSET: usize = EXT_SUPERBLOCK_AT + 92;
+/// `s_feature_incompat` (`u32`): superblock-relative 96.
+const EXT_INCOMPAT_OFFSET: usize = EXT_SUPERBLOCK_AT + 96;
 /// ext feature bits: `has_journal` in `s_feature_compat`, and the
 /// ext4-only bits in `s_feature_incompat` (extents, 64bit, flex_bg,
 /// ea_inode).
@@ -267,6 +275,8 @@ fn probe_microsoft(prefix: &[u8]) -> Option<FsKind> {
 /// ext4-only incompatible feature → ext4; else ext3. Unreadable
 /// feature words (physically short buffer) count as 0, which makes the
 /// answer degrade to plain ext2 instead of an invented ext4 claim.
+/// The three reads use the absolute `EXT_*_OFFSET` positions from the
+/// 1024 base above, so boot-block bytes never decide the generation.
 fn probe_ext(prefix: &[u8]) -> Option<FsKind> {
     if u16_le(prefix, EXT_MAGIC_OFFSET) != Some(0xEF53) {
         return None;
@@ -428,9 +438,12 @@ mod tests {
     /// An ext superblock with the two feature words set as given.
     fn ext_superblock(compat: u32, incompat: u32) -> Vec<u8> {
         let mut buffer = vec![0u8; 0x800];
-        buffer[0x438..0x43A].copy_from_slice(&0xEF53u16.to_le_bytes());
-        buffer[0x5C..0x60].copy_from_slice(&compat.to_le_bytes());
-        buffer[0x60..0x64].copy_from_slice(&incompat.to_le_bytes());
+        buffer[super::EXT_MAGIC_OFFSET..super::EXT_MAGIC_OFFSET + 2]
+            .copy_from_slice(&0xEF53u16.to_le_bytes());
+        buffer[super::EXT_COMPAT_OFFSET..super::EXT_COMPAT_OFFSET + 4]
+            .copy_from_slice(&compat.to_le_bytes());
+        buffer[super::EXT_INCOMPAT_OFFSET..super::EXT_INCOMPAT_OFFSET + 4]
+            .copy_from_slice(&incompat.to_le_bytes());
         buffer
     }
 
@@ -444,6 +457,37 @@ mod tests {
         for bit in [0x40u32, 0x80, 0x200, 0x400] {
             assert_probe(&ext_superblock(0x2C, bit), Some(FsKind::Ext4));
         }
+    }
+
+    /// Regression pin: the feature words live in the superblock, not the
+    /// boot block. A superblock-relative read at 0x5C/0x60 sees only boot
+    /// zeros on real volumes and always answers ext2.
+    ///
+    /// Measured on this host with e2fsprogs 1.47.4, 32 MiB images with
+    /// `-b 4096 -I 256`: magic 0xEF53 at 0x438 on all three flavours,
+    /// boot words 0x5C = 0x00000000 and 0x60 = 0x00000000 on all three,
+    /// ext2 0x45C = 0x00000038 with 0x460 = 0x00000002, ext3 0x45C =
+    /// 0x0000003C with 0x460 = 0x00000002, ext4 0x45C = 0x0000103C with
+    /// 0x460 = 0x000022C2. The old offsets read the boot zeros, so the
+    /// first and third cases below answered ext2 and the second
+    /// answered ext4.
+    #[test]
+    fn ext_feature_words_are_read_at_the_superblock_not_the_boot_block() {
+        // Real-shape ext4: boot zeros with journal plus extent bits in
+        // the superblock. The old read saw only the boot zeros (ext2).
+        let mut real = ext_superblock(0x103C, 0x22C2);
+        real[0x5C..0x60].copy_from_slice(&0u32.to_le_bytes());
+        real[0x60..0x64].copy_from_slice(&0u32.to_le_bytes());
+        assert_probe(&real, Some(FsKind::Ext4));
+        // Stale-offset decoy: journal and ext4 bits only where the old
+        // code looked, superblock words zero. Must stay ext2, never ext4.
+        let mut decoy = ext_superblock(0, 0);
+        decoy[0x5C..0x60].copy_from_slice(&0x103Cu32.to_le_bytes());
+        decoy[0x60..0x64].copy_from_slice(&0x22C2u32.to_le_bytes());
+        assert_probe(&decoy, Some(FsKind::Ext2));
+        // Real-shape ext3: journal set with no ext4-only bit in the
+        // superblock. The old read saw boot zeros (ext2).
+        assert_probe(&ext_superblock(0x3C, 0x2), Some(FsKind::Ext3));
     }
 
     #[test]
