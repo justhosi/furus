@@ -1,6 +1,7 @@
 //! The filesystem write side's storage abstraction plus the formatters
-//! that drive it: FAT32 (S09), exFAT (S10) and NTFS (S11, via the
-//! external `mkntfs` tool).
+//! that drive it: FAT32 (S09), exFAT (S10), NTFS (S11, via the external
+//! `mkntfs` tool) and ext2/3/4 (S12, via the external `mke2fs` /
+//! `mkfs.ext*` tool).
 //!
 //! The crate layering puts privileged I/O in `rufus-linux` and the
 //! formatter logic in `rufus-core`; the two meet here in [`Volume`], the
@@ -36,6 +37,7 @@ use crate::error::CoreError;
 use crate::error::Result;
 
 pub mod exfat;
+pub mod ext;
 pub mod fat32;
 pub mod ntfs;
 
