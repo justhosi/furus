@@ -41,6 +41,8 @@ pub mod ext;
 pub mod fat32;
 pub mod ntfs;
 
+mod tool;
+
 /// The byte-store surface the write side of `rufus-core` drives.
 ///
 /// Implementations promise:

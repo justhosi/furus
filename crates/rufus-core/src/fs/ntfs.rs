@@ -23,16 +23,11 @@
 //! synthetic fixtures pin is the NTFS on-disk format, not tool
 //! behaviour.
 
-use std::env;
-use std::io;
 use std::os::unix::fs::FileExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::process::Output;
 use std::process::Stdio;
-use std::time::Duration;
 
 use crate::error::CoreError;
 use crate::error::Result;
@@ -40,6 +35,7 @@ use crate::fs::exfat::get_u16;
 use crate::fs::exfat::get_u32;
 use crate::fs::exfat::get_u64;
 use crate::fs::exfat::put_u16;
+use crate::fs::tool;
 use crate::log::Level;
 use crate::log::Logger;
 use crate::text::device_text;
@@ -97,15 +93,7 @@ const MISSING_TOOL_HINT: &str =
 /// which Debian/Ubuntu ships inside the `ntfs-3g` package named by PLAN.md
 /// line 137.
 pub fn find_tool() -> Result<&'static str> {
-    find_tool_in(&path_dirs()).map(|(name, _)| name)
-}
-
-/// The `PATH` directories of this process, in order (empty when `PATH` is
-/// unset — the probe below then finds nothing and reports the package).
-fn path_dirs() -> Vec<PathBuf> {
-    env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).collect())
-        .unwrap_or_default()
+    find_tool_in(&tool::path_dirs()).map(|(name, _)| name)
 }
 
 /// [`find_tool`] over an explicit directory list, so tests can point the
@@ -113,75 +101,7 @@ fn path_dirs() -> Vec<PathBuf> {
 /// (`std::env::set_var` is `unsafe` under this crate's edition and
 /// `forbid(unsafe_code)` leaves no room for it).
 fn find_tool_in(dirs: &[PathBuf]) -> Result<(&'static str, PathBuf)> {
-    for name in TOOL_NAMES {
-        for dir in dirs {
-            let candidate = dir.join(name);
-            if !is_executable_file(&candidate) {
-                continue;
-            }
-            match probe_tool(&candidate) {
-                Ok(true) => return Ok((name, candidate)),
-                Ok(false) => {
-                    // A candidate whose `--version` probe runs and fails is
-                    // treated as absent, and the scan moves on.
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    // A candidate that vanished between the executable
-                    // check and the spawn is absent too.
-                }
-                Err(error) => return Err(CoreError::io(&candidate, error)),
-            }
-        }
-    }
-    Err(missing_tool_error())
-}
-
-/// A regular file with at least one execute bit set.
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .metadata()
-            .map(|meta| meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-}
-
-/// Run `candidate --version` and report whether it exits successfully.
-/// Output is captured and dropped — the probe only asks "are you there".
-///
-/// A spawn failure is returned, never swallowed: `NotFound` means the
-/// candidate vanished between the executable check and the spawn (the scan
-/// treats it as absent), while any other error — including a busy exec that
-/// survives [`output_retrying`] — becomes [`CoreError::io`] at the scan.
-fn probe_tool(candidate: &Path) -> std::result::Result<bool, io::Error> {
-    let mut command = Command::new(candidate);
-    command.arg("--version").env("LC_ALL", "C");
-    output_retrying(&mut command).map(|output| output.status.success())
-}
-
-/// Run `cmd` as a bounded capture, retrying a busy exec — and only a busy
-/// exec.
-///
-/// A script or executable file that another thread still holds open for
-/// writing fails `execve` with `ETXTBSY` (errno 26, mapped to
-/// [`io::ErrorKind::ExecutableFileBusy`] — measured on this host with rustc
-/// 1.99.0: holding a write descriptor open makes `Command::output` fail with
-/// `Text file busy (os error 26)`, and the same command succeeds after the
-/// descriptor closes). The failure means the child never started, so
-/// retrying is safe: at most three attempts with 10 ms sleeps between busy
-/// failures (at most about 20 ms of added delay), and every other error
-/// returns immediately.
-fn output_retrying(cmd: &mut Command) -> io::Result<Output> {
-    let mut attempt = 0;
-    loop {
-        match cmd.output() {
-            Ok(output) => return Ok(output),
-            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 2 => {
-                attempt += 1;
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    tool::scan_candidates(dirs, &TOOL_NAMES, "--version", missing_tool_error)
 }
 
 /// The shared refusal for an absent formatter: nothing found, nothing
@@ -419,7 +339,7 @@ fn shape_mft_record_bytes(vbr: &[u8; 512], cluster_bytes: u32) -> Result<u32> {
 /// returned. On success the summary is the snapshot's final line and the
 /// verified boot plus label come back as an [`NtfsVolume`].
 pub fn format(target: &Path, options: &Options, logger: &Logger) -> Result<NtfsVolume> {
-    let (tool, tool_path) = find_tool_in(&path_dirs())?;
+    let (tool, tool_path) = find_tool_in(&tool::path_dirs())?;
     format_with(target, options, logger, tool, &tool_path)
 }
 
@@ -460,7 +380,8 @@ fn format_with(
     // Bounded capture: the tool is this slice's external mandate
     // (PLAN lines 661-679), and `output` drains both pipes so a chatty
     // tool cannot block on a full buffer.
-    let output = output_retrying(&mut command).map_err(|error| CoreError::io(tool_path, error))?;
+    let output =
+        tool::output_retrying(&mut command).map_err(|error| CoreError::io(tool_path, error))?;
 
     let stdout_lines = captured_lines(&output.stdout);
     let stderr_lines = captured_lines(&output.stderr);
@@ -908,6 +829,7 @@ fn volume_name_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// A fixed serial baked into every synthetic VBR, so the round-trip
     /// pins the exact `u64` LE field rather than "some serial".
@@ -1246,53 +1168,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_reports_a_busy_executable_as_an_io_refusal() {
-        // Holding the stub open for writing makes every exec fail with
-        // ETXTBSY (measured on this host with rustc 1.99.0), so the scan
-        // must refuse as I/O naming the path — never the package hint. The
-        // held descriptor stays open across the whole scan, so the bounded
-        // retry budget cannot recover: no timing dependency. Stub behaviour
-        // only.
-        let scratch = tempfile::tempdir().expect("a scratch dir");
-        let stub = write_stub(scratch.path(), "mkntfs", "#!/bin/sh\nexit 0\n");
-        let _held = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&stub)
-            .expect("the write descriptor holds");
-        let error = find_tool_in(&probe_dirs(scratch.path())).expect_err("a busy stub refuses");
-        let text = error.to_string();
-        assert!(matches!(error, CoreError::Io { .. }), "{text}");
-        assert!(text.contains(&stub.display().to_string()), "{text}");
-        let CoreError::Io { source, .. } = &error else {
-            panic!("the error is the house io variant: {text}")
-        };
-        assert_eq!(source.kind(), std::io::ErrorKind::ExecutableFileBusy);
-        assert!(!text.contains(MISSING_TOOL_HINT), "{text}");
-        assert!(!text.contains("ntfs-3g"), "{text}");
-    }
-
-    #[test]
-    fn probe_retries_a_busy_executable_until_it_executes() {
-        // The held write descriptor drops about 10 ms later, inside the
-        // retry budget, so the scan recovers and finds the stub. Stub
-        // behaviour only.
-        let scratch = tempfile::tempdir().expect("a scratch dir");
-        let stub = write_stub(scratch.path(), "mkntfs", "#!/bin/sh\nexit 0\n");
-        let held = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&stub)
-            .expect("the write descriptor holds");
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            drop(held);
-        });
-        let (name, path) = find_tool_in(&probe_dirs(scratch.path())).expect("the retry probes");
-        assert_eq!(name, "mkntfs");
-        assert_eq!(path, stub);
-        assert!(releaser.join().is_ok());
-    }
-
-    #[test]
     fn probe_skips_files_that_are_not_executable() {
         let scratch = tempfile::tempdir().expect("a scratch dir");
         std::fs::write(scratch.path().join("mkntfs"), "#!/bin/sh\nexit 0\n")
@@ -1300,6 +1175,23 @@ mod tests {
         let error =
             find_tool_in(&probe_dirs(scratch.path())).expect_err("a non-executable is skipped");
         assert!(error.to_string().contains("ntfs-3g"), "{error}");
+    }
+
+    #[test]
+    fn probe_pins_the_double_dash_version_flag() {
+        // The version check sends `--version` (this module's fixed contract)
+        // and the stub records its first argument as proof.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let record = scratch.path().join("args");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > '{}'\nexit 0\n",
+            record.display()
+        );
+        write_stub(scratch.path(), "mkntfs", &body);
+        let (name, _) = find_tool_in(&probe_dirs(scratch.path())).expect("the stub probes");
+        assert_eq!(name, "mkntfs");
+        let recorded = std::fs::read_to_string(&record).expect("the stub recorded");
+        assert_eq!(recorded.trim(), "--version");
     }
 
     #[test]
