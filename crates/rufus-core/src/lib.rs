@@ -17,7 +17,10 @@
 //!   [`format`](fs::fat32::format) (superblocks, both FATs, root
 //!   directory) — and the exFAT formatter under [`fs::exfat`]
 //!   (boot region and its backup, checksum sector, FAT, allocation
-//!   bitmap, up-case table, root directory).
+//!   bitmap, up-case table, root directory). The NTFS integration under
+//!   [`fs::ntfs`] (S11) probes and drives the external `mkntfs`/`mkfs.ntfs`
+//!   tool and verifies the VBR — a native writer is out of scope, and the
+//!   S21 VBR-fix hook of PLAN lines 948-949 ships no code here.
 //! * [`log`] — [`Logger`](log::Logger): an `Arc`-shared in-memory ring
 //!   (10,000 records) with level filtering and an optional append-only
 //!   file sink; UTC timestamps without a date/time dependency.
