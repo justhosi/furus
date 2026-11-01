@@ -31,6 +31,14 @@ side is the most complete part:
   writer is out of scope, and the S21 post-format VBR-fix hook is
   explicitly deferred - no hook code ships (see
   `crates/rufus-core/src/fs/ntfs.rs`).
+* ext2, ext3 and ext4 are written by detecting and driving the external
+  `mke2fs` / `mkfs.ext*` tool (the `e2fsprogs` package); the flavour
+  decides the journal bit and the fixed 4096-byte block / 256-byte inode
+  geometry, labels are read back from the superblock, and `e2fsck -f -n`
+  verifies. Persistence mode labels the volume `persistence` and writes
+  `/persistence.conf` through `debugfs`. The QEMU persistence-boot
+  acceptance is not measurable on the build host, so it is documented in
+  the test module docs rather than claimed.
 * Device discovery, introspection, the safety verdict, partition-table
   writers (MBR + GPT) and the privileged helper are implemented.
 * The end-to-end write path is the least complete part: the CLI's
@@ -52,8 +60,8 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
   helper event stream.
 * `rufus-core` - the safe, non-privileged foundation and the filesystem
   write side: error/config/paths/i18n/hash/units, MBR + GPT table
-  readers and writers, the FAT32/exFAT/NTFS formatters, superblock
-  probing and the safety verdict.
+  readers and writers, the FAT32/exFAT/NTFS/ext2/3/4 formatters,
+  superblock probing and the safety verdict.
 * `wimlib-sys` - FFI bindings to wimlib, for applying WIM/ESD images.
 * `rufus-linux` - the only crate that touches `/sys` and `/run/udev`:
   device discovery, mount/swap/holder introspection, and the
