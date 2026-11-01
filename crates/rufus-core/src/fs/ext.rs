@@ -1,5 +1,5 @@
 //! ext2/3/4 integration: drive the external `mke2fs`/`mkfs.ext*` tool, then
-//! verify the superblock fields the mandate pins (S12, slice 1 of 3).
+//! verify the superblock fields the mandate pins (S12, slice 2 of 3).
 //!
 //! PLAN lines 681-701 mandate ext volumes matching Rufus's options, built by
 //! shelling out to `mke2fs -q -F -t ext2|ext3|ext4 -L <label> -b 4096 -I 256`
@@ -28,10 +28,10 @@
 //!
 //! Deferred with notes, per the `fs::ntfs` S21 precedent: the optional
 //! `libext2fs` e2fsprogs feature of PLAN lines 696-698 (the A5 fallback for
-//! distros that forbid external tools) stays documented-not-implemented; the
-//! persistence work of PLAN lines 695-697 (the label plus
-//! `/persistence.conf` files) and the `e2fsck -f -n` verification of PLAN
-//! line 700 are slice 2.
+//! distros that forbid external tools) stays documented-not-implemented, as
+//! do the persistence activation of PLAN lines 695-697 (the label plus
+//! `/persistence.conf` files) and `debugfs`; the `e2fsck -f -n`
+//! verification of PLAN line 700 ships in this slice.
 //!
 //! Test discipline: every test drives `#!/bin/sh` stubs or synthetic
 //! superblocks and claims nothing about real `mke2fs` output; the layout the
@@ -106,8 +106,10 @@ const SB_MAGIC_AT: usize = SB_AT + 56;
 /// the superblock-relative 76 of `s_rev_level`, the field just before.
 const SB_FEATURE_COMPAT_AT: usize = SB_AT + 92;
 
-/// `s_volume_name[16]`: the label run, `NUL`-terminated within the
-/// 16-byte field (`EXT2_LABEL_LEN`). Superblock-relative 0x78.
+/// `s_volume_name[16]`: the label run — the bytes up to the first NUL,
+/// or the whole 16 bytes when the run carries no NUL (`EXT2_LABEL_LEN`
+/// is the ceiling, never a terminator requirement). Superblock-relative
+/// 0x78.
 const SB_VOLUME_NAME_AT: usize = SB_AT + 120;
 
 /// One past the label run: the last byte the parser reads, so a buffer
@@ -124,6 +126,17 @@ const LABEL_BYTES_MAX: usize = 16;
 /// neighbouring NTFS row at line 137 set this hint's shape in `fs::ntfs`).
 const MISSING_TOOL_HINT: &str =
     "no ext formatter found (mke2fs or mkfs.ext*): install the e2fsprogs package";
+
+/// The checker tool name [`verify`] probes: the read-only `e2fsck` run
+/// (`-n` answers no to every repair prompt — measured read-only on this
+/// host against e2fsprogs 1.47.4 during this slice: a corrupt ext4 image's
+/// sha256 was identical before and after `e2fsck -f -n`, exit 4).
+const VERIFY_TOOL: &str = "e2fsck";
+
+/// Refusal when no usable ext checker is on `PATH`: names the tool and the
+/// package that ships it — `e2fsprogs` — in the shape of [`MISSING_TOOL_HINT`].
+const VERIFY_MISSING_TOOL_HINT: &str =
+    "no ext checker found (e2fsck): install the e2fsprogs package";
 
 /// Locate the ext formatter over `PATH` without a flavour in hand: `mke2fs`,
 /// falling back through `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` in that order.
@@ -157,6 +170,13 @@ fn path_dirs() -> Vec<PathBuf> {
 /// a binary.
 fn find_tool_in(dirs: &[PathBuf], flavour: Flavour) -> Result<(&'static str, PathBuf)> {
     probe_candidates(dirs, &[CANONICAL_TOOL, flavour.alias()])
+}
+
+/// [`verify`]'s tool resolution over an explicit directory list, so tests
+/// can point the probe at scratch directories without touching the process
+/// environment (same injection seam as [`find_tool_in`]).
+fn find_verify_tool_in(dirs: &[PathBuf]) -> Result<(&'static str, PathBuf)> {
+    probe_candidates(dirs, &[VERIFY_TOOL]).map_err(|_| verify_missing_tool_error())
 }
 
 /// Probe `names` in order over `dirs`, returning the first entry that is an
@@ -194,12 +214,12 @@ fn is_executable_file(path: &Path) -> bool {
 ///
 /// The probe flag is `-V`: the e2fsprogs family rejects `--version` as an
 /// invalid option (measured on this host against e2fsprogs 1.47.4 during
-/// this slice — exit 1 on every family member — while `-V` exits 0), so a
-/// `--version` probe would refuse the real toolchain on every host that
-/// has it; the NTFS module's `--version` shape stays over there with its
-/// own family. Output is captured and dropped — the probe only asks "are
-/// you there", never reads what came out. The stub tests pin the flag as
-/// sent.
+/// this slice — `mke2fs --version` exits 1, `e2fsck --version` exits 16,
+/// while `-V` exits 0 for both), so a `--version` probe would refuse the
+/// real toolchain on every host that has it; the NTFS module's `--version`
+/// shape stays over there with its own family. Output is captured and
+/// dropped — the probe only asks "are you there", never reads what came
+/// out. The stub tests pin the flag as sent.
 fn probe_tool(candidate: &Path) -> bool {
     Command::new(candidate)
         .arg("-V")
@@ -213,6 +233,12 @@ fn probe_tool(candidate: &Path) -> bool {
 /// "the toolchain is missing" path names the same package.
 fn missing_tool_error() -> CoreError {
     CoreError::invalid(MISSING_TOOL_HINT)
+}
+
+/// The shared checker refusal: spawn failures map onto this text too, so every
+/// "the checker is missing" path names the same package.
+fn verify_missing_tool_error() -> CoreError {
+    CoreError::invalid(VERIFY_MISSING_TOOL_HINT)
 }
 
 /// The ext flavour a format run builds: the `-t` spawn token and, as
@@ -320,8 +346,9 @@ pub struct Super {
     /// Block size in bytes from `s_log_block_size`: the mandate pins
     /// `-b 4096`, anything else is refused.
     pub block_bytes: u32,
-    /// The label `super_label` decoded from `s_volume_name`,
-    /// NUL-terminated-trimmed through the one device-text sanitiser;
+    /// The label `super_label` decoded from `s_volume_name`: the bytes
+    /// up to the first NUL, or the whole 16 bytes when the run carries
+    /// no NUL, trimmed through the one device-text sanitiser;
     /// `None` when the run is empty.
     pub label: Option<String>,
     /// Whether `s_feature_compat` carries [`HAS_JOURNAL_BIT`] — the
@@ -343,9 +370,9 @@ pub struct Super {
 /// * `s_log_block_size` (`u32` LE, `1024 << value`) encodes exactly
 ///   [`FIXED_BLOCK_BYTES`] — the mandate pins `-b 4096`, both the encoded
 ///   value and the encoded size are named on refusal;
-/// * the 16-byte `s_volume_name` run ends in a NUL: the bytes up to the
-///   first NUL are the label (empty run → no label), a run of 16 non-NUL
-///   bytes refuses.
+/// * the 16-byte `s_volume_name` run holds the label: the bytes up to
+///   the first NUL are the label (empty run → no label), and a run with
+///   no NUL at all is a full-width 16-byte label.
 ///
 /// The journal bit is parsed but not screened here — the flavour
 /// invariant is the caller's contract ([`superblock_for`]); the plain
@@ -373,7 +400,7 @@ pub fn superblock(sb: &[u8]) -> Result<Super> {
     })?;
     if magic != SUPER_MAGIC {
         return Err(CoreError::invalid(format!(
-            "the ext superblock magic is 0x{SUPER_MAGIC:04X} not 0x{magic:04X}"
+            "the ext superblock magic is 0x{magic:04X} not 0x{SUPER_MAGIC:04X}"
         )));
     }
     let log_block_size = get_u32(sb, SB_LOG_BLOCK_SIZE_AT).ok_or_else(|| {
@@ -437,10 +464,16 @@ pub fn superblock_for(sb: &[u8], flavour: Flavour) -> Result<Super> {
 }
 
 /// The 16-byte `s_volume_name` run into a label: bytes up to the first NUL
-/// are the value (all-NUL is no label at all), a run of 16 non-NUL bytes
-/// refuses — a label that never ends is not a label. The bytes decode
-/// through `String::from_utf8_lossy` and the one device-text sanitiser
+/// are the value (all-NUL is no label at all), and a run with no NUL is a
+/// full-width 16-byte label. The bytes decode through
+/// `String::from_utf8_lossy` and the one device-text sanitiser
 /// ([`device_text`]): non-ASCII becomes `?` instead of mojibake in the log.
+///
+/// A trailing space survives intact on disk and reads back intact through
+/// `e2label`/`dumpe2fs`, while `blkid` shortens it — measured with
+/// e2fsprogs 1.47.4 on this host, on-disk `RUFUS ` reports as
+/// `LABEL="RUFUS"` — so comparisons must use the on-disk field or
+/// `e2label`/`dumpe2fs`, never `blkid`.
 fn super_label(sb: &[u8]) -> Result<Option<String>> {
     let run = sb
         .get(SB_VOLUME_NAME_AT..SB_VOLUME_NAME_END)
@@ -450,14 +483,11 @@ fn super_label(sb: &[u8]) -> Result<Option<String>> {
              byte {SB_VOLUME_NAME_AT}"
             ))
         })?;
-    let Some(nul) = run.iter().position(|&byte| byte == 0) else {
-        return Err(CoreError::invalid(
-            "the ext label is 16 non-NUL bytes with no NUL terminator: the label \
-             must end inside the 16-byte s_volume_name run",
-        ));
-    };
-    let Some(bytes) = run.get(..nul) else {
-        return Err(CoreError::invalid("the ext label window vanished mid-copy"));
+    let bytes = match run.iter().position(|&byte| byte == 0) {
+        Some(nul) => run
+            .get(..nul)
+            .ok_or_else(|| CoreError::invalid("the ext label window vanished mid-copy"))?,
+        None => run,
     };
     let decoded = device_text(&String::from_utf8_lossy(bytes));
     if decoded.is_empty() {
@@ -566,6 +596,75 @@ fn format_with(
     Ok(verified)
 }
 
+/// Verify `target` with the external checker.
+///
+/// Runs `e2fsck -f -n <target>` (the target path is always the last
+/// argument) as a bounded capture — both streams piped and drained via
+/// `output()`, `LC_ALL=C` in the child environment, stdin null. Every
+/// non-empty captured line (stdout then stderr, each through the one
+/// device-text sanitiser) is logged verbatim at `Info` under the `ext`
+/// target; a failing exit becomes a refusal naming the tool, the status and
+/// the last [`MAX_TAIL_LINES`] lines of stderr followed by stdout (stderr
+/// first, then stdout, capped as one sequence — `e2fsck` reports its
+/// findings on stdout, measured on this host against e2fsprogs 1.47.4
+/// during this slice: a corrupt filesystem's `Pass 1: ...` lines went to
+/// stdout with only the version banner on stderr). Exit 0 means the
+/// filesystem is clean (measured against e2fsprogs 1.47.4 during this
+/// slice: clean image exit 0, corrupt image exit 4). The `-n` flag answers
+/// no to every repair prompt, so this never writes to the target
+/// (measured read-only on this host against e2fsprogs 1.47.4 during this
+/// slice: a corrupt ext4 image's sha256 was identical before and after
+/// `e2fsck -f -n`).
+pub fn verify(target: &Path, logger: &Logger) -> Result<()> {
+    let (tool, tool_path) = find_verify_tool_in(&path_dirs())?;
+    verify_with(target, logger, tool, &tool_path)
+}
+
+/// [`verify`] with the tool already resolved, so tests can point the run at
+/// a stub by absolute path without touching the process environment.
+fn verify_with(target: &Path, logger: &Logger, tool: &'static str, tool_path: &Path) -> Result<()> {
+    let mut command = Command::new(tool_path);
+    command.arg("-f").arg("-n").arg(target);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C");
+    // Bounded capture: `output` drains both pipes so a chatty tool cannot
+    // block on a full buffer.
+    let output = command.output().map_err(|_| verify_missing_tool_error())?;
+
+    let stdout_lines = captured_lines(&output.stdout);
+    let stderr_lines = captured_lines(&output.stderr);
+    for line in stdout_lines.iter().chain(stderr_lines.iter()) {
+        logger.log(Level::Info, "ext", line);
+    }
+
+    if !output.status.success() {
+        // The refusal tail chains stderr then stdout: `e2fsck` reports
+        // its findings on stdout (measured against e2fsprogs 1.47.4), so
+        // a stderr-only tail would read as a bare banner on a real
+        // refusal. `format_failure` caps the chained sequence at
+        // [`MAX_TAIL_LINES`].
+        let combined: Vec<String> = stderr_lines
+            .iter()
+            .chain(stdout_lines.iter())
+            .cloned()
+            .collect();
+        return Err(format_failure(tool, &output.status.to_string(), &combined));
+    }
+
+    logger.log(
+        Level::Info,
+        "ext",
+        &format!(
+            "{tool} finished ({}): verified ext filesystem clean",
+            output.status,
+        ),
+    );
+    Ok(())
+}
+
 /// Split captured output into sanitised, non-empty log lines.
 fn captured_lines(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes)
@@ -576,7 +675,9 @@ fn captured_lines(bytes: &[u8]) -> Vec<String> {
 }
 
 /// Refusal for a failing tool exit: the tool name, the status text and the
-/// last [`MAX_TAIL_LINES`] stderr lines (empty when the tool said nothing).
+/// last [`MAX_TAIL_LINES`] lines of the given sequence (empty when the tool
+/// said nothing) — the callers choose the sequence ([`format`] passes
+/// stderr only; [`verify`] passes stderr followed by stdout).
 fn format_failure(tool: &str, status: &str, stderr_lines: &[String]) -> CoreError {
     let mut tail: Vec<&str> = stderr_lines
         .iter()
@@ -709,6 +810,12 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("0xEF53"), "{text}");
         assert!(text.contains("0xEF52"), "{text}");
+        let found_at = text.find("0xEF52").expect("the found magic is named");
+        let expected_at = text.find("0xEF53").expect("the expected magic is named");
+        assert!(
+            found_at < expected_at,
+            "the found magic comes first: {text}"
+        );
     }
 
     #[test]
@@ -725,13 +832,10 @@ mod tests {
     }
 
     #[test]
-    fn superblock_refuses_a_label_without_a_nul() {
-        let buffer = synthetic_sb(false, 2, &[b'x'; LABEL_BYTES_MAX]);
-        let error = superblock(&buffer).expect_err("16 non-NUL bytes never end");
-        let text = error.to_string();
-        assert!(text.contains("the ext label"), "{text}");
-        assert!(text.contains("16"), "{text}");
-        assert!(text.contains("NUL"), "{text}");
+    fn superblock_accepts_a_full_width_label_without_a_nul() {
+        let buffer = synthetic_sb(false, 2, b"ABCDEFGHIJKLMNOP");
+        let parsed = superblock(&buffer).expect("16 non-NUL bytes are a full-width label");
+        assert_eq!(parsed.label.as_deref(), Some("ABCDEFGHIJKLMNOP"));
     }
 
     #[test]
@@ -1091,6 +1195,148 @@ mod tests {
             panic!("the error is the house io variant: {text}")
         };
         assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn verify_drives_the_stub_checker_with_force_and_read_only_flags() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let record = scratch.path().join("args");
+        let body = format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > '{}'\necho stub-stdout-line\necho stub-stderr-line >&2\nexit 0\n",
+            record.display()
+        );
+        let tool_path = write_stub(scratch.path(), "e2fsck", &body);
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, [0u8; 64]).expect("the target writes");
+        let logger = Logger::new(Level::Trace);
+
+        verify_with(&target, &logger, "e2fsck", &tool_path).expect("the stub exits 0");
+
+        let recorded = std::fs::read_to_string(&record).expect("the stub recorded");
+        // One `<%s>` group per argv element, in order: a single
+        // space-joined argument could never produce this shape, so the
+        // flags are pinned as separate elements.
+        let expected = format!("<-f><-n><{}>", target.display());
+        assert_eq!(recorded, expected);
+        let snapshot = logger.snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .all(|record| record.target == "ext" && record.level == Level::Info),
+            "every line is logged at Info under the ext target"
+        );
+        let messages: Vec<&str> = snapshot
+            .iter()
+            .map(|record| record.message.as_str())
+            .collect();
+        assert!(messages.contains(&"stub-stdout-line"), "{messages:?}");
+        assert!(messages.contains(&"stub-stderr-line"), "{messages:?}");
+        let summary = messages.last().expect("the summary is logged");
+        assert!(summary.contains("e2fsck"), "{summary}");
+        assert!(summary.contains("exit status: 0"), "{summary}");
+    }
+
+    #[test]
+    fn verify_failure_carries_the_status_and_the_tail() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let tool_path = write_stub(
+            scratch.path(),
+            "e2fsck",
+            "#!/bin/sh\necho wiping\necho\n\
+             echo l01 >&2\necho l02 >&2\necho l03 >&2\necho l04 >&2\necho l05 >&2\n\
+             echo l06 >&2\necho l07 >&2\necho l08 >&2\necho l09 >&2\necho l10 >&2\n\
+             exit 4\n",
+        );
+        // No target file is created: the run fails before any read-back.
+        let target = scratch.path().join("missing.bin");
+        let logger = Logger::new(Level::Trace);
+
+        let error =
+            verify_with(&target, &logger, "e2fsck", &tool_path).expect_err("the stub exits 4");
+        let text = error.to_string();
+        assert!(text.contains("e2fsck"), "{text}");
+        assert!(text.contains("exit status: 4"), "{text}");
+        assert!(text.contains("l10"), "{text}");
+        assert!(text.contains("l04"), "{text}");
+        assert!(!text.contains("l01"), "{text}");
+        assert!(!text.contains("l02"), "{text}");
+        assert!(!text.contains("l03"), "{text}");
+        // The stdout line is the newest entry of the chained
+        // stderr-then-stdout sequence, so it survives the 8-line cap
+        // alongside the last seven stderr lines.
+        assert!(text.contains("wiping"), "{text}");
+
+        // The stdout lines were still logged before the failure, and the
+        // blank echo never became a record.
+        let messages: Vec<String> = logger
+            .snapshot()
+            .iter()
+            .map(|record| record.message.clone())
+            .collect();
+        assert!(messages.contains(&"wiping".to_string()), "{messages:?}");
+        assert!(
+            messages.iter().all(|message| !message.is_empty()),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn verify_failure_carries_stdout_findings() {
+        // `e2fsck` reports its findings on stdout (measured against
+        // e2fsprogs 1.47.4 during this slice): a stub that writes only to
+        // stdout must still have those lines carried in the refusal.
+        // Stub behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let tool_path = write_stub(
+            scratch.path(),
+            "e2fsck",
+            "#!/bin/sh\necho 'Pass 1: Checking inodes, blocks, and sizes'\n\
+             echo 'Inode 7 has illegal block(s). Clear? no'\nexit 4\n",
+        );
+        let target = scratch.path().join("missing.bin");
+        let logger = Logger::new(Level::Trace);
+
+        let error =
+            verify_with(&target, &logger, "e2fsck", &tool_path).expect_err("the stub exits 4");
+        let text = error.to_string();
+        assert!(text.contains("e2fsck"), "{text}");
+        assert!(text.contains("exit status: 4"), "{text}");
+        assert!(
+            text.contains("Pass 1: Checking inodes, blocks, and sizes"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Inode 7 has illegal block(s). Clear? no"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn verify_refuses_a_killed_checker() {
+        // A child killed by a signal has no exit code, so
+        // `status.success()` is false and the run refuses: never `Ok`.
+        // Stub behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let tool_path = write_stub(scratch.path(), "e2fsck", "#!/bin/sh\nkill -9 $$\n");
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, [0u8; 64]).expect("the target writes");
+        let logger = Logger::new(Level::Trace);
+
+        verify_with(&target, &logger, "e2fsck", &tool_path)
+            .expect_err("a killed child is never clean");
+    }
+
+    #[test]
+    fn verify_without_a_checker_names_the_package() {
+        let error = find_verify_tool_in(&[]).expect_err("nothing can be found");
+        assert_eq!(
+            error.to_string(),
+            format!("invalid input: {VERIFY_MISSING_TOOL_HINT}"),
+            "the empty-PATH text is pinned exactly"
+        );
+        let text = error.to_string();
+        assert!(text.contains("e2fsck"), "{text}");
+        assert!(text.contains("e2fsprogs"), "{text}");
     }
 
     #[test]
