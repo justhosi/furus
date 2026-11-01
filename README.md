@@ -1,9 +1,9 @@
 # furus
 
-A Rust rewrite of Rufus, the Windows utility for making bootable USB
-drives, targeting Linux. `furus` is the workspace name used in the code
-(see `xtask`); it is a from-scratch implementation that keeps Rufus's
-on-disk formats and behaviour but none of its code.
+A clean implementation of Rufus in Rust, targeting Linux. Rufus is the
+Windows utility for making bootable USB drives. `furus` is the workspace
+name used in the code (see `xtask`); it is a from-scratch implementation
+that keeps Rufus's on-disk formats and behaviour but none of its code.
 
 The work is organised as a slice plan. The plan document itself lives
 outside this repository (module docs cite it as `rust-rewrite/PLAN.md`
@@ -17,8 +17,8 @@ A2) remain marked "proposed".
 
 ## Status
 
-The rewrite is in progress, one slice at a time. The filesystem write
-side is the most complete part:
+The implementation is in progress, one slice at a time. The filesystem
+write side is the most complete part:
 
 * FAT32 and exFAT are formatted natively by `rufus-core` - no mount, no
   external tool - with a file API (create, write, read, list,
@@ -138,7 +138,7 @@ package split).
 * `DECISIONS.md` - frozen S00 planning decisions; implementation has
   since advanced.
 * `LICENSES.md` - asset licence audit for the Rufus 4.15 resources the
-  rewrite reuses; the code licence is GPL-3.0-or-later (decision A1,
-  still proposed).
+  implementation reuses; the code licence is GPL-3.0-or-later (decision
+  A1, still proposed).
 * `assets/`, `data/`, `packaging/` and the `tests/` fixtures carry their
   own READMEs.

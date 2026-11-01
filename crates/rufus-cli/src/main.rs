@@ -319,7 +319,7 @@ impl HostPaths {
 #[command(
     name = "rufus",
     version,
-    about = "Native Linux USB/ISO writer — command line rewrite (slice S05)"
+    about = "Native Linux USB/ISO writer — command line (slice S05)"
 )]
 struct Cli {
     /// Emit machine-readable JSON for results and errors.
