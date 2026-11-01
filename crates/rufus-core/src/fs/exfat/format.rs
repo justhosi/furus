@@ -257,7 +257,7 @@ fn system_entry(
 }
 
 /// The 0x83 volume-label entry: character count then UTF-16LE units.
-fn label_entry(units: &[u16]) -> Result<[u8; ENTRY_BYTES]> {
+pub(crate) fn label_entry(units: &[u16]) -> Result<[u8; ENTRY_BYTES]> {
     if units.len() > MAX_LABEL_UNITS {
         return Err(CoreError::invalid(format!(
             "an exFAT label holds {MAX_LABEL_UNITS} characters, not {}",
@@ -277,7 +277,7 @@ fn label_entry(units: &[u16]) -> Result<[u8; ENTRY_BYTES]> {
 }
 
 /// Validate the label and return its UTF-16 units.
-fn label_units(label: Option<&str>) -> Result<Option<Vec<u16>>> {
+pub(crate) fn label_units(label: Option<&str>) -> Result<Option<Vec<u16>>> {
     let Some(label) = label else {
         return Ok(None);
     };

@@ -353,6 +353,86 @@ fn the_label_round_trips_through_exfatlabel() {
     assert!(read.combined().to_lowercase().contains("second"));
 }
 
+/// The label the API writes is the label an independent reader reads:
+/// `exfatlabel` must agree with `set_label`'s replacement of the label
+/// the formatter carried. Mirrors
+/// `the_label_round_trips_through_exfatlabel` in the API-to-tool
+/// direction.
+#[test]
+fn exfatlabel_agrees_with_the_api_set_label() {
+    if skip_without_tool("fsck.exfat", "the label acceptance test") {
+        return;
+    }
+    if skip_without_tool("exfatlabel", "the label acceptance test") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = FileVolume::path(dir.path());
+    let display = path.display().to_string();
+    formatted_image(&path, 64 * MIB, 512, Some("RUFUSVOL"));
+
+    // The API replaces the live label in place, the two-phase one-slot
+    // rewrite the unit tests pin (the deleted image first, the live
+    // image second), then flushes so the image on disk carries it.
+    let mut volume = Exfat::open(reopened(&path)).expect("the volume opens again");
+    volume
+        .set_label(Some("SECOND"))
+        .expect("the api label set lands");
+    volume.flush().expect("the volume flushes");
+    drop(volume);
+
+    let read = run_tool("exfatlabel", &[&display]).expect("exfatlabel runs");
+    assert!(
+        read.status.success(),
+        "exfatlabel failed:\n{}",
+        read.combined()
+    );
+    let text = read.combined().to_lowercase();
+    assert!(
+        text.contains("second") && !text.contains("rufusvol"),
+        "exfatlabel must read the label set_label wrote:\n{}",
+        read.combined()
+    );
+    eprintln!("exfatlabel after the api set: {}", read.combined().trim());
+}
+
+/// A byte flipped inside the checksummed boot region must refuse to
+/// open with the checksum named — the [`FileVolume`] shape of the
+/// guard the volume's unit test pins
+/// (`open_refuses_a_damaged_boot_region_checksum`). The flipped byte
+/// sits in sector 0's boot-code field: past the `EXFAT   ` signature
+/// the parser checks first, and outside the volume-flags word and
+/// PercentInUse byte the checksum excludes.
+#[test]
+fn open_refuses_a_stale_boot_checksum() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let path = FileVolume::path(dir.path());
+    // The geometry floor is 3 MiB (geometry::MIN_VOLUME_BYTES), so this
+    // is the smallest image the formatter can make.
+    formatted_image(&path, 3 * MIB, 512, None);
+    // The undamaged image opens; only the damage below may break it.
+    drop(Exfat::open(reopened(&path)).expect("the freshly formatted image opens"));
+
+    // Read eight boot bytes at a field-free offset, flip one, write the
+    // eight back: exactly one byte of the covered region changes.
+    let mut boot = read_at(&path, 128, 8);
+    boot[0] ^= 0x40;
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("the image opens");
+    file.write_all_at(&boot, 128).expect("the damage lands");
+    drop(file);
+
+    let Err(error) = Exfat::open(reopened(&path)) else {
+        panic!("a stale boot checksum must not open");
+    };
+    assert!(
+        error.to_string().contains("checksum"),
+        "the refusal names the checksum: {error}"
+    );
+}
+
 #[test]
 fn the_fsck_guard_rejects_a_damaged_boot_checksum() {
     let dir = tempfile::tempdir().expect("a temporary directory");

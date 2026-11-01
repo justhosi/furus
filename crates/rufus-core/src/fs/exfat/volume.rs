@@ -3,8 +3,8 @@
 //! [`Exfat::open`] build (or adopt) a volume, and every operation this
 //! slice owns is a method on it: `mkdir`, `create_file`, `list_dir`,
 //! `free_bytes`, `flush` plus the geometry handle. `write_at` and
-//! `read_file` joined in part B2's content half; `set_times` and
-//! `set_label` follow it.
+//! `read_file` joined in part B2's content half; `set_times` joined in
+//! B2b's stamp half, `set_label` alongside it.
 //!
 //! Design notes, the ones the implementations lean on:
 //!
@@ -54,10 +54,13 @@
 //!   and every reader accepts it). The root's reserved system entries
 //!   (0x81 bitmap, 0x82 up-case, 0x83 label) sit in front of the first
 //!   file set; they are skipped by the listing walk (only 0x85 opens a
-//!   set) and can never be overwritten, because nothing ever writes
-//!   before the terminator slot. The one 0x00 marker ends the
-//!   directory, and the slots behind it stay zero, so the set written
-//!   into the marker's slot always leaves a fresh marker after itself.
+//!   set) and are never overwritten, because nothing ever writes
+//!   before the terminator slot — `set_label`'s replacement of a live
+//!   0x83 slot is the one deliberate exception, with a fresh label
+//!   appending at the marker slot like every set. The one 0x00 marker
+//!   ends the directory, and the slots behind it stay zero, so the set
+//!   written into the marker's slot always leaves a fresh marker after
+//!   itself.
 //! * **Directory growth** adds one cluster of entry space when the set
 //!   would run past the allocation:
 //!   * a *subdirectory* extends in place when the run's next cluster
@@ -1542,6 +1545,85 @@ impl<V: Volume> Exfat<V> {
     }
 
     // ------------------------------------------------------------------
+    // Labels: set_label
+    // ------------------------------------------------------------------
+
+    /// Rewrite the volume label: `Some(name)` stores `name`, `None`
+    /// retires a label that is on the volume — and an empty label
+    /// string clears exactly like `None`, matching `format()`'s
+    /// reading of an empty label.
+    ///
+    /// The label lives only in the root directory's 0x83 slot: the
+    /// boot sector carries no label field, so this call moves no boot
+    /// byte, no FAT word, no bitmap bit and no PercentInUse value.
+    /// Nothing is allocated, so no [`Snapshot`] ledger is involved.
+    ///
+    /// Every refusal happens before the first write, so a refused call
+    /// leaves the image untouched: the label's length and characters
+    /// are validated through [`format::label_units`] first, then the
+    /// destination slot is resolved — for an append, bounded by
+    /// [`fresh_label_slot`] with the slot numbers named — before
+    /// anything moves. A live label is rewritten in its own slot, the
+    /// one root system slot this module may write before the
+    /// terminator slot; a fresh label takes over the end-of-directory
+    /// marker's slot, whose checked-zero successor becomes the marker
+    /// exactly like every other append there. Deleted label slots
+    /// (lead 0x03) are never reused, the same rule deleted sets follow.
+    ///
+    /// The one-slot write keeps the two-phase order the set rewrites
+    /// use: the deleted image goes down first and the live image makes
+    /// the label visible, so a torn window leaves either a deleted
+    /// label or the fresh one — both states every walker handles —
+    /// instead of a half-written entry.
+    pub fn set_label(&mut self, label: Option<&str>) -> Result<()> {
+        let Some(units) = format::label_units(label)? else {
+            return self.clear_label();
+        };
+        // The live image is built before any write: the label's shape
+        // above, the destination slot below — past both, only an I/O
+        // failure can still refuse, and a torn window there leaves a
+        // label-shaped slot of one whole form or the other.
+        let image = format::label_entry(&units)?;
+        let (root, listing) = self.root_listing()?;
+        // The destination slot: the live label's own slot when there is
+        // one, else the marker slot a fresh label takes over.
+        let slot = match live_label_slot(&root.content, &listing) {
+            Some(slot) => slot,
+            None => fresh_label_slot(&root.content, &listing)?,
+        };
+        let at = root.content.slot_address(&self.geometry, slot)?;
+        self.volume.write_all_at(at, &deleted_label_image()?)?;
+        self.volume.write_all_at(at, &image)?;
+        Ok(())
+    }
+
+    /// The clear half of [`Exfat::set_label`]: a live label's slot is
+    /// rewritten to the deleted image in a single write — the deleted
+    /// form is the *final* state, so there is no second phase to tear,
+    /// and a window torn inside that one write leaves either the old
+    /// live label or the deleted shape, both parseable — while a root
+    /// without a live label writes nothing at all.
+    fn clear_label(&mut self) -> Result<()> {
+        let (root, listing) = self.root_listing()?;
+        let Some(slot) = live_label_slot(&root.content, &listing) else {
+            return Ok(()); // no label on the volume: a clear is already true
+        };
+        let at = root.content.slot_address(&self.geometry, slot)?;
+        let deleted = deleted_label_image()?;
+        self.volume.write_all_at(at, &deleted)
+    }
+
+    /// The root directory's content and its parsed listing, resolved
+    /// once: the facts both label paths need — a live label's slot
+    /// inside the content, plus the marker slot and the capacity the
+    /// listing reports.
+    fn root_listing(&self) -> Result<(Level, dirent::DirListing)> {
+        let root = self.root_level()?;
+        let listing = dirent::parse_dir_listing(&root.content.bytes)?;
+        Ok((root, listing))
+    }
+
+    // ------------------------------------------------------------------
     // Internal: path resolution
     // ------------------------------------------------------------------
 
@@ -2201,6 +2283,70 @@ fn slot_image(
     let Ok(image) = <[u8; format::ENTRY_BYTES]>::try_from(window) else {
         return Err(CoreError::invalid(format!("slot {slot} is not 32 bytes")));
     };
+    Ok(image)
+}
+
+/// The root slot whose lead byte carries a *live* 0x83 label, or
+/// `None` when the root holds none. The scan reads raw lead bytes slot
+/// by slot up to the first end-of-directory marker —
+/// [`dirent::parse_dir_listing`] skips the system entries it walks
+/// over, so a label can only be found outside that listing's
+/// `entries`. A deleted label (lead 0x03, the shape a clear leaves)
+/// never matches: deleted slots are never reused, exactly like every
+/// other deleted set in this crate.
+fn live_label_slot(content: &DirContent, listing: &dirent::DirListing) -> Option<usize> {
+    (0..listing.terminator_slot).find(|slot| {
+        content.bytes.get(slot * format::ENTRY_BYTES).copied() == Some(format::ENTRY_VOLUME_LABEL)
+    })
+}
+
+/// The slot a fresh label is written into: the current end-of-directory
+/// marker's slot, with the check that a slot exists behind it AND is
+/// zeroed — the marker itself moves one slot back, and a slot holding
+/// anything else would swallow the marker. The slots behind the marker
+/// are the zeros this crate's format and growth always leave there, so
+/// either refusal fires only on a foreign image, and both name the
+/// numbers before anything is written.
+fn fresh_label_slot(content: &DirContent, listing: &dirent::DirListing) -> Result<usize> {
+    let terminator = listing.terminator_slot;
+    let behind = terminator
+        .checked_add(1)
+        .ok_or_else(|| CoreError::invalid("a label slot index overflows".to_string()))?;
+    if behind >= listing.total_slots {
+        return Err(CoreError::invalid(format!(
+            "the root directory ends at slot {terminator} of {} slots, leaving no slot \
+             behind the marker for a fresh label",
+            listing.total_slots
+        )));
+    }
+    let window = content
+        .bytes
+        .get(behind * format::ENTRY_BYTES..(behind + 1) * format::ENTRY_BYTES)
+        .ok_or_else(|| CoreError::invalid(format!("the root's slot {behind} lost its window")))?;
+    if window.iter().any(|byte| *byte != 0) {
+        return Err(CoreError::invalid(format!(
+            "the root directory ends at slot {terminator} of {} slots, but the slot behind \
+             the marker is not zeroed, so a fresh label would erase the end-of-directory \
+             marker",
+            listing.total_slots
+        )));
+    }
+    Ok(terminator)
+}
+
+/// The deleted label image: lead 0x83 with its InUse bit clear over
+/// entirely zeroed bytes — the shape a cleared label ends at, the
+/// dormant state a replaced label passes through and the lead state an
+/// appended one starts from. Every walker (this crate's
+/// [`dirent::parse_dir_listing`], the kernel driver, fsck) skips such a
+/// slot one at a time instead of parsing it.
+fn deleted_label_image() -> Result<[u8; format::ENTRY_BYTES]> {
+    let mut image = [0_u8; format::ENTRY_BYTES];
+    put_bytes(
+        &mut image,
+        0,
+        &[format::ENTRY_VOLUME_LABEL & !dirent::ENTRY_IN_USE],
+    )?;
     Ok(image)
 }
 
@@ -3709,5 +3855,302 @@ mod tests {
             "DataLength ends at the write"
         );
         assert_eq!(valid, b"payload".len() as u64, "ValidDataLength covers it");
+    }
+
+    // ------------------------------------------------------------------
+    // Labels: set_label
+    // ------------------------------------------------------------------
+
+    /// A formatted volume whose root carries a live "RUFUS" label: the
+    /// variant `set_label` replaces, clears and refuses around (the
+    /// struct-literal options mirror the format.rs label test, pinning
+    /// this fixture's own serial).
+    fn labelled() -> Exfat<VecVolume> {
+        let volume = VecVolume::new(8 * MIB, 512).expect("an eight mebibyte store");
+        let options = format::FormatOptions {
+            label: Some("RUFUS".to_string()),
+            volume_id: SERIAL,
+            cluster_bytes: None,
+        };
+        Exfat::format(volume, &options).expect("the formatter accepts this store")
+    }
+
+    /// The raw 32 bytes of the root's `slot`-th slot.
+    #[track_caller]
+    fn root_slot(volume: &Exfat<VecVolume>, slot: usize) -> [u8; 32] {
+        let root = volume.root_level().expect("the root reads");
+        let cluster_bytes = usize::try_from(volume.geometry().cluster_bytes())
+            .expect("a cluster fits this machine's usize");
+        slot_image(&root.content, cluster_bytes, slot).expect("the slot reads")
+    }
+
+    /// The root's live label entry, found the raw way the volume code
+    /// scans for it (a lead byte of 0x83 before the terminator): the
+    /// slot it sits in and its 32 bytes. The slot index pins *where* a
+    /// label landed — slot 0 on a labelled format, behind the up-case
+    /// entry after an append, at the marker after a clear.
+    #[track_caller]
+    fn live_label(volume: &Exfat<VecVolume>) -> (usize, [u8; 32]) {
+        let root = volume.root_level().expect("the root reads");
+        let listing = dirent::parse_dir_listing(&root.content.bytes).expect("the listing parses");
+        for slot in 0..listing.terminator_slot {
+            let image = root_slot(volume, slot);
+            if image[0] == format::ENTRY_VOLUME_LABEL {
+                return (slot, image);
+            }
+        }
+        panic!("the root has no live label entry");
+    }
+
+    /// The label text a 0x83 slot's bytes carry: count byte, then
+    /// UTF-16LE units.
+    fn label_text(image: &[u8]) -> String {
+        let units: Vec<u16> = (0..usize::from(image[1]))
+            .map(|step| u16::from_le_bytes([image[2 + step * 2], image[3 + step * 2]]))
+            .collect();
+        String::from_utf16(&units).expect("the label decodes")
+    }
+
+    /// A byte-copy reopen: the fixture's image, flushed, copied into a
+    /// fresh store and parsed back with `Exfat::open` — the round trip
+    /// the older reopen tests carry out inline.
+    #[track_caller]
+    fn reopened(volume: &mut Exfat<VecVolume>) -> Exfat<VecVolume> {
+        volume.flush().expect("the volume flushes");
+        let bytes = volume.volume.bytes().to_vec();
+        let mut store = VecVolume::new(8 * MIB, 512).expect("an eight mebibyte store");
+        store
+            .write_all_at(0, &bytes)
+            .expect("the image copies back");
+        Exfat::open(store).expect("the image opens")
+    }
+
+    #[test]
+    fn set_label_replaces_a_formatted_label_in_place() {
+        let mut volume = labelled();
+        volume
+            .set_label(Some("HELLO"))
+            .expect("the replacement lands");
+
+        let (slot, image) = live_label(&volume);
+        assert_eq!(slot, 0, "the live label is rewritten in its own slot");
+        assert_eq!(
+            image[0],
+            format::ENTRY_VOLUME_LABEL,
+            "the lead is a live label"
+        );
+        assert_eq!(
+            usize::from(image[1]),
+            "HELLO".encode_utf16().count(),
+            "the count byte carries the unit count"
+        );
+        assert_eq!(label_text(&image), "HELLO", "the units decode back");
+        assert!(
+            image.iter().skip(12).all(|byte| *byte == 0),
+            "past the units the slot is zero"
+        );
+
+        // The rewritten slot survives a reopen round trip, and the
+        // listing walk still ends in an empty listing (labels never list).
+        let volume = reopened(&mut volume);
+        assert!(volume.list_dir("/").expect("the root lists").is_empty());
+        assert_eq!(
+            live_label(&volume),
+            (slot, image),
+            "the replaced label round-trips"
+        );
+    }
+
+    #[test]
+    fn set_label_none_deletes_the_live_label_entry() {
+        let mut volume = labelled();
+        volume.set_label(None).expect("the clear lands");
+
+        // The old label slot is the deleted shape: lead 0x03, then zeros.
+        let image = root_slot(&volume, 0);
+        assert_eq!(
+            image[0],
+            format::ENTRY_VOLUME_LABEL & !dirent::ENTRY_IN_USE,
+            "the slot's lead carries the deleted label type"
+        );
+        assert!(
+            image[1..].iter().all(|byte| *byte == 0),
+            "count and units are zeroed"
+        );
+
+        // The walk still parses, ending at the same marker; the system
+        // entries behind the deleted slot stay in place (and never list).
+        let root = volume.root_level().expect("the root reads");
+        let listing = dirent::parse_dir_listing(&root.content.bytes).expect("the walk parses");
+        assert_eq!(
+            listing.terminator_slot, 3,
+            "the marker kept its slot behind the system entries"
+        );
+        assert_eq!(
+            root_slot(&volume, 1)[0],
+            format::ENTRY_BITMAP,
+            "the bitmap entry stayed"
+        );
+        assert_eq!(
+            root_slot(&volume, 2)[0],
+            format::ENTRY_UP_CASE,
+            "the up-case entry stayed"
+        );
+        assert_eq!(
+            listing.total_slots,
+            usize::try_from(volume.geometry().cluster_bytes()).expect("fits") / format::ENTRY_BYTES,
+            "the capacity read is the cluster's slot count"
+        );
+        assert!(
+            volume.list_dir("/").expect("the root lists").is_empty(),
+            "the system entries (and the deleted label) never list"
+        );
+
+        // And the image still opens: the bitmap is found through the walk.
+        let volume = reopened(&mut volume);
+        assert!(volume.list_dir("/").expect("the root lists").is_empty());
+    }
+
+    #[test]
+    fn set_label_appends_behind_the_system_entries_when_there_was_none() {
+        let mut volume = formatted();
+        volume
+            .set_label(Some("APPENDED"))
+            .expect("the append lands");
+
+        let (slot, image) = live_label(&volume);
+        assert_eq!(
+            slot, 2,
+            "the label took the marker's slot behind the bitmap (0) and up-case (1) entries"
+        );
+        assert_eq!(image[0], format::ENTRY_VOLUME_LABEL);
+        assert_eq!(label_text(&image), "APPENDED");
+
+        // The marker moved one slot back: the slot behind the label is
+        // the fresh end-of-directory zeros.
+        let marker = root_slot(&volume, slot + 1);
+        assert!(
+            marker.iter().all(|byte| *byte == 0),
+            "the marker moved behind the label"
+        );
+
+        // A single-slot entry behind the system entries stays walkable
+        // across a reopen, and the bitmap is still found through it.
+        let volume = reopened(&mut volume);
+        assert!(volume.list_dir("/").expect("the root lists").is_empty());
+        assert_eq!(
+            live_label(&volume),
+            (slot, image),
+            "the appended label round-trips"
+        );
+    }
+
+    #[test]
+    fn set_label_carries_the_maximum_of_eleven_characters() {
+        let mut volume = formatted();
+        let name = "ELEVENCHARS"; // eleven ASCII characters
+        volume
+            .set_label(Some(name))
+            .expect("the maximum length lands");
+
+        let (slot, image) = live_label(&volume);
+        assert!(slot >= 2, "the label sits behind the system entries");
+        assert_eq!(image[0], format::ENTRY_VOLUME_LABEL);
+        assert_eq!(
+            usize::from(image[1]),
+            name.encode_utf16().count(),
+            "every unit counted"
+        );
+        assert_eq!(label_text(&image), name, "all eleven round-trip exactly");
+    }
+
+    #[test]
+    fn set_label_refusals_move_not_a_byte() {
+        let mut volume = labelled();
+        let before = volume.volume.bytes().to_vec();
+
+        // Twelve characters: over the limit, refusing with the exact
+        // text the formatter's own label validation carries.
+        let error = volume
+            .set_label(Some("TWELVE_CHARS"))
+            .expect_err("twelve characters refuse");
+        let text = error.to_string();
+        assert!(
+            text.contains("an exFAT label holds 11 characters, this one needs 12"),
+            "the refusal quotes the limit: {text}"
+        );
+        assert!(text.is_ascii(), "refusals stay ascii: {text}");
+
+        // A forbidden character refuses with the character named.
+        let error = volume
+            .set_label(Some("BAD:NAME"))
+            .expect_err("the colon refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("an exFAT label cannot contain the character U+003A"),
+            "the refusal names the character: {text}"
+        );
+        assert!(text.is_ascii(), "refusals stay ascii: {text}");
+
+        assert_eq!(volume.volume.bytes(), &before[..], "neither refusal wrote");
+        assert_eq!(
+            label_text(&live_label(&volume).1),
+            "RUFUS",
+            "the live label is untouched"
+        );
+    }
+
+    #[test]
+    fn clearing_a_label_that_was_never_there_writes_nothing() {
+        let mut volume = formatted();
+        let before = volume.volume.bytes().to_vec();
+
+        // `None` with no live label anywhere: Ok, and not one byte moves.
+        volume.set_label(None).expect("the clear is a no-op");
+        assert_eq!(volume.volume.bytes(), &before[..], "not one byte moved");
+        // An empty string clears, matching format(): also a no-op here.
+        volume
+            .set_label(Some(""))
+            .expect("an empty label clears like None");
+        assert_eq!(
+            volume.volume.bytes(),
+            &before[..],
+            "the empty label moved nothing either"
+        );
+    }
+
+    #[test]
+    fn a_cleared_label_is_set_again_behind_the_marker() {
+        let mut volume = labelled();
+        volume.set_label(None).expect("the clear lands");
+        assert_eq!(
+            root_slot(&volume, 0)[0],
+            format::ENTRY_VOLUME_LABEL & !dirent::ENTRY_IN_USE,
+            "the old slot is left deleted"
+        );
+
+        volume
+            .set_label(Some("THIRD"))
+            .expect("the second set lands");
+        let (slot, image) = live_label(&volume);
+        assert_eq!(
+            slot, 3,
+            "the fresh label appended at the marker, not into the deleted slot 0"
+        );
+        assert_eq!(label_text(&image), "THIRD");
+        let marker = root_slot(&volume, slot + 1);
+        assert!(
+            marker.iter().all(|byte| *byte == 0),
+            "the marker moved one slot back"
+        );
+
+        // Open still succeeds — the deleted slot never blocks the walk.
+        let volume = reopened(&mut volume);
+        assert_eq!(
+            live_label(&volume),
+            (slot, image),
+            "the relabelled volume reopens"
+        );
+        assert!(volume.list_dir("/").expect("the root lists").is_empty());
     }
 }
