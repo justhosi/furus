@@ -77,17 +77,22 @@ const ATTR_END_MARKER: u32 = 0xFFFF_FFFF;
 /// claim about real tool output is involved).
 const MAX_NAME_VALUE_BYTES: u32 = 512;
 
-/// Refusal when no usable NTFS formatter is on `PATH`.
+/// Refusal when no usable NTFS formatter is on `PATH`. Package split as
+/// measured in tests/ntfs_format.rs: on Arch, `mkntfs`/`mkfs.ntfs` live
+/// in the separate `ntfsprogs` package, while Debian/Ubuntu ship them
+/// inside the `ntfs-3g` package (PLAN.md line 137's package mapping).
 const MISSING_TOOL_HINT: &str =
-    "no NTFS formatter found (mkntfs or mkfs.ntfs): install the ntfs-3g package";
+    "no NTFS formatter found (mkntfs or mkfs.ntfs): install ntfsprogs, or ntfs-3g on Debian/Ubuntu";
 
 /// Locate the NTFS formatter: `mkntfs`, falling back to `mkfs.ntfs`.
 ///
 /// Each `PATH` directory is scanned by hand (existence plus the owner execute
 /// bit — never a shell, never a `PATH` mutation), and the first candidate
 /// whose `--version` probe exits successfully wins; a candidate whose probe
-/// fails is treated as absent. The package mapping (`ntfs-3g` provides both
-/// names) follows PLAN.md line 137.
+/// fails is treated as absent. The hint names the measured package split
+/// (tests/ntfs_format.rs): on Arch the formatter tools live in `ntfsprogs`,
+/// which Debian/Ubuntu ships inside the `ntfs-3g` package named by PLAN.md
+/// line 137.
 pub fn find_tool() -> Result<&'static str> {
     find_tool_in(&path_dirs()).map(|(name, _)| name)
 }
@@ -189,6 +194,14 @@ pub struct Boot {
     pub bytes_per_sector: u32,
     /// Cluster size in bytes (sectors-per-cluster times bytes-per-sector).
     pub cluster_bytes: u32,
+    /// The volume length in bytes the VBR itself declares: the `u64` LE
+    /// total-sectors field at offset 0x28 times the parsed bytes per
+    /// sector. [`volume_label`] bounds-checks the `$MFT` record 3
+    /// window against this VBR-declared length and nothing else — not
+    /// the target's metadata stat. Zero total sectors refuse in
+    /// [`boot_sector`], and the product refusing on `u64` overflow
+    /// does too.
+    pub volume_bytes: u64,
     /// Volume serial from VBR offset 0x48.
     pub volume_serial: u64,
     /// First cluster of `$MFT` from the `u64` LE at VBR offset 0x30.
@@ -206,7 +219,11 @@ pub struct Boot {
 /// LE at 11) is 512 or 4096 — the only sizes the house
 /// [`Volume`](crate::fs::Volume) trait admits; sectors-per-cluster (`u8`
 /// at 13) is non-zero and the resulting cluster size lands in
-/// 512..=65536 bytes; the `$MFT` start cluster (`u64` LE at 0x30) is
+/// 512..=65536 bytes; the total sector count (`u64` LE at 0x28) is
+/// non-zero — the VBR's own declaration is the only volume length the
+/// label read checks against — and its product with the parsed sector
+/// size pre-computes into [`Boot::volume_bytes`], refused on `u64`
+/// overflow; the `$MFT` start cluster (`u64` LE at 0x30) is
 /// non-zero; the `0x55 0xAA` signature at 510..512. The signed-ish `u8`
 /// at 0x40 shapes the `$MFT` record size per the NTFS on-disk format,
 /// and the shape is refused when it does not produce a power of two in
@@ -214,8 +231,9 @@ pub struct Boot {
 /// product with the parsed cluster size must be such a power of two;
 /// bit 0x80 set — a byte-size exponent, record bytes 2^(256 - byte),
 /// accepted exactly for the exponents inside that window. Returns the
-/// parsed sector size, cluster size, `$MFT` start cluster and shaped
-/// `$MFT` record size, and the `u64` LE volume serial at 0x48.
+/// parsed sector size, cluster size, declared volume length, `$MFT`
+/// start cluster and shaped `$MFT` record size, and the `u64` LE
+/// volume serial at 0x48.
 ///
 /// The field reads reuse the exFAT side's checked getters — one helper set
 /// for the whole `fs` tree, no second implementation to drift. The record
@@ -260,6 +278,19 @@ pub fn boot_sector(vbr: &[u8; 512]) -> Result<Boot> {
              cluster size must be from {MIN_CLUSTER_BYTES} to {MAX_CLUSTER_BYTES} bytes"
         )));
     }
+    let total_sectors = get_u64(vbr, 0x28).ok_or_else(|| {
+        CoreError::invalid("NTFS VBR ends before the total sectors at offset 0x28")
+    })?;
+    if total_sectors == 0 {
+        return Err(CoreError::invalid(
+            "NTFS total sectors is zero: the VBR declares an empty volume",
+        ));
+    }
+    let volume_bytes = total_sectors
+        .checked_mul(u64::from(bytes_per_sector))
+        .ok_or_else(|| {
+            CoreError::invalid("NTFS total sectors times the sector size overflows a u64")
+        })?;
     let mft_start_cluster = get_u64(vbr, 0x30).ok_or_else(|| {
         CoreError::invalid("NTFS VBR ends before the $MFT start cluster at offset 0x30")
     })?;
@@ -281,6 +312,7 @@ pub fn boot_sector(vbr: &[u8; 512]) -> Result<Boot> {
     Ok(Boot {
         bytes_per_sector: u32::from(bytes_per_sector),
         cluster_bytes,
+        volume_bytes,
         volume_serial,
         mft_start_cluster,
         mft_record_bytes,
@@ -480,9 +512,12 @@ fn read_vbr(target: &Path) -> Result<[u8; 512]> {
 /// `boot` carries the verified VBR facts and drives the arithmetic — the
 /// record lives `boot.mft_start_cluster * boot.cluster_bytes` bytes into
 /// the target and record 3 at `3` records (`boot.mft_record_bytes` each)
-/// past that. The record window is bounds-checked against the target's
-/// file length (`std::fs::File::metadata`) before anything is read, and
-/// the read is one exact [`FileExt::read_exact_at`].
+/// past that. The record window is bounds-checked against the volume
+/// length the target's own VBR declares (`Boot::volume_bytes`, the total
+/// sectors at offset 0x28 times the bytes per sector) before anything is
+/// read — never the target's metadata stat — and the read is one exact
+/// [`FileExt::read_exact_at`] that io-fails when the actual target comes
+/// up short of what its VBR declared.
 ///
 /// Per the NTFS on-disk format, record 3 then must read `FILE` at 0..4
 /// and carry the update sequence array: its `u16` LE offset sits in
@@ -507,10 +542,6 @@ fn read_vbr(target: &Path) -> Result<[u8; 512]> {
 /// `Ok(None)`.
 pub fn volume_label(target: &Path, boot: &Boot) -> Result<Option<String>> {
     let file = std::fs::File::open(target).map_err(|err| CoreError::io(target, err))?;
-    let bytes = file
-        .metadata()
-        .map_err(|err| CoreError::io(target, err))?
-        .len();
 
     let record_bytes = u64::from(boot.mft_record_bytes);
     let mft_offset = boot
@@ -531,10 +562,12 @@ pub fn volume_label(target: &Path, boot: &Boot) -> Result<Option<String>> {
             "the NTFS $MFT record 3 byte offset overflows: refusing to read the volume label",
         )
     })?;
-    if record_end > bytes {
+    if record_end > boot.volume_bytes {
         return Err(CoreError::invalid(format!(
             "the NTFS $MFT record 3 at byte {record_at} needs bytes up to \
-             {record_end} but the target holds only {bytes} bytes"
+             {record_end} but the volume the VBR declares holds only \
+             {} bytes",
+            boot.volume_bytes
         )));
     }
 
@@ -848,6 +881,15 @@ mod tests {
     /// the on-disk format's negative byte-exponent 0xF6 = 2^10.
     const SYNTHETIC_RECORD_BYTES: u32 = 1024;
 
+    /// The byte length every [`write_target`] image gets: `$MFT` start
+    /// cluster times the synthetic 4096-byte clusters, plus four
+    /// records (records 0..3 with the label record last). Every
+    /// synthetic VBR's 0x28 total sectors divide this length by the
+    /// VBR's own sector size, so the declared volume length matches
+    /// the image length exactly.
+    const SYNTHETIC_TARGET_BYTES: u64 =
+        SYNTHETIC_MFT_CLUSTER * 4096 + 4 * (SYNTHETIC_RECORD_BYTES as u64);
+
     /// Where the fixup array sits in the synthetic records — the
     /// canonical position (VBR-independent) of the on-disk layout.
     const SYNTHETIC_USA_OFFSET: u16 = 48;
@@ -870,13 +912,19 @@ mod tests {
     /// `cluster_bytes`). Stub/synthetic only: pins the layout this module
     /// parses, claims nothing about real `mkntfs` output. The `$MFT`
     /// fields at 0x30/0x40 come from the [`SYNTHETIC_MFT_CLUSTER`] /
-    /// [`SYNTHETIC_RECORD_BYTES`] defaults above.
+    /// [`SYNTHETIC_RECORD_BYTES`] defaults above, and the 0x28 total
+    /// sectors divide [`SYNTHETIC_TARGET_BYTES`] by this VBR's own
+    /// sector size, so `boot_sector`'s non-zero total-sector check
+    /// accepts and the declared volume length is exact.
     fn synthetic_vbr(bytes_per_sector: u16, cluster_bytes: u32) -> [u8; 512] {
         let mut vbr = [0u8; 512];
         vbr[3..11].copy_from_slice(b"NTFS    ");
         vbr[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
         let ratio = cluster_bytes / u32::from(bytes_per_sector);
         vbr[13] = ratio as u8;
+        // Offset 0x28: the u64 LE total sectors the VBR declares.
+        vbr[0x28..0x30]
+            .copy_from_slice(&(SYNTHETIC_TARGET_BYTES / u64::from(bytes_per_sector)).to_le_bytes());
         vbr[0x30..0x38].copy_from_slice(&SYNTHETIC_MFT_CLUSTER.to_le_bytes());
         // 0xF6 = -10: the negative byte-exponent encoding of a 1024-byte
         // $MFT record (per the on-disk format; synthetic, not a tool
@@ -949,7 +997,7 @@ mod tests {
     /// record 3 once. Returns the path.
     fn write_target(scratch: &Path, record: &[u8]) -> PathBuf {
         let mft_offset = SYNTHETIC_MFT_CLUSTER * 4096;
-        let mut image = vec![0u8; (mft_offset + 4 * u64::from(SYNTHETIC_RECORD_BYTES)) as usize];
+        let mut image = vec![0u8; SYNTHETIC_TARGET_BYTES as usize];
         image[..512].copy_from_slice(&synthetic_vbr(512, 4096));
         let record_at = (mft_offset + 3 * u64::from(SYNTHETIC_RECORD_BYTES)) as usize;
         image[record_at..record_at + record.len()].copy_from_slice(record);
@@ -1018,9 +1066,11 @@ mod tests {
             assert_eq!(boot.volume_serial, SYNTHETIC_SERIAL);
             // The fixtures carry $MFT at cluster 8 with 0xF6-shaped
             // 1024-byte records; both fields round-trip through the
-            // parser.
+            // parser, and the 0x28 total sectors back out the exact
+            // byte length of the synthetic targets.
             assert_eq!(boot.mft_start_cluster, SYNTHETIC_MFT_CLUSTER);
             assert_eq!(boot.mft_record_bytes, SYNTHETIC_RECORD_BYTES);
+            assert_eq!(boot.volume_bytes, SYNTHETIC_TARGET_BYTES);
         }
     }
 
@@ -1303,6 +1353,29 @@ mod tests {
     }
 
     #[test]
+    fn boot_sector_refuses_zero_total_sectors() {
+        // Offset 0x28 zeroed: the VBR would declare an empty volume,
+        // which leaves nothing for the label read's bounds arithmetic.
+        let mut vbr = synthetic_vbr(512, 4096);
+        vbr[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());
+        let error = boot_sector(&vbr).expect_err("a zero total-sector field is refused");
+        let text = error.to_string();
+        assert!(text.contains("zero"), "{text}");
+        assert!(text.contains("empty volume"), "{text}");
+    }
+
+    #[test]
+    fn boot_sector_refuses_a_volume_length_overflow() {
+        // u64::MAX total sectors times the sector size cannot land in a
+        // u64: the pre-multiplied volume length refuses instead of
+        // wrapping the arithmetic the label read would run.
+        let mut vbr = synthetic_vbr(512, 4096);
+        vbr[0x28..0x30].copy_from_slice(&u64::MAX.to_le_bytes());
+        let error = boot_sector(&vbr).expect_err("total sectors times sector size overflows");
+        assert!(error.to_string().contains("overflow"), "{error}");
+    }
+
+    #[test]
     fn boot_sector_accepts_mft_record_shapes() {
         // Positive cluster counts that land on a power of two inside the
         // window, and negative exponents at both window edges (0xF0 =
@@ -1383,7 +1456,9 @@ mod tests {
     fn format_logs_a_failed_label_read_before_refusing() {
         // Label-READ failure after a successful stub run is a hard
         // refusal, logged at Error before it surfaces; here the VBR
-        // points $MFT beyond the target, so only the VBR verifies.
+        // points $MFT past the volume it declares, so only the VBR
+        // verifies. The refusal is the declared-volume bounds check,
+        // and the wrapper passes it through unchanged.
         let scratch = tempfile::tempdir().expect("a scratch dir");
         let tool_path = write_stub(scratch.path(), "mkntfs", "#!/bin/sh\nexit 0\n");
         let mut vbr = synthetic_vbr(512, 4096);
@@ -1436,10 +1511,12 @@ mod tests {
     }
 
     #[test]
-    fn volume_label_refuses_an_mft_beyond_the_target() {
-        // $MFT at cluster 128 of a 512-byte file: record 3 (1024 bytes)
-        // lives past the metadata length; the refusal names the byte
-        // window and the file length.
+    fn volume_label_refuses_an_mft_beyond_the_declared_volume() {
+        // $MFT at cluster 128 of a volume the VBR declares as 72 * 512 =
+        // 36864 bytes: record 3 (1024 bytes) cannot end inside that
+        // declared length, and the refusal names the byte window plus
+        // the declared volume length. The check reads the VBR's own
+        // declaration, not the 512-byte file's metadata length.
         let scratch = tempfile::tempdir().expect("a scratch dir");
         let mut vbr = synthetic_vbr(512, 4096);
         vbr[0x30..0x38].copy_from_slice(&128u64.to_le_bytes());
@@ -1447,12 +1524,43 @@ mod tests {
         std::fs::write(&target, vbr).expect("the target VBR writes");
         let boot = boot_sector(&vbr).expect("the custom VBR parses");
 
-        let error = volume_label(&target, &boot).expect_err("the $MFT lies beyond the target");
+        let error =
+            volume_label(&target, &boot).expect_err("the $MFT lies beyond the declared volume");
         let text = error.to_string();
-        // 128 * 4096 + 3 * 1024 = 527360; + 1024 = 528384.
+        eprintln!("MEASUREMENT-BOUNDS: {text}");
+        // 128 * 4096 + 3 * 1024 = 527360; + 1024 = 528384; the VBR
+        // declares 72 * 512 = 36864 bytes.
         assert!(text.contains("527360"), "{text}");
         assert!(text.contains("528384"), "{text}");
-        assert!(text.contains("512 bytes"), "{text}");
+        assert!(text.contains("36864"), "{text}");
+    }
+
+    #[test]
+    fn volume_label_refuses_a_short_file_below_the_declared_volume() {
+        // The record-3 window fits the declared volume but runs past
+        // the end of the actual 512-byte file: the bounds check passes
+        // on the VBR's declaration alone, and the exact read hits the
+        // io shortfall instead — the refusal is the house io variant,
+        // not a metadata-length refusal (no length is stat'd anymore).
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let vbr = synthetic_vbr(512, 4096);
+        let target = scratch.path().join("short-under-declared.bin");
+        std::fs::write(&target, vbr).expect("the target VBR writes");
+        let boot = boot_sector(&vbr).expect("the synthetic VBR parses");
+
+        let error =
+            volume_label(&target, &boot).expect_err("the record read runs past the file's own end");
+        let text = error.to_string();
+        eprintln!("MEASUREMENT-IO: {text}");
+        assert!(matches!(error, CoreError::Io { .. }), "{text}");
+        assert!(text.contains(&target.display().to_string()), "{text}");
+        // `read_exact_at`'s UnexpectedEof surfaces with the source's
+        // own text; the test pins the whole house shape: path + source.
+        assert!(text.contains("failed to fill whole buffer"), "{text}");
+        let CoreError::Io { source, .. } = &error else {
+            panic!("the error is the house io variant: {text}")
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

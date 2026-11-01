@@ -53,11 +53,13 @@
 //! - mkntfs accepts a loop node with or without `-F`, and the VBR it
 //!   writes carries 512-byte sectors with the requested cluster size
 //!   (00 02 01 00 for -c 512, 00 02 08 00 for -c 4096, 00 02 80 00 for
-//!   -c 65536, 00 10 10 00 for --sector-size 4096 + -c 65536). This
-//!   kernel reports the loop node's st_size as 0, so the crate's
-//!   label-read stage - which bounds-checks against the stat size -
-//!   refuses AFTER the successful mkntfs run; a test below pins that
-//!   measured product/tool integration fact.
+//!   -c 65536, 00 10 10 00 for --sector-size 4096 + -c 65536). The
+//!   label-read stage bounds-checks record 3 against the length the
+//!   volume's own VBR declares (total sectors times bytes per
+//!   sector), NOT the target's stat size (this run's loop node
+//!   statted as 0 bytes), so the wrapper completes through the loop
+//!   node - the test below pins the measured end-to-end label read
+//!   (this run's volume: 67108352 declared bytes).
 //! - `ntfsfix -n` on a freshly formatted volume: exit 0 + the lines
 //!   "Mounting volume... OK" / "Processing of $MFT and $MFTMirr
 //!   completed successfully." / "Checking the alternate boot sector...
@@ -70,20 +72,23 @@
 //!   mounts an mkntfs volume read-write inside the privileged
 //!   container, holds dirs/files written through the mount, unmounts
 //!   clean, and the volume stays ntfsfix-clean with its label intact.
-//! - The final binary run of this file measured, test by test: all
+//! - The final binary runs of this file measured, test by test: all
 //!   seven ladder steps format and read the label back at 512-byte
-//!   sectors with real non-zero serials - the first run handed the
-//!   same serial to six of the seven volumes, the second run to all
-//!   seven (the serial source is mkntfs's, and no cause is claimed
-//!   here); the raw record-3 walk
+//!   sectors - this run handed the same real non-zero serial to all
+//!   seven volumes (the serial source is mkntfs's, and no cause is
+//!   claimed here); the raw record-3 walk
 //!   found the first resident $VOLUME_NAME at record offset 360 with
-//!   its value offset 0x18; the no-label read-back stayed empty; the
-//!   Persian label agreed on both sides; the 4Kn refusal then the 4Kn
-//!   volume verified; both product-path refusals measured exactly as
-//!   documented above; and the `#[ignore]`d mount run walked through
-//!   every stage line (formatted, attached /dev/loop0, mounted
-//!   read-write with ntfs3, tree written and read back, unmounted and
-//!   detached, ntfsfix clean, label survived).
+//!   its value offset 0x18; the no-label read-back printed nothing
+//!   but one empty stdout line (od-measured in this run's container)
+//!   and the empty shape is pinned by a test below (at most one empty
+//!   line in either stream, never a word); the Persian label agreed
+//!   on both sides; the 4Kn refusal then the 4Kn volume verified; the
+//!   file-target wrapper refusal measured exactly as documented
+//!   above, and the loop-node wrapper completed with the label
+//!   verified through the node; and the `#[ignore]`d mount run walked
+//!   through every stage line (formatted, attached /dev/loop0,
+//!   mounted read-write with ntfs3, tree written and read back,
+//!   unmounted and detached, ntfsfix clean, label survived).
 
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
@@ -187,7 +192,8 @@ fn skip_without_tool(program: &str, what: &str) -> bool {
         return false;
     }
     eprintln!(
-        "skip: {what} needs {program}, which this host does not ship (install ntfs-3g and re-run)"
+        "skip: {what} needs {program}, which this host does not ship \
+         (install ntfsprogs, or ntfs-3g on Debian/Ubuntu, and re-run)"
     );
     true
 }
@@ -204,7 +210,8 @@ fn skip_without_formatter(what: &str) -> bool {
         return false;
     }
     eprintln!(
-        "skip: {what} needs mkntfs or mkfs.ntfs, which this host does not ship (install ntfs-3g and re-run)"
+        "skip: {what} needs mkntfs or mkfs.ntfs, which this host does not ship \
+         (install ntfsprogs, or ntfs-3g on Debian/Ubuntu, and re-run)"
     );
     true
 }
@@ -488,9 +495,14 @@ fn mkntfs_without_a_label_leaves_none() {
         "ntfslabel failed on a label-less volume:\n{}",
         read.combined()
     );
+    // The exact empty shape this run measures: the combined output is
+    // empty in words — `trim()` is empty and every line blank. The
+    // harness join adds one `"\n"` of its own and ntfslabel prints at
+    // most one of its own (measured: a single empty stdout line), so
+    // at most two entries in `combined().lines()`, every one blank.
     assert!(
-        read.combined().trim().is_empty(),
-        "ntfslabel must print one empty line for a label-less volume:\n{:?}",
+        read.combined().lines().count() <= 2 && read.combined().lines().all(str::is_empty),
+        "ntfslabel must print nothing but one empty line for a label-less volume:\n{:?}",
         read.combined()
     );
 }
@@ -618,11 +630,12 @@ fn a_4kn_volume_stays_readable() {
 
 // ---------------------------------------------------------------------------
 // The crate's format() wrapper itself, measured against the two target
-// shapes this environment can produce. Both refusals below are the
-// measured product/tool integration facts of slice 3: the wrapper's
-// argument set cannot satisfy mkntfs on a file, and a loop node that
-// mkntfs happily formats still fails the wrapper's own label-read
-// stage because this kernel gives the node st_size 0.
+// shapes this environment can produce: the wrapper's argument set
+// cannot satisfy mkntfs on a plain file (the measured device refusal),
+// and on a loop node - which mkntfs happily formats and which this
+// kernel gives st_size 0 - the wrapper completes, because the label
+// read checks the length the volume's own VBR declares, not the node's
+// stat size.
 // ---------------------------------------------------------------------------
 
 /// A loop-detach guard: hand out the node, detach it on every exit
@@ -679,8 +692,9 @@ fn format_refuses_a_file_target_the_way_mkntfs_does() {
         .expect_err("measured: mkntfs refuses a plain file target, so the wrapper must refuse");
     let text = error.to_string();
     assert!(
-        text.contains("mkntfs failed") && text.contains("exit status: 1"),
-        "the refusal must name the failing tool and its status:\n{text}"
+        text.contains(" failed") && text.contains("exit status: 1"),
+        "the refusal must name whichever formatter ran (mkntfs or the mkfs.ntfs alias) \
+         and its status:\n{text}"
     );
     // The tool's own refusal lines were logged verbatim (both streams),
     // and the refusal message names the status (mkntfs exits 1 here).
@@ -704,17 +718,21 @@ fn format_refuses_a_file_target_the_way_mkntfs_does() {
     eprintln!("format() on a file: refused exactly as mkntfs does");
 }
 
-/// The measured loop-target path: mkntfs DOES accept the loop node
-/// (exit 0), the wrapper's VBR half verifies, and then the wrapper's
-/// label-read stage refuses because this kernel reports the node's
-/// st_size as 0 - `volume_label` bounds-checks record 3 against the
-/// stat size and finds 0 bytes. The same volume stays ntfsfix-clean
-/// and ntfslabel-readable through the loop node, so the format really
-/// happened; only the wrapper's own read-back cannot complete.
+/// The measured loop-target path: mkntfs accepts the loop node (exit
+/// 0) and the wrapper completes — VBR verification and the label read
+/// both run through the node, because `volume_label` bounds-checks
+/// record 3 against the length the volume's own VBR declares (total
+/// sectors times bytes per sector), not against the node's stat size
+/// (which this kernel reports as 0 for loop nodes). ntfslabel through
+/// the same node reads the same label, and the volume stays
+/// ntfsfix-clean.
 #[test]
-fn format_on_a_loop_target_refuses_the_label_read() {
+fn format_on_a_loop_target_verifies_the_label_read() {
     let what = "the loop-target label-read acceptance";
-    if skip_without_formatter(what) || skip_without_tool("ntfsfix", what) {
+    if skip_without_formatter(what)
+        || skip_without_tool("ntfsfix", what)
+        || skip_without_tool("ntfslabel", what)
+    {
         return;
     }
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -725,25 +743,24 @@ fn format_on_a_loop_target_refuses_the_label_read() {
     let guard = Detached { device };
     let logger = Logger::new(Level::Trace);
     let options = Options::new(Some("RUFUS NTFS".to_string()));
-    let error = format(&loop_path, &options, &logger)
-        .expect_err("measured: the label-read stage refuses a loop node (st_size 0)");
-    let text = error.to_string();
-    assert!(
-        text.contains("$MFT record 3") && text.contains("holds only 0 bytes"),
-        "the refusal must be the stat-size bounds check, naming record 3:\n{text}"
+    let volume = format(&loop_path, &options, &logger)
+        .expect("measured: the wrapper completes label-verified on a loop node");
+    assert_eq!(
+        volume.label.as_deref(),
+        Some("RUFUS NTFS"),
+        "the wrapper must read the label it asked for, through the node: {volume:?}"
     );
-    // The run formatted the volume anyway: the loop node is
-    // ntfsfix-clean and ntfslabel reads the label it asked for.
-    assert_ntfsfix_clean(&loop_path, what);
-    let read = run_tool("ntfslabel", &[&loop_path.display().to_string()])
-        .expect("ntfslabel runs after the skip gate");
-    assert!(
-        read.status.success() && read.combined().trim() == "RUFUS NTFS",
-        "ntfslabel must read the label the wrapper's mkntfs run wrote:\n{}",
-        read.combined()
+    assert_eq!(
+        volume.boot.cluster_bytes, SMALL_IMAGE_CLUSTERS,
+        "the loop node's VBR must carry the requested cluster size"
     );
-    // And the wrapper logged its hard label-read refusal at Error
-    // before returning it (its own on-failure shape).
+    assert_ne!(
+        volume.boot.volume_serial, 0,
+        "the serial must be a real u64"
+    );
+    // The run is a real success: the wrapper logged the label-verified
+    // line and the tool summary (its own shape, not a tool claim) and
+    // never the old `could not be verified` failure line.
     let messages: Vec<String> = logger
         .snapshot()
         .iter()
@@ -752,10 +769,36 @@ fn format_on_a_loop_target_refuses_the_label_read() {
     assert!(
         messages
             .iter()
-            .any(|message| message.contains("could not be verified")),
-        "the wrapper must log the label-read failure:\n{messages:?}"
+            .any(|message| message.contains("verified NTFS volume label `RUFUS NTFS`")),
+        "the wrapper must log the verified label:\n{messages:?}"
     );
-    eprintln!("format() on a loop node: mkntfs succeeded, the label read refused (st_size 0)");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("verified NTFS volume with")),
+        "the wrapper must log the final summary:\n{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.contains("could not be verified")),
+        "no refusal stage may appear in the log:\n{messages:?}"
+    );
+    // The run formatted the volume: the loop node is ntfsfix-clean.
+    assert_ntfsfix_clean(&loop_path, what);
+    // Two independent readers agree through the loop node: the crate's
+    // walk above and the installed ntfslabel.
+    let read = run_tool("ntfslabel", &[&loop_path.display().to_string()])
+        .expect("ntfslabel runs after the skip gate");
+    assert!(
+        read.status.success() && read.combined().trim() == "RUFUS NTFS",
+        "ntfslabel must read the label through the loop node:\n{}",
+        read.combined()
+    );
+    eprintln!(
+        "format() on a loop node: completed, {} bytes of VBR-declared volume, label verified",
+        volume.boot.volume_bytes
+    );
     drop(guard);
 }
 
@@ -852,7 +895,10 @@ fn the_kernel_mounts_the_written_tree() {
     // Kernel driver first, FUSE fallback second: one of the two must
     // mount the volume read-write, and a double refusal fails the test
     // with both outputs.
-    let mount = match mount_attempt("ntfs3", &guard.device, &mountpoint) {
+    // Both match arms above bind only successful runs, so no second
+    // status assert exists here: a reach past the match is by
+    // construction a successful mount.
+    match mount_attempt("ntfs3", &guard.device, &mountpoint) {
         Ok(run) if run.status.success() => {
             eprintln!("stage: mounted read-write with ntfs3 (kernel)");
             run
@@ -875,12 +921,6 @@ fn the_kernel_mounts_the_written_tree() {
         },
         Err(err) => panic!("the ntfs3 mount could not be spawned: {err}"),
     };
-    assert!(
-        mount.status.success(),
-        "mounting {} failed: {}",
-        guard.device,
-        String::from_utf8_lossy(&mount.stderr)
-    );
 
     std::fs::create_dir(mountpoint.join("a")).expect("mkdir a through the mount");
     std::fs::create_dir(mountpoint.join("a/b")).expect("mkdir a/b through the mount");
