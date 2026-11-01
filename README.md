@@ -105,8 +105,9 @@ development host cargo lives under `~/.cargo/bin`:
     cargo test --offline --workspace
 
 The size gate builds the release binaries, enforces their per-binary
-budgets and compares them against `size-baseline.json` (it never
-rewrites the baseline):
+budgets and checks growth against `size-baseline.json` within a 4096-byte
+allowance (the same compiler emits slightly different bytes on different
+system linkers; it never rewrites the baseline):
 
     CARGO_NET_OFFLINE=true cargo xtask size
 

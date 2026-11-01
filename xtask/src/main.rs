@@ -6,8 +6,8 @@
 //! * `parity`          — validate `data/parity.csv` against `data/functions.csv`
 //! * `parity --check`  — additionally prove `data/parity.csv` is freshly
 //!   regenerated (CI gate; never dirties the tree)
-//! * `size`            — release-build, enforce budgets, compare against the
-//!   committed baseline (never writes it)
+//! * `size`            — release-build, enforce budgets, check growth
+//!   against the committed baseline within allowance (never writes it)
 //! * `size --write-baseline` — update the committed baseline (humans only)
 //! * `ci`              — run every gate in order (fmt, clippy, test, ...)
 //! * `qa`, `dist`      — honest stubs for S27 / S26
@@ -510,6 +510,16 @@ const BINARY_BUDGETS: &[BinaryBudget] = &[
     },
 ];
 
+/// How many bytes a measured binary may exceed its committed baseline
+/// before the gate calls it drift. Rust binaries are not byte-identical
+/// across systems: the same rustc 1.99.0 produced +80 bytes (`rufus`),
+/// +264 bytes (`rufus-helper`) and +32 bytes (`rufus-gui`) on the
+/// ubuntu-latest runner versus the recording host (CI run 41327026453,
+/// total +376). The allowance is far larger than that measured noise and
+/// far smaller than any real regression (a new crate or feature adds tens
+/// of kilobytes).
+const SIZE_DRIFT_ALLOWANCE: u64 = 4096;
+
 #[derive(Debug, Deserialize, PartialEq, Eq, Clone)]
 struct BaselineEntry {
     bytes: u64,
@@ -532,8 +542,12 @@ fn parse_size_baseline(text: &str) -> Result<BTreeMap<String, BaselineEntry>> {
     Ok(out)
 }
 
-/// Fail when a measured binary differs from the committed baseline, or when
-/// the baseline entry is missing or carries a different budget (stale).
+/// Fail when a measured binary grows beyond its baseline plus the
+/// committed allowance, or when the baseline entry is missing or carries
+/// a different budget (stale). Shrinkage and growth within the allowance
+/// pass: the same compiler emits slightly different bytes on different
+/// system linkers, so byte-exact equality cannot hold off the recording
+/// host.
 fn check_size_drift(
     measured: &BTreeMap<String, u64>,
     baseline: &BTreeMap<String, BaselineEntry>,
@@ -554,12 +568,14 @@ fn check_size_drift(
             );
         }
         let bytes = measured.get(spec.name).copied().unwrap_or(0);
-        if bytes != entry.bytes {
+        if bytes > entry.bytes + SIZE_DRIFT_ALLOWANCE {
             bail!(
-                "size drift for `{}`: baseline {} bytes, measured {} bytes; run `cargo xtask size --write-baseline` to update the baseline",
+                "size drift for `{}`: baseline {} bytes, measured {} bytes (growth {} bytes exceeds allowance {} bytes); run `cargo xtask size --write-baseline` to update the baseline",
                 spec.name,
                 entry.bytes,
-                bytes
+                bytes,
+                bytes.saturating_sub(entry.bytes),
+                SIZE_DRIFT_ALLOWANCE
             );
         }
     }
@@ -618,7 +634,7 @@ fn cmd_size(root: &Path, write_baseline: bool) -> Result<()> {
     )?;
     let baseline = parse_size_baseline(&text)?;
     check_size_drift(&measured, &baseline)?;
-    println!("size: matches committed baseline, all budgets OK");
+    println!("size: within committed baseline allowance, all budgets OK");
     Ok(())
 }
 
@@ -678,8 +694,9 @@ tasks:
                    validate data/parity.csv (--regenerate rewrites it in
                    place; --check proves a rewrite would change nothing)
   size [--write-baseline]
-                   release-build, enforce budgets, compare against the
-                   committed baseline (--write-baseline updates it instead)
+                   release-build, enforce budgets, check growth against the
+                   committed baseline within 4096-byte allowance
+                   (--write-baseline updates it instead)
   ci               fmt + clippy + test + assets + parity --check + size (+ deny/audit)
   qa               not implemented (S27)
   dist             not implemented (S26)"
@@ -895,10 +912,6 @@ mod tests {
 
     #[test]
     fn size_drift_detection() {
-        let measured: BTreeMap<String, u64> =
-            [("rufus".to_string(), 100), ("rufus-helper".to_string(), 90)]
-                .into_iter()
-                .collect();
         let baseline: BTreeMap<String, BaselineEntry> = [
             (
                 "rufus".to_string(),
@@ -924,19 +937,34 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        // Exact match passes; any byte difference fails.
-        let mut drifted = measured.clone();
-        drifted.insert("rufus".to_string(), 101);
-        // check_size_drift iterates BINARY_BUDGETS, so give it a full map.
-        let mut full = drifted.clone();
-        full.insert("rufus-gui".to_string(), 80);
-        assert!(check_size_drift(&full, &baseline).is_err());
-        let mut exact = measured.clone();
-        exact.insert("rufus-gui".to_string(), 80);
-        assert!(check_size_drift(&exact, &baseline).is_ok());
+        let full = |rufus_bytes: u64| -> BTreeMap<String, u64> {
+            [
+                ("rufus".to_string(), rufus_bytes),
+                ("rufus-helper".to_string(), 90),
+                ("rufus-gui".to_string(), 80),
+            ]
+            .into_iter()
+            .collect()
+        };
+        // Exact match passes; growth within the allowance passes and any
+        // shrink passes; only growth beyond the allowance fails.
+        assert!(check_size_drift(&full(100), &baseline).is_ok());
+        assert!(check_size_drift(&full(100 + SIZE_DRIFT_ALLOWANCE), &baseline).is_ok());
+        assert!(check_size_drift(&full(100 + SIZE_DRIFT_ALLOWANCE + 1), &baseline).is_err());
+        assert!(check_size_drift(&full(99), &baseline).is_ok());
         // Missing baseline entry fails.
         let mut missing = baseline.clone();
         missing.remove("rufus-gui");
-        assert!(check_size_drift(&exact, &missing).is_err());
+        assert!(check_size_drift(&full(100), &missing).is_err());
+        // Stale budget fails even when the bytes match.
+        let mut stale = baseline.clone();
+        stale.insert(
+            "rufus".to_string(),
+            BaselineEntry {
+                bytes: 100,
+                budget: 3_000_001,
+            },
+        );
+        assert!(check_size_drift(&full(100), &stale).is_err());
     }
 }
