@@ -218,7 +218,7 @@ fn serve() -> i32 {
         return 1;
     }
 
-    let connection = match zbus::blocking::Connection::system() {
+    let connection = match zbus::block_on(zbus::Connection::system()) {
         Ok(connection) => connection,
         Err(err) => {
             eprintln!(
@@ -238,10 +238,11 @@ fn serve() -> i32 {
         authorization,
         emitter,
     ));
-    if let Err(err) = connection
-        .object_server()
-        .at(dbus::OBJECT_PATH, dbus::Helper1::new(registry))
-    {
+    if let Err(err) = zbus::block_on(
+        connection
+            .object_server()
+            .at(dbus::OBJECT_PATH, dbus::Helper1::new(registry)),
+    ) {
         eprintln!(
             "rufus-helper: failed: cannot export {}: {}",
             dbus::OBJECT_PATH,
@@ -249,7 +250,7 @@ fn serve() -> i32 {
         );
         return 4;
     }
-    if let Err(err) = connection.request_name(dbus::BUS_NAME) {
+    if let Err(err) = zbus::block_on(connection.request_name(dbus::BUS_NAME)) {
         eprintln!(
             "rufus-helper: failed: cannot own {}: {}",
             dbus::BUS_NAME,
@@ -258,9 +259,18 @@ fn serve() -> i32 {
         return 4;
     }
 
-    // The connection runs its own thread; the main thread only has to
-    // stay alive (and cleanly outlive nothing — the process is killed
-    // by the service manager, which drops every session with it).
+    // The reading is that the connection keeps serving on the
+    // `block_on` helper thread once those setup calls return, so the
+    // main thread only sleeps to stay alive (the process is killed by
+    // the service manager, which drops every session with it). What was
+    // measured, on a private session bus with zbus 6.2.0 and zruntime
+    // 0.2.2: a service set up this way (`Connection::session`,
+    // `object_server().at(...)`, `request_name(...)`, each via
+    // `zbus::block_on`) still answered a method call from a second
+    // connection after setup returned while the serving thread only
+    // slept (`RESULT call returned: pong`).
+    // The probe used a private session bus only and says nothing about
+    // the system bus or polkit.
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3_600));
     }

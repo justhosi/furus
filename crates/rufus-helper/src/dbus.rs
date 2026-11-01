@@ -14,9 +14,57 @@
 //! after it — the polkit-backed [`PolkitAuthorizer`], the
 //! signal-backed [`EventEmitter`] and the exported [`Helper1`] object.
 //! The split inside this file keeps the service logic bus-free: only
-//! the second half reaches for `zbus` (`zbus::blocking::Connection`
-//! supplies both the polkit proxy and the signal channel; no direct
-//! `async-io` is needed — zbus pulls its own async-io runtime).
+//! the second half reaches for `zbus`.
+//!
+//! # The async shape (zbus 6)
+//!
+//! zbus 6 is async-only: there is no `blocking` API, and every bus
+//! call (`Connection::system`, `Proxy::new`, `call_method`,
+//! `emit_signal`, `request_name`, `ObjectServer::at`) is an `async fn`
+//! on the connection's runtime (the default `default-rt` feature, so
+//! no extra dependency). The sync internals above stay sync on
+//! purpose — [`Registry::execute`] and the [`Authorizer`] /
+//! [`EventEmitter`] traits are unchanged, with all their tests — and
+//! the bus half bridges the two worlds in one direction only:
+//!
+//! * The bus-facing [`PolkitAuthorizer`] and [`SignalEmitter`] hold a
+//!   plain async [`zbus::Connection`] and drive it with
+//!   [`zbus::block_on`] from inside their sync trait methods. That is
+//!   safe exactly because those methods always run on ordinary
+//!   `std::thread`s (the `rufus-session` worker, or the short-lived
+//!   `rufus-accept` thread below) — never on the connection's own
+//!   runtime. The never half is measured, not assumed: calling
+//!   `zbus::block_on` from a task the runtime drives panics instead of
+//!   hanging — on zbus 6.2.0 with zruntime 0.2.2 the panic (at
+//!   `zruntime-0.2.2/src/driver.rs:797:9`) reads `block_on called from
+//!   a task this runtime is running: the call would wait for the very
+//!   thread it is on` — so a misplaced call fails fast instead of
+//!   wedging the service silently.
+//! * The exported [`Helper1`] methods are `async`, so they run on the
+//!   runtime. `execute` therefore never calls the sync registry
+//!   directly: it hands the whole accept path to a `rufus-accept`
+//!   thread and awaits a [`Handoff`], a one-shot slot woken by the
+//!   thread's completion. `cancel` needs no thread — it only touches
+//!   the in-memory claim lock, performing no bus I/O at all.
+//!
+//! The deadlock rule, in one sentence: `zbus::block_on` runs only on
+//! threads the runtime does not drive, and runtime tasks never block
+//! on a thread — they `await` its [`Handoff`]. Reversing the first half
+//! (blocking the runtime on a thread whose bus calls need the runtime)
+//! would wedge the service; reversing the second (driving `block_on`
+//! from a runtime task) panics as measured above, which is why the
+//! shape is pinned this way.
+//!
+//! The serve side is measured too: a throwaway probe (not in this repo)
+//! followed the same setup shape as `serve()` —
+//! `object_server().at(...)`, `request_name(...)`, each via
+//! `zbus::block_on` — but on a private session bus
+//! (`Connection::session`; `serve()` uses `Connection::system`)
+//! under zbus 6.2.0 and zruntime 0.2.2, and a method call from a second
+//! connection still answered after the setup calls had returned while
+//! the serving thread only slept (`RESULT call returned: pong`). That
+//! probe says nothing about the system bus or polkit, which it did not
+//! exercise.
 //!
 //! # The life of a session
 //!
@@ -439,11 +487,12 @@ impl ProgressSink for SignalSink {
 /// most one accepted run, always on its own `rufus-session` thread.
 ///
 /// Every method is synchronous and blocking-safe: the bus half (5b)
-/// shares a `Registry` across `zbus::blocking::Connection` handlers
-/// (pinned `Send + Sync` by the tests below). Nothing here talks to a
-/// bus — [`Registry::new`] takes only the seams ([`Authorizer`],
-/// [`EventEmitter`]) and the shared facts (sessions root validation
-/// env).
+/// shares a `Registry` across the async [`Helper1`] handlers by way
+/// of plain worker threads (see the module docs), never by calling
+/// these methods on the runtime itself (pinned `Send + Sync` by the
+/// tests below). Nothing here talks to a bus — [`Registry::new`]
+/// takes only the seams ([`Authorizer`], [`EventEmitter`]) and the
+/// shared facts (sessions root validation env).
 pub struct Registry {
     /// Where session directories live (`Session::create`'s parameter,
     /// so unit tests point it at a scratch tempdir instead of the
@@ -749,10 +798,10 @@ const POLKIT_FLAG_ALLOW_USER_INTERACTION: u32 = 1;
 /// Kept a free function so the wire shape is unit-testable without a
 /// bus, which is the only part of a polkit check a test can pin here.
 #[must_use]
-pub fn polkit_subject(caller: &str) -> zbus::zvariant::Value<'static> {
-    let mut fields: HashMap<&str, zbus::zvariant::Value<'static>> = HashMap::new();
-    fields.insert("name", zbus::zvariant::Value::from(device_text(caller)));
-    zbus::zvariant::Value::from(("system-bus-name", fields))
+pub fn polkit_subject(caller: &str) -> zbus::Variant<'static> {
+    let mut fields: HashMap<&str, zbus::Variant<'static>> = HashMap::new();
+    fields.insert("name", zbus::Variant::from(device_text(caller)));
+    zbus::Variant::from(("system-bus-name", fields))
 }
 
 /// The verdict of a polkit `CheckAuthorization` reply
@@ -772,30 +821,34 @@ fn polkit_disk_write_verdict(reply: (bool, bool, HashMap<String, String>)) -> bo
 /// The real [`Authorizer`]: ask polkit's authority whether `caller` may
 /// run [`POLKIT_ACTION`] (S06: `auth_admin_keep`).
 ///
-/// **Where it may be called from:** the blocking proxy below runs its
-/// own little `block_on`, which zbus forbids inside an async context.
-/// [`Helper1::execute`] therefore makes the check on a plain thread and
-/// waits for the answer, never on the object server's own task.
+/// **Where it may be called from:** every bus call below is `async`
+/// and is driven with [`zbus::block_on`], which panics inside a task
+/// the connection's runtime is driving. The sync [`Registry`] path
+/// therefore runs this only on plain worker threads (the
+/// `rufus-session` worker via [`Registry::execute`], itself invoked
+/// from the `rufus-accept` thread — see [`Helper1::execute`]), never
+/// on the object server's own task.
 pub struct PolkitAuthorizer {
-    connection: zbus::blocking::Connection,
+    connection: zbus::Connection,
 }
 
 impl PolkitAuthorizer {
     /// Wrap an already-open (system) bus connection.
     #[must_use]
-    pub fn new(connection: zbus::blocking::Connection) -> Self {
+    pub fn new(connection: zbus::Connection) -> Self {
         Self { connection }
     }
-}
 
-impl Authorizer for PolkitAuthorizer {
-    fn authorize(&self, caller: &str) -> Result<bool, String> {
-        let proxy = zbus::blocking::Proxy::new(
+    /// The async body of [`Authorizer::authorize`], driven with
+    /// [`zbus::block_on`] by the sync trait method below.
+    async fn check(&self, caller: &str) -> Result<bool, String> {
+        let proxy = zbus::Proxy::new(
             &self.connection,
             POLKIT_SERVICE,
             POLKIT_PATH,
             POLKIT_INTERFACE,
         )
+        .await
         .map_err(|err| device_text(&format!("cannot reach polkit: {err}")))?;
         let details: HashMap<&str, &str> = HashMap::new();
         let reply = proxy
@@ -809,6 +862,7 @@ impl Authorizer for PolkitAuthorizer {
                     "",
                 ),
             )
+            .await
             .map_err(|err| device_text(&format!("the polkit check failed: {err}")))?;
         // `(is_authorized, is_challenge, details)` — the gate reads
         // only the verdict (see [`polkit_disk_write_verdict`]).
@@ -820,6 +874,12 @@ impl Authorizer for PolkitAuthorizer {
     }
 }
 
+impl Authorizer for PolkitAuthorizer {
+    fn authorize(&self, caller: &str) -> Result<bool, String> {
+        zbus::block_on(self.check(caller))
+    }
+}
+
 /// The outcome as the `Done` signal's argument: compact JSON, so a bus
 /// consumer needs no typed plan/outcome decoding.
 #[must_use]
@@ -828,8 +888,8 @@ pub fn outcome_json(outcome: &Outcome) -> String {
         .unwrap_or_else(|_| "{\"outcome\":\"failed\",\"code\":\"json\",\"message\":\"the outcome could not be encoded\"}".to_string())
 }
 
-/// The `total` argument's "no known size" sentinel (zvariant has no
-/// `Option<u64>`; see [`progress_args`]).
+/// The `total` argument's "no known size" sentinel (the D-Bus wire has
+/// no `Option<u64>`; see [`progress_args`]).
 pub const UNKNOWN_TOTAL: i64 = -1;
 
 /// The `percent` argument's "unknown" sentinel.
@@ -851,7 +911,7 @@ struct ProgressArgs {
 /// split out so the mapping is unit-testable without a bus).
 ///
 /// Absent sizes ride the bus as the documented `-1` sentinels
-/// (zvariant has no `Option<u64>` type, and a separate "known" boolean
+/// (the wire has no `Option<u64>` type, and a separate "known" boolean
 /// would be noise). A total too large for the `i64` wire saturates to
 /// `i64::MAX` instead of collapsing into the sentinel: an honest huge
 /// total must stay positive and distinct from "size unknown".
@@ -875,26 +935,35 @@ fn progress_args(progress: &Progress) -> ProgressArgs {
 /// [`INTERFACE_NAME`] at [`OBJECT_PATH`].
 ///
 /// The emitter is called from the `rufus-session` worker thread, never
-/// from the object server's task, so the blocking send below is the
-/// intended one (see [`PolkitAuthorizer`] for the same rule).
+/// from the object server's task, so driving the async send with
+/// [`zbus::block_on`] below is the intended one (see
+/// [`PolkitAuthorizer`] for the same rule).
 pub struct SignalEmitter {
-    connection: zbus::blocking::Connection,
+    connection: zbus::Connection,
 }
 
 impl SignalEmitter {
     /// Wrap the connection the object is exported on.
     #[must_use]
-    pub fn new(connection: zbus::blocking::Connection) -> Self {
+    pub fn new(connection: zbus::Connection) -> Self {
         Self { connection }
+    }
+
+    async fn send_async<B>(&self, signal: &'static str, body: &B) -> Result<(), String>
+    where
+        B: serde::Serialize + zbus::DynamicType,
+    {
+        self.connection
+            .emit_signal(None::<&str>, OBJECT_PATH, INTERFACE_NAME, signal, body)
+            .await
+            .map_err(|err| device_text(&format!("cannot emit {signal}: {err}")))
     }
 
     fn send<B>(&self, signal: &'static str, body: &B) -> Result<(), String>
     where
-        B: serde::Serialize + zbus::zvariant::DynamicType,
+        B: serde::Serialize + zbus::DynamicType,
     {
-        self.connection
-            .emit_signal(None::<&str>, OBJECT_PATH, INTERFACE_NAME, signal, body)
-            .map_err(|err| device_text(&format!("cannot emit {signal}: {err}")))
+        zbus::block_on(self.send_async(signal, body))
     }
 }
 
@@ -952,6 +1021,11 @@ pub fn to_dbus_error(error: &ServiceError) -> zbus::fdo::Error {
 /// session id as soon as the session exists. Because the object server
 /// dispatches method calls in order, a `Cancel` issued during that
 /// window is answered once `Execute` returns, before the first step.
+///
+/// Both methods are `async` (zbus 6 has no sync dispatch): `execute`
+/// hands the sync accept path to a short-lived `rufus-accept` thread
+/// and awaits its [`Handoff`], so the runtime task never blocks;
+/// `cancel` runs inline, touching only the in-memory claim lock.
 pub struct Helper1 {
     registry: Arc<Registry>,
 }
@@ -964,11 +1038,95 @@ impl Helper1 {
     }
 }
 
+/// A one-shot handoff from a plain worker thread to an async service
+/// method: the thread publishes its answer with [`Handoff::complete`],
+/// the method awaits it with [`Handoff::wait`], parking its task on
+/// the stored waker instead of blocking the runtime thread.
+///
+/// The parked wait is what keeps [`Helper1::execute`] deadlock-free:
+/// the `rufus-accept` thread drives its polkit bus calls with
+/// [`zbus::block_on`] on its own thread, while the runtime task
+/// sleeps until woken — neither side ever waits on the other holding
+/// the runtime. Lock poisoning is recovered like
+/// [`Registry::lock_state`]: a poisoned lock still yields its value
+/// rather than panicking the service.
+struct Handoff<T> {
+    /// The worker's answer once published.
+    slot: Mutex<Option<T>>,
+    /// The parked task's waker, registered while waiting.
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl<T> Handoff<T> {
+    /// An empty handoff, awaiting its worker's answer.
+    fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            waker: Mutex::new(None),
+        }
+    }
+
+    /// Publish the worker's answer and wake the parked task, if any.
+    /// In builds that unwind (dev and test, where the tests run), a
+    /// worker that unwound never reaches this: `execute`'s
+    /// `catch_unwind` answers for it, so every waiter wakes. The
+    /// release profile sets `panic = "abort"` (see the workspace
+    /// `Cargo.toml`), so a panicking worker in the shipped helper
+    /// aborts the service exactly as before — no containment beyond
+    /// unwinding builds is claimed here.
+    fn complete(&self, value: T) {
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(value);
+        if let Some(waker) = self
+            .waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            waker.wake();
+        }
+    }
+
+    /// The waiter's poll: the answer if published, else park with the
+    /// current waker registered. The slot is re-checked after
+    /// registering, so an answer racing the registration is never
+    /// missed (the worker's `complete` either finds the waker or lands
+    /// before the re-check).
+    fn poll(&self, context: &mut std::task::Context<'_>) -> std::task::Poll<T> {
+        if let Some(value) = self
+            .slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return std::task::Poll::Ready(value);
+        }
+        *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(context.waker().clone());
+        match self
+            .slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            Some(value) => {
+                *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                std::task::Poll::Ready(value)
+            }
+            None => std::task::Poll::Pending,
+        }
+    }
+
+    /// Wait for the worker's answer without blocking the calling
+    /// runtime thread.
+    async fn wait(&self) -> T {
+        std::future::poll_fn(|context| self.poll(context)).await
+    }
+}
+
 #[zbus::interface(name = "org.rufuslinux.Helper1")]
 impl Helper1 {
     /// Authorize the caller, then start a plan; replies with the
     /// session id.
-    fn execute(
+    async fn execute(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
         plan_json: String,
@@ -979,32 +1137,48 @@ impl Helper1 {
             ));
         };
         let caller = caller.to_string();
-        // The check may prompt, and the blocking polkit proxy must not
-        // run on the object server's task (see `PolkitAuthorizer`);
-        // hand the whole accept path to a plain thread and wait.
+        // The check may prompt, and its bus calls run under
+        // `block_on` — which must not run on the object server's task
+        // (see `PolkitAuthorizer`). Hand the whole sync accept path to
+        // a plain thread and await its handoff instead of blocking.
         let registry = Arc::clone(&self.registry);
-        let (tx, rx) = mpsc::channel();
+        let handoff = Arc::new(Handoff::new());
+        let worker = Arc::clone(&handoff);
         std::thread::Builder::new()
             .name(ACCEPT_THREAD_NAME.to_string())
             .spawn(move || {
-                let _ = tx.send(registry.execute(&caller, &plan_json));
+                // In builds that unwind (dev and test), a worker that
+                // unwound still owes the waiter an answer: without
+                // this, the `Handoff` would park the task forever. The
+                // sentence stays the one the old channel-disconnect
+                // path reported. In the release profile
+                // (`panic = "abort"`) a panicking worker aborts the
+                // service instead, exactly as before.
+                let answer = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    registry.execute(&caller, &plan_json)
+                })) {
+                    Ok(Ok(session)) => Ok(session),
+                    Ok(Err(error)) => Err(to_dbus_error(&error)),
+                    Err(_) => Err(zbus::fdo::Error::Failed(
+                        "the helper thread ended without an answer".to_string(),
+                    )),
+                };
+                worker.complete(answer);
             })
             .map_err(|err| {
                 zbus::fdo::Error::Failed(device_text(&format!("cannot start a worker: {err}")))
             })?;
-        match rx.recv() {
-            Ok(Ok(session)) => Ok(session),
-            Ok(Err(error)) => Err(to_dbus_error(&error)),
-            Err(_) => Err(zbus::fdo::Error::Failed(
-                "the helper thread ended without an answer".to_string(),
-            )),
-        }
+        handoff.wait().await
     }
 
     /// Ask the run named by `session_id` to stop. Only the connection
     /// that started the run may stop it (the sender recorded at
     /// `execute` time; see [`Registry::cancel`]).
-    fn cancel(
+    ///
+    /// Inline on the runtime task on purpose: cancelling only takes
+    /// the claim lock and sets a flag — no bus I/O, no `block_on`, so
+    /// no thread is needed.
+    async fn cancel(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
         session_id: String,
@@ -1093,6 +1267,7 @@ mod tests {
     use super::ERROR_UNKNOWN_SESSION;
     use super::EVENT_STREAM_VERSION;
     use super::EventEmitter;
+    use super::Handoff;
     use super::OBJECT_PATH;
     use super::POLKIT_ACTION;
     use super::Registry;
@@ -1977,9 +2152,75 @@ mod tests {
         assert!(registry.is_idle());
     }
 
+    // -- the Handoff (the one-shot accept bridge) ----------------------------
+
+    #[test]
+    fn handoff_complete_before_wait_returns_the_value() {
+        // The slot-already-set path: the worker answered before the
+        // waiter ever parked, so `wait` returns without blocking.
+        let handoff = Handoff::new();
+        handoff.complete(41u32);
+        let got = zbus::block_on(handoff.wait());
+        assert_eq!(got, 41u32, "an answer published before waiting is returned");
+    }
+
+    #[test]
+    fn handoff_wakes_a_waiter_parked_before_complete() {
+        // The register-then-wake path: the waiter parks first and the
+        // worker's `complete` must wake it. The worker sleeps a few
+        // tens of milliseconds so the waiter is reliably parked when
+        // it answers, without pushing the test near a second.
+        let handoff = Arc::new(Handoff::new());
+        let worker = Arc::clone(&handoff);
+        let worker_thread = std::thread::Builder::new()
+            .spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                worker.complete("late".to_string());
+            })
+            .expect("the handoff test worker spawns");
+        let got = zbus::block_on(handoff.wait());
+        worker_thread.join().expect("the handoff test worker joins");
+        assert_eq!(
+            got,
+            "late".to_string(),
+            "a parked waiter wakes with the worker's answer"
+        );
+    }
+
+    #[test]
+    fn handoff_catch_unwind_answers_a_worker_that_unwound() {
+        // Pins `Helper1::execute`'s containment where it holds (dev
+        // and test unwind; release aborts — see `Handoff::complete`):
+        // a worker that panics still answers the waiter with the
+        // disconnect sentence instead of parking it forever.
+        let handoff = Arc::new(Handoff::<Result<String, String>>::new());
+        let worker = Arc::clone(&handoff);
+        let worker_thread = std::thread::Builder::new()
+            .spawn(move || {
+                let answer: Result<String, String> = match std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| -> Result<String, String> {
+                        panic!("a worker bug in a test");
+                    }),
+                ) {
+                    Ok(Ok(session)) => Ok(session),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err("the helper thread ended without an answer".to_string()),
+                };
+                worker.complete(answer);
+            })
+            .expect("the handoff test worker spawns");
+        let got = zbus::block_on(handoff.wait());
+        worker_thread.join().expect("the handoff test worker joins");
+        assert_eq!(
+            got,
+            Err("the helper thread ended without an answer".to_string()),
+            "the unwind fallback answers with the disconnect sentence"
+        );
+    }
+
     // -- the compile-time contract -----------------------------------------
 
-    /// The bus half (5b) shares a `Registry` across blocking handlers
+    /// The bus half (5b) shares a `Registry` across async handlers
     /// and raises a `ServiceError` into a `zbus` error; both must be
     /// `Send + Sync`-grade so the wiring cannot break silently.
     #[test]

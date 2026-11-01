@@ -10,9 +10,11 @@ publish.workspace = true
 # for the geteuid root check. No clap (three flags are hand-parsed), no
 # libc.
 # S06 part 5b: src/dbus.rs uses zbus directly now — the polkit-backed
-# authorizer and the signal emitter both talk to
-# `zbus::blocking::Connection`. No direct `async-io`: nothing here
-# names the crate, and zbus pulls the runtime it needs itself.
+# authorizer and the signal emitter both talk to `zbus::Connection`
+# (async-only since zbus 6: sync call sites drive it with
+# `zbus::block_on` on plain threads, never on the runtime). No direct
+# runtime crate: nothing here names one, and zbus pulls the runtime
+# it needs itself.
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -66,13 +66,16 @@ libc = "0.2"
 # planner draws fresh per-partition unique GUIDs with `Uuid::new_v4()`
 # (feature "v4").
 uuid = { version = "1", features = ["v4"] }
-# S06 part 5b: the privileged D-Bus service. zbus 5's default features
-# ("async-io" + "blocking-api") are what the helper's src/dbus.rs uses
-# (`zbus::blocking::Connection`, whose proxy layer runs on zbus's own
-# async-io worker runtime); no version below 5 has "blocking-api".
-# No direct `async-io` dependency exists anywhere in the workspace now:
-# no crate names the crate, and zbus brings the runtime transitively.
-zbus = { version = "5" }
+# S06 part 5b: the privileged D-Bus service. zbus 6's API is
+# async-only (there is no `blocking` feature anymore): the helper
+# drives its `zbus::Connection` with `zbus::block_on` on plain
+# `std::thread`s (the default `default-rt` feature bundles the
+# runtime, so no extra dependency is needed); see
+# `crates/rufus-helper/src/dbus.rs` for the deadlock rule this shape
+# obeys.
+# No direct runtime dependency exists anywhere in the workspace now:
+# no crate names one, and zbus brings the runtime it needs itself.
+zbus = { version = "6" }
 # Internal crates (path form, so workspaces can share them exactly).
 rufus-core = { path = "crates/rufus-core" }
 rufus-proto = { path = "crates/rufus-proto" }
