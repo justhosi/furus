@@ -1,5 +1,7 @@
 //! ext2/3/4 integration: drive the external `mke2fs`/`mkfs.ext*` tool, then
-//! verify the superblock fields the mandate pins (S12, slice 2 of 3).
+//! verify the superblock fields the mandate pins and, for persistence
+//! volumes, activate Rufus's persistence mode through `debugfs`
+//! (S12, slice 2 of 3).
 //!
 //! PLAN lines 681-701 mandate ext volumes matching Rufus's options, built by
 //! shelling out to `mke2fs -q -F -t ext2|ext3|ext4 -L <label> -b 4096 -I 256`
@@ -20,18 +22,19 @@
 //! of the compatible-feature word) and our own contract (the 4096-byte block
 //! size is the mandate's `-b 4096`, the label shape is the 16-byte
 //! `s_volume_name` field, and [`superblock_for`] enforces the mandate's
-//! journal split: none for ext2, one for ext3/4). No claim is made here about
-//! real `mke2fs` or `e2fsck` output: their agreement with the mandate is
-//! slice 3's acceptance guarantee — mount and write, `e2fsck` clean, the
-//! 2 TB sparse image and the QEMU-absent caveat are slice 3's tests (PLAN
-//! lines 702-703).
+//! journal split: none for ext2, one for ext3/4). No *conformance* claim is
+//! made here about real `mke2fs`, `e2fsck` or `debugfs` output; their
+//! agreement with the mandate rests on measurements taken on this host
+//! against e2fsprogs 1.47.4 (each cited where the tool is driven), while
+//! mount and write, the 2 TB sparse image and the QEMU-absent caveat stay
+//! acceptance tests beyond this slice (PLAN lines 702-703).
 //!
 //! Deferred with notes, per the `fs::ntfs` S21 precedent: the optional
 //! `libext2fs` e2fsprogs feature of PLAN lines 696-698 (the A5 fallback for
-//! distros that forbid external tools) stays documented-not-implemented, as
-//! do the persistence activation of PLAN lines 695-697 (the label plus
-//! `/persistence.conf` files) and `debugfs`; the `e2fsck -f -n`
-//! verification of PLAN line 700 ships in this slice.
+//! distros that forbid external tools) stays documented-not-implemented.
+//! The persistence activation of PLAN lines 695-697 (the label plus
+//! `/persistence.conf`, written through `debugfs`) and the `e2fsck -f -n`
+//! verification of PLAN line 700 ship in this slice.
 //!
 //! Test discipline: every test drives `#!/bin/sh` stubs or synthetic
 //! superblocks and claims nothing about real `mke2fs` output; the layout the
@@ -45,6 +48,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::error::CoreError;
 use crate::error::Result;
@@ -138,6 +145,40 @@ const VERIFY_TOOL: &str = "e2fsck";
 const VERIFY_MISSING_TOOL_HINT: &str =
     "no ext checker found (e2fsck): install the e2fsprogs package";
 
+/// The persistence label: with `persistence` set, the volume label must be
+/// exactly this (Rufus names the live-boot persistence volume `persistence`,
+/// PLAN lines 695-697), enforced by [`effective_label`] before any tool runs.
+const PERSISTENCE_LABEL: &str = "persistence";
+
+/// The persistence flag file inside the volume: Rufus's live boot reads
+/// `/persistence.conf` carrying [`PERSISTENCE_CONF_BYTES`].
+const PERSISTENCE_CONF_PATH: &str = "/persistence.conf";
+
+/// The exact bytes `/persistence.conf` must carry: `/ union` plus a newline
+/// (8 bytes; Rufus's persistence mode reads this file for the union
+/// directive).
+const PERSISTENCE_CONF_BYTES: [u8; 8] = *b"/ union\n";
+
+/// The read-only request that proves the persistence write: run without
+/// `-w`, its captured stdout must equal [`PERSISTENCE_CONF_BYTES`] exactly —
+/// exit status alone is no proof (see [`activate_persistence`]).
+const PERSISTENCE_CONF_CAT: &str = "cat /persistence.conf";
+
+/// The persistence-writer tool [`activate_persistence`] probes: `debugfs`
+/// carries the `write` and `cat` requests (measured with e2fsprogs 1.47.4).
+const WRITER_TOOL: &str = "debugfs";
+
+/// Refusal when no usable persistence writer is on `PATH`: names the tool
+/// and the package that ships it — `e2fsprogs` — in the shape of
+/// [`MISSING_TOOL_HINT`].
+const WRITER_MISSING_TOOL_HINT: &str =
+    "no ext persistence writer found (debugfs): install the e2fsprogs package";
+
+/// Staging filename prefix inside [`std::env::temp_dir`]: the suffix carries
+/// the process id, a nanosecond timestamp and a per-process counter (see
+/// [`stage_persistence_source`]).
+const STAGE_NAME_PREFIX: &str = "rufus-persistence-";
+
 /// Locate the ext formatter over `PATH` without a flavour in hand: `mke2fs`,
 /// falling back through `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` in that order.
 ///
@@ -177,6 +218,14 @@ fn find_tool_in(dirs: &[PathBuf], flavour: Flavour) -> Result<(&'static str, Pat
 /// environment (same injection seam as [`find_tool_in`]).
 fn find_verify_tool_in(dirs: &[PathBuf]) -> Result<(&'static str, PathBuf)> {
     probe_candidates(dirs, &[VERIFY_TOOL]).map_err(|_| verify_missing_tool_error())
+}
+
+/// [`activate_persistence`]'s tool resolution over an explicit directory
+/// list, so tests can point the probe at scratch directories without
+/// touching the process environment (same injection seam as
+/// [`find_tool_in`]).
+fn find_writer_in(dirs: &[PathBuf]) -> Result<(&'static str, PathBuf)> {
+    probe_candidates(dirs, &[WRITER_TOOL]).map_err(|_| writer_missing_tool_error())
 }
 
 /// Probe `names` in order over `dirs`, returning the first entry that is an
@@ -241,6 +290,12 @@ fn verify_missing_tool_error() -> CoreError {
     CoreError::invalid(VERIFY_MISSING_TOOL_HINT)
 }
 
+/// The shared writer refusal: spawn failures map onto this text too, so every
+/// "the writer is missing" path names the same package.
+fn writer_missing_tool_error() -> CoreError {
+    CoreError::invalid(WRITER_MISSING_TOOL_HINT)
+}
+
 /// The ext flavour a format run builds: the `-t` spawn token and, as
 /// [`Flavour::alias`], the `mkfs.` alias the probe accepts — the same word
 /// by design. The journal split goes with the flavour: ext2 carries no
@@ -296,8 +351,9 @@ pub struct Options {
     /// Volume label passed as `mke2fs -L`; `None` omits the flag entirely.
     /// Validated by [`Options::with_label`]: at most 16 bytes of ASCII.
     pub label: Option<String>,
-    /// The slice-2 persistence switch (label plus `/persistence.conf`,
-    /// PLAN lines 695-697); this slice only gives it a place to live.
+    /// The persistence switch (label plus `/persistence.conf`,
+    /// PLAN lines 695-697); [`format`] enforces the `persistence` label and
+    /// writes the flag file through `debugfs` when this is set.
     pub persistence: bool,
 }
 
@@ -474,6 +530,12 @@ pub fn superblock_for(sb: &[u8], flavour: Flavour) -> Result<Super> {
 /// e2fsprogs 1.47.4 on this host, on-disk `RUFUS ` reports as
 /// `LABEL="RUFUS"` — so comparisons must use the on-disk field or
 /// `e2label`/`dumpe2fs`, never `blkid`.
+///
+/// The read-back above passes through [`device_text`], which trims: a
+/// trailing-space label reads back shortened by our own reader too. The
+/// persistence label check therefore compares against the no-space label
+/// `persistence`, and callers must never compare [`Super::label`] to a
+/// trailing-space [`Options::label`] for equality.
 fn super_label(sb: &[u8]) -> Result<Option<String>> {
     let run = sb
         .get(SB_VOLUME_NAME_AT..SB_VOLUME_NAME_END)
@@ -497,6 +559,34 @@ fn super_label(sb: &[u8]) -> Result<Option<String>> {
     }
 }
 
+/// Resolve the label [`format`] passes as `mke2fs -L`, enforcing the
+/// persistence label rule before any tool runs.
+///
+/// With `persistence` unset the options' label passes through untouched
+/// (`None` omits `-L`). With `persistence` set the label must be
+/// [`PERSISTENCE_LABEL`]: `None` resolves to it (the formatter passes
+/// `-L persistence` itself), while a conflicting `Some` refuses — naming the
+/// conflict and the required label — before any `mke2fs`/`debugfs`
+/// invocation, so a refusal never touches the caller's volume. The conflict
+/// text runs through the one device-text sanitiser, so the refusal stays
+/// ASCII even for a hand-built non-ASCII label.
+fn effective_label(options: &Options) -> Result<Option<String>> {
+    if !options.persistence {
+        return Ok(options.label.clone());
+    }
+    match options.label.as_deref() {
+        None => Ok(Some(PERSISTENCE_LABEL.to_string())),
+        Some(PERSISTENCE_LABEL) => Ok(Some(PERSISTENCE_LABEL.to_string())),
+        Some(conflict) => {
+            let conflict = device_text(conflict);
+            Err(CoreError::invalid(format!(
+                "ext persistence needs the label `persistence` but the options carry \
+                 `{conflict}`: pass no label or the `persistence` label (refusing before any tool runs)"
+            )))
+        }
+    }
+}
+
 /// Format `target` as ext with the external formatter.
 ///
 /// Runs `mke2fs -q -F -t <flavour> [-L <label>] -b 4096 -I 256
@@ -510,7 +600,18 @@ fn super_label(sb: &[u8]) -> Result<Option<String>> {
 /// target; a failing exit becomes a refusal naming the tool, the status and
 /// the last [`MAX_TAIL_LINES`] stderr lines. On success the summary is the
 /// snapshot's final line and the verified fields come back as a [`Super`].
+///
+/// With `persistence` set, the label rule is enforced before any tool runs
+/// (see [`effective_label`]: a conflicting label refuses without touching
+/// the volume, an absent label becomes `-L persistence`), and after the
+/// `mke2fs` read-back [`activate_persistence`] writes `/persistence.conf`
+/// through `debugfs`, proves the write by reading the bytes back, and
+/// re-checks the on-disk label — any of those steps can still refuse after
+/// the volume was formatted.
 pub fn format(target: &Path, options: &Options, logger: &Logger) -> Result<Super> {
+    // The label rule runs before the probe: a refusal must not even run
+    // `mke2fs -V`, let alone format the caller's volume.
+    effective_label(options)?;
     let (tool, tool_path) = find_tool_in(&path_dirs(), options.flavour)?;
     format_with(target, options, logger, tool, &tool_path)
 }
@@ -524,13 +625,32 @@ fn format_with(
     tool: &'static str,
     tool_path: &Path,
 ) -> Result<Super> {
+    format_with_in(target, options, logger, tool, tool_path, &path_dirs())
+}
+
+/// [`format_with`] with the persistence-writer probe directories injected,
+/// so tests can point the writer probe at scratch directories without
+/// touching the process environment (same seam as [`find_writer_in`]).
+/// Production passes the real `PATH` directories.
+fn format_with_in(
+    target: &Path,
+    options: &Options,
+    logger: &Logger,
+    tool: &'static str,
+    tool_path: &Path,
+    writer_dirs: &[PathBuf],
+) -> Result<Super> {
+    // The label rule runs before the formatter spawns: a conflicting label
+    // refuses here, before any `mke2fs`/`debugfs` invocation, so the
+    // caller's volume is never touched by a refusal.
+    let label = effective_label(options)?;
     let mut command = Command::new(tool_path);
     command
         .arg("-q")
         .arg("-F")
         .arg("-t")
         .arg(options.flavour.as_str());
-    if let Some(label) = options.label.as_deref() {
+    if let Some(label) = label.as_deref() {
         command.arg("-L").arg(label);
     }
     command
@@ -560,11 +680,8 @@ fn format_with(
     // cannot block on a full buffer.
     let output = command.output().map_err(|_| missing_tool_error())?;
 
-    let stdout_lines = captured_lines(&output.stdout);
     let stderr_lines = captured_lines(&output.stderr);
-    for line in stdout_lines.iter().chain(stderr_lines.iter()) {
-        logger.log(Level::Info, "ext", line);
-    }
+    log_captured_lines(logger, &output);
 
     if !output.status.success() {
         return Err(format_failure(
@@ -575,6 +692,54 @@ fn format_with(
     }
 
     let verified = superblock_for(&read_superblock(target)?, options.flavour)?;
+    if !options.persistence {
+        log_format_summary(
+            logger,
+            tool,
+            &output.status.to_string(),
+            options.flavour,
+            &verified,
+        );
+        return Ok(verified);
+    }
+    // Persistence tail: the writer probe runs only now, after `mke2fs`
+    // succeeded (a missing `debugfs` refuses with the volume otherwise
+    // formatted; the stub tests pin this order).
+    let (writer, writer_path) = find_writer_in(writer_dirs)?;
+    activate_persistence(target, logger, writer, &writer_path)?;
+    // Label read-back defence: the on-disk label must still be
+    // `persistence` after the `debugfs` write.
+    let final_verified = superblock_for(&read_superblock(target)?, options.flavour)?;
+    if final_verified.label.as_deref() != Some(PERSISTENCE_LABEL) {
+        let found = match final_verified.label.as_deref() {
+            Some(name) => format!("`{name}`"),
+            None => "missing".to_string(),
+        };
+        return Err(CoreError::invalid(format!(
+            "persistence label read-back is {found} not `persistence`: the on-disk label \
+             must stay `persistence` after the debugfs write"
+        )));
+    }
+    log_format_summary(
+        logger,
+        tool,
+        &output.status.to_string(),
+        options.flavour,
+        &final_verified,
+    );
+    Ok(final_verified)
+}
+
+/// Log the format success summary at `Info` under the `ext` target: the
+/// tool, its exit, the flavour, the block size, the label and the journal
+/// presence — the snapshot's final line on every successful [`format`].
+fn log_format_summary(
+    logger: &Logger,
+    tool: &str,
+    status: &str,
+    flavour: Flavour,
+    verified: &Super,
+) {
     let label_text = match &verified.label {
         Some(name) => format!("label `{name}`"),
         None => "no label".to_string(),
@@ -588,12 +753,211 @@ fn format_with(
         Level::Info,
         "ext",
         &format!(
-            "{tool} finished ({}): verified {} superblock with {} byte blocks, \
+            "{tool} finished ({status}): verified {flavour} superblock with {} byte blocks, \
              {label_text} and {journal_text}",
-            output.status, options.flavour, verified.block_bytes,
+            verified.block_bytes,
         ),
     );
-    Ok(verified)
+}
+
+/// Per-process counter disambiguating staged files that share a timestamp
+/// (parallel format runs in one process, coarse host clocks).
+static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Stage [`PERSISTENCE_CONF_BYTES`] in a unique file under the process
+/// temporary directory and return its path; the caller deletes it on both
+/// the success and failure paths (see [`activate_persistence`]).
+///
+/// Uniqueness is process id plus a nanosecond timestamp plus a per-process
+/// counter, created with `create_new` so a collision refuses instead of
+/// clobbering: the id separates formatter processes, the timestamp
+/// separates successive calls, and the counter separates calls that land in
+/// the same timestamp (parallel threads, coarse clocks). Even a pathological
+/// reuse (a recycled process id inside one shared timestamp) can only fail
+/// the staging, never overwrite another run's bytes. `tempfile` stays a
+/// dev-dependency: nothing is added to `[dependencies]` for this.
+fn stage_persistence_source() -> Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|span| span.as_nanos())
+        .map_err(|error| {
+            CoreError::invalid(format!(
+                "the system clock reads before the Unix epoch so no unique staged \
+                 persistence name can be built: {error}"
+            ))
+        })?;
+    let counter = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "{STAGE_NAME_PREFIX}{}-{nanos}-{counter}.conf",
+        std::process::id()
+    );
+    let path = std::env::temp_dir().join(name);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| {
+            use std::io::Write as _;
+            file.write_all(&PERSISTENCE_CONF_BYTES)
+        })
+        .map_err(|error| CoreError::io(&path, error))?;
+    Ok(path)
+}
+
+/// Build the `debugfs -R` write request for a staged path, quoting the
+/// native path (a bare path with spaces fails as
+/// `write: Usage: write <native file> <new file>` — measured with e2fsprogs
+/// 1.47.4, exit still 0).
+///
+/// A staged path holding `"` or a newline is refused instead of escaped:
+/// `debugfs` honours no quoting of `"` — backslash-escaped, single-quoted
+/// and raw forms all die as `debugfs: Unbalanced quotes in command line`
+/// (measured with e2fsprogs 1.47.4, exit still 0) — and a newline would turn
+/// the single `-R` request into several lines on a parser outside any
+/// contract (a quoted newline happened to write on this host, but the shape
+/// is version-fragile and would split the logged transcript). Refusing keeps
+/// the request one ASCII line the tool either runs whole or never sees.
+fn staged_write_request(staged: &Path) -> Result<String> {
+    let text = staged.to_str().ok_or_else(|| {
+        CoreError::invalid(
+            "the staged persistence path is not UTF-8 so no debugfs write request can \
+             name it: refusing before any tool runs",
+        )
+    })?;
+    if text.contains('"') || text.contains('\n') {
+        return Err(CoreError::invalid(format!(
+            "the staged persistence path `{}` holds a double quote or newline the \
+             debugfs write request cannot quote: refusing before any tool runs",
+            device_text(text)
+        )));
+    }
+    Ok(format!("write \"{text}\" {PERSISTENCE_CONF_PATH}"))
+}
+
+/// Write and prove `/persistence.conf` through an already-resolved `debugfs`.
+///
+/// Stages [`PERSISTENCE_CONF_BYTES`] in a unique file under the process
+/// temporary directory (see [`stage_persistence_source`]), runs
+/// `debugfs -w -R "write \"<staged>\" /persistence.conf" <target>`, and
+/// deletes the staged file on both the success and failure paths. The write
+/// exit status is not a success contract — `debugfs` exits 0 even when the
+/// write fails (measured with e2fsprogs 1.47.4: `write: Ext2 file already
+/// exists` and `write: File not found by ext2_lookup` both exit 0) — so
+/// success is only the read-back: `debugfs -R "cat /persistence.conf"`
+/// `<target>` (no `-w`, read-only) must exit 0 with its captured stdout
+/// exactly equal to the staged bytes (measured with e2fsprogs 1.47.4: the
+/// `cat` run returns exactly those 8 bytes on stdout, the version banner on
+/// stderr). Anything else is a refusal naming `debugfs`, the status (or the
+/// byte mismatch) and the last at most [`MAX_TAIL_LINES`] lines of the
+/// diagnostic streams. Every non-empty captured line of both runs is logged
+/// verbatim at `Info` under the `ext` target; the byte comparison runs on
+/// the raw captured stdout, never on the line-split sanitised view.
+fn activate_persistence(
+    target: &Path,
+    logger: &Logger,
+    writer: &str,
+    writer_path: &Path,
+) -> Result<()> {
+    let staged = stage_persistence_source()?;
+    let request = match staged_write_request(&staged) {
+        Ok(request) => request,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    };
+    let mut write = Command::new(writer_path);
+    write.arg("-w").arg("-R").arg(&request).arg(target);
+    write
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C");
+    // Bounded capture, as in [`format`]: `output` drains both pipes so a
+    // chatty tool cannot block on a full buffer.
+    let write_output = match write.output() {
+        Ok(output) => output,
+        Err(_) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(writer_missing_tool_error());
+        }
+    };
+    let _ = std::fs::remove_file(&staged);
+    log_captured_lines(logger, &write_output);
+    if !write_output.status.success() {
+        return Err(format_failure(
+            writer,
+            &write_output.status.to_string(),
+            &combined_tail(&write_output),
+        ));
+    }
+    let mut cat = Command::new(writer_path);
+    cat.arg("-R").arg(PERSISTENCE_CONF_CAT).arg(target);
+    cat.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C");
+    let cat_output = cat.output().map_err(|_| writer_missing_tool_error())?;
+    log_captured_lines(logger, &cat_output);
+    if !cat_output.status.success() {
+        return Err(format_failure(
+            writer,
+            &cat_output.status.to_string(),
+            &combined_tail(&cat_output),
+        ));
+    }
+    if cat_output.stdout != PERSISTENCE_CONF_BYTES {
+        return Err(persistence_mismatch(writer, &cat_output));
+    }
+    Ok(())
+}
+
+/// Log every non-empty captured line of a tool run (stdout then stderr,
+/// each through the one device-text sanitiser) verbatim at `Info` under the
+/// `ext` target — the shared transcript shape of [`format`], [`verify`] and
+/// the persistence writer.
+fn log_captured_lines(logger: &Logger, output: &std::process::Output) {
+    let stdout_lines = captured_lines(&output.stdout);
+    let stderr_lines = captured_lines(&output.stderr);
+    for line in stdout_lines.iter().chain(stderr_lines.iter()) {
+        logger.log(Level::Info, "ext", line);
+    }
+}
+
+/// Chain a writer run's stderr lines then its stdout lines for a refusal
+/// tail: `debugfs` splits its transcript the way `e2fsck` does (the version
+/// banner and the errors on stderr, request notes like `Allocated inode: N`
+/// on stdout — measured with e2fsprogs 1.47.4), so a stderr-only tail would
+/// drop half the transcript. [`format_failure`] caps the chained sequence
+/// at [`MAX_TAIL_LINES`].
+fn combined_tail(output: &std::process::Output) -> Vec<String> {
+    captured_lines(&output.stderr)
+        .into_iter()
+        .chain(captured_lines(&output.stdout))
+        .collect()
+}
+
+/// Refusal for a persistence read-back that is not exactly
+/// [`PERSISTENCE_CONF_BYTES`]: names `debugfs`, the flag file, the expected
+/// and found byte counts with a sanitised preview of what came back, and the
+/// last at most [`MAX_TAIL_LINES`] lines of the diagnostic streams (the
+/// preview runs through the one device-text sanitiser, so the refusal stays
+/// ASCII whatever bytes the tool returned).
+fn persistence_mismatch(writer: &str, output: &std::process::Output) -> CoreError {
+    let preview = device_text(&String::from_utf8_lossy(&output.stdout));
+    let combined = combined_tail(output);
+    let tail = capped_tail(&combined);
+    let report = format!(
+        "{writer} read-back mismatch on {PERSISTENCE_CONF_PATH}: expected {} bytes \
+         `/ union` plus newline but got {} bytes `{preview}`",
+        PERSISTENCE_CONF_BYTES.len(),
+        output.stdout.len(),
+    );
+    if tail.is_empty() {
+        CoreError::invalid(format!("{report} with no diagnostic output"))
+    } else {
+        CoreError::invalid(format!("{report}: {}", tail.join("; ")))
+    }
 }
 
 /// Verify `target` with the external checker.
@@ -634,11 +998,7 @@ fn verify_with(target: &Path, logger: &Logger, tool: &'static str, tool_path: &P
     // block on a full buffer.
     let output = command.output().map_err(|_| verify_missing_tool_error())?;
 
-    let stdout_lines = captured_lines(&output.stdout);
-    let stderr_lines = captured_lines(&output.stderr);
-    for line in stdout_lines.iter().chain(stderr_lines.iter()) {
-        logger.log(Level::Info, "ext", line);
-    }
+    log_captured_lines(logger, &output);
 
     if !output.status.success() {
         // The refusal tail chains stderr then stdout: `e2fsck` reports
@@ -646,12 +1006,11 @@ fn verify_with(target: &Path, logger: &Logger, tool: &'static str, tool_path: &P
         // a stderr-only tail would read as a bare banner on a real
         // refusal. `format_failure` caps the chained sequence at
         // [`MAX_TAIL_LINES`].
-        let combined: Vec<String> = stderr_lines
-            .iter()
-            .chain(stdout_lines.iter())
-            .cloned()
-            .collect();
-        return Err(format_failure(tool, &output.status.to_string(), &combined));
+        return Err(format_failure(
+            tool,
+            &output.status.to_string(),
+            &combined_tail(&output),
+        ));
     }
 
     logger.log(
@@ -677,20 +1036,28 @@ fn captured_lines(bytes: &[u8]) -> Vec<String> {
 /// Refusal for a failing tool exit: the tool name, the status text and the
 /// last [`MAX_TAIL_LINES`] lines of the given sequence (empty when the tool
 /// said nothing) — the callers choose the sequence ([`format`] passes
-/// stderr only; [`verify`] passes stderr followed by stdout).
-fn format_failure(tool: &str, status: &str, stderr_lines: &[String]) -> CoreError {
-    let mut tail: Vec<&str> = stderr_lines
+/// stderr only; [`verify`] and the persistence writer pass stderr followed
+/// by stdout).
+fn format_failure(tool: &str, status: &str, tail_lines: &[String]) -> CoreError {
+    let tail = capped_tail(tail_lines);
+    if tail.is_empty() {
+        CoreError::invalid(format!("{tool} failed ({status}) with no error output"))
+    } else {
+        CoreError::invalid(format!("{tool} failed ({status}): {}", tail.join("; ")))
+    }
+}
+
+/// The last at most [`MAX_TAIL_LINES`] entries of a diagnostic sequence,
+/// oldest first — the shared cap behind every tool refusal tail.
+fn capped_tail(lines: &[String]) -> Vec<&str> {
+    let mut tail: Vec<&str> = lines
         .iter()
         .rev()
         .take(MAX_TAIL_LINES)
         .map(String::as_str)
         .collect();
     tail.reverse();
-    if tail.is_empty() {
-        CoreError::invalid(format!("{tool} failed ({status}) with no error output"))
-    } else {
-        CoreError::invalid(format!("{tool} failed ({status}): {}", tail.join("; ")))
-    }
+    tail
 }
 
 /// Read bytes 0..4096 of `target` — the first-block region where the
@@ -1363,5 +1730,450 @@ mod tests {
             assert!(text.contains("clear"), "{text}");
             assert!(text.contains("requires one"), "{text}");
         }
+    }
+
+    /// Persistence options with the given label (or none): the struct
+    /// fields are set directly so a conflicting label needs no
+    /// [`Options::with_label`] round-trip.
+    fn persistence_options(label: Option<&str>) -> Options {
+        Options {
+            flavour: Flavour::Ext4,
+            label: label.map(str::to_string),
+            persistence: true,
+        }
+    }
+
+    /// Write an executable `#!/bin/sh` stub `mke2fs` that appends one
+    /// `printf '<%s>' "$@"` line per invocation to `log`, so a test can
+    /// assert the exact argv it received.
+    fn write_recording_mke2fs(dir: &Path, log: &Path) -> PathBuf {
+        let body = format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" >> '{}'\nprintf '\\n' >> '{}'\nexit 0\n",
+            log.display(),
+            log.display()
+        );
+        write_stub(dir, "mke2fs", &body)
+    }
+
+    /// Write an executable `#!/bin/sh` stub `debugfs` that appends one
+    /// `printf '<%s>' "$@"` line per invocation to `log` (including the
+    /// `-V` probe), answers every `cat /persistence.conf` request by
+    /// printing `cat_body` on stdout, and exits 0 for everything — the
+    /// honest shape of the real tool's lying exit status. `cat_body` is a
+    /// shell `printf` payload without `%` or quotes: `"/ union\\n"` for the
+    /// real bytes, `"WRONG\\n"` for wrong bytes, `""` for an empty reply.
+    fn write_debugfs_stub(dir: &Path, log: &Path, cat_body: &str) -> PathBuf {
+        let body = format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" >> '{}'\nprintf '\\n' >> '{}'\n\
+             if [ \"$2\" = 'cat /persistence.conf' ]; then\nprintf '{cat_body}'\nfi\nexit 0\n",
+            log.display(),
+            log.display()
+        );
+        write_stub(dir, "debugfs", &body)
+    }
+
+    /// Read a stub argv log back as one entry per invocation line.
+    fn stub_log_lines(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .expect("the stub recorded")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Pull the staged path out of a recorded writer line of the shape
+    /// `<-w><-R><write "<staged>" /persistence.conf><target>>`, and assert
+    /// the staged file is already gone (the run deletes it on every path).
+    fn staged_path_from_write_line(line: &str, target: &Path) -> PathBuf {
+        let prefix = "<-w><-R><write \"";
+        let suffix = format!("\" /persistence.conf><{}>", target.display());
+        let rest = line
+            .strip_prefix(prefix)
+            .expect("the write request opens quoted");
+        let staged = rest
+            .strip_suffix(&suffix)
+            .expect("the write request names the flag file and the target");
+        let path = PathBuf::from(staged);
+        assert!(
+            !path.exists(),
+            "the staged file is gone after the run: {}",
+            path.display()
+        );
+        path
+    }
+
+    #[test]
+    fn effective_label_resolves_the_persistence_rule() {
+        // Plain options pass through untouched.
+        let plain = effective_label(&Options::new(Flavour::Ext4)).expect("no label, no rule");
+        assert_eq!(plain, None);
+        let labeled = effective_label(
+            &Options::new(Flavour::Ext2)
+                .with_label("RUFUS")
+                .expect("the label is valid"),
+        )
+        .expect("plain labels pass through");
+        assert_eq!(labeled.as_deref(), Some("RUFUS"));
+
+        // Persistence with no label resolves to the mandated one.
+        let resolved =
+            effective_label(&persistence_options(None)).expect("None becomes persistence");
+        assert_eq!(resolved.as_deref(), Some("persistence"));
+
+        // Persistence with the mandated label passes through.
+        let kept = effective_label(&persistence_options(Some("persistence")))
+            .expect("the mandated label passes");
+        assert_eq!(kept.as_deref(), Some("persistence"));
+
+        // Persistence with a conflicting label refuses, naming both.
+        let error = effective_label(&persistence_options(Some("RUFUS-X")))
+            .expect_err("a conflicting label refuses");
+        let text = error.to_string();
+        assert!(text.contains("persistence"), "{text}");
+        assert!(text.contains("RUFUS-X"), "{text}");
+
+        // The refusal stays ASCII even for a hand-built non-ASCII label.
+        let mut nasty = persistence_options(None);
+        nasty.label = Some("RUFU\u{4e2d}S".to_string());
+        let error = effective_label(&nasty).expect_err("non-ASCII conflicts refuse");
+        assert!(error.to_string().is_ascii(), "{error}");
+    }
+
+    #[test]
+    fn staged_write_request_quotes_but_never_invents_escaping() {
+        let plain = staged_write_request(Path::new("/tmp/rufus-persistence-1-2-3.conf"))
+            .expect("a plain path quotes");
+        assert_eq!(
+            plain,
+            "write \"/tmp/rufus-persistence-1-2-3.conf\" /persistence.conf"
+        );
+        // Spaces ride inside the quotes.
+        let spaced = staged_write_request(Path::new("/tmp/with space/staged.conf"))
+            .expect("a spaced path quotes");
+        assert_eq!(
+            spaced,
+            "write \"/tmp/with space/staged.conf\" /persistence.conf"
+        );
+        // A double quote or a newline refuses: debugfs honours no escaping
+        // for the first (measured `Unbalanced quotes`), and the second
+        // would split the single `-R` request.
+        for bad in ["/tmp/quo\"te.conf", "/tmp/new\nline.conf"] {
+            let error =
+                staged_write_request(Path::new(bad)).expect_err("unsafe staged paths refuse");
+            let text = error.to_string();
+            assert!(text.contains("refusing before any tool runs"), "{text}");
+            assert!(text.is_ascii(), "{text}");
+        }
+    }
+
+    #[test]
+    fn staging_writes_the_exact_flag_bytes_under_unique_names() {
+        let first = stage_persistence_source().expect("staging writes");
+        let second = stage_persistence_source().expect("staging writes again");
+        assert_ne!(first, second, "successive stages never share a name");
+        let bytes = std::fs::read(&first).expect("the staged file reads");
+        assert_eq!(bytes, b"/ union\n", "exactly the 8 flag bytes");
+        assert!(
+            first
+                .file_name()
+                .expect("the staged path has a name")
+                .to_str()
+                .expect("the staged name is UTF-8")
+                .starts_with(STAGE_NAME_PREFIX),
+            "staged names carry the house prefix: {}",
+            first.display()
+        );
+        std::fs::remove_file(&first).expect("cleanup");
+        std::fs::remove_file(&second).expect("cleanup");
+        assert!(!first.exists() && !second.exists());
+    }
+
+    #[test]
+    fn writer_probe_finds_debugfs_and_names_the_package_when_absent() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let writer_log = scratch.path().join("writer.log");
+        let stub = write_debugfs_stub(scratch.path(), &writer_log, "/ union\\n");
+        let (name, path) = find_writer_in(&probe_dirs(scratch.path())).expect("the stub probes");
+        assert_eq!(name, "debugfs");
+        assert_eq!(path, stub);
+        // The probe itself is the one `-V` line in the stub log.
+        assert_eq!(stub_log_lines(&writer_log), ["<-V>".to_string()]);
+
+        let error = find_writer_in(&[]).expect_err("nothing can be found");
+        assert_eq!(
+            error.to_string(),
+            format!("invalid input: {WRITER_MISSING_TOOL_HINT}"),
+            "the empty-PATH text is pinned exactly"
+        );
+
+        // A stub whose version check fails is absent, same package text.
+        let failing = tempfile::tempdir().expect("a scratch dir");
+        write_stub(failing.path(), "debugfs", "#!/bin/sh\nexit 1\n");
+        let error =
+            find_writer_in(&probe_dirs(failing.path())).expect_err("the failing probe is absent");
+        assert!(error.to_string().contains("e2fsprogs"), "{error}");
+    }
+
+    #[test]
+    fn persistence_writes_the_flag_file_through_debugfs() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let mke_log = scratch.path().join("mke.log");
+        let tool_path = write_recording_mke2fs(scratch.path(), &mke_log);
+        let writer_log = scratch.path().join("writer.log");
+        write_debugfs_stub(scratch.path(), &writer_log, "/ union\\n");
+        // The stub `mke2fs` never touches the target bytes: the target
+        // carries the synthetic ext4 superblock the read-backs verify.
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, synthetic_sb(true, 2, b"persistence"))
+            .expect("the synthetic target writes");
+        let logger = Logger::new(Level::Trace);
+        let options = persistence_options(None);
+
+        let verified = format_with_in(
+            &target,
+            &options,
+            &logger,
+            "mke2fs",
+            &tool_path,
+            &probe_dirs(scratch.path()),
+        )
+        .expect("persistence with no label activates");
+        assert_eq!(verified.label.as_deref(), Some("persistence"));
+        assert_eq!(verified.block_bytes, FIXED_BLOCK_BYTES);
+        assert!(verified.has_journal);
+
+        // No label in the options, yet `-L persistence` reaches the stub:
+        // the formatter fills the mandated label in itself.
+        let mke_lines = stub_log_lines(&mke_log);
+        assert_eq!(mke_lines.len(), 1, "{mke_lines:?}");
+        assert_eq!(
+            mke_lines[0],
+            format!(
+                "<-q><-F><-t><ext4><-L><persistence><-b><4096><-I><256>\
+                 <-E><lazy_itable_init=0,lazy_journal_init=0><{}>",
+                target.display()
+            ),
+            "the label flag and the -E set are pinned exactly"
+        );
+
+        // The writer ran twice through the real probe seam: the `-V`
+        // probe, the quoted write, and the read-back cat, each argv
+        // pinned exactly.
+        let writer_lines = stub_log_lines(&writer_log);
+        assert_eq!(writer_lines.len(), 3, "{writer_lines:?}");
+        assert_eq!(writer_lines[0], "<-V>");
+        let staged = staged_path_from_write_line(&writer_lines[1], &target);
+        assert_eq!(
+            writer_lines[1],
+            format!(
+                "<-w><-R><write \"{}\" /persistence.conf><{}>",
+                staged.display(),
+                target.display()
+            ),
+        );
+        assert_eq!(
+            writer_lines[2],
+            format!("<-R><cat /persistence.conf><{}>", target.display()),
+        );
+
+        // The summary names the persistence label.
+        let messages: Vec<String> = logger
+            .snapshot()
+            .iter()
+            .map(|record| record.message.clone())
+            .collect();
+        let summary = messages.last().expect("the summary is logged");
+        assert!(summary.contains("label `persistence`"), "{summary}");
+    }
+
+    #[test]
+    fn persistence_refuses_a_conflicting_label_before_any_tool_runs() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let mke_log = scratch.path().join("mke.log");
+        let tool_path = write_recording_mke2fs(scratch.path(), &mke_log);
+        let target = scratch.path().join("volume.bin");
+        let logger = Logger::new(Level::Trace);
+        let options = persistence_options(Some("RUFUS-X"));
+
+        let error = format_with_in(
+            &target,
+            &options,
+            &logger,
+            "mke2fs",
+            &tool_path,
+            &probe_dirs(scratch.path()),
+        )
+        .expect_err("a conflicting label refuses");
+        let text = error.to_string();
+        assert!(text.contains("persistence"), "{text}");
+        assert!(text.contains("RUFUS-X"), "{text}");
+        assert!(
+            !mke_log.exists(),
+            "the stub formatter never ran, not even its probe: the refusal precedes every tool invocation"
+        );
+
+        // The public entry refuses the same way even with the real
+        // toolchain on PATH: the label rule precedes the probe.
+        let error = format(&target, &options, &logger).expect_err("format refuses before probing");
+        let text = error.to_string();
+        assert!(text.contains("persistence"), "{text}");
+        assert!(text.contains("RUFUS-X"), "{text}");
+    }
+
+    #[test]
+    fn persistence_refuses_when_the_write_leaves_nothing_behind() {
+        // The stub exits 0 for everything (the real tool's lying shape)
+        // but the `cat` reply is empty: the read-back proof must refuse.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let mke_log = scratch.path().join("mke.log");
+        let tool_path = write_recording_mke2fs(scratch.path(), &mke_log);
+        let writer_log = scratch.path().join("writer.log");
+        write_debugfs_stub(scratch.path(), &writer_log, "");
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, synthetic_sb(true, 2, b"persistence"))
+            .expect("the synthetic target writes");
+        let logger = Logger::new(Level::Trace);
+
+        let error = format_with_in(
+            &target,
+            &persistence_options(None),
+            &logger,
+            "mke2fs",
+            &tool_path,
+            &probe_dirs(scratch.path()),
+        )
+        .expect_err("an empty read-back refuses");
+        let text = error.to_string();
+        assert!(text.contains("debugfs"), "{text}");
+        assert!(text.contains("persistence.conf"), "{text}");
+        assert!(text.contains("mismatch"), "{text}");
+        assert!(text.contains("got 0 bytes"), "{text}");
+
+        // The staged file is gone even on the refused path.
+        let writer_lines = stub_log_lines(&writer_log);
+        assert_eq!(writer_lines.len(), 3, "{writer_lines:?}");
+        staged_path_from_write_line(&writer_lines[1], &target);
+    }
+
+    #[test]
+    fn persistence_refuses_when_the_read_back_returns_wrong_bytes() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let mke_log = scratch.path().join("mke.log");
+        let tool_path = write_recording_mke2fs(scratch.path(), &mke_log);
+        let writer_log = scratch.path().join("writer.log");
+        write_debugfs_stub(scratch.path(), &writer_log, "WRONG\\n");
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, synthetic_sb(true, 2, b"persistence"))
+            .expect("the synthetic target writes");
+        let logger = Logger::new(Level::Trace);
+
+        let error = format_with_in(
+            &target,
+            &persistence_options(None),
+            &logger,
+            "mke2fs",
+            &tool_path,
+            &probe_dirs(scratch.path()),
+        )
+        .expect_err("a wrong read-back refuses");
+        let text = error.to_string();
+        assert!(text.contains("debugfs"), "{text}");
+        assert!(text.contains("persistence.conf"), "{text}");
+        assert!(text.contains("mismatch"), "{text}");
+        assert!(text.contains("got 6 bytes"), "{text}");
+        assert!(text.contains("WRONG"), "{text}");
+
+        // The staged file is gone even on the refused path.
+        let writer_lines = stub_log_lines(&writer_log);
+        assert_eq!(writer_lines.len(), 3, "{writer_lines:?}");
+        staged_path_from_write_line(&writer_lines[1], &target);
+    }
+
+    #[test]
+    fn persistence_without_a_writer_names_e2fsprogs() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let mke_log = scratch.path().join("mke.log");
+        let tool_path = write_recording_mke2fs(scratch.path(), &mke_log);
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, synthetic_sb(true, 2, b"persistence"))
+            .expect("the synthetic target writes");
+        let logger = Logger::new(Level::Trace);
+
+        let error = format_with_in(
+            &target,
+            &persistence_options(None),
+            &logger,
+            "mke2fs",
+            &tool_path,
+            &[],
+        )
+        .expect_err("no writer on PATH refuses");
+        let text = error.to_string();
+        assert!(text.contains("debugfs"), "{text}");
+        assert!(text.contains("e2fsprogs"), "{text}");
+
+        // The formatter ran first: the volume is otherwise formatted but
+        // the call still refuses.
+        let mke_lines = stub_log_lines(&mke_log);
+        assert_eq!(mke_lines.len(), 1, "{mke_lines:?}");
+        assert!(mke_lines[0].contains("<-L><persistence>"), "{mke_lines:?}");
+    }
+
+    #[test]
+    fn plain_formatting_never_touches_debugfs() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let mke_log = scratch.path().join("mke.log");
+        let tool_path = write_recording_mke2fs(scratch.path(), &mke_log);
+        // A stub `debugfs` that records any invocation at all (even the
+        // `-V` probe): the plain path must leave its log unwritten.
+        let writer_log = scratch.path().join("writer.log");
+        write_debugfs_stub(scratch.path(), &writer_log, "/ union\\n");
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, synthetic_sb(true, 2, b"RUFUS-EXT4-TEST"))
+            .expect("the synthetic target writes");
+        let logger = Logger::new(Level::Trace);
+
+        format_with_in(
+            &target,
+            &Options::new(Flavour::Ext4),
+            &logger,
+            "mke2fs",
+            &tool_path,
+            &probe_dirs(scratch.path()),
+        )
+        .expect("plain formatting succeeds");
+        assert!(
+            !writer_log.exists(),
+            "no debugfs invocation at all, not even a probe, on the plain path"
+        );
+    }
+
+    #[test]
+    fn persistence_refuses_when_the_label_read_back_differs() {
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let mke_log = scratch.path().join("mke.log");
+        let tool_path = write_recording_mke2fs(scratch.path(), &mke_log);
+        let writer_log = scratch.path().join("writer.log");
+        write_debugfs_stub(scratch.path(), &writer_log, "/ union\\n");
+        // The stub `debugfs` cannot rewrite the target, so the on-disk
+        // label stays foreign through a byte-perfect `cat` proof: the
+        // read-back defence is what refuses.
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, synthetic_sb(true, 2, b"RUFUS-EXT4-TEST"))
+            .expect("the synthetic target writes");
+        let logger = Logger::new(Level::Trace);
+
+        let error = format_with_in(
+            &target,
+            &persistence_options(None),
+            &logger,
+            "mke2fs",
+            &tool_path,
+            &probe_dirs(scratch.path()),
+        )
+        .expect_err("a foreign on-disk label refuses");
+        let text = error.to_string();
+        assert!(text.contains("persistence"), "{text}");
+        assert!(text.contains("RUFUS-EXT4-TEST"), "{text}");
     }
 }

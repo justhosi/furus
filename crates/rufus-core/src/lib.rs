@@ -24,9 +24,11 @@
 //!   ext2/3/4 integration under [`fs::ext`] (S12) probes and drives the
 //!   external `mke2fs`/`mkfs.ext*` tool under the same A4 rule and
 //!   verifies the superblock fields the mandate pins (4096-byte blocks,
-//!   the NUL-terminated label, the journal bit); persistence, `e2fsck`
-//!   verification and the mount/2 TB/QEMU acceptance tests are the
-//!   following S12 slices.
+//!   the label field read up to the first NUL or the full 16 bytes, the
+//!   journal bit), the `e2fsck -f -n` check, and the persistence mode
+//!   (label `persistence` plus `/persistence.conf` holding `/ union`);
+//!   the mount-and-write, 2 TB sparse-image and QEMU persistence-boot
+//!   acceptance tests are the next slice.
 //! * [`log`] — [`Logger`](log::Logger): an `Arc`-shared in-memory ring
 //!   (10,000 records) with level filtering and an optional append-only
 //!   file sink; UTC timestamps without a date/time dependency.
