@@ -37,13 +37,19 @@
 //! 0.001 s + fsck 0.003 s; 2 GiB format 0.003 s + fsck 0.010 s; 2 TiB
 //! format 0.027 s + fsck 0.002 s (the sparse file is never materialised).
 
+mod common;
+
+use common::Mounted;
+use common::is_root;
+use common::pattern;
+use common::read_at;
+use common::run_tool_plain as run_tool;
 use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::process::ExitStatus;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -122,29 +128,6 @@ impl Volume for FileVolume {
     }
 }
 
-/// Result of running one external tool.
-struct ToolRun {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-impl ToolRun {
-    fn combined(&self) -> String {
-        format!("{}\n{}", self.stdout, self.stderr)
-    }
-}
-
-/// Run `program` with `args`, or `None` when the program is missing.
-fn run_tool(program: &str, args: &[&str]) -> Option<ToolRun> {
-    let output = Command::new(program).args(args).output().ok()?;
-    Some(ToolRun {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
-
 /// Print the skip line for a missing tool and answer whether it is gone.
 fn skip_without_tool(program: &str, what: &str) -> bool {
     // Presence, not a version verdict: `fsck.exfat -V` exits 16 on this
@@ -170,15 +153,6 @@ fn formatted_image(path: &Path, total: u64, sector_size: u32, label: Option<&str
         cluster_bytes: None,
     };
     format(&mut volume, &options).expect("the image formats")
-}
-
-/// Read `len` bytes at `offset` from the image.
-fn read_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
-    let file = std::fs::File::open(path).expect("the image opens");
-    let mut buffer = vec![0u8; len];
-    file.read_exact_at(&mut buffer, offset)
-        .expect("the read works");
-    buffer
 }
 
 /// Run `fsck.exfat -n` and refuse anything that is not a clean verdict.
@@ -535,11 +509,6 @@ fn a_written_tree_stays_fsck_clean() {
     assert_fsck_clean(&path);
 }
 
-/// A deterministic byte pattern, so a mismatch points at the exact offset.
-fn pattern(len: usize) -> Vec<u8> {
-    (0..len).map(|index| (index % 251) as u8).collect()
-}
-
 #[test]
 fn written_files_keep_their_bytes_and_stay_fsck_clean() {
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -791,30 +760,6 @@ fn a_refused_create_after_a_root_growth_keeps_the_image_fsck_clean() {
 // loop device reads the written tree back. Mirrors the FAT32 sibling
 // `fat32_format.rs::the_kernel_mounts_the_written_tree` in shape.
 // ---------------------------------------------------------------------------
-
-/// The loop-device guard: attach the image, hand out the node, and
-/// detach it on every exit path.
-struct Mounted {
-    device: String,
-    mountpoint: PathBuf,
-}
-
-impl Drop for Mounted {
-    fn drop(&mut self) {
-        let _ = Command::new("umount").arg(&self.mountpoint).status();
-        let _ = Command::new("losetup").args(["-d", &self.device]).status();
-    }
-}
-
-fn is_root() -> bool {
-    // euid 0 is the only thing that can mount; a non-root run reports a
-    // skip rather than pretending the check passed.
-    std::fs::metadata("/proc/self").is_ok()
-        && Command::new("id")
-            .arg("-u")
-            .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
-}
 
 /// The kernel acceptance: a real exfat mount of the tree this crate
 /// wrote, read back through the mounted path. Needs root and a loop

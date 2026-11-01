@@ -90,12 +90,19 @@
 //!   mounted read-write with ntfs3, tree written and read back,
 //!   unmounted and detached, ntfsfix clean, label survived).
 
-use std::fs::OpenOptions;
-use std::os::unix::fs::FileExt;
+mod common;
+
+use common::Mounted;
+use common::ToolRun;
+use common::attach_loop;
+use common::is_root;
+use common::pattern;
+use common::read_at;
+use common::run_tool;
+use common::sparse_image;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::process::ExitStatus;
 
 use rufus_core::fs::ntfs::Boot;
 use rufus_core::fs::ntfs::Options;
@@ -127,58 +134,15 @@ const VOLUME_NAME_TYPE: u32 = 0x0000_0060;
 const END_MARKER_TYPE: u32 = 0xFFFF_FFFF;
 
 // ---------------------------------------------------------------------------
-// The image double + external-tool harness, copied across from
-// tests/exfat_format.rs (and tests/fat32_format.rs), minimised: mkntfs
-// targets a filesystem path, so the suite needs only a sparse file -
-// no `Volume` implementation at all.
+// The image double: mkntfs targets a filesystem path, so the suite needs
+// only a sparse file ([`common::sparse_image`]) - no `Volume`
+// implementation at all. The captured tool run, byte reader, loop
+// guard and root probe live in tests/common/mod.rs too.
 // ---------------------------------------------------------------------------
-
-/// Create `path` (or truncate it) as a sparse image of `total` bytes:
-/// `set_len` on a fresh file is a hole, not a write, so a 128 MiB image
-/// costs almost nothing on disk before the formatter touches it.
-fn sparse_image(path: &Path, total: u64) {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(path)
-        .expect("the sparse image opens");
-    file.set_len(total).expect("the sparse image extends");
-}
 
 /// The sparse image path under a scratch directory.
 fn image_path(dir: &Path) -> PathBuf {
     dir.join("ntfs.img")
-}
-
-/// One captured invocation of an external tool (spawned with a C
-/// locale, like the crate's own formatter run), both streams verbatim.
-struct ToolRun {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-impl ToolRun {
-    fn combined(&self) -> String {
-        format!("{}\n{}", self.stdout, self.stderr)
-    }
-}
-
-/// Run `program` with `args`, or `None` when the program could not be
-/// spawned at all (the everyday reason: it is not on this host's PATH).
-fn run_tool(program: &str, args: &[&str]) -> Option<ToolRun> {
-    let output = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
-    Some(ToolRun {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
 }
 
 /// The skip gate for tools the suite drives directly (`ntfsfix`,
@@ -241,15 +205,6 @@ fn mkntfs_forced(
     args.push(path.display().to_string());
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     run_tool("mkntfs", &borrowed)
-}
-
-/// Read `len` bytes at `offset` from the image.
-fn read_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
-    let file = std::fs::File::open(path).expect("the image opens");
-    let mut buffer = vec![0u8; len];
-    file.read_exact_at(&mut buffer, offset)
-        .expect("the read works");
-    buffer
 }
 
 /// The crate's boot_sector over the real VBR bytes of `target`: the
@@ -315,12 +270,6 @@ fn u16_le(bytes: &[u8], at: usize) -> u16 {
 /// A `u32` LE field at `at` of a raw on-disk window.
 fn u32_le(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-}
-
-/// A deterministic byte pattern, so a mismatch points at the exact
-/// offset (the mounted-tree check reuses it).
-fn pattern(len: usize) -> Vec<u8> {
-    (0..len).map(|index| (index % 251) as u8).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -650,26 +599,6 @@ impl Drop for Detached {
     }
 }
 
-/// Attach `path` as a fresh loop device and return the node string.
-/// `--direct-io=off` matches the siblings' mount bookkeeping: the
-/// image is page-cached. The CALLER owns exactly one detach path from
-/// here on - wrap in [`Detached`] or [`Mounted`], never both.
-fn attach_loop(path: &Path, what: &str) -> String {
-    let attached = Command::new("losetup")
-        .args(["--find", "--show", "--direct-io=off"])
-        .arg(path)
-        .output()
-        .expect("losetup runs");
-    assert!(
-        attached.status.success(),
-        "losetup failed ({what}): {}",
-        String::from_utf8_lossy(&attached.stderr)
-    );
-    let device = String::from_utf8_lossy(&attached.stdout).trim().to_owned();
-    assert!(!device.is_empty(), "losetup printed no node ({what})");
-    device
-}
-
 /// The measured refusal on the crate's file-target path: mkntfs
 /// (v2026.9.28, driven by the crate's own spawn: bounded capture, C
 /// locale, `-f [-L] -c` order) rejects a non-block target, so
@@ -816,30 +745,6 @@ fn format_on_a_loop_target_verifies_the_label_read() {
 // write a tree through the mounted path, unmount, then re-verify the
 // image with the crate readers and ntfsfix.
 // ---------------------------------------------------------------------------
-
-/// The loop mount guard: attach (via [`attach_loop`]), track the
-/// mountpoint, and on every exit path unmount and detach.
-struct Mounted {
-    device: String,
-    mountpoint: PathBuf,
-}
-
-impl Drop for Mounted {
-    fn drop(&mut self) {
-        let _ = Command::new("umount").arg(&self.mountpoint).status();
-        let _ = Command::new("losetup").args(["-d", &self.device]).status();
-    }
-}
-
-fn is_root() -> bool {
-    // euid 0 is the only identity that can mount; a non-root run
-    // reports a skip rather than pretending the check passed.
-    std::fs::metadata("/proc/self").is_ok()
-        && Command::new("id")
-            .arg("-u")
-            .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
-}
 
 /// Mount with filesystem type `kind` and capture the run.
 fn mount_attempt(

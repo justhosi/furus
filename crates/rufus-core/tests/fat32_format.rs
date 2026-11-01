@@ -31,6 +31,10 @@
 //! formatter publishes is informational — it contains no error line
 //! and the exit status stays 0 (verified before pinning).
 
+mod common;
+
+use common::Mounted;
+use common::is_root;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -661,30 +665,6 @@ fn a_written_tree_stays_fsck_clean() {
         return;
     }
     assert_fsck_clean(&fsck, "the written-tree acceptance");
-}
-
-/// The loop-device guard: attach the image, hand out the node, and
-/// detach it on every exit path.
-struct Mounted {
-    device: String,
-    mountpoint: PathBuf,
-}
-
-impl Drop for Mounted {
-    fn drop(&mut self) {
-        let _ = Command::new("umount").arg(&self.mountpoint).status();
-        let _ = Command::new("losetup").args(["-d", &self.device]).status();
-    }
-}
-
-fn is_root() -> bool {
-    // euid 0 is the only thing that can mount; a non-root run reports a
-    // skip rather than pretending the check passed.
-    std::fs::metadata("/proc/self").is_ok()
-        && Command::new("id")
-            .arg("-u")
-            .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
 }
 
 /// The kernel acceptance: a real vfat mount of the tree this crate wrote.
