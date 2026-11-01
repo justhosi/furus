@@ -15,11 +15,12 @@
 //! channel; the calling thread runs a `recv_timeout` drain loop that
 //! emits `Event::Log` lines — `Info` with a `stdout: …` message for the
 //! child's stdout, `Warn` with `stderr: …` for stderr — and checks the
-//! cancel flag at every line and every quiet gap. On cancel the child
-//! is `kill()`ed and then `wait()`ed on (reaped, never left a zombie),
-//! the channel is drained, and both reader threads are joined — all
-//! before the [`Cancelled`](ProgramOutcome::Cancelled) outcome is
-//! returned, so no log event can escape after it.
+//! cancel flag at every line and every quiet gap. On cancel the
+//! child's whole process group is killed and the child is then
+//! `wait()`ed on (reaped, never left a zombie), the channel is
+//! drained, and both reader threads are joined — all before the
+//! [`Cancelled`](ProgramOutcome::Cancelled) outcome is returned, so
+//! no log event can escape after it.
 //!
 //! # Documented caps and limits
 //!
@@ -30,16 +31,21 @@
 //!   bytes too. Lines that sanitise to empty (blank lines) are dropped
 //!   rather than spammed into the JSONL stream.
 //! * `stdin` is detached (`Stdio::null`): a tool that reads input must
-//!   fail fast, not inhale the caller's stdin.
-//! * A child that forks a descendant which inherits and holds the
-//!   output pipes can delay EOF past the child's own exit; the final
-//!   drain + join waits for it. Supervised tools (mkfs, dd, losetup,
-//!   …) do not do that, and with this crate's
-//!   `#![forbid(unsafe_code)]` there is no libc escape hatch to harden
-//!   against it — the boundary is documented, not hidden. `sh -c`
-//!   shells have long exec'd a single simple command (no descendant
-//!   survives the exec), which is how the tests exercise the whole
-//!   contract.
+//!   fail fast, not inhale the caller's stdin — and a backgrounded
+//!   process group never contends for the terminal either.
+//! * Each child starts in its own process group (it becomes the group
+//!   leader, so its pid is also its pgid). On cancel the whole group
+//!   gets `SIGKILL` first and the direct child gets `kill()` as a
+//!   fallback, so a tool that forks is stopped too: `dash -c "sleep
+//!   3"` leaves `sleep` as a grandchild (measured — `sh -c` does not
+//!   always exec its single command), and without the group kill the
+//!   orphan would hold the output pipes open past the child's own
+//!   exit. One case escapes the group kill: a descendant that leaves
+//!   the group itself (with `setsid`, for example) — such a runaway
+//!   that inherits and holds the pipes can still delay EOF, and the
+//!   final drain + join waits for it. Supervised tools (mkfs, dd,
+//!   losetup, …) do not do that — the boundary is documented, not
+//!   hidden.
 //
 // The whole seam below is complete but only *wired* by the S07/S17
 // writing executor (the device-writing step itself stays their slice);
@@ -52,6 +58,7 @@
 
 use std::io;
 use std::io::BufReader;
+use std::os::unix::process::CommandExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::process::Child;
@@ -168,12 +175,18 @@ pub fn run_program(
 ) -> Result<ProgramOutcome, ProgramError> {
     // stdin detached (module docs); both output streams piped so the
     // child cannot talk straight to the helper's own stdout/stderr.
+    // The child starts in its own process group (pgid 0 makes it the
+    // leader, so its pid is the pgid): the cancel path can then kill
+    // the whole group, reaching forks a direct child.kill() alone
+    // would leave behind (dash -c "sleep 3" leaves sleep as a
+    // grandchild, measured).
     let mut command = Command::new(program);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = command
         .spawn()
         .map_err(|source| ProgramError::spawn(program, &source))?;
@@ -208,11 +221,12 @@ pub fn run_program(
     };
     match end {
         End::Cancel => {
-            // kill first, best effort: its only failure mode is "the
-            // child is already a zombie", which the `wait` below reaps.
-            // A user cancel must not be turned into an error by a
-            // SIGKILL that had nothing left to kill.
-            let _ = child.kill();
+            // Group kill first, direct kill as fallback, both best
+            // effort: their only failure mode is "everyone is already
+            // gone", which the `wait` below reaps. A user cancel must
+            // not be turned into an error by a SIGKILL that had
+            // nothing left to kill.
+            stop_child(&mut child);
             if let Err(source) = child.wait() {
                 drain_and_join(&rx, &mut handles, ctx.sink, ctx.session);
                 return Err(ProgramError::io(program, "wait for", &source));
@@ -228,6 +242,23 @@ pub fn run_program(
             Ok(exit_outcome(&status))
         }
     }
+}
+
+/// Stop a child and everything it forked: SIGKILL the child's process
+/// group first (the child runs as its own group leader — see the spawn
+/// in [`run_program`]), then `kill()` the direct child as a fallback.
+/// Both kills are best effort; a kill that finds nobody left is fine,
+/// because every caller reaps with `wait()` right after.
+fn stop_child(child: &mut Child) {
+    // The pid conversion cannot fail in practice (Linux pids fit in
+    // i32), but a kill helper must never panic: a failed conversion
+    // just skips the group kill and falls through to the direct kill.
+    if let Ok(raw) = i32::try_from(child.id())
+        && let Some(pid) = rustix::process::Pid::from_raw(raw)
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
 }
 
 /// What the supervision ended on, ahead of building the outcome.
@@ -275,10 +306,11 @@ fn supervise(
                         Ok(None) => thread::sleep(CHILD_EXIT_POLL),
                         Err(source) => {
                             // The wait status is unreadable: shoot what
-                            // is left (best effort) and surface the OS
+                            // is left (the whole group, then the direct
+                            // child; best effort) and surface the OS
                             // error to the caller, which then closes
                             // the supervision (drain + join).
-                            let _ = child.kill();
+                            stop_child(child);
                             let _ = child.wait();
                             return Err(source);
                         }
@@ -307,9 +339,9 @@ fn attach_readers(
         Some(Ok(handle)) => handles.push(handle),
         Some(Err(source)) => {
             // No half-supervised tool exits this module killing
-            // nothing: reap the child, and keep already-running
-            // readers for the caller's final join.
-            let _ = child.kill();
+            // nothing: reap the child and its group, and keep
+            // already-running readers for the caller's final join.
+            stop_child(child);
             let _ = child.wait();
             return (handles, Some(source));
         }
@@ -320,7 +352,7 @@ fn attach_readers(
         Some(Ok(handle)) => handles.push(handle),
         Some(Err(source)) => {
             // Same posture as above (any stdout reader keeps running).
-            let _ = child.kill();
+            stop_child(child);
             let _ = child.wait();
             return (handles, Some(source));
         }
@@ -582,7 +614,7 @@ mod tests {
 
         let outcome = run_program(
             Path::new("sh"),
-            &argv("sleep 5"),
+            &argv("sleep 5 & wait"),
             &mut ctx(&cancel, &mut sink),
         )
         .expect("sh runs here");
@@ -594,13 +626,55 @@ mod tests {
             "cancellation arrives in time: {:?}",
             started.elapsed()
         );
-        // The `sleep 5` never printed anything, and `sh -c` execs its
-        // single command (no descendant): whatever survived the kill
-        // would show up here as a hanging drain. The Cancelled outcome
-        // itself is only produced after `wait()` reaped the child.
+        // The `sleep 5` never printed anything, and the script forces
+        // a grandchild on purpose (`sleep` backgrounded, `wait` in
+        // front — no shell can exec-optimise this away): only a kill
+        // that reaches the whole process group returns in time, and
+        // whatever survived the kill would show up here as a hanging
+        // drain. The Cancelled outcome itself is only produced after
+        // `wait()` reaped the child.
         assert!(
             lines(&sink).is_empty(),
             "nothing leaks from a killed child: {:?}",
+            lines(&sink)
+        );
+    }
+
+    #[test]
+    fn cancel_kills_a_forked_grandchild_too() {
+        let cancel = Cancel::new();
+        let mut sink = VecSink::new();
+        let killer = cancel.clone();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            // Canceled from "the other thread", like the handler of the
+            // D-Bus order would.
+            killer.set();
+        });
+        let started = Instant::now();
+
+        // The same fork-forcing script as above: `sleep` runs as a
+        // grandchild of the helper, so returning in well under its own
+        // 5s runtime proves the group kill reached past the direct
+        // child (killing just the `sh` would leave `sleep` holding the
+        // pipes and the drain hanging for the full 5s).
+        let outcome = run_program(
+            Path::new("sh"),
+            &argv("sleep 5 & wait"),
+            &mut ctx(&cancel, &mut sink),
+        )
+        .expect("sh runs here");
+        late.join().expect("the killer thread ends");
+
+        assert_eq!(outcome, ProgramOutcome::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a forked grandchild is killed with the group: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            lines(&sink).is_empty(),
+            "nothing leaks from a killed group: {:?}",
             lines(&sink)
         );
     }
