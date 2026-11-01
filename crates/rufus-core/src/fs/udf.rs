@@ -909,4 +909,331 @@ mod tests {
         assert!(text.contains("100"), "{text}");
         assert!(text.contains("6144"), "{text}");
     }
+
+    #[test]
+    fn format_writes_the_recognition_sequence_for_both_block_sizes() {
+        // A stub that records its argv, parses its own -b value, writes
+        // the three descriptors at the measured offsets and exits 0.
+        // Stub behaviour only: the shape it writes is the on-disk layout,
+        // not a claim about the real tool.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let log = scratch.path().join("argv.log");
+        let body = format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" >> '{}'\nprintf '\\n' >> '{}'\nprev=\"\"\nlast=\"\"\nb=\"\"\nfor a in \"$@\"; do\nif [ \"$prev\" = \"-b\" ]; then b=\"$a\"; fi\nprev=\"$a\"\nlast=\"$a\"\ndone\nif [ \"$b\" != \"512\" ] && [ \"$b\" != \"2048\" ]; then exit 1; fi\nprintf '\\000BEA01\\001' | dd of=\"$last\" bs=1 seek=32768 conv=notrunc 2>/dev/null\nprintf '\\000NSR03\\001' | dd of=\"$last\" bs=1 seek=34816 conv=notrunc 2>/dev/null\nprintf '\\000TEA01\\001' | dd of=\"$last\" bs=1 seek=36864 conv=notrunc 2>/dev/null\nexit 0\n",
+            log.display(),
+            log.display()
+        );
+        let tool_path = write_stub(scratch.path(), "mkudffs", &body);
+        for (block, token) in [(BlockSize::Bytes512, "512"), (BlockSize::Bytes2048, "2048")] {
+            // Each target starts as zeroes so only the stub's writes can
+            // make the read-back verify.
+            let target = scratch.path().join(format!("volume-{token}.bin"));
+            std::fs::write(&target, vec![0u8; RECOGNITION_END]).expect("the zero target writes");
+            let logger = Logger::new(Level::Trace);
+            let options = Options::new(block);
+
+            let verified = format_with(&target, &options, &logger, "mkudffs", &tool_path)
+                .expect("the writing stub exits 0");
+            assert_eq!(verified.nsr, Nsr::Nsr03, "block {token}");
+
+            let snapshot = logger.snapshot();
+            assert!(
+                snapshot
+                    .iter()
+                    .all(|record| record.target == "udf" && record.level == Level::Info),
+                "every line is logged at Info under the udf target: {snapshot:?}"
+            );
+            let summary = snapshot
+                .last()
+                .expect("the summary is logged")
+                .message
+                .clone();
+            assert!(summary.contains("mkudffs"), "{summary}");
+            assert!(summary.contains("exit status: 0"), "{summary}");
+            assert!(summary.contains(token), "{summary}");
+            assert!(summary.contains("no label"), "{summary}");
+            assert!(summary.contains("NSR03"), "{summary}");
+        }
+        // Both -b values reached the tool, one argv line per run.
+        let lines: Vec<String> = std::fs::read_to_string(&log)
+            .expect("the stub recorded")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("<-b><512>"), "{lines:?}");
+        assert!(lines[1].contains("<-b><2048>"), "{lines:?}");
+    }
+
+    #[test]
+    fn format_refuses_when_the_stub_writes_no_recognition_sequence() {
+        // A stub that exits 0 without touching the target bytes: the
+        // read-back must fail naming the recognition region, never Ok.
+        // Stub behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let record = scratch.path().join("args");
+        let body = format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > '{}'\nexit 0\n",
+            record.display()
+        );
+        let tool_path = write_stub(scratch.path(), "mkudffs", &body);
+        // Full-size zeroes: the read succeeds but the parse has no
+        // sequence to accept.
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, vec![0u8; RECOGNITION_END]).expect("the zero target writes");
+        let logger = Logger::new(Level::Trace);
+        let options = Options::new(BlockSize::Bytes512);
+
+        let error = format_with(&target, &options, &logger, "mkudffs", &tool_path)
+            .expect_err("an unwritten sequence never verifies");
+        let text = error.to_string();
+        assert!(matches!(error, CoreError::InvalidInput { .. }), "{text}");
+        assert!(text.contains("recognition"), "{text}");
+        assert!(text.contains("32768"), "{text}");
+        assert!(
+            record.exists(),
+            "the stub ran: the failure is the read-back"
+        );
+    }
+
+    #[test]
+    fn format_refuses_an_nsr02_sequence_written_by_the_tool() {
+        // A stub that writes NSR02, simulating --udfrev=0x0150: the run
+        // must refuse with the revision-mismatch message naming both
+        // identifiers. Stub behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let record = scratch.path().join("args");
+        let body = format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > '{}'\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '\\000BEA01\\001' | dd of=\"$last\" bs=1 seek=32768 conv=notrunc 2>/dev/null\nprintf '\\000NSR02\\001' | dd of=\"$last\" bs=1 seek=34816 conv=notrunc 2>/dev/null\nprintf '\\000TEA01\\001' | dd of=\"$last\" bs=1 seek=36864 conv=notrunc 2>/dev/null\nexit 0\n",
+            record.display()
+        );
+        let tool_path = write_stub(scratch.path(), "mkudffs", &body);
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, vec![0u8; RECOGNITION_END]).expect("the zero target writes");
+        let logger = Logger::new(Level::Trace);
+        let options = Options::new(BlockSize::Bytes2048);
+
+        let error = format_with(&target, &options, &logger, "mkudffs", &tool_path)
+            .expect_err("NSR02 is a revision mismatch");
+        let text = error.to_string();
+        assert!(text.contains("34816"), "{text}");
+        assert!(text.contains("NSR02"), "{text}");
+        assert!(text.contains("NSR03"), "{text}");
+        assert!(text.contains("0x0201"), "{text}");
+        assert!(text.contains("mismatch"), "{text}");
+    }
+
+    #[test]
+    fn format_refuses_a_bad_struct_type_written_by_the_tool() {
+        // A stub that writes 0x01 as the first sector's type byte: the
+        // read-back must refuse naming the offset and both values.
+        // Stub behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let record = scratch.path().join("args");
+        let body = format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > '{}'\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '\\001BEA01\\001' | dd of=\"$last\" bs=1 seek=32768 conv=notrunc 2>/dev/null\nprintf '\\000NSR03\\001' | dd of=\"$last\" bs=1 seek=34816 conv=notrunc 2>/dev/null\nprintf '\\000TEA01\\001' | dd of=\"$last\" bs=1 seek=36864 conv=notrunc 2>/dev/null\nexit 0\n",
+            record.display()
+        );
+        let tool_path = write_stub(scratch.path(), "mkudffs", &body);
+        let target = scratch.path().join("volume.bin");
+        std::fs::write(&target, vec![0u8; RECOGNITION_END]).expect("the zero target writes");
+        let logger = Logger::new(Level::Trace);
+        let options = Options::new(BlockSize::Bytes512);
+
+        let error = format_with(&target, &options, &logger, "mkudffs", &tool_path)
+            .expect_err("0x01 is not the struct type");
+        let text = error.to_string();
+        assert!(text.contains("32768"), "{text}");
+        assert!(text.contains("0x01"), "{text}");
+        assert!(text.contains("0x00"), "{text}");
+    }
+
+    #[test]
+    fn format_accepts_the_alias_and_prefers_the_canonical_tool() {
+        // The alias alone probes, the canonical name wins when both
+        // exist, and a format run through the alias path verifies.
+        // Stub behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let banner = "#!/bin/sh\necho 'mkudffs from udftools 9.9' >&2\nexit 1\n";
+        write_stub(scratch.path(), "mkfs.udf", banner);
+        let (alias, alias_path) =
+            find_tool_in(&probe_dirs(scratch.path())).expect("the alias probes");
+        assert_eq!(alias, "mkfs.udf");
+        assert!(alias_path.ends_with("mkfs.udf"));
+        write_stub(scratch.path(), "mkudffs", banner);
+        let (canonical, _) = find_tool_in(&probe_dirs(scratch.path())).expect("both stubs probe");
+        assert_eq!(canonical, "mkudffs");
+
+        // The alias path itself formats: a plain exit-0 stub under the
+        // alias name verifies against a synthetic target.
+        let fmt_scratch = tempfile::tempdir().expect("a scratch dir");
+        let fmt_stub = write_stub(fmt_scratch.path(), "mkfs.udf", "#!/bin/sh\nexit 0\n");
+        let target = write_target(fmt_scratch.path(), "volume.bin", &synthetic_region("NSR03"));
+        let logger = Logger::new(Level::Trace);
+        let options = Options::new(BlockSize::Bytes512);
+        let verified = format_with(&target, &options, &logger, "mkfs.udf", &fmt_stub)
+            .expect("the alias tool path formats");
+        assert_eq!(verified.nsr, Nsr::Nsr03);
+    }
+
+    #[test]
+    fn probe_skips_a_non_executable_mkudffs() {
+        // A plain file without the execute bit is skipped: the probe
+        // reports the package hint, never a spawn error. Stub only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        std::fs::write(scratch.path().join("mkudffs"), "#!/bin/sh\nexit 1\n")
+            .expect("the non-executable file writes");
+        let error =
+            find_tool_in(&probe_dirs(scratch.path())).expect_err("a non-executable is skipped");
+        assert!(matches!(error, CoreError::InvalidInput { .. }), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!("invalid input: {MISSING_TOOL_HINT}"),
+            "the missing-tool hint comes back"
+        );
+    }
+
+    #[test]
+    fn format_retries_a_busy_executable_until_it_executes() {
+        // Holding the stub open for writing fails the first exec with
+        // ETXTBSY; the releaser drops inside the retry budget so the run
+        // still completes. Stub behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let tool_path = write_stub(scratch.path(), "mkudffs", "#!/bin/sh\nexit 0\n");
+        let target = write_target(scratch.path(), "volume.bin", &synthetic_region("NSR03"));
+        let logger = Logger::new(Level::Trace);
+        let options = Options::new(BlockSize::Bytes512);
+
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tool_path)
+            .expect("the write descriptor holds");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            drop(held);
+        });
+        let verified = format_with(&target, &options, &logger, "mkudffs", &tool_path)
+            .expect("the retry executes");
+        assert_eq!(verified.nsr, Nsr::Nsr03);
+        assert!(releaser.join().is_ok());
+    }
+
+    #[test]
+    fn format_reports_a_spawn_error_naming_the_candidate() {
+        // A directory in place of the tool file fails the spawn with
+        // PermissionDenied: the run reports house io naming the path,
+        // never the package hint. No stub runs here.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let tool_dir = scratch.path().join("tool-dir");
+        std::fs::create_dir(&tool_dir).expect("the tool directory creates");
+        let target = write_target(scratch.path(), "volume.bin", &synthetic_region("NSR03"));
+        let logger = Logger::new(Level::Trace);
+        let options = Options::new(BlockSize::Bytes512);
+
+        let error = format_with(&target, &options, &logger, "mkudffs", &tool_dir)
+            .expect_err("a directory never spawns");
+        let text = error.to_string();
+        assert!(matches!(error, CoreError::Io { .. }), "{text}");
+        assert!(text.contains(&tool_dir.display().to_string()), "{text}");
+        assert!(!text.contains(MISSING_TOOL_HINT), "{text}");
+        assert!(!text.contains("udftools"), "{text}");
+        let CoreError::Io { source, .. } = &error else {
+            panic!("the error is the house io variant: {text}")
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn format_refuses_a_missing_target_before_any_probe_or_spawn() {
+        // The stub is discoverable through the injected dir, yet a
+        // missing target never invokes it: no record file appears and
+        // the refusal names the target. The public entry refuses the
+        // same way before any probe runs.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let record = scratch.path().join("args");
+        // The stub answers the banner probe with no args and records a
+        // format run otherwise, so one file serves both seams.
+        let body = format!(
+            "#!/bin/sh\nif [ \"$#\" = \"0\" ]; then echo 'mkudffs from udftools 9.9' >&2\nexit 1\nfi\nprintf '<%s>' \"$@\" > '{}'\nexit 0\n",
+            record.display()
+        );
+        let tool_path = write_stub(scratch.path(), "mkudffs", &body);
+        let (name, _) =
+            find_tool_in(&probe_dirs(scratch.path())).expect("the stub is discoverable");
+        assert_eq!(name, "mkudffs");
+        let target = scratch.path().join("absent.bin");
+        let logger = Logger::new(Level::Trace);
+        let options = Options::new(BlockSize::Bytes512);
+
+        let error = format_with(&target, &options, &logger, "mkudffs", &tool_path)
+            .expect_err("a missing target refuses before spawning");
+        let text = error.to_string();
+        assert!(text.contains("does not exist"), "{text}");
+        assert!(text.contains("absent.bin"), "{text}");
+        assert!(
+            !record.exists(),
+            "the stub never ran: the refusal precedes every tool invocation"
+        );
+
+        let error = format(&target, &options, &logger).expect_err("format refuses before probing");
+        let text = error.to_string();
+        assert!(text.contains("does not exist"), "{text}");
+        assert!(text.contains("absent.bin"), "{text}");
+    }
+
+    #[test]
+    fn format_passes_a_126_byte_label_with_spaces_and_non_ascii_byte_for_byte() {
+        // A 126-byte label with spaces and one non-ASCII char reaches
+        // the tool byte-for-byte while the summary echoes the sanitised
+        // shape. Stub behaviour only.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let record = scratch.path().join("args");
+        let body = format!(
+            "#!/bin/sh\nprintf '<%s>' \"$@\" > '{}'\nexit 0\n",
+            record.display()
+        );
+        let tool_path = write_stub(scratch.path(), "mkudffs", &body);
+        let target = write_target(scratch.path(), "volume.bin", &synthetic_region("NSR03"));
+        let logger = Logger::new(Level::Trace);
+        // 12-byte prefix with spaces and one 2-byte char, plus 114
+        // ASCII bytes: exactly the 126-byte ceiling.
+        let label = format!("MY LABEL \u{e9} {}", "X".repeat(114));
+        assert_eq!(label.len(), LABEL_BYTES_MAX, "the label fills the ceiling");
+        assert!(label.contains(' '), "the label carries spaces");
+        assert!(
+            label.contains('\u{e9}'),
+            "the label carries a non-ASCII char"
+        );
+        let options = Options::new(BlockSize::Bytes512)
+            .with_label(label.clone())
+            .expect("126 bytes fit the label");
+
+        let verified = format_with(&target, &options, &logger, "mkudffs", &tool_path)
+            .expect("the stub exits 0");
+        assert_eq!(verified.nsr, Nsr::Nsr03);
+
+        let recorded = std::fs::read_to_string(&record).expect("the stub recorded");
+        let expected = format!(
+            "<--utf8><--media-type=hd><--udfrev=0x0201><-b><512><-l><{label}><{}>",
+            target.display()
+        );
+        assert_eq!(
+            recorded, expected,
+            "the label reached the tool byte-for-byte"
+        );
+
+        let summary = logger
+            .snapshot()
+            .last()
+            .expect("the summary is logged")
+            .message
+            .clone();
+        let sanitised = device_text(&label);
+        assert!(
+            summary.contains(&format!("label `{sanitised}`")),
+            "{summary}"
+        );
+        assert!(summary.is_ascii(), "the summary echoes sanely: {summary}");
+        assert!(summary.contains("NSR03"), "{summary}");
+    }
 }
