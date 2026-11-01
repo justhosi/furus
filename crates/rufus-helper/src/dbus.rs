@@ -1013,14 +1013,42 @@ pub fn to_dbus_error(error: &ServiceError) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(device_text(&format!("{}: {error}", error.code())))
 }
 
+/// The answer reported when the `rufus-accept` worker ends without one
+/// (it unwound before [`Handoff::complete`]): the sentence the old
+/// channel-disconnect path reported, kept byte-identical so clients see
+/// no change.
+const WORKER_NO_ANSWER_MESSAGE: &str = "the helper thread ended without an answer";
+
+/// Map the `rufus-accept` worker's outcome onto the bus answer: a
+/// returned session id passes through, a returned [`ServiceError`]
+/// becomes its D-Bus error (see [`to_dbus_error`]), and an unwound
+/// worker becomes the [`WORKER_NO_ANSWER_MESSAGE`] failure.
+fn worker_answer(
+    outcome: std::thread::Result<Result<String, ServiceError>>,
+) -> zbus::fdo::Result<String> {
+    match outcome {
+        Ok(Ok(session)) => Ok(session),
+        Ok(Err(error)) => Err(to_dbus_error(&error)),
+        Err(_) => Err(zbus::fdo::Error::Failed(
+            WORKER_NO_ANSWER_MESSAGE.to_string(),
+        )),
+    }
+}
+
 /// The exported object: `org.rufuslinux.Helper1`.
 ///
 /// `Execute` blocks its caller for as long as authorization (a polkit
 /// prompt may wait on a human) plus validation (the image is hashed)
 /// take; the *run* itself never blocks it — `Execute` returns the
-/// session id as soon as the session exists. Because the object server
-/// dispatches method calls in order, a `Cancel` issued during that
-/// window is answered once `Execute` returns, before the first step.
+/// session id as soon as the session exists. Method calls may run
+/// concurrently (`Interface::spawn_tasks_for_methods` defaults to true,
+/// as in zbus 5.19), so a `Cancel` arriving while `Execute` is still
+/// authorizing finds no claim yet, and one arriving after the claim but
+/// before the worker publishes the id finds `Claim::id` still `None`;
+/// [`Registry::cancel`] refuses both as `UnknownSession` — it only sets
+/// the flag when the claim's owner and published id both match (see
+/// [`Registry::execute`]'s claim-then-`Opening::Started` order) — so a
+/// caller must wait for `Execute`'s session-id reply before cancelling.
 ///
 /// Both methods are `async` (zbus 6 has no sync dispatch): `execute`
 /// hands the sync accept path to a short-lived `rufus-accept` thread
@@ -1151,18 +1179,12 @@ impl Helper1 {
                 // unwound still owes the waiter an answer: without
                 // this, the `Handoff` would park the task forever. The
                 // sentence stays the one the old channel-disconnect
-                // path reported. In the release profile
-                // (`panic = "abort"`) a panicking worker aborts the
-                // service instead, exactly as before.
-                let answer = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    registry.execute(&caller, &plan_json)
-                })) {
-                    Ok(Ok(session)) => Ok(session),
-                    Ok(Err(error)) => Err(to_dbus_error(&error)),
-                    Err(_) => Err(zbus::fdo::Error::Failed(
-                        "the helper thread ended without an answer".to_string(),
-                    )),
-                };
+                // path reported (see `WORKER_NO_ANSWER_MESSAGE`). In the
+                // release profile (`panic = "abort"`) a panicking worker
+                // aborts the service instead, exactly as before.
+                let answer = worker_answer(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || registry.execute(&caller, &plan_json),
+                )));
                 worker.complete(answer);
             })
             .map_err(|err| {
@@ -2164,6 +2186,26 @@ mod tests {
         assert_eq!(got, 41u32, "an answer published before waiting is returned");
     }
 
+    /// Wait for a [`Handoff`] with a hard bound: the wait runs on a
+    /// spawned thread and the answer rides an `mpsc` channel, so a lost
+    /// wake fails fast instead of hanging the harness until it kills
+    /// the test. The bound (seconds) is far above the real wait
+    /// (milliseconds).
+    fn wait_handoff<T>(handoff: Arc<Handoff<T>>) -> T
+    where
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let answer = zbus::block_on(handoff.wait());
+                let _ = tx.send(answer);
+            })
+            .expect("the handoff wait thread spawns");
+        rx.recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|err| panic!("the handoff wait timed out after 5 s: {err}"))
+    }
+
     #[test]
     fn handoff_wakes_a_waiter_parked_before_complete() {
         // The register-then-wake path: the waiter parks first and the
@@ -2178,7 +2220,7 @@ mod tests {
                 worker.complete("late".to_string());
             })
             .expect("the handoff test worker spawns");
-        let got = zbus::block_on(handoff.wait());
+        let got = wait_handoff(Arc::clone(&handoff));
         worker_thread.join().expect("the handoff test worker joins");
         assert_eq!(
             got,
@@ -2193,28 +2235,28 @@ mod tests {
         // and test unwind; release aborts — see `Handoff::complete`):
         // a worker that panics still answers the waiter with the
         // disconnect sentence instead of parking it forever.
-        let handoff = Arc::new(Handoff::<Result<String, String>>::new());
+        assert_eq!(
+            super::WORKER_NO_ANSWER_MESSAGE,
+            "the helper thread ended without an answer",
+            "the fallback sentence stays byte-identical"
+        );
+        let handoff = Arc::new(Handoff::<zbus::fdo::Result<String>>::new());
         let worker = Arc::clone(&handoff);
         let worker_thread = std::thread::Builder::new()
             .spawn(move || {
-                let answer: Result<String, String> = match std::panic::catch_unwind(
-                    std::panic::AssertUnwindSafe(|| -> Result<String, String> {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> Result<String, ServiceError> {
                         panic!("a worker bug in a test");
-                    }),
-                ) {
-                    Ok(Ok(session)) => Ok(session),
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err("the helper thread ended without an answer".to_string()),
-                };
-                worker.complete(answer);
+                    },
+                ));
+                worker.complete(super::worker_answer(outcome));
             })
             .expect("the handoff test worker spawns");
-        let got = zbus::block_on(handoff.wait());
+        let got = wait_handoff(Arc::clone(&handoff));
         worker_thread.join().expect("the handoff test worker joins");
-        assert_eq!(
-            got,
-            Err("the helper thread ended without an answer".to_string()),
-            "the unwind fallback answers with the disconnect sentence"
+        assert!(
+            matches!(&got, Err(zbus::fdo::Error::Failed(message)) if message == super::WORKER_NO_ANSWER_MESSAGE),
+            "the unwind fallback answers with the disconnect sentence: {got:?}"
         );
     }
 
