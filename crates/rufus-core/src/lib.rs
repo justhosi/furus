@@ -80,6 +80,9 @@
 //!   descriptor, directory listings, regular-file reads and a
 //!   depth-bounded walk over `Box<dyn Volume>`, read-only alongside
 //!   the [`fs::udf`](fs::udf) writer side.
+//! * [`report`] — the S16 image report (slice 1 of 6): the label
+//!   candidates, the [`ImageReport`](report::ImageReport) shape later
+//!   slices fill, and the case-insensitive tree index behind it.
 //! * [`units`] — checked sector math, human-readable sizes, durations.
 //! * [`version`] — crate version, compile-time git hash, user-agent string.
 //!
@@ -103,6 +106,7 @@ pub mod log;
 pub mod part;
 pub mod partition;
 pub mod paths;
+pub mod report;
 pub mod safety;
 pub mod text;
 pub mod udf;
