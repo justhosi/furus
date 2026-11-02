@@ -48,17 +48,22 @@
 //! * [`record`] — directory-record parsing shared by both trees, and the
 //!   `;1`/trailing-dot stripping for primary-tree (raw-byte) names.
 //! * [`reader`] — [`IsoReader`](reader::IsoReader): the chosen tree
-//!   ([`TreeKind`]), label, `root`, `lookup`, `read_dir`,
-//!   `open_file`/`read_file` with multi-extent joining, and the Rock
+//!   ([`TreeKind`]), label, `root`, `lookup`, `read_dir`, `walk`,
+//!   `open_file`/`read_file` with multi-extent joining, the Rock
 //!   Ridge names, symlinks, attributes and relocation the primary tree
-//!   carries on a SUSP volume.
+//!   carries on a SUSP volume, and the El Torito boot catalog.
+//! * [`boot`] — El Torito boot catalog parsing: the validation entry
+//!   (header id, key, zero-sum checksum), the initial/default entry and
+//!   every `0x90`/`0x91` section with its entries, all bounds-checked
+//!   against the store.
 //! * [`rock`] — SUSP/Rock Ridge system-use parsing: `SP` detection,
 //!   `CE` continuations, `NM` names, `SL` targets, `PX`/`TF` metadata
 //!   and `CL`/`PL`/`RE` relocation (primary tree only; the Joliet tree
 //!   never consults SUSP).
 //!
-//! Deliberately left for later slices: path tables, El Torito boot
-//! handling, and recording-date decoding.
+//! Deliberately left for a later PLAN item: path tables and the 7-byte
+//! recording-date decoding (Rock Ridge stamps already decode in
+//! [`rock`]).
 //! A directory whose data length is not a multiple of the sector size
 //! reads its last partial sector the way ECMA-119 allows (only the
 //! valid prefix carries records); anything cut mid-sector past the
@@ -88,6 +93,7 @@ pub const MAX_DIR_DEPTH: usize = 32;
 /// hostile path string can demand.
 pub const MAX_PATH_COMPONENTS: usize = 256;
 
+pub mod boot;
 pub mod cache;
 pub mod descriptor;
 pub mod joliet;
@@ -95,6 +101,13 @@ pub mod reader;
 pub mod record;
 pub mod rock;
 
+pub use boot::BOOT_ENTRY_LEN;
+pub use boot::BootCatalog;
+pub use boot::BootEntry;
+pub use boot::BootSection;
+pub use boot::MAX_BOOT_CATALOG_SECTORS;
+pub use boot::MediaType;
+pub use boot::ValidationEntry;
 pub use cache::SectorCache;
 pub use descriptor::BootRecord;
 pub use descriptor::DescriptorSet;

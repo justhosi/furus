@@ -102,14 +102,20 @@ pub struct SupplementaryDescriptor {
     pub root: DirRecord,
 }
 
-/// Boot record (type 0): accepted and retained, never executed. El
-/// Torito handling belongs to a later slice.
+/// Boot record (type 0): accepted and retained, never executed. The
+/// catalog pointer feeds the El Torito parser
+/// ([`boot`](crate::iso::boot)); the image itself is never booted here.
 #[derive(Debug, Clone)]
 pub struct BootRecord {
     /// Boot system identifier (32 bytes, trailing spaces trimmed).
     pub system_id: String,
     /// Boot identifier (32 bytes, trailing spaces trimmed).
     pub boot_id: String,
+    /// Boot catalog LBA: the 4-byte little-endian field at bytes 71..75
+    /// of the boot record sector (byte 71 holds the low byte). Zero when
+    /// the mastering tool wrote none — [`IsoReader::boot_catalog`](crate::iso::reader::IsoReader::boot_catalog)
+    /// refuses a zero (or out-of-store) catalog.
+    pub catalog_lba: u32,
 }
 
 /// The parsed descriptor sequence: exactly one primary, the kept
@@ -367,11 +373,23 @@ fn parse_supplementary(sector: &[u8], sector_no: u32) -> Result<SupplementaryDes
 }
 
 /// Parse a boot record body (header already checked): the two 32-byte
-/// identifiers, retained and never executed.
+/// identifiers, retained and never executed, plus the El Torito boot
+/// catalog pointer at bytes 71..75 (little-endian; checked like every
+/// access even though descriptor sectors always span it).
 fn parse_boot(sector: &[u8], sector_no: u32) -> Result<BootRecord> {
     let system_id = text_field(sector, 7, 32, sector_no, "boot system identifier")?;
     let boot_id = text_field(sector, 39, 32, sector_no, "boot identifier")?;
-    Ok(BootRecord { system_id, boot_id })
+    let catalog_lba = u32::from_le_bytes([
+        byte_at(sector, 71, sector_no, "boot catalog pointer")?,
+        byte_at(sector, 72, sector_no, "boot catalog pointer")?,
+        byte_at(sector, 73, sector_no, "boot catalog pointer")?,
+        byte_at(sector, 74, sector_no, "boot catalog pointer")?,
+    ]);
+    Ok(BootRecord {
+        system_id,
+        boot_id,
+        catalog_lba,
+    })
 }
 
 /// Read the descriptor sequence starting at sector 16, one sector at a

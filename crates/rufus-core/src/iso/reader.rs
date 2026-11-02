@@ -1,5 +1,5 @@
-//! ISO9660/Joliet/Rock Ridge reader: label, lookup, listings and file
-//! reads (S14, slices 1-3).
+//! ISO9660/Joliet/Rock Ridge reader: label, lookup, listings, walks,
+//! file reads and the El Torito boot catalog (S14, slices 1-4).
 //!
 //! *Measured* — everything here walks the structures [`descriptor`] and
 //! [`record`] parse, over sectors the [`SectorCache`](crate::iso::SectorCache)
@@ -23,15 +23,25 @@
 //! followed; `PX`/`TF` decode to the exposed attributes and stamps; and
 //! `CL` relocates deep directories (followed on descent, `..` checked
 //! against `PL`, `RE` surfaced). Under Joliet, SUSP is never consulted.
+//! [`IsoReader::walk`] lists the chosen tree depth-first (root as `/`,
+//! then every descendant pre-order), and [`IsoReader::boot_catalog`]
+//! parses the El Torito catalog the first boot record points at: the
+//! validation entry (header id, key, zero-sum checksum), the
+//! initial/default entry (indicator, media, segment, type, count, RBA)
+//! and every `0x90`/`0x91` section — all byte-checked against one real
+//! `xorriso` boot image (see [`boot`](crate::iso::boot)).
 //!
 //! *Inferred* — that preferring the highest Joliet level is what users
 //! want (as libcdio does), that the RRIP flag tables in
 //! [`rock`](crate::iso::rock) match what real mastering tools emit
 //! (the slice report says which shapes `xorriso` was seen to write),
 //! and that loading a whole file into RAM in `read_file` stays
-//! acceptable (a streaming read belongs to a later slice; huge files
+//! acceptable (a streaming read belongs to a later PLAN item; huge files
 //! fail gracefully through `try_reserve`, never with a panicking
-//! allocator call).
+//! allocator call). The 64 KiB sector cache is what makes repeat walks
+//! cheap: a repeated `lookup` of a cached path costs no store read at
+//! all (pinned by a counting-volume test that prints its numbers), and a
+//! full `walk` reads each directory sector once.
 //!
 //! Refusals, not panics: a malformed Joliet name (odd length, unpaired
 //! surrogate, interior NUL) refuses naming the path and the byte
@@ -45,9 +55,14 @@
 //! name left continued past its run, an empty alternate name, a
 //! continued-into special `SL` component, a `..` step disagreeing with
 //! its record (`PL` when present), and opening or descending through a
-//! symlink all refuse naming the path. A directory whose length is not
-//! a sector multiple reads its last partial sector (only the valid
-//! prefix carries records, per ECMA-119); a volume cut inside that
+//! symlink all refuse naming the path. The boot catalog refuses a
+//! missing boot record, a zero catalog LBA, a wrong header id/key/
+//! checksum (naming expected and actual), a wrong boot indicator or
+//! media type, a section count running past the catalog or overlapping
+//! the next header, and a boot image window past the store. A walk past
+//! the depth bound refuses rather than hanging. A directory whose length
+//! is not a sector multiple reads its last partial sector (only the
+//! valid prefix carries records, per ECMA-119); a volume cut inside that
 //! sector refuses, because the sector is not fully present.
 
 use std::cell::RefCell;
@@ -59,6 +74,8 @@ use crate::iso::MAX_DIR_DEPTH;
 use crate::iso::MAX_PATH_COMPONENTS;
 use crate::iso::SECTOR_BYTES;
 use crate::iso::SECTOR_BYTES_U64;
+use crate::iso::boot::BootCatalog;
+use crate::iso::boot::parse_catalog;
 use crate::iso::cache::SectorCache;
 use crate::iso::descriptor::BootRecord;
 use crate::iso::descriptor::PrimaryDescriptor;
@@ -289,6 +306,31 @@ pub struct IsoReader {
     /// root `.` record carries no `SP`, or when the reader walks the
     /// Joliet tree, whose records never consult SUSP).
     susp_skip: Option<u8>,
+}
+
+/// Group directory records into adjacent same-identifier runs (`.`/`..`
+/// skipped without breaking a run): each run joins into one entry or
+/// chain. Shared by [`IsoReader::read_dir`] and [`IsoReader::walk`] so
+/// listings and walks always agree on the set.
+fn group_runs(records: Vec<DirRecord>) -> Vec<Vec<DirRecord>> {
+    let mut runs: Vec<Vec<DirRecord>> = Vec::new();
+    for child in records {
+        if child.is_dot() || child.is_parent() {
+            continue;
+        }
+        let continues = runs
+            .last()
+            .and_then(|run: &Vec<DirRecord>| run.first())
+            .is_some_and(|first| first.identifier.as_slice() == child.identifier.as_slice());
+        if continues {
+            if let Some(run) = runs.last_mut() {
+                run.push(child);
+            }
+        } else {
+            runs.push(vec![child]);
+        }
+    }
+    runs
 }
 
 /// First record of a resolved chain: every chain is non-empty by
@@ -689,6 +731,24 @@ impl IsoReader {
         &self.boot_records
     }
 
+    /// The El Torito boot catalog through the first type-0 boot record:
+    /// the validation entry, the initial/default entry and every
+    /// section in order (see [`boot`](crate::iso::boot) for the layout
+    /// and bounds). Refuses images without a boot record, a zero
+    /// catalog LBA, and any malformed catalog or out-of-store boot
+    /// image. The image itself is never executed here.
+    pub fn boot_catalog(&self) -> Result<BootCatalog> {
+        let record = self.boot_records.first().ok_or_else(|| {
+            CoreError::invalid(
+                "the image carries no El Torito boot record: no boot catalog to read",
+            )
+        })?;
+        let catalog_lba = record.catalog_lba;
+        let total = self.total_bytes;
+        let mut read = |sector: u32| self.read_sector_cached(sector);
+        parse_catalog(&mut read, total, catalog_lba)
+    }
+
     /// The root directory entry (empty identifier, always a directory).
     /// Synthesised from the descriptor root, so it carries no Rock Ridge
     /// attributes even on a SUSP volume: the on-disk root `.` record's
@@ -781,31 +841,85 @@ impl IsoReader {
         })?;
         // Group adjacent same-identifier records: each run joins into
         // one entry (multi-extent files list once, with the total).
-        let mut runs: Vec<Vec<DirRecord>> = Vec::new();
-        for child in records {
-            if child.is_dot() || child.is_parent() {
-                continue;
-            }
-            let continues = runs
-                .last()
-                .and_then(|run: &Vec<DirRecord>| run.first())
-                .is_some_and(|first| first.identifier.as_slice() == child.identifier.as_slice());
-            if continues {
-                if let Some(run) = runs.last_mut() {
-                    run.push(child);
-                }
-            } else {
-                runs.push(vec![child]);
-            }
-        }
         let mut out = Vec::new();
-        for run in &runs {
+        for run in &group_runs(records) {
             let entry = self.entry_from_chain(run, path).map_err(|error| {
                 CoreError::invalid(format!("cannot list `{}`: {error}", short_path(path)))
             })?;
             out.push(entry);
         }
         Ok(out)
+    }
+
+    /// Depth-first listing over the chosen tree: the root as (`/`,
+    /// root) first, then every descendant pre-order as (`/A`,
+    /// `/A/B`, ...) with its [`Entry`]. Paths are absolute (leading
+    /// `/`) so each one feeds [`IsoReader::lookup`]; a name that is not
+    /// valid UTF-8 renders lossy in the path string (the entry keeps
+    /// the raw bytes). A hostile Rock Ridge name containing `/` yields
+    /// an ambiguous path that [`IsoReader::lookup`] cannot resolve back
+    /// (segments split on `/`); the entry itself still carries the raw
+    /// name. Bounded like resolution: descent past
+    /// [`MAX_DIR_DEPTH`](crate::iso::MAX_DIR_DEPTH) refuses as a
+    /// possible directory loop (path components stay far below
+    /// [`MAX_PATH_COMPONENTS`](crate::iso::MAX_PATH_COMPONENTS) since
+    /// depth caps them), `CL` relocation is followed, and symlinks list
+    /// but never descend.
+    pub fn walk(&self) -> Result<Vec<(String, Entry)>> {
+        let mut out = Vec::new();
+        out.push(("/".to_string(), self.root()));
+        self.walk_dir(&self.root_record, "/", 0, &mut out)?;
+        Ok(out)
+    }
+
+    /// One level of [`IsoReader::walk`]: list `record` (following `CL`
+    /// to the relocated target), push one (`path`, entry) pair per
+    /// adjacent same-name run, and descend into directories — never
+    /// into symlinks. `depth` counts descents from the root; past
+    /// [`MAX_DIR_DEPTH`](crate::iso::MAX_DIR_DEPTH) the tree cycles, so
+    /// the walk refuses instead of hanging.
+    fn walk_dir(
+        &self,
+        record: &DirRecord,
+        path: &str,
+        depth: usize,
+        out: &mut Vec<(String, Entry)>,
+    ) -> Result<()> {
+        if depth > MAX_DIR_DEPTH {
+            return Err(CoreError::invalid(format!(
+                "walk of `{}` nests past {MAX_DIR_DEPTH} directories: \
+                 refusing as a possible directory loop",
+                short_path(path)
+            )));
+        }
+        let dir_record = self.effective_dir_record(record, path)?;
+        let records = self.read_dir_records(&dir_record).map_err(|error| {
+            CoreError::invalid(format!("cannot walk `{}`: {error}", short_path(path)))
+        })?;
+        for run in &group_runs(records) {
+            let entry = self.entry_from_chain(run, path).map_err(|error| {
+                CoreError::invalid(format!("cannot walk `{}`: {error}", short_path(path)))
+            })?;
+            let name = String::from_utf8_lossy(&entry.file_name()).into_owned();
+            let child = if path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{path}/{name}")
+            };
+            let first = first_record(run, path)?;
+            let is_link = self
+                .rock_attrs_of(first)?
+                .is_some_and(|attrs| attrs.symlink_target.is_some());
+            let is_dir = first.is_dir()
+                || self
+                    .rock_attrs_of(first)?
+                    .is_some_and(|attrs| attrs.child_link.is_some());
+            out.push((child.clone(), entry));
+            if is_dir && !is_link {
+                self.walk_dir(first, &child, depth + 1, out)?;
+            }
+        }
+        Ok(())
     }
 
     /// Open the file at `path` for reading with [`IsoReader::read_open`].
@@ -1208,6 +1322,7 @@ impl IsoReader {
 mod tests {
     use super::*;
     use crate::fs::VecVolume;
+    use crate::iso::MediaType;
     use crate::iso::descriptor::TYPE_BOOT;
     use crate::iso::descriptor::TYPE_PRIMARY;
     use crate::iso::descriptor::TYPE_SUPPLEMENTARY;
@@ -1216,6 +1331,8 @@ mod tests {
     use crate::iso::record::FLAG_MULTI_EXTENT;
     use crate::iso::record::RECORD_FIXED_LEN;
     use crate::iso::rock::RockTime;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     /// Sectors of the shared fixture image (32 sectors total).
     const ROOT_SECTOR: u32 = 20;
@@ -1721,6 +1838,91 @@ mod tests {
         let mut volume = VecVolume::new(bytes.len() as u64, 512).expect("the variant fits in RAM");
         volume.write_all_at(0, bytes).expect("the variant writes");
         IsoReader::open(Box::new(volume))
+    }
+
+    /// Boot record sector naming `catalog_lba` as the El Torito catalog.
+    /// Test-only.
+    fn boot_sector_with_catalog(catalog_lba: u32) -> [u8; SECTOR_BYTES] {
+        let mut sector = boot_sector();
+        sector[71..75].copy_from_slice(&catalog_lba.to_le_bytes());
+        sector
+    }
+
+    /// Bootable primary-only image: descriptors at 16..18 (the boot
+    /// record names `catalog_lba`), a minimal root at sector 20,
+    /// `catalog` at `catalog_lba`, and `extra` owned (sector, bytes)
+    /// writes. Synthetic layout only, claims nothing about real
+    /// mastering tools.
+    fn boot_image(catalog_lba: u32, catalog: &[u8], extra: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut image = vec![0u8; IMAGE_SECTORS as usize * SECTOR_BYTES];
+        let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut image,
+            16,
+            &primary_sector("ET", ROOT_SECTOR, SECTOR_BYTES as u32),
+        );
+        put(&mut image, 17, &boot_sector_with_catalog(catalog_lba));
+        put(&mut image, 18, &terminator_sector());
+        put(
+            &mut image,
+            ROOT_SECTOR,
+            &dir_sector(&[
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            ]),
+        );
+        put(&mut image, catalog_lba, catalog);
+        for (sector, bytes) in extra {
+            put(&mut image, *sector, bytes);
+        }
+        image
+    }
+
+    /// Validation entry with an empty id string: header `01`, platform
+    /// 0, zero reserved, key `AA 55`, checksum `55 AA` (the words sum to
+    /// zero). Test-only.
+    fn boot_validation() -> Vec<u8> {
+        let mut out = vec![0x01, 0x00, 0x00, 0x00];
+        out.extend_from_slice(&[0u8; 24]);
+        out.extend_from_slice(&[0xAA, 0x55, 0x55, 0xAA]);
+        out
+    }
+
+    /// One 32-byte boot entry from its fields, zero tail. Test-only.
+    fn boot_entry(
+        indicator: u8,
+        media: u8,
+        segment: u16,
+        kind: u8,
+        count: u16,
+        rba: u32,
+    ) -> Vec<u8> {
+        let mut out = vec![
+            indicator,
+            media,
+            (segment & 0xFF) as u8,
+            (segment >> 8) as u8,
+            kind,
+            0,
+            (count & 0xFF) as u8,
+            (count >> 8) as u8,
+        ];
+        out.extend_from_slice(&rba.to_le_bytes());
+        out.resize(32, 0);
+        out
+    }
+
+    /// One 32-byte section header, 28-byte id. Test-only.
+    fn boot_header(id: u8, platform: u8, count: u16, name: &[u8]) -> Vec<u8> {
+        let mut out = vec![id, platform, (count & 0xFF) as u8, (count >> 8) as u8];
+        let mut field = vec![0u8; 28];
+        let take = name.len().min(28);
+        field[..take].copy_from_slice(&name[..take]);
+        out.extend_from_slice(&field);
+        out
     }
 
     #[test]
@@ -2803,5 +3005,352 @@ mod tests {
         assert!(!listed[0].relocated);
         assert!(reader.lookup("trap").is_none());
         assert!(reader.lookup("b.txt").is_some());
+    }
+
+    #[test]
+    fn boot_catalog_zero_lba_refused() {
+        // The plain fixtures carry a zeroed boot record: no catalog.
+        let reader = fixture_reader();
+        assert_eq!(reader.boot_records().len(), 1);
+        assert_eq!(reader.boot_records()[0].catalog_lba, 0);
+        let error = reader.boot_catalog().expect_err("a zero catalog refuses");
+        assert!(error.to_string().contains("zero"), "{error}");
+    }
+
+    #[test]
+    fn boot_catalog_without_boot_record_refused() {
+        let primary = primary_sector("LABEL", ROOT_SECTOR, SECTOR_BYTES as u32);
+        let terminator = terminator_sector();
+        let image = desc_only_image(&[&primary, &terminator]);
+        let reader = reader_over(&image).expect("descriptors parse");
+        assert!(reader.boot_records().is_empty());
+        let error = reader.boot_catalog().expect_err("no boot record refuses");
+        assert!(
+            error.to_string().contains("no El Torito boot record"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn boot_catalog_reads_validation_initial_and_sections() {
+        let mut catalog = boot_validation();
+        catalog.extend_from_slice(&boot_entry(0x88, 0, 0, 0, 4, 29));
+        catalog.extend_from_slice(&boot_header(0x91, 0, 1, b"sec"));
+        catalog.extend_from_slice(&boot_entry(0x00, 4, 0x07C0, 0x06, 8, 29));
+        let image = boot_image(28, &catalog, &[(29, vec![9; 100])]);
+        let reader = reader_over(&image).expect("the bootable image opens");
+        let parsed = reader.boot_catalog().expect("the catalog parses");
+        assert_eq!(parsed.validation.platform, 0);
+        assert_eq!(parsed.validation.id_string, "");
+        assert_eq!(parsed.initial.load_rba, 29);
+        assert_eq!(parsed.initial.sector_count, 4);
+        assert!(parsed.initial.bootable);
+        assert_eq!(parsed.sections.len(), 1);
+        assert!(parsed.sections[0].is_final);
+        assert_eq!(parsed.sections[0].id_string, "sec");
+        assert_eq!(parsed.sections[0].entries.len(), 1);
+        assert_eq!(parsed.sections[0].entries[0].media, MediaType::HardDisk);
+        assert_eq!(parsed.sections[0].entries[0].load_segment, 0x07C0);
+    }
+
+    #[test]
+    fn boot_catalog_image_past_the_store_refused() {
+        let mut catalog = boot_validation();
+        catalog.extend_from_slice(&boot_entry(0x88, 0, 0, 0, 4, 9999));
+        let image = boot_image(28, &catalog, &[]);
+        let reader = reader_over(&image).expect("the image opens");
+        let error = reader
+            .boot_catalog()
+            .expect_err("the past-end image refuses");
+        let text = error.to_string();
+        assert!(text.contains("9999"), "{text}");
+        assert!(text.contains("past"), "{text}");
+    }
+
+    #[test]
+    fn walk_matches_recursive_read_dir() {
+        for reader in [fixture_reader(), joliet_fixture_reader()] {
+            let walked = reader.walk().expect("the walk works");
+            assert_eq!(walked[0].0, "/");
+            assert_eq!(walked[0].1, reader.root());
+            // Reference set: recursive read_dir crawl from the root.
+            let mut stack = vec!["/".to_string()];
+            let mut crawled = vec![("/".to_string(), reader.root())];
+            while let Some(dir) = stack.pop() {
+                let entries = reader.read_dir(&dir).expect("the crawl lists");
+                for entry in entries {
+                    let name = String::from_utf8_lossy(&entry.file_name()).into_owned();
+                    let child = if dir == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{dir}/{name}")
+                    };
+                    if entry.is_dir {
+                        stack.push(child.clone());
+                    }
+                    crawled.push((child, entry));
+                }
+            }
+            let mut walked_sorted = walked.clone();
+            walked_sorted.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut crawled_sorted = crawled;
+            crawled_sorted.sort_by(|left, right| left.0.cmp(&right.0));
+            assert_eq!(walked_sorted, crawled_sorted);
+            // Every walked path resolves back to its entry.
+            for (path, entry) in &walked_sorted {
+                assert_eq!(reader.lookup(path).as_ref(), Some(entry), "path {path}");
+            }
+        }
+        // Exact pre-order on the primary fixture.
+        let reader = fixture_reader();
+        let walked = reader.walk().expect("the walk works");
+        let paths: Vec<&str> = walked.iter().map(|pair| pair.0.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/", "/A", "/A/B.TXT", "/A/CAF\u{e9}.TXT", "/ROOT.TXT"]
+        );
+    }
+
+    #[test]
+    fn walk_cyclic_tree_refused() {
+        // Directory L contains itself: the walk must refuse at the
+        // depth bound, never hang.
+        let mut image = image_with_root(&[
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(25, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"L"),
+        ]);
+        let looping = dir_sector(&[
+            encode_record(25, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(25, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"L"),
+        ]);
+        image[25 * SECTOR_BYTES..26 * SECTOR_BYTES].copy_from_slice(&looping);
+        let reader = reader_over(&image).expect("descriptors still parse");
+        let error = reader.walk().expect_err("the cycle refuses");
+        let text = error.to_string();
+        assert!(text.contains("32"), "{text}");
+        assert!(text.contains("loop"), "{text}");
+    }
+
+    #[test]
+    fn directory_extent_outside_the_store_refused() {
+        // The root record points at sector 999 of a 32-sector image:
+        // descriptors parse, but the directory does not exist.
+        let mut image = vec![0u8; IMAGE_SECTORS as usize * SECTOR_BYTES];
+        let base = 16 * SECTOR_BYTES;
+        image[base..base + SECTOR_BYTES].copy_from_slice(&primary_sector(
+            "LABEL",
+            999,
+            SECTOR_BYTES as u32,
+        ));
+        let boot_base = 17 * SECTOR_BYTES;
+        image[boot_base..boot_base + SECTOR_BYTES].copy_from_slice(&boot_sector());
+        let term_base = 18 * SECTOR_BYTES;
+        image[term_base..term_base + SECTOR_BYTES].copy_from_slice(&terminator_sector());
+        let reader = reader_over(&image).expect("descriptors still parse");
+        assert!(reader.lookup("X").is_none());
+        let error = reader
+            .read_dir("/")
+            .expect_err("the outside extent refuses");
+        let text = error.to_string();
+        assert!(text.contains("999"), "{text}");
+        assert!(reader.walk().is_err(), "the walk refuses too");
+    }
+
+    #[test]
+    fn ten_thousand_components_refused() {
+        // 10 001 segments: refused at the component bound, in bounded
+        // time (the test completing is the no-hang proof).
+        let reader = fixture_reader();
+        let mut path = String::new();
+        for _ in 0..10_000 {
+            path.push_str("a/");
+        }
+        path.push('b');
+        assert!(reader.lookup(&path).is_none());
+        let error = reader
+            .read_dir(&path)
+            .expect_err("10 000 components refuse");
+        assert!(error.to_string().contains("256"), "{error}");
+    }
+
+    /// Counting in-memory [`Volume`]: records store reads so cache hits
+    /// versus misses are observable at the reader level. Test-only.
+    #[derive(Debug)]
+    struct CountingVolume {
+        bytes: Vec<u8>,
+        reads: Rc<Cell<u64>>,
+    }
+
+    impl Volume for CountingVolume {
+        fn total_bytes(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.reads.set(self.reads.get() + 1);
+            let start = offset as usize;
+            let end = start + buf.len();
+            let window = self.bytes.get(start..end).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "read of {} bytes at offset {offset} runs past the volume end",
+                    buf.len()
+                ))
+            })?;
+            buf.copy_from_slice(window);
+            Ok(())
+        }
+
+        fn write_all_at(&mut self, _offset: u64, _buf: &[u8]) -> Result<()> {
+            Err(CoreError::invalid("counting volume is read-only"))
+        }
+    }
+
+    /// Performance image: `dirs` directories `D0000..` directly under
+    /// the root (53 records per sector plus a zero tail, so no record
+    /// straddles a sector), each holding one file `F*.TXT;1` sharing a
+    /// single content sector. Synthetic layout only, claims nothing
+    /// about real mastering tools.
+    fn perf_image(dirs: u32) -> Vec<u8> {
+        const PER_SECTOR: u32 = 53;
+        let root_sectors = dirs.div_ceil(PER_SECTOR);
+        let dir_base = ROOT_SECTOR + root_sectors;
+        let content = dir_base + dirs;
+        let total = content + 1;
+        let mut image = vec![0u8; total as usize * SECTOR_BYTES];
+        let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut image,
+            16,
+            &primary_sector("PERF", ROOT_SECTOR, root_sectors * SECTOR_BYTES as u32),
+        );
+        put(&mut image, 17, &boot_sector());
+        put(&mut image, 18, &terminator_sector());
+        for sector in 0..root_sectors {
+            let mut area = vec![0u8; SECTOR_BYTES];
+            let mut at = 0usize;
+            for index in 0..PER_SECTOR {
+                let number = sector * PER_SECTOR + index;
+                if number >= dirs {
+                    break;
+                }
+                let id = format!("D{number:04}");
+                let record = encode_record(
+                    dir_base + number,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    id.as_bytes(),
+                );
+                area[at..at + record.len()].copy_from_slice(&record);
+                at += record.len();
+            }
+            put(&mut image, ROOT_SECTOR + sector, &area);
+        }
+        for number in 0..dirs {
+            let file_id = format!("F{number:04}.TXT;1");
+            put(
+                &mut image,
+                dir_base + number,
+                &dir_sector(&[
+                    encode_record(
+                        dir_base + number,
+                        SECTOR_BYTES as u32,
+                        FLAG_DIRECTORY,
+                        b"\x00",
+                    ),
+                    encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                    encode_record(content, 5, 0, file_id.as_bytes()),
+                ]),
+            );
+        }
+        put(&mut image, content, b"hello");
+        image
+    }
+
+    #[test]
+    fn perf_repeated_lookup_reads_nothing_new() {
+        const DIRS: u32 = 1500;
+        let bytes = perf_image(DIRS);
+        let total_sectors = bytes.len() / SECTOR_BYTES;
+        let reads = Rc::new(Cell::new(0u64));
+        let volume = CountingVolume {
+            bytes,
+            reads: Rc::clone(&reads),
+        };
+        let reader = IsoReader::open(Box::new(volume)).expect("the big image opens");
+        let after_open = reads.get();
+        let path = "D0749/F0749.TXT";
+        assert!(reader.lookup(path).is_some());
+        let warm = reads.get();
+        for _ in 0..30 {
+            assert!(reader.lookup(path).is_some());
+        }
+        let repeated = reads.get();
+        println!(
+            "perf: {DIRS} dirs in {total_sectors} sectors; open cost {after_open} reads, warm \
+             lookup {} reads, 30 repeats {} new reads",
+            warm - after_open,
+            repeated - warm
+        );
+        assert_eq!(
+            repeated, warm,
+            "repeat lookups of a cached path cost no store reads"
+        );
+    }
+
+    #[test]
+    fn perf_walk_reads_each_sector_once() {
+        const DIRS: u32 = 1500;
+        let bytes = perf_image(DIRS);
+        let total_sectors = bytes.len() / SECTOR_BYTES;
+        let reads = Rc::new(Cell::new(0u64));
+        let volume = CountingVolume {
+            bytes,
+            reads: Rc::clone(&reads),
+        };
+        let reader = IsoReader::open(Box::new(volume)).expect("the big image opens");
+        let before = reads.get();
+        let walked = reader.walk().expect("the walk works");
+        let walk_reads = reads.get() - before;
+        assert_eq!(
+            walked.len() as u32,
+            1 + 2 * DIRS,
+            "root plus every dir and file"
+        );
+        // Reference set: recursive read_dir crawl from the root.
+        let mut stack = vec!["/".to_string()];
+        let mut crawled = vec![("/".to_string(), reader.root())];
+        while let Some(dir) = stack.pop() {
+            let entries = reader.read_dir(&dir).expect("the crawl lists");
+            for entry in entries {
+                let name = String::from_utf8_lossy(&entry.file_name()).into_owned();
+                let child = if dir == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{dir}/{name}")
+                };
+                if entry.is_dir {
+                    stack.push(child.clone());
+                }
+                crawled.push((child, entry));
+            }
+        }
+        let mut walked_sorted = walked;
+        walked_sorted.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut crawled_sorted = crawled;
+        crawled_sorted.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(walked_sorted, crawled_sorted);
+        println!(
+            "perf: walk of {DIRS} dirs cost {walk_reads} store reads over {total_sectors} image \
+             sectors"
+        );
+        assert!(
+            walk_reads <= u64::from(DIRS) + 64,
+            "the walk reads each directory sector once, not once per descent: {walk_reads}"
+        );
     }
 }

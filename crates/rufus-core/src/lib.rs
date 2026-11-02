@@ -41,13 +41,14 @@
 //! * [`i18n`] — [`Catalog`](i18n::Catalog): the Rufus `.loc`
 //!   (pollock-format) catalog, parsed eagerly from disk, with locale
 //!   normalisation, an English fallback chain and a [`Translator`](i18n::Translator).
-//! * [`iso`] — the ISO9660 reader (S14, slices 1-3 of 4): a 64 KiB sector
+//! * [`iso`] — the ISO9660 reader (S14, slices 1-4 of 4): a 64 KiB sector
 //!   cache over [`Volume`](fs::Volume), the sector-16 volume-descriptor
 //!   sequence (primary, supplementary with Joliet tree selection,
-//!   boot record, terminator), UCS-2BE Joliet name decoding, the
-//!   shared directory records with multi-extent joining, SUSP/Rock
-//!   Ridge names, symlinks, attributes and relocation on the primary
-//!   tree, and path lookup with listings and file reads.
+//!   boot record with the El Torito catalog pointer, terminator),
+//!   UCS-2BE Joliet name decoding, the shared directory records with
+//!   multi-extent joining, SUSP/Rock Ridge names, symlinks, attributes
+//!   and relocation on the primary tree, the El Torito boot catalog,
+//!   and path lookup with listings, depth-first walks and file reads.
 //! * [`hash`] — [`Algo`](hash::Algo) selection plus streaming
 //!   [`hash_reader`](hash::hash_reader) / [`hash_file`](hash::hash_file)
 //!   digests (MD5/SHA-1/SHA-256/SHA-512) over a 1 MiB buffer.
