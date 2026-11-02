@@ -1,11 +1,13 @@
-//! UDF volume reader: anchor, descriptors, file set and the root
-//! directory listing (S15, slice 1 of 4).
+//! UDF volume reader: anchor, descriptors, file set, listings, file
+//! reads and walks (S15, slices 1-2 of 4).
 //!
-//! Slice 1 reads the UDF descriptor chain and lists the root directory,
-//! read-only, over any [`Volume`](crate::fs::Volume). The writer side
-//! lives elsewhere ([`fs::udf`](crate::fs::udf) drives the external
-//! `mkudffs` tool); this module never writes and never spawns anything.
-//! It owns the store as `Box<dyn Volume>` for the same lifetime reason
+//! Slices 1-2 read a UDF volume back: the descriptor chain, the root
+//! listing, any directory listing, any regular file's bytes and a
+//! depth-bounded walk — read-only, over any
+//! [`Volume`](crate::fs::Volume). The writer side lives elsewhere
+//! ([`fs::udf`](crate::fs::udf) drives the external `mkudffs` tool); this
+//! module never writes and never spawns anything. It owns the store as
+//! `Box<dyn Volume>` for the same lifetime reason
 //! [`IsoReader`](crate::iso::reader::IsoReader) does: a borrow would leak
 //! the store's lifetime into every call site for no benefit.
 //!
@@ -71,12 +73,10 @@
 //! *Inferred* — spec text (ECMA-167) with no real-image sample behind it:
 //! the long address implementation-use position (all measured addresses
 //! have reference 0 and zero use bytes, so the offsets are unreadable off
-//! the images), short/long/extended allocation descriptor shapes (all
-//! measured directories are embedded), type-2 partition map identifier
-//! strings, compression id 16 names, multi-block directory tag locations
-//! (the measured single-block rule applied per containing block), and
-//! extent-type bits on allocation extents (only recorded extents are
-//! accepted).
+//! the images), short allocation descriptor shapes (every measured extent
+//! is long), type-2 partition map identifier strings, compression id 16
+//! names, and extent-type bits on allocation extents (only recorded
+//! extents are accepted).
 //!
 //! What this slice owns, file by file:
 //!
@@ -89,15 +89,18 @@
 //! * [`descriptor`] — the volume descriptor sequence walk: primary,
 //!   partition, logical volume (with its partition maps), and the
 //!   skipped implementation-use, unallocated-space and terminator shapes.
-//! * [`file`] — the file set descriptor, file/extended-file entries and
-//!   allocation-descriptor resolution (embedded, short and long).
+//! * [`file`] — the file set descriptor, file/extended-file entries
+//!   (with the ICB file-type byte), allocation-descriptor resolution
+//!   (embedded, short and long — extended refuses as an unfollowed
+//!   tag-258 chain) and extent reads.
 //! * [`fid`] — file identifier descriptor parsing over directory data.
 //! * [`reader`] — [`UdfReader`](reader::UdfReader): open, label, revision,
-//!   NSR, block size, partition, file set, root and `read_dir` listings.
+//!   NSR, block size, partition, file set, root, `read_dir` listings,
+//!   `open_file`/`read_file`/`read_file_at` file reads and `walk`.
 //!
-//! Deliberately left for later slices: file content reads (slice 2 owns
-//! the entry ICBs exposed here), logical volume integrity descriptors,
-//! extended attributes, and any write path.
+//! Deliberately left for later slices: logical volume integrity
+//! descriptors, extended attributes, symlink target decoding (symlinks
+//! refuse rather than follow), and any write path.
 //!
 //! On sharing the ISO sector cache: it is not shared, on purpose. That
 //! cache serves fixed 2048-byte sectors (`[u8; 2048]` sits in its type),
@@ -134,6 +137,7 @@ pub use fid::FileId;
 pub use file::FileEntry;
 pub use file::FileSetDescriptor;
 pub use reader::Entry;
+pub use reader::OpenFile;
 pub use reader::UdfReader;
 
 /// Block sizes the anchor probe tries, in order: 2048 first (the mandated
@@ -165,6 +169,22 @@ pub const MAX_DIR_BYTES: u64 = 8 * 1024 * 1024;
 /// Hard ceiling on allocation extents joined for one directory: bounds
 /// the I/O a hostile file entry can demand.
 pub const MAX_DIR_EXTENTS: usize = 1024;
+
+/// Hard ceiling on allocation extents joined for one file: larger than
+/// the directory cap because a fragmented file may scatter further, still
+/// far below what one entry block can name.
+pub const MAX_FILE_EXTENTS: usize = 4096;
+
+/// Hard ceiling on file bytes collected before returning: bounds the
+/// allocation a hostile file entry can demand. Reads stop at the
+/// information length; a sum past it truncates, never errors.
+pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Hard ceiling on directory nesting while walking: a descent past this
+/// is a directory looping on itself (through corrupt ICBs), refused
+/// rather than followed forever. Mirrors
+/// [`MAX_DIR_DEPTH`](crate::iso::MAX_DIR_DEPTH) for the same reason.
+pub const MAX_WALK_DEPTH: usize = 32;
 
 /// Little-endian `u16` at `at` of `bytes`: refuses with `what` and the
 /// byte range when the window is not there. No indexing, no panics.

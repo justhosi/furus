@@ -71,11 +71,12 @@
 //!   helper, with the builtin-name list shared with discovery.
 //! * [`text`] — [`device_text`](text::device_text), the one sanitiser
 //!   for untrusted device text (trim, then control/non-ASCII → `?`).
-//! * [`udf`] — the UDF reader (S15, slice 1 of 4): the sector-256 anchor
+//! * [`udf`] — the UDF reader (S15, slices 1-2 of 4): the sector-256 anchor
 //!   probe, the volume descriptor sequence walk (primary, partition,
 //!   logical volume with its type-1 partition maps), the file set
-//!   descriptor and the root directory listing over `Box<dyn Volume>`,
-//!   read-only alongside the [`fs::udf`](fs::udf) writer side.
+//!   descriptor, directory listings, regular-file reads and a
+//!   depth-bounded walk over `Box<dyn Volume>`, read-only alongside
+//!   the [`fs::udf`](fs::udf) writer side.
 //! * [`units`] — checked sector math, human-readable sizes, durations.
 //! * [`version`] — crate version, compile-time git hash, user-agent string.
 //!

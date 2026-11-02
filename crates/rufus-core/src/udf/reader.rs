@@ -1,17 +1,25 @@
-//! The UDF reader: open, label, revision, NSR, listings (S15, slice 1).
+//! The UDF reader: open, label, revision, NSR, listings, file reads and
+//! walks (S15, slices 1-2).
 //!
 //! [`UdfReader::open`] walks the whole chain up front — recognition
 //! sequence, anchor probe, main (or reserve) descriptor sequence, file
 //! set descriptor, root file entry — so any malformed volume refuses at
 //! open time, before any listing. [`UdfReader::read_dir`] then lists any
-//! directory entry by resolving its ICB through the partition maps,
-//! which is exactly what slice 2 reuses to read file content.
+//! directory entry by resolving its ICB through the partition maps;
+//! [`UdfReader::open_file`]/[`UdfReader::read_file`] read regular files
+//! the same way, and [`UdfReader::walk`] lists the whole tree.
 //!
 //! *Measured* — the chain above parses byte-identical on the `mkudffs`
-//! images from udftools 2.3 (see [`udf`](super) and the slice report):
-//! the label reads `LABEL`, the revision `2.01`, the NSR `NSR03`, the
-//! empty root lists nothing (only its skipped parent entry), and the
-//! populated root lists one subdirectory plus three files with their ICBs.
+//! images from udftools 2.3 (see [`udf`](super) and the slice reports):
+//! the label reads `LABEL`, the revision `2.01`, the NSR `NSR03`; small
+//! files and directories read embedded straight from their entries
+//! (an 88-byte subdirectory, a 19-byte file, a 14-byte file holding a
+//! NUL byte and non-ASCII content, a 3-byte file, each returned
+//! byte-exact); a 10000-byte file reads back byte-identical through one
+//! long extent. Multi-extent directories, symlinks (type 12) and FIFOs
+//! (type 9) are synthetic-fixture facts: the unit tests join two directory
+//! extents and refuse symlinks and FIFOs in both directions with their
+//! kind named.
 //!
 //! *Inferred* — that accepting both `NSR02` and `NSR03` is right (the
 //! writer side pins `NSR03` and refuses `NSR02`; a *reader* that refused
@@ -28,6 +36,8 @@ use crate::fs::Volume;
 use crate::fs::udf::Nsr;
 use crate::text::device_text;
 use crate::udf::LongAd;
+use crate::udf::MAX_FILE_EXTENTS;
+use crate::udf::MAX_WALK_DEPTH;
 use crate::udf::PartitionDesc;
 use crate::udf::anchor;
 use crate::udf::descriptor;
@@ -56,6 +66,45 @@ pub struct Entry {
     pub icb: LongAd,
     /// File version number from the file identifier (1 on real images).
     pub file_version: u16,
+}
+
+/// An opened regular file: the resolved extent windows (or the embedded
+/// bytes) with the information length. The addressing stays inside the
+/// handle so every read clamps to the length: callers cannot bypass the
+/// truncation, and the file type was already gated at
+/// [`UdfReader::open_file`]. Read it with [`UdfReader::read_open`] or
+/// [`UdfReader::read_open_at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFile {
+    /// Absolute byte windows in file order (empty for embedded files).
+    windows: Vec<file::ResolvedExtent>,
+    /// Embedded file bytes cut to the information length (empty for
+    /// extent-backed files).
+    embedded: Vec<u8>,
+    /// Information length in bytes: every read stops here.
+    size: u64,
+    /// Entry name, for error messages only.
+    name: String,
+}
+
+impl OpenFile {
+    /// File length in bytes (the information length).
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+
+    /// True when the file holds no bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Entry name the file was opened from.
+    #[must_use]
+    pub fn file_name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// UDF reader over an owned byte store: the anchor, the descriptor
@@ -249,16 +298,31 @@ impl UdfReader {
 
     /// List `entry` (the root or any directory entry): resolve its ICB
     /// through the partition maps, read its file entry, join its data and
-    /// parse the file identifiers. Deleted entries (bit 0) and parent
-    /// entries (bit 3) are skipped, exactly like ISO skips dot records.
-    /// Refuses files, unresolvable ICBs and malformed directory data,
-    /// naming the entry.
+    /// parse the file identifiers. Deleted entries (bit 2) and parent
+    /// entries (bit 3) are skipped, exactly like ISO skips dot records;
+    /// hidden entries (bit 0) list normally. Refuses non-directories (a
+    /// symlink gets its own message: symlinks are never followed),
+    /// unresolvable ICBs and malformed directory data, naming the entry.
+    /// A directory whose identifiers span several extents lists all of
+    /// them: the extents join in order before parsing.
     pub fn read_dir(&self, entry: &Entry) -> Result<Vec<Entry>> {
         let display = short_name(&entry.name);
         let (home, abs, rel) = self.resolve(&entry.icb, &display)?;
         check_icb_window(self.block_size, self.total, &entry.icb, abs, &display)?;
         let file_entry = file::read_file_entry(&*self.volume, self.block_size, abs, rel)
             .map_err(|error| CoreError::invalid(format!("cannot list `{display}`: {error}")))?;
+        if file_entry.file_type == file::TYPE_SYMLINK {
+            return Err(CoreError::invalid(format!(
+                "cannot list `{display}`: it is a symbolic link, not a directory: \
+                 symlinks are listed but never followed"
+            )));
+        }
+        if file_entry.file_type != file::TYPE_DIRECTORY {
+            return Err(CoreError::invalid(format!(
+                "cannot list `{display}`: it is a {}, not a directory",
+                file::file_type_name(file_entry.file_type)
+            )));
+        }
         let what = format!("directory `{display}`");
         let (data, segs) = file::collect_data(
             &*self.volume,
@@ -291,6 +355,241 @@ impl UdfReader {
             });
         }
         Ok(out)
+    }
+
+    /// Open the regular file `entry` for reading with
+    /// [`UdfReader::read_open`]: resolve its ICB, gate its file type and
+    /// resolve its extents against their partitions. Only regular files
+    /// (type 5) open: directories, symlinks (whose targets are
+    /// path-component records this reader does not decode), FIFOs,
+    /// sockets, devices and anything else refuse with the kind named.
+    /// Embedded files (allocation type 3) carry their bytes in the
+    /// handle; extent-backed files resolve to absolute byte windows.
+    pub fn open_file(&self, entry: &Entry) -> Result<OpenFile> {
+        let display = short_name(&entry.name);
+        let (home, abs, rel) = self.resolve(&entry.icb, &display)?;
+        check_icb_window(self.block_size, self.total, &entry.icb, abs, &display)?;
+        let file_entry = file::read_file_entry(&*self.volume, self.block_size, abs, rel)
+            .map_err(|error| CoreError::invalid(format!("cannot open `{display}`: {error}")))?;
+        match file_entry.file_type {
+            file::TYPE_FILE => {}
+            file::TYPE_DIRECTORY => {
+                return Err(CoreError::invalid(format!(
+                    "cannot open `{display}`: it is a directory, not a regular file"
+                )));
+            }
+            file::TYPE_SYMLINK => {
+                return Err(CoreError::invalid(format!(
+                    "cannot open `{display}`: it is a symbolic link, not a regular file: \
+                     symlink targets are path-component records this reader does not decode, \
+                     so symlinks are listed but never followed"
+                )));
+            }
+            other => {
+                return Err(CoreError::invalid(format!(
+                    "cannot open `{display}`: it is a {}, not a regular file: only regular \
+                     files open for reading",
+                    file::file_type_name(other)
+                )));
+            }
+        }
+        let what = format!("file `{display}`");
+        if file_entry.ads.is_empty() {
+            let len = usize::try_from(file_entry.info_len).map_err(|_| {
+                CoreError::invalid(format!(
+                    "cannot open `{display}`: information length {} is not addressable",
+                    file_entry.info_len
+                ))
+            })?;
+            let data = file_entry.embedded.get(..len).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "cannot open `{display}`: information length {} runs past the {} embedded \
+                     bytes",
+                    file_entry.info_len,
+                    file_entry.embedded.len()
+                ))
+            })?;
+            return Ok(OpenFile {
+                windows: Vec::new(),
+                embedded: data.to_vec(),
+                size: file_entry.info_len,
+                name: display,
+            });
+        }
+        let windows = file::resolve_extents(
+            self.block_size,
+            &self.maps,
+            &self.partitions,
+            &home,
+            &file_entry.ads,
+            &what,
+            MAX_FILE_EXTENTS,
+        )
+        .map_err(|error| CoreError::invalid(format!("cannot open `{display}`: {error}")))?;
+        file::check_file_bounds(file_entry.info_len, &windows, &what)
+            .map_err(|error| CoreError::invalid(format!("cannot open `{display}`: {error}")))?;
+        Ok(OpenFile {
+            windows,
+            embedded: Vec::new(),
+            size: file_entry.info_len,
+            name: display,
+        })
+    }
+
+    /// Read the whole regular file `entry` into RAM: opens it, then reads
+    /// through [`UdfReader::read_open`]. Only the information length
+    /// returns even when the extents sum past it; a short sum refuses at
+    /// open time.
+    pub fn read_file(&self, entry: &Entry) -> Result<Vec<u8>> {
+        let file = self.open_file(entry)?;
+        self.read_open(&file).map_err(|error| {
+            CoreError::invalid(format!(
+                "cannot read `{}`: {error}",
+                short_name(&entry.name)
+            ))
+        })
+    }
+
+    /// Read the whole opened file into RAM: embedded bytes clone out of
+    /// the handle, extent windows read in file order and clamp at the
+    /// information length. An empty file reads nothing; any window running
+    /// past the store refuses as truncation with the numbers named.
+    pub fn read_open(&self, file: &OpenFile) -> Result<Vec<u8>> {
+        if file.size == 0 {
+            return Ok(Vec::new());
+        }
+        if !file.embedded.is_empty() {
+            return Ok(file.embedded.clone());
+        }
+        let what = format!("file `{}`", short_name(&file.name));
+        file::read_windows(&*self.volume, &file.windows, file.size, &what).map_err(|error| {
+            CoreError::invalid(format!("cannot read `{}`: {error}", short_name(&file.name)))
+        })
+    }
+
+    /// Read up to `buf.len()` bytes of the regular file `entry` at
+    /// `offset`: opens it, then reads through
+    /// [`UdfReader::read_open_at`]. Returns the bytes placed (0 at end of
+    /// file).
+    pub fn read_file_at(&self, entry: &Entry, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let file = self.open_file(entry)?;
+        self.read_open_at(&file, offset, buf).map_err(|error| {
+            CoreError::invalid(format!(
+                "cannot read `{}`: {error}",
+                short_name(&entry.name)
+            ))
+        })
+    }
+
+    /// Read up to `buf.len()` bytes of the opened file at `offset`:
+    /// returns the bytes placed (0 at end of file). Refuses an offset past
+    /// the length, naming both; every window read is bounds-checked before
+    /// its I/O.
+    pub fn read_open_at(&self, file: &OpenFile, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let name = short_name(&file.name);
+        if !file.windows.is_empty() {
+            let what = format!("file `{name}`");
+            return file::read_windows_at(
+                &*self.volume,
+                &file.windows,
+                file.size,
+                offset,
+                buf,
+                &what,
+            )
+            .map_err(|error| CoreError::invalid(format!("cannot read `{name}`: {error}")));
+        }
+        if offset > file.size {
+            return Err(CoreError::invalid(format!(
+                "cannot read `{name}` at offset {offset}: past the {} byte file",
+                file.size
+            )));
+        }
+        if buf.is_empty() || offset == file.size {
+            return Ok(0);
+        }
+        let start = usize::try_from(offset).map_err(|_| {
+            CoreError::invalid(format!(
+                "cannot read `{name}` at offset {offset}: not addressable"
+            ))
+        })?;
+        let want = (file.size.saturating_sub(offset)).min(buf.len() as u64);
+        let count = usize::try_from(want).map_err(|_| {
+            CoreError::invalid(format!(
+                "cannot read `{name}` of {want} bytes: not addressable"
+            ))
+        })?;
+        let end = start.saturating_add(count);
+        let embedded_len = file.embedded.len();
+        let src = file.embedded.get(start..end).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "cannot read `{name}` bytes {start}..{end} past the {embedded_len} embedded bytes"
+            ))
+        })?;
+        let buffer_len = buf.len();
+        let dest = buf.get_mut(..count).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "cannot read `{name}` of {count} bytes past the {buffer_len} byte buffer"
+            ))
+        })?;
+        dest.copy_from_slice(src);
+        Ok(count)
+    }
+
+    /// Depth-first listing over the whole tree: the root as (`/`, root)
+    /// first, then every descendant pre-order as (`/A`, `/A/B`, ...) with
+    /// its [`Entry`]. Paths are absolute (leading `/`) and only
+    /// directories descend — symlinks list but never descend (opening one
+    /// refuses anyway). Descent past
+    /// [`MAX_WALK_DEPTH`](crate::udf::MAX_WALK_DEPTH) refuses as a
+    /// possible directory loop: corrupt ICBs that cycle refuse here
+    /// rather than hanging. A hostile name containing `/` yields an
+    /// ambiguous path the entry still carries verbatim.
+    pub fn walk(&self) -> Result<Vec<(String, Entry)>> {
+        let root = self.root();
+        let mut out = Vec::new();
+        out.push(("/".to_string(), root.clone()));
+        self.walk_dir(&root, "/", 0, &mut out)?;
+        Ok(out)
+    }
+
+    /// One level of [`UdfReader::walk`]: list `dir`, push one (`path`,
+    /// entry) pair per child, and descend into directories. `depth` counts
+    /// descents from the root; past
+    /// [`MAX_WALK_DEPTH`](crate::udf::MAX_WALK_DEPTH) the tree cycles, so
+    /// the walk refuses instead.
+    fn walk_dir(
+        &self,
+        dir: &Entry,
+        path: &str,
+        depth: usize,
+        out: &mut Vec<(String, Entry)>,
+    ) -> Result<()> {
+        if depth > MAX_WALK_DEPTH {
+            return Err(CoreError::invalid(format!(
+                "walk of `{}` nests past {MAX_WALK_DEPTH} directories: refusing as a possible \
+                 directory loop",
+                short_name(path)
+            )));
+        }
+        let children = self
+            .read_dir(dir)
+            .map_err(|error| CoreError::invalid(format!("cannot walk `{path}`: {error}")))?;
+        for child in &children {
+            // Paths carry the decoded name verbatim (not the sanitised
+            // error form): a hostile `/` inside a name yields an ambiguous
+            // path, documented above.
+            let child_path = if path == "/" {
+                format!("/{}", child.name)
+            } else {
+                format!("{path}/{}", child.name)
+            };
+            out.push((child_path.clone(), child.clone()));
+            if child.is_directory {
+                self.walk_dir(child, &child_path, depth.saturating_add(1), out)?;
+            }
+        }
+        Ok(())
     }
 
     /// Resolve an ICB to its partition, absolute block and
@@ -580,15 +879,48 @@ mod tests {
     }
 
     /// Extended file entry with `data` embedded (information length =
-    /// data length), claiming partition-relative `rel`.
+    /// data length), file type directory, claiming partition-relative
+    /// `rel`.
     fn ext_entry(rel: u32, data: &[u8]) -> Vec<u8> {
+        ext_typed_entry(rel, data, 4)
+    }
+
+    /// Extended file entry with `data` embedded and file type `ftype`.
+    fn ext_typed_entry(rel: u32, data: &[u8], ftype: u8) -> Vec<u8> {
         let mut block = vec![0u8; SIZE as usize];
+        block[27] = ftype;
         block[16 + 18..16 + 20].copy_from_slice(&3u16.to_le_bytes());
         block[56..64].copy_from_slice(&(data.len() as u64).to_le_bytes());
         block[208..212].copy_from_slice(&0u32.to_le_bytes());
         block[212..216].copy_from_slice(&(data.len() as u32).to_le_bytes());
         block[216..216 + data.len()].copy_from_slice(data);
         stamp_tag(&mut block, 266, (SIZE - 16) as u16, rel);
+        block
+    }
+
+    /// Extended file entry with inline long allocation descriptors
+    /// `(length, block)` (partition reference 0), information length
+    /// `info`, file type `ftype`, claiming partition-relative `rel`.
+    fn ext_long_entry(rel: u32, ads: &[(u32, u32)], info: u64, ftype: u8) -> Vec<u8> {
+        let mut block = vec![0u8; SIZE as usize];
+        block[27] = ftype;
+        block[16 + 18..16 + 20].copy_from_slice(&1u16.to_le_bytes());
+        block[56..64].copy_from_slice(&info.to_le_bytes());
+        block[208..212].copy_from_slice(&0u32.to_le_bytes());
+        block[212..216].copy_from_slice(&(ads.len() as u32 * 16).to_le_bytes());
+        for (index, (len, lbn)) in ads.iter().enumerate() {
+            let at = 216 + index * 16;
+            block[at..at + 4].copy_from_slice(&len.to_le_bytes());
+            block[at + 4..at + 8].copy_from_slice(&lbn.to_le_bytes());
+        }
+        stamp_tag(&mut block, 266, (SIZE - 16) as u16, rel);
+        block
+    }
+
+    /// Raw data block holding `data` in its first bytes.
+    fn data_block(data: &[u8]) -> Vec<u8> {
+        let mut block = vec![0u8; SIZE as usize];
+        block[..data.len()].copy_from_slice(data);
         block
     }
 
@@ -613,11 +945,19 @@ mod tests {
     /// unallocated, implementation use, terminator), file set at absolute
     /// `PART_AT + 8` and root entry at `PART_AT + 10` embedding `root`.
     /// Layout sketch (512-byte blocks): anchor 256, main 96..104, FSD
-    /// 265, root entry 267.
+    /// 265, root entry 267. Extra `(absolute block, bytes)` pairs land
+    /// after the fixed layout; the store grows to hold them.
     fn full_volume(root: &[u8]) -> VecVolume {
+        full_volume_with(root, &[])
+    }
+
+    fn full_volume_with(root: &[u8], extra: &[(u32, Vec<u8>)]) -> VecVolume {
         let fsd_rel = 8u32;
         let root_rel = 10u32;
-        let total_blocks = PART_AT + 16;
+        let mut total_blocks = PART_AT + 16;
+        for (abs, _) in extra {
+            total_blocks = total_blocks.max(abs.saturating_add(1));
+        }
         let mut volume = VecVolume::new(u64::from(total_blocks) * u64::from(SIZE), 512)
             .expect("the fixture fits in RAM");
         let recognition = recognition(b"NSR03");
@@ -638,6 +978,9 @@ mod tests {
         put(101, &terminator(101));
         put(PART_AT + fsd_rel, &fsd(fsd_rel, root_rel));
         put(PART_AT + root_rel, &ext_entry(root_rel, root));
+        for (abs, bytes) in extra {
+            put(*abs, bytes);
+        }
         volume
     }
 
@@ -758,5 +1101,345 @@ mod tests {
         };
         let error = reader.resolve_icb(&bad).expect_err("reference 4 refuses");
         assert!(error.to_string().contains('4'), "{:?}", error);
+    }
+
+    /// Open a volume with `root` embedded in the root entry plus `extra`
+    /// absolute blocks (file entries and data).
+    fn open_with(root: &[u8], extra: &[(u32, Vec<u8>)]) -> UdfReader {
+        UdfReader::open(Box::new(full_volume_with(root, extra))).expect("the volume opens")
+    }
+
+    /// Root data with a parent plus one embedded file (`f`, ICB at
+    /// relative 11) and one empty file (`e`, ICB at relative 16).
+    fn file_root() -> Vec<u8> {
+        let mut data = fid_record(0x0A, 10, &[], 10);
+        data.extend_from_slice(&fid_record(0x00, 11, &[8, b'f'], 10));
+        data.extend_from_slice(&fid_record(0x00, 16, &[8, b'e'], 10));
+        data
+    }
+
+    #[test]
+    fn embedded_file_reads_and_seeks() {
+        let reader = open_with(
+            &file_root(),
+            &[
+                (PART_AT + 11, ext_typed_entry(11, b"hello udf", 5)),
+                (PART_AT + 16, ext_typed_entry(16, b"", 5)),
+            ],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        assert_eq!(entries.len(), 2);
+        let file = reader.open_file(&entries[0]).expect("f opens");
+        assert_eq!(file.len(), 9);
+        assert!(!file.is_empty());
+        assert_eq!(file.file_name(), "f");
+        assert_eq!(reader.read_open(&file).expect("open reads"), b"hello udf");
+        assert_eq!(
+            reader.read_file(&entries[0]).expect("f reads"),
+            b"hello udf"
+        );
+        let mut buf = [0u8; 4];
+        let placed = reader
+            .read_file_at(&entries[0], 0, &mut buf)
+            .expect("offset 0 reads");
+        assert_eq!(placed, 4);
+        assert_eq!(&buf, b"hell");
+        let placed = reader
+            .read_file_at(&entries[0], 9, &mut buf)
+            .expect("offset 9 is EOF");
+        assert_eq!(placed, 0);
+        let error = reader
+            .read_file_at(&entries[0], 10, &mut buf)
+            .expect_err("offset 10 past 9 refuses");
+        let text = error.to_string();
+        assert!(text.contains("10"), "{text}");
+        assert!(text.contains('9'), "{text}");
+        assert_eq!(reader.read_file(&entries[1]).expect("e reads"), b"");
+        assert!(reader.open_file(&entries[1]).expect("e opens").is_empty());
+    }
+
+    #[test]
+    fn extent_file_joins_across_blocks_and_cuts_to_length() {
+        // One file as two 300-byte extents with information length 600
+        // (exact join), one alias entry with length 500 (the tail never
+        // reads).
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x00, 13, &[8, b'b', b'i', b'g'], 10));
+        root.extend_from_slice(&fid_record(0x00, 14, &[8, b'h', b'a', b'l', b'f'], 10));
+        let first = vec![1u8; 300];
+        let second = vec![2u8; 300];
+        let reader = open_with(
+            &root,
+            &[
+                (
+                    PART_AT + 13,
+                    ext_long_entry(13, &[(300, 20), (300, 21)], 600, 5),
+                ),
+                (
+                    PART_AT + 14,
+                    ext_long_entry(14, &[(300, 20), (300, 21)], 500, 5),
+                ),
+                (PART_AT + 20, data_block(&first)),
+                (PART_AT + 21, data_block(&second)),
+            ],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        assert_eq!(entries.len(), 2);
+        let mut joined = vec![1u8; 300];
+        joined.extend_from_slice(&vec![2u8; 300]);
+        assert_eq!(reader.read_file(&entries[0]).expect("big reads"), joined);
+        assert_eq!(
+            reader.read_file(&entries[1]).expect("half reads"),
+            joined[..500].to_vec()
+        );
+        let opened = reader.open_file(&entries[0]).expect("big opens");
+        assert_eq!(opened.len(), 600);
+        let mut buf = [0u8; 10];
+        let placed = reader
+            .read_open_at(&opened, 295, &mut buf)
+            .expect("the straddle reads");
+        assert_eq!(placed, 10);
+        assert_eq!(&buf[..5], &[1u8; 5]);
+        assert_eq!(&buf[5..], &[2u8; 5]);
+    }
+
+    #[test]
+    fn directory_entry_refuses_file_reads_and_vice_versa() {
+        let reader = open_with(
+            &root_data(),
+            &[(PART_AT + 11, ext_typed_entry(11, b"data", 5))],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        let error = reader
+            .read_dir(&entries[0])
+            .expect_err("a file never lists");
+        let text = error.to_string();
+        assert!(text.contains("f.txt"), "{text}");
+        assert!(text.contains("not a directory"), "{text}");
+        let error = reader
+            .read_file(&reader.root())
+            .expect_err("the root never reads as a file");
+        assert!(error.to_string().contains("directory"), "{:?}", error);
+    }
+
+    #[test]
+    fn symlink_and_fifo_refuse_with_their_kind() {
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x00, 14, &[8, b'L'], 10));
+        root.extend_from_slice(&fid_record(0x00, 15, &[8, b'F'], 10));
+        let reader = open_with(
+            &root,
+            &[
+                (PART_AT + 14, ext_typed_entry(14, b"\x05\x03link", 12)),
+                (PART_AT + 15, ext_typed_entry(15, b"", 9)),
+            ],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        assert_eq!(entries.len(), 2);
+        let error = reader
+            .read_file(&entries[0])
+            .expect_err("a symlink never reads");
+        assert!(error.to_string().contains("symbolic link"), "{:?}", error);
+        let error = reader
+            .read_file(&entries[1])
+            .expect_err("a FIFO never reads");
+        assert!(error.to_string().contains("FIFO"), "{:?}", error);
+        let error = reader
+            .read_dir(&entries[0])
+            .expect_err("a symlink never lists");
+        assert!(error.to_string().contains("symbolic link"), "{:?}", error);
+        let fifo = reader
+            .open_file(&entries[1])
+            .expect_err("a FIFO never opens");
+        assert!(fifo.to_string().contains("FIFO"), "{:?}", fifo);
+    }
+
+    #[test]
+    fn other_file_types_refuse_with_their_kind() {
+        // Socket (10), terminal (11), stream directory (13), block device
+        // (6) and metadata main (250): every non-regular type refuses to
+        // open with its kind named, and refuses to list as a directory.
+        // Types 252-255 have no name table entry (see `file_type_name`)
+        // and refuse as `unknown file type N`; 255 stands in for that
+        // range here.
+        let kinds: [(u8, &str, u8); 6] = [
+            (10, "socket", b'S'),
+            (11, "terminal", b'T'),
+            (13, "stream directory", b'R'),
+            (6, "block device", b'B'),
+            (250, "metadata main", b'M'),
+            (255, "unknown file type 255", b'U'),
+        ];
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        for (index, (_, _, tag)) in kinds.iter().enumerate() {
+            let rel = 20 + index as u32;
+            root.extend_from_slice(&fid_record(0x00, rel, &[8, *tag], 10));
+        }
+        let mut extra = Vec::new();
+        for (index, (ftype, _, _)) in kinds.iter().enumerate() {
+            let rel = 20 + index as u32;
+            extra.push((PART_AT + rel, ext_typed_entry(rel, b"", *ftype)));
+        }
+        let reader = open_with(&root, &extra);
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        assert_eq!(entries.len(), kinds.len());
+        for (entry, (_, want, _)) in entries.iter().zip(kinds.iter()) {
+            let error = reader.open_file(entry).expect_err("never opens");
+            assert!(error.to_string().contains(want), "{:?}", error);
+            let error = reader.read_dir(entry).expect_err("never lists");
+            assert!(error.to_string().contains(want), "{:?}", error);
+        }
+    }
+
+    #[test]
+    fn multi_extent_directory_lists_every_extent() {
+        // D (relative 12) holds its identifiers in two extents sized to
+        // the data: the parent plus a.txt live at relative 20, b.txt at
+        // relative 21, joined contiguously before parsing.
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x02, 12, &[8, b'D'], 10));
+        let mut first = fid_record(0x0A, 12, &[], 20);
+        first.extend_from_slice(&fid_record(0x00, 30, &[8, b'a'], 20));
+        let second = fid_record(0x00, 31, &[8, b'b'], 21);
+        let info = first.len() as u64 + second.len() as u64;
+        let reader = open_with(
+            &root,
+            &[
+                (
+                    PART_AT + 12,
+                    ext_long_entry(
+                        12,
+                        &[(first.len() as u32, 20), (second.len() as u32, 21)],
+                        info,
+                        4,
+                    ),
+                ),
+                (PART_AT + 20, data_block(&first)),
+                (PART_AT + 21, data_block(&second)),
+            ],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        assert_eq!(entries.len(), 1);
+        let listed = reader.read_dir(&entries[0]).expect("D lists both extents");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "a");
+        assert_eq!(listed[0].icb.lbn, 30);
+        assert_eq!(listed[1].name, "b");
+        assert_eq!(listed[1].icb.lbn, 31);
+    }
+
+    #[test]
+    fn walk_lists_the_tree_with_absolute_paths() {
+        // Root holds f (file) and D (directory holding inner).
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x00, 11, &[8, b'f'], 10));
+        root.extend_from_slice(&fid_record(0x02, 12, &[8, b'D'], 10));
+        let mut sub = fid_record(0x0A, 12, &[], 12);
+        sub.extend_from_slice(&fid_record(0x00, 15, &[8, b'i'], 12));
+        let reader = open_with(
+            &root,
+            &[
+                (PART_AT + 11, ext_typed_entry(11, b"hi", 5)),
+                (PART_AT + 12, ext_typed_entry(12, &sub, 4)),
+                (PART_AT + 15, ext_typed_entry(15, b"in", 5)),
+            ],
+        );
+        let walked = reader.walk().expect("the tree walks");
+        let paths: Vec<&str> = walked.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, vec!["/", "/f", "/D", "/D/i"]);
+        assert_eq!(walked[1].1.name, "f");
+        assert!(!walked[1].1.is_directory);
+        assert!(walked[2].1.is_directory);
+        assert_eq!(walked[3].1.name, "i");
+    }
+
+    #[test]
+    fn walk_refuses_a_directory_loop() {
+        // L contains itself: every descent finds L again, so only the
+        // depth bound stops the walk.
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x02, 12, &[8, b'L'], 10));
+        let mut looping = fid_record(0x0A, 12, &[], 12);
+        looping.extend_from_slice(&fid_record(0x02, 12, &[8, b'L'], 12));
+        let reader = open_with(&root, &[(PART_AT + 12, ext_typed_entry(12, &looping, 4))]);
+        let error = reader.walk().expect_err("the loop refuses");
+        assert!(error.to_string().contains("loop"), "{:?}", error);
+    }
+
+    #[test]
+    fn hidden_lists_and_deleted_skips() {
+        // h (0x01, hidden) lists; g (0x04, deleted) never appears even
+        // though its record parses.
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x01, 11, &[8, b'h'], 10));
+        root.extend_from_slice(&fid_record(0x04, 12, &[8, b'g'], 10));
+        let reader = open_with(
+            &root,
+            &[
+                (PART_AT + 11, ext_typed_entry(11, b"hi", 5)),
+                (PART_AT + 12, ext_typed_entry(12, b"gone", 5)),
+            ],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "h");
+    }
+
+    #[test]
+    fn corrupt_extent_type_names_the_file_and_index() {
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x00, 13, &[8, b'b', b'a', b'd'], 10));
+        let mut entry = ext_long_entry(13, &[(4, 20)], 4, 5);
+        entry[216..220].copy_from_slice(&((1u32 << 30) | 4).to_le_bytes());
+        stamp_tag(&mut entry, 266, (SIZE - 16) as u16, 13);
+        let reader = open_with(&root, &[(PART_AT + 13, entry)]);
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        let error = reader.read_file(&entries[0]).expect_err("type 1 refuses");
+        let text = error.to_string();
+        assert!(text.contains("bad"), "{text}");
+        assert!(text.contains("descriptor 0"), "{text}");
+        assert!(text.contains("type 1"), "{text}");
+    }
+
+    #[test]
+    fn escaping_extent_names_the_file_and_range() {
+        // One block at relative 900 of a 900-block partition: the start
+        // itself is past the end.
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x00, 13, &[8, b'b', b'i', b'g'], 10));
+        let reader = open_with(
+            &root,
+            &[(
+                PART_AT + 13,
+                ext_long_entry(13, &[(SIZE, 900)], SIZE as u64, 5),
+            )],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        let error = reader
+            .read_file(&entries[0])
+            .expect_err("block 900 refuses");
+        let text = error.to_string();
+        assert!(text.contains("big"), "{text}");
+        assert!(text.contains("900"), "{text}");
+    }
+
+    #[test]
+    fn short_information_length_refuses() {
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(0x00, 13, &[8, b's'], 10));
+        let reader = open_with(
+            &root,
+            &[
+                (PART_AT + 13, ext_long_entry(13, &[(4, 20)], 9, 5)),
+                (PART_AT + 20, data_block(&[1, 2, 3, 4])),
+            ],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        let error = reader
+            .read_file(&entries[0])
+            .expect_err("info 9 past 4 refuses");
+        let text = error.to_string();
+        assert!(text.contains('9'), "{text}");
+        assert!(text.contains('4'), "{text}");
     }
 }

@@ -1,4 +1,4 @@
-//! File identifier descriptors (S15, slice 1).
+//! File identifier descriptors (S15, slices 1-2).
 //!
 //! A directory's data is a run of file identifier descriptors (tag 257):
 //! the file version, characteristics, name length, the entry's ICB (a
@@ -16,9 +16,9 @@
 //! tag (name and padding included).
 //!
 //! *Inferred* — multi-block tag locations (the measured rule applied per
-//! containing block: no measured directory spans blocks) and the
-//! characteristics bit 2 (parsed nowhere: only bits 0, 1 and 3 matter
-//! here).
+//! containing block: slice 2 measures multi-block directories whose every
+//! record still tags its own containing block) and the metadata bit 4
+//! (parsed nowhere: only bits 0-3 matter here).
 
 use crate::error::CoreError;
 use crate::error::Result;
@@ -48,11 +48,14 @@ const FID_ICB_AT: usize = 20;
 /// descriptor.
 const FID_IU_AT: usize = 36;
 
-/// Characteristics bit 0: set means deleted — the ICB is then undefined
-/// and the entry is skipped, never followed.
-pub const CHAR_DELETED: u8 = 0x01;
+/// Characteristics bit 0: hidden — the entry lists normally (like ISO
+/// lists hidden records); the ICB is valid and followed.
+pub const CHAR_HIDDEN: u8 = 0x01;
 /// Characteristics bit 1: set means directory.
 pub const CHAR_DIRECTORY: u8 = 0x02;
+/// Characteristics bit 2: set means deleted — the ICB is then undefined
+/// and the entry is skipped, never followed.
+pub const CHAR_DELETED: u8 = 0x04;
 /// Characteristics bit 3: set means parent (`..`) — skipped in listings
 /// like ISO's dot records.
 pub const CHAR_PARENT: u8 = 0x08;
@@ -80,7 +83,7 @@ pub struct FileId {
 }
 
 impl FileId {
-    /// True when the deleted bit (bit 0) is set.
+    /// True when the deleted bit (bit 2) is set.
     #[must_use]
     pub fn is_deleted(&self) -> bool {
         self.characteristics & CHAR_DELETED != 0
@@ -299,6 +302,28 @@ mod tests {
         }];
         let parsed = parse_fids(&data, &segs, 2048, "test").expect("the tail ends it");
         assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn deleted_bit_is_bit_two_and_hidden_lists() {
+        // 0x04 (deleted) parses but marks itself skipped; 0x01 (hidden)
+        // parses as a normal listed entry. Slice 1 read bit 0 as deleted,
+        // which both dropped hidden files and followed truly deleted
+        // entries; ECMA-167 4/14.4.3 (as Linux's ecma_167.h and OpenBSD's
+        // ecma167-udf.h agree) puts hidden at 0x01 and deleted at 0x04.
+        let mut data = fid_record(0x04, 5, &[8, b'g'], 3);
+        data.extend_from_slice(&fid_record(0x01, 6, &[8, b'h'], 3));
+        let segs = vec![DataSeg {
+            start: 3,
+            len: data.len() as u64,
+        }];
+        let parsed = parse_fids(&data, &segs, 2048, "test").expect("both records parse");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].is_deleted());
+        assert!(!parsed[0].is_parent());
+        assert!(!parsed[1].is_deleted());
+        assert!(!parsed[1].is_parent());
+        assert_eq!(parsed[1].name, vec![8, b'h']);
     }
 
     #[test]
