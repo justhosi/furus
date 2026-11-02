@@ -1,23 +1,29 @@
-//! ISO9660 reader: volume descriptors and the primary directory tree
-//! (S14, slice 1 of 4).
+//! ISO9660 reader: volume descriptors, the chosen directory tree and
+//! multi-extent files (S14, slices 1-2 of 4).
 //!
 //! PLAN's S14 asks for an ISO9660/Joliet/Rock Ridge reader over the image
 //! with the volume descriptors "mmap"ed for amortised reads. Two facts
 //! shape what this slice can honestly claim, split here the way the house
 //! requires:
 //!
-//! * *Measured* — the ECMA-119 on-disk layout this slice parses: 2048-byte
-//!   sectors, the descriptor sequence at sector 16 (`CD001` at bytes 1..6,
-//!   type byte at 0, version 1 at 6), the primary/supplementary/boot/
-//!   terminator shapes, both-endian fields, and the packed directory
-//!   records that never straddle a sector. Every layout fact below is
-//!   pinned by synthetic fixtures built byte by byte in the `#[cfg(test)]`
-//!   modules, which claim nothing about real mastering tools.
+//! * *Measured* — the ECMA-119 on-disk layout slices 1-2 parse:
+//!   2048-byte sectors, the descriptor sequence at sector 16 (`CD001`
+//!   at bytes 1..6, type byte at 0, version 1 at 6), the
+//!   primary/supplementary/boot/terminator shapes, both-endian fields,
+//!   and the packed directory records that never straddle a sector. The
+//!   Joliet additions: the `%/@`, `%/C`, `%/E` escape openings marking
+//!   levels 1-3 (highest level present wins, as libcdio selects),
+//!   UCS-2BE identifiers with surrogate pairs combining per Unicode,
+//!   `;1`/trailing-dot stripping on the decoded text, and adjacent
+//!   same-name records joining into one multi-extent file in order.
+//!   Every layout fact below is pinned by synthetic fixtures built byte
+//!   by byte in the `#[cfg(test)]` modules, which claim nothing about
+//!   real mastering tools.
 //! * *Inferred* — that real `xorriso`/`genisoimage` output follows the
-//!   same layout. Slice 1 cross-checks one directory listing against
-//!   `isoinfo` inside `archlinux:latest` where docker is available (see
-//!   the slice report); whatever could not be run is stated plainly
-//!   there, never faked.
+//!   same layout. Slices 1-2 cross-check directory listings and one
+//!   Joliet tree against `xorriso` inside `archlinux:latest` where
+//!   docker is available (see the slice reports); whatever could not be
+//!   run is stated plainly there, never faked.
 //!
 //! The mmap half of the mandate is impossible here: the crate carries
 //! `#![forbid(unsafe_code)]` and no new dependency is allowed, so there
@@ -34,21 +40,23 @@
 //!   reader carries no lifetime; a borrow would leak the store's lifetime
 //!   into every call site for no benefit).
 //! * [`descriptor`] — the sector-16 descriptor sequence: primary (type 1),
-//!   supplementary (type 2, header plus the Joliet escape sequences kept
-//!   for slice 2 — no Joliet name decoding yet), boot record (type 0) and
-//!   terminator (type 255).
-//! * [`record`] — directory-record parsing and the `;1`/trailing-dot
-//!   name stripping (byte-exact otherwise; non-ASCII stays as bytes).
-//! * [`reader`] — [`IsoReader`](reader::IsoReader): label, `root`,
-//!   `lookup`, `read_dir`, `open_file`/`read_file` over the primary tree.
+//!   supplementary (type 2, with the Joliet level detected and the
+//!   volume identifier UCS-2BE-decoded for Joliet), boot record
+//!   (type 0) and terminator (type 255).
+//! * [`joliet`] — UCS-2BE name and label decoding with surrogate-pair
+//!   handling, plus `;1`/trailing-dot stripping on decoded text.
+//! * [`record`] — directory-record parsing shared by both trees, and the
+//!   `;1`/trailing-dot stripping for primary-tree (raw-byte) names.
+//! * [`reader`] — [`IsoReader`](reader::IsoReader): the chosen tree
+//!   ([`TreeKind`]), label, `root`, `lookup`, `read_dir`,
+//!   `open_file`/`read_file` with multi-extent joining.
 //!
-//! Deliberately left for later slices: Joliet name decoding and the
-//! multi-extent join (both slice 2, which owns the kept supplementary
-//! descriptors), Rock Ridge system-use parsing, path tables, and El
-//! Torito boot handling. A directory whose data length is not a multiple
-//! of the sector size reads its last partial sector the way ECMA-119
-//! allows (only the valid prefix carries records); anything cut
-//! mid-sector past the volume end is refused as truncated.
+//! Deliberately left for later slices: Rock Ridge system-use parsing,
+//! path tables, El Torito boot handling, and recording-date decoding.
+//! A directory whose data length is not a multiple of the sector size
+//! reads its last partial sector the way ECMA-119 allows (only the
+//! valid prefix carries records); anything cut mid-sector past the
+//! volume end is refused as truncated.
 
 /// ISO9660 logical sector size in bytes (ECMA-119 fixes it; the reader
 /// addresses every extent in units of this).
@@ -76,6 +84,7 @@ pub const MAX_PATH_COMPONENTS: usize = 256;
 
 pub mod cache;
 pub mod descriptor;
+pub mod joliet;
 pub mod reader;
 pub mod record;
 
@@ -88,6 +97,7 @@ pub use descriptor::read_descriptor_set;
 pub use reader::Entry;
 pub use reader::IsoReader;
 pub use reader::OpenFile;
+pub use reader::TreeKind;
 pub use record::DirRecord;
 pub use record::FLAG_ASSOCIATED;
 pub use record::FLAG_DIRECTORY;

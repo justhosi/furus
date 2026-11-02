@@ -1,4 +1,4 @@
-//! Directory records of the primary tree (S14, slice 1).
+//! Directory records of the primary tree (S14, slices 1-2).
 //!
 //! *Measured* — ECMA-119 section 9.1: one length byte, one extended
 //! attribute length byte, the extent and data length as both-endian
@@ -16,10 +16,11 @@
 //! whether the `isoinfo` cross-check ran.
 //!
 //! Names strip the `;1` version suffix and one trailing `.`, byte-exact
-//! otherwise: non-ASCII bytes stay as bytes because Joliet decoding is
-//! slice 2's job, and case is never folded. The `.` (`[0x00]`) and `..`
-//! (`[0x01]`) records are recognised so listings can skip them while
-//! traversal still resolves `..`.
+//! otherwise: the primary tree keeps non-ASCII bytes as bytes, while the
+//! Joliet tree decodes UCS-2BE first ([`joliet`](crate::iso::joliet)) and
+//! strips on the decoded text. Case is never folded. The `.` (`[0x00]`)
+//! and `..` (`[0x01]`) records are recognised so listings can skip them
+//! while traversal still resolves `..`.
 
 use crate::error::CoreError;
 use crate::error::Result;
@@ -31,7 +32,7 @@ pub const FLAG_DIRECTORY: u8 = 0x02;
 /// Flag bit 2: the record is an associated file.
 pub const FLAG_ASSOCIATED: u8 = 0x04;
 /// Flag bit 7: this is not the final record of a multi-extent file.
-/// Slice 1 refuses such records (slice 2 joins the extents).
+/// The reader joins such records into one file view.
 pub const FLAG_MULTI_EXTENT: u8 = 0x80;
 
 /// Fixed-part length of a directory record: length byte, extended
@@ -75,8 +76,8 @@ impl DirRecord {
         self.flags & FLAG_DIRECTORY != 0
     }
 
-    /// Flag bit 7: not the final extent; slice 1 refuses these, slice 2
-    /// joins them.
+    /// Flag bit 7: not the final extent; the reader joins the adjacent
+    /// same-name records into one file view.
     #[must_use]
     pub fn is_multi_extent(&self) -> bool {
         self.flags & FLAG_MULTI_EXTENT != 0
@@ -269,9 +270,11 @@ pub fn parse_records(sector: &[u8], valid_len: usize, sector_no: u32) -> Result<
     Ok(out)
 }
 
-/// Display/matching form of an identifier: the `;1` version suffix and
-/// one trailing `.` stripped, everything else byte-exact (non-ASCII
-/// bytes survive untouched for slice 2's Joliet decoding).
+/// Display/matching form of a primary-tree identifier: the `;1`
+/// version suffix and one trailing `.` stripped, everything else
+/// byte-exact (non-ASCII bytes survive untouched). Joliet identifiers
+/// decode from UCS-2BE first and strip on the decoded text instead
+/// ([`strip_version`](crate::iso::joliet::strip_version)).
 #[must_use]
 pub fn strip_version(identifier: &[u8]) -> Vec<u8> {
     let mut end = identifier.len();

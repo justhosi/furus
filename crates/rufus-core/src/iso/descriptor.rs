@@ -1,4 +1,4 @@
-//! Volume-descriptor sequence at sector 16 (S14, slice 1).
+//! Volume-descriptor sequence at sector 16 (S14, slices 1-2 of 4).
 //!
 //! *Measured* — ECMA-119 section 8: one 2048-byte sector per descriptor,
 //! the type byte at 0, `CD001` at bytes 1..6, version 1 at byte 6. Type 1
@@ -19,9 +19,10 @@
 //! worth reading: the reader addresses 2048-byte sectors throughout, so
 //! any other block size is refused with the value named.
 //!
-//! Slice 2 owns Joliet name decoding and the multi-extent join; this
-//! slice only parses the supplementary header, detects the Joliet level
-//! from the escape sequences, and keeps the descriptor.
+//! Slice 2 decodes the supplementary volume identifier from UCS-2BE
+//! for Joliet descriptors (plain text otherwise) and keeps the
+//! descriptor the reader walks; Rock Ridge and path tables stay for
+//! later slices.
 
 use crate::error::CoreError;
 use crate::error::Result;
@@ -29,6 +30,7 @@ use crate::iso::FIRST_DESCRIPTOR_SECTOR;
 use crate::iso::MAX_DESCRIPTORS;
 use crate::iso::SECTOR_BYTES_U64;
 use crate::iso::cache::SectorCache;
+use crate::iso::joliet::decode_label;
 use crate::iso::record::DirRecord;
 use crate::iso::record::parse_record;
 use crate::text::device_text;
@@ -83,11 +85,11 @@ pub struct PrimaryDescriptor {
 }
 
 /// Supplementary volume descriptor: the header slice 1 parses plus the
-/// escape sequences slice 2 decodes names with. Joliet name decoding is
-/// deliberately not here.
+/// escape sequences slice 2 selects the walked tree with.
 #[derive(Debug, Clone)]
 pub struct SupplementaryDescriptor {
-    /// Volume identifier (32 bytes, trailing spaces trimmed).
+    /// Volume identifier: decoded from UCS-2BE for Joliet descriptors,
+    /// plain text otherwise (trailing spaces trimmed either way).
     pub label: String,
     /// Raw 32-byte escape-sequences field, kept for slice 2.
     pub escape_sequences: [u8; ESCAPE_LEN],
@@ -95,8 +97,8 @@ pub struct SupplementaryDescriptor {
     /// `%/E` (levels 1, 2, 3); `None` for non-Joliet supplementary
     /// descriptors, whose names this slice reads as plain bytes.
     pub joliet_level: Option<u8>,
-    /// Root directory record of the supplementary tree (kept for slice
-    /// 2, which walks it with Joliet decoding).
+    /// Root directory record of the supplementary tree (walked with
+    /// Joliet decoding when this descriptor is the chosen tree).
     pub root: DirRecord,
 }
 
@@ -310,17 +312,10 @@ fn joliet_level(escape: &[u8; ESCAPE_LEN]) -> Option<u8> {
 }
 
 /// Parse a supplementary descriptor body (header already checked): the
-/// header, the escape sequences with the Joliet level, and the root
-/// record kept for slice 2. Joliet name decoding is deliberately not
-/// here.
+/// header, the escape sequences with the Joliet level, the volume
+/// identifier (UCS-2BE for Joliet, plain text otherwise), and the root
+/// record of the supplementary tree.
 fn parse_supplementary(sector: &[u8], sector_no: u32) -> Result<SupplementaryDescriptor> {
-    let label = text_field(
-        sector,
-        VOLUME_ID_AT,
-        VOLUME_ID_LEN,
-        sector_no,
-        "volume identifier",
-    )?;
     let _space = both32(sector, 80, 84, sector_no, "volume space size")?;
     let escape_bytes = sector
         .get(ESCAPE_AT..ESCAPE_AT + ESCAPE_LEN)
@@ -334,6 +329,31 @@ fn parse_supplementary(sector: &[u8], sector_no: u32) -> Result<SupplementaryDes
     let mut escape_sequences = [0u8; ESCAPE_LEN];
     escape_sequences.copy_from_slice(escape_bytes);
     let level = joliet_level(&escape_sequences);
+    let label = match level {
+        Some(_) => {
+            let field = sector
+                .get(VOLUME_ID_AT..VOLUME_ID_AT + VOLUME_ID_LEN)
+                .ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "volume descriptor at sector {sector_no} ends inside its volume \
+                         identifier at bytes {VOLUME_ID_AT}..{}",
+                        VOLUME_ID_AT + VOLUME_ID_LEN
+                    ))
+                })?;
+            decode_label(field).map_err(|error| {
+                CoreError::invalid(format!(
+                    "volume descriptor at sector {sector_no} volume identifier: {error}"
+                ))
+            })?
+        }
+        None => text_field(
+            sector,
+            VOLUME_ID_AT,
+            VOLUME_ID_LEN,
+            sector_no,
+            "volume identifier",
+        )?,
+    };
     let _set_size = both16(sector, 120, 122, sector_no, "volume set size")?;
     let _sequence = both16(sector, 124, 126, sector_no, "volume sequence number")?;
     block_size(sector, sector_no)?;
@@ -488,6 +508,10 @@ mod tests {
     }
 
     /// Supplementary-descriptor sector with the given escape opening.
+    /// The volume identifier matches the opening: UCS-2BE "SUPP"
+    /// (space-padded, as real mastering tools pad) for Joliet
+    /// openings, ASCII "SUPP" otherwise — so both label paths read it
+    /// back as `SUPP`.
     fn supplementary_sector(escape: &[u8]) -> [u8; SECTOR_BYTES] {
         let mut sector = primary_sector("SUPP");
         sector[0] = TYPE_SUPPLEMENTARY;
@@ -497,6 +521,21 @@ mod tests {
         }
         let take = escape.len().min(ESCAPE_LEN);
         sector[ESCAPE_AT..ESCAPE_AT + take].copy_from_slice(&escape[..take]);
+        let joliet =
+            escape.starts_with(b"%/@") || escape.starts_with(b"%/C") || escape.starts_with(b"%/E");
+        if joliet {
+            let mut field = [0u8; VOLUME_ID_LEN];
+            for pair in field.chunks_mut(2) {
+                pair.copy_from_slice(&0x0020u16.to_be_bytes());
+            }
+            for (index, unit) in [0x0053u16, 0x0055, 0x0050, 0x0050].iter().enumerate() {
+                match field.get_mut(index * 2..index * 2 + 2) {
+                    Some(pair) => pair.copy_from_slice(&unit.to_be_bytes()),
+                    None => break,
+                }
+            }
+            sector[VOLUME_ID_AT..VOLUME_ID_AT + VOLUME_ID_LEN].copy_from_slice(&field);
+        }
         sector
     }
 
@@ -594,7 +633,30 @@ mod tests {
             let supplementary = supplementary_sector(escape);
             let parsed = parse_supplementary(&supplementary, 17).expect("the supplementary parses");
             assert_eq!(parsed.joliet_level, level, "escape {escape:?}");
+            // The fixture writes the label for its own opening (UCS-2BE
+            // for Joliet, ASCII otherwise), so both paths read `SUPP`.
+            assert_eq!(parsed.label, "SUPP", "escape {escape:?}");
         }
+    }
+
+    #[test]
+    fn supplementary_joliet_label_decoded_from_ucs2() {
+        let mut sector = supplementary_sector(b"%/E");
+        // "JOLIe-t" with a non-ASCII unit, space-padded to 32 bytes.
+        let mut field = [0u8; VOLUME_ID_LEN];
+        for pair in field.chunks_mut(2) {
+            pair.copy_from_slice(&0x0020u16.to_be_bytes());
+        }
+        let name = [0x004Au16, 0x004F, 0x004C, 0x0049, 0x00E9, 0x002D, 0x0054];
+        for (index, unit) in name.iter().enumerate() {
+            match field.get_mut(index * 2..index * 2 + 2) {
+                Some(pair) => pair.copy_from_slice(&unit.to_be_bytes()),
+                None => break,
+            }
+        }
+        sector[VOLUME_ID_AT..VOLUME_ID_AT + VOLUME_ID_LEN].copy_from_slice(&field);
+        let parsed = parse_supplementary(&sector, 17).expect("the supplementary parses");
+        assert_eq!(parsed.label, "JOLI\u{e9}-T");
     }
 
     #[test]
