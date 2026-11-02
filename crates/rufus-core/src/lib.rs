@@ -80,6 +80,12 @@
 //!   descriptor, directory listings, regular-file reads and a
 //!   depth-bounded walk over `Box<dyn Volume>`, read-only alongside
 //!   the [`fs::udf`](fs::udf) writer side.
+//! * [`wim`] — the WIM reader (S16, slice 2 of 6): the 208-byte header
+//!   (magic, version, compression flags, part numbers, image count,
+//!   the XML resource extent) and the narrow UTF-16LE XML scanner
+//!   behind [`WimReader`](wim::WimReader). No decompressor: the XML
+//!   resource measures as always uncompressed (see the module docs),
+//!   so non-UTF-16 bytes read as absent rather than erroring.
 //! * [`report`] — the S16 image report (slice 1 of 6): the label
 //!   candidates, the [`ImageReport`](report::ImageReport) shape later
 //!   slices fill, and the case-insensitive tree index behind it.
@@ -112,6 +118,7 @@ pub mod text;
 pub mod udf;
 pub mod units;
 pub mod version;
+pub mod wim;
 
 pub use config::AdvancedConfig;
 pub use config::Config;
