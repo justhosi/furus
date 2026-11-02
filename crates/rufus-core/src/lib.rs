@@ -41,6 +41,11 @@
 //! * [`i18n`] — [`Catalog`](i18n::Catalog): the Rufus `.loc`
 //!   (pollock-format) catalog, parsed eagerly from disk, with locale
 //!   normalisation, an English fallback chain and a [`Translator`](i18n::Translator).
+//! * [`iso`] — the ISO9660 reader (S14, slice 1 of 4): a 64 KiB sector
+//!   cache over [`Volume`](fs::Volume), the sector-16 volume-descriptor
+//!   sequence (primary, supplementary with the Joliet escape sequences
+//!   kept for slice 2, boot record, terminator), the primary-tree
+//!   directory records, and path lookup with listings and file reads.
 //! * [`hash`] — [`Algo`](hash::Algo) selection plus streaming
 //!   [`hash_reader`](hash::hash_reader) / [`hash_file`](hash::hash_file)
 //!   digests (MD5/SHA-1/SHA-256/SHA-512) over a 1 MiB buffer.
@@ -80,6 +85,7 @@ pub mod fs;
 pub mod fsprobe;
 pub mod hash;
 pub mod i18n;
+pub mod iso;
 pub mod log;
 pub mod part;
 pub mod partition;
