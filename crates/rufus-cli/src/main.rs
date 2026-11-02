@@ -155,7 +155,11 @@ struct ListOutput<'a> {
 /// `analyze --json` output: owned-field structs instead of a hand-built
 /// `json!` value (the same panic-free, declaration-stable spelling as
 /// [`ListOutput`]). The image part keeps the pre-S05 four-key shape
-/// byte for byte; the `device` member only serialises with `--device`.
+/// byte for byte — `path`, `size_bytes`, `sha256`, `kind` keep their
+/// names, order and values; `report` is additive, always present. The
+/// `device` member only serialises with `--device`. The human form
+/// prints a one-line `report:` summary after `sha256:` instead — `--json`
+/// carries the whole report.
 #[derive(Serialize)]
 struct AnalyzeOutput {
     /// Image path as given on the command line.
@@ -170,6 +174,48 @@ struct AnalyzeOutput {
     /// pre-S05 JSON contract stays exactly four keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     device: Option<AnalyzeDevice>,
+    /// The S16 image report, always serialized; `null` when the report
+    /// could not be produced — the volume probed positive but the
+    /// reader refused it (a corrupt or truncated image), or reading the
+    /// image failed — so a broken ISO never turns `analyze` into an
+    /// error.
+    report: Option<rufus_core::report::ImageReport>,
+}
+
+/// One-line `report:` summary for human `analyze` output: the kind
+/// first, then the non-empty highlights in a fixed order (label, the
+/// Windows version/build, distro, boot family), comma-separated. Empty
+/// parts are omitted and no placeholder is ever printed for a missing
+/// part — `--json` carries the whole report, this line is a summary
+/// only.
+fn report_summary(report: &rufus_core::report::ImageReport) -> String {
+    let mut parts = vec![report.kind.clone()];
+    if let Some(label) = report.labels.best() {
+        parts.push(format!("label {}", device_text(label)));
+    }
+    if report.is_windows {
+        let mut windows = String::from("windows");
+        if let Some(version) = &report.windows_version {
+            windows.push_str(&format!(" {}", device_text(version)));
+        }
+        if let Some(build) = report.build {
+            windows.push_str(&format!(" ({build})"));
+        }
+        parts.push(windows);
+    }
+    if let Some(distro) = &report.distro {
+        parts.push(format!("distro {}", device_text(distro)));
+    }
+    let boot = match report.boot_mode() {
+        rufus_core::report::BootMode::Bios => Some("bios"),
+        rufus_core::report::BootMode::Uefi => Some("uefi"),
+        rufus_core::report::BootMode::Both => Some("bios+uefi"),
+        rufus_core::report::BootMode::None => None,
+    };
+    if let Some(mode) = boot {
+        parts.push(format!("boot {mode}"));
+    }
+    parts.join(", ")
 }
 
 /// One probed partition filesystem of the table-order list.
@@ -664,6 +710,10 @@ fn cmd_analyze(
     paths: &HostPaths,
 ) -> Result<Exit, Fail> {
     let inspected = image::inspect(image_path).map_err(Fail::from_core)?;
+    // The S16 image report, filled on every path (image and `--device`
+    // alike) from the same image file, so `null` always means the report
+    // could not be produced — never "not asked".
+    let image_report = rufus_core::report::analyze_file(image_path).ok();
     let Some(requested) = device else {
         // The pre-S05 surface, unchanged in every byte: four image facts
         // in both output modes and no `device` key in JSON.
@@ -674,6 +724,7 @@ fn cmd_analyze(
                 sha256: inspected.sha256,
                 kind: inspected.kind.to_string(),
                 device: None,
+                report: image_report,
             };
             println!("{}", to_pretty(&output)?);
         } else {
@@ -685,6 +736,10 @@ fn cmd_analyze(
             );
             println!("kind:   {}", inspected.kind);
             println!("sha256: {}", inspected.sha256);
+            match &image_report {
+                Some(report) => println!("report: {}", report_summary(report)),
+                None => println!("report: analysis refused"),
+            }
         }
         return Ok(Exit::Ok);
     };
@@ -828,6 +883,7 @@ fn cmd_analyze(
             sha256: inspected.sha256,
             kind: inspected.kind.to_string(),
             device: Some(device_output),
+            report: image_report,
         };
         println!("{}", to_pretty(&output)?);
     } else {
@@ -839,6 +895,10 @@ fn cmd_analyze(
         );
         println!("kind:   {}", inspected.kind);
         println!("sha256: {}", inspected.sha256);
+        match &image_report {
+            Some(report) => println!("report: {}", report_summary(report)),
+            None => println!("report: analysis refused"),
+        }
 
         // The device half (S05). Every device/kernel-supplied string
         // reaches these lines through its sanitiser — `device_text` at

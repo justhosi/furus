@@ -1,5 +1,11 @@
 # Golden files (S03)
 
+`analyze-report.json` is the `report` object (only that object, not the
+whole `analyze` output) for 4096 bytes of `0xAA` — the `RAW_SHA256`
+constant in `crates/rufus-cli/tests/cli.rs`. Regenerate it with
+`json.dumps(report, indent=2)` from `rufus analyze --json` over those
+bytes.
+
 `plan-v2.json` is the exact `--json` output of
 
 ```sh

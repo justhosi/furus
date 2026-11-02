@@ -1,0 +1,13 @@
+{
+  "kind": "raw",
+  "is_iso": false,
+  "is_udf": false,
+  "is_windows": false,
+  "is_windows_to_go": false,
+  "has_efi": false,
+  "has_bios": false,
+  "has_grub": false,
+  "has_syslinux": false,
+  "labels": {},
+  "truncated": false
+}

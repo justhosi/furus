@@ -107,6 +107,29 @@ There is no production-readiness claim here. Open acceptance items (for
 example a real 32 GB Windows installer boot) are documented as such in
 the test module docs rather than faked.
 
+### `analyze` report
+
+`rufus analyze [--json] <image>` reports the S16 image analysis in a
+`report` object next to the four long-standing image keys (`path`,
+`size_bytes`, `sha256`, `kind`), which keep their names, order and
+values. The human output summarises the report as one `report:` line
+after `sha256:` (kind, label, Windows version/build, distro and boot
+mode only); `--json` carries the whole object. With `--device`, the
+same `report` object is filled from the image file alongside the device
+report.
+
+The object holds the image family (`kind`, `is_iso`, `is_udf`), the
+Windows payload (`is_windows`, `windows_version`, `build`,
+`is_windows_to_go`, `wim_images`), the Linux distro and persistence
+family (`distro`, `persistence` — `distro` also carries the DOS-family
+markers `KolibriOS`, `ReactOS`, `FreeDOS` and `MS-DOS`), the bootloader
+capabilities (`has_efi`, `has_bios`, `has_grub`, `grub_version`,
+`has_syslinux`, `syslinux_version`), the label candidates and a
+`truncated` flag for capped tree walks. A `null` report means the report
+could not be produced — the volume probed positive but its reader
+refused it (a corrupt or truncated image), or reading the image failed:
+a broken ISO never turns `analyze` into an error.
+
 ## Layout
 
 A Cargo workspace (edition 2024, `resolver = "3"`):

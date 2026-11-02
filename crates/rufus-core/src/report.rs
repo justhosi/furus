@@ -456,6 +456,34 @@ const MININT: &str = "/minint";
 /// [`classify_windows`]).
 const WINDOWS_TO_GO_MIN_BUILD: u32 = 9200;
 
+/// KolibriOS image marker (`0x140017f40.c` sets `KolibriOS` for a root
+/// `kolibri.img` and logs `Uses: KolibriOS`).
+const KOLIBRI_IMG: &str = "/kolibri.img";
+
+/// ReactOS setup loader (`0x140017f40.c` reads the ReactOS flag from a
+/// directory holding `setupldr.sys` or `freeldr.sys` and logs
+/// `Uses: ReactOS`).
+const SETUPLDR_SYS: &str = "/setupldr.sys";
+
+/// ReactOS free loader (see [`SETUPLDR_SYS`]).
+const FREELDR_SYS: &str = "/freeldr.sys";
+
+/// FreeDOS kernel: with [`FDCONFIG_SYS`] below it marks a FreeDOS
+/// image. FreeDOS and MS-DOS are Rufus *extraction sources*
+/// (`0x1400150c0.c`, `0x140014650.c`), not image properties Rufus
+/// itself reports, so these two rules are ours and say so.
+const KERNEL_SYS: &str = "/kernel.sys";
+
+/// FreeDOS config (see [`KERNEL_SYS`]).
+const FDCONFIG_SYS: &str = "/fdconfig.sys";
+
+/// MS-DOS I/O system: with [`MSDOS_SYS`] below it marks an MS-DOS
+/// image (see [`KERNEL_SYS`] for the extraction-source note).
+const IO_SYS: &str = "/io.sys";
+
+/// MS-DOS system file (see [`IO_SYS`]).
+const MSDOS_SYS: &str = "/msdos.sys";
+
 /// Ubuntu-style release metadata: the first non-empty line names the
 /// image.
 const DISK_INFO: &str = "/.disk/info";
@@ -950,9 +978,19 @@ fn classify_windows(
     })
 }
 
-/// Classify the distro name from the volume label and the release
-/// metadata files. Precedence, highest first:
+/// Classify the distro name from the tree markers, the volume label
+/// and the release metadata files. Precedence, highest first:
 ///
+/// 0. the DOS-family markers — [`KOLIBRI_IMG`] is `KolibriOS`,
+///    [`SETUPLDR_SYS`] or [`FREELDR_SYS`] is `ReactOS` (both per
+///    `0x140017f40.c`), [`KERNEL_SYS`] with [`FDCONFIG_SYS`] is
+///    `FreeDOS`, [`IO_SYS`] with [`MSDOS_SYS`] is `MS-DOS` (both pairs
+///    ours: Rufus uses those files as extraction sources, never as
+///    reported image properties). A volume carrying several markers
+///    resolves in that order, so the answer is deterministic.
+///    (`grldr` and `.miso` are detected by Rufus too but have no field
+///    here — `.miso` only forces DD mode — so those markers stay
+///    deliberately unread.)
 /// 1. a [`DistroTable`](crate::distro::DistroTable) rule matching the
 ///    label — the faithful port of `0x140031220.c`, checked against
 ///    [`best`](Labels::best()), else the UDF label;
@@ -962,10 +1000,23 @@ fn classify_windows(
 /// Steps 2-3 are this project's addition: Rufus's report has no distro
 /// name at all.
 fn classify_distro(
+    index: &TreeIndex,
     labels: &Labels,
     disk_info: Option<&str>,
     diskdefines: Option<&str>,
 ) -> Option<String> {
+    if index.has(KOLIBRI_IMG) {
+        return Some("KolibriOS".to_string());
+    }
+    if index.has(SETUPLDR_SYS) || index.has(FREELDR_SYS) {
+        return Some("ReactOS".to_string());
+    }
+    if index.has(KERNEL_SYS) && index.has(FDCONFIG_SYS) {
+        return Some("FreeDOS".to_string());
+    }
+    if index.has(IO_SYS) && index.has(MSDOS_SYS) {
+        return Some("MS-DOS".to_string());
+    }
     if let Some(label) = labels.best().or(labels.udf.as_deref())
         && let Some(rule) = crate::distro::DistroTable::embedded().match_label(label)
     {
@@ -1576,7 +1627,12 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
         };
         let disk_info = read_iso_text(&reader, &index, DISK_INFO)?;
         let diskdefines = read_iso_text(&reader, &index, README_DISKDEFINES)?;
-        let distro = classify_distro(&labels, disk_info.as_deref(), diskdefines.as_deref());
+        let distro = classify_distro(
+            &index,
+            &labels,
+            disk_info.as_deref(),
+            diskdefines.as_deref(),
+        );
         // Config greps stay behind the marker gate: no persistence tree,
         // no config reads.
         let track_markers = index.has(CASPER_DIR)
@@ -1664,7 +1720,12 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
         };
         let disk_info = read_udf_text(&reader, walked, DISK_INFO)?;
         let diskdefines = read_udf_text(&reader, walked, README_DISKDEFINES)?;
-        let distro = classify_distro(&labels, disk_info.as_deref(), diskdefines.as_deref());
+        let distro = classify_distro(
+            &index,
+            &labels,
+            disk_info.as_deref(),
+            diskdefines.as_deref(),
+        );
         let track_markers = index.has(CASPER_DIR)
             || index.has(CASPER_KERNEL)
             || index.has(LIVE_SQUASHFS)
@@ -3078,5 +3139,77 @@ mod tests {
             analyze(Box::new(memory_volume(&iso))).expect("an oversize binary never errors");
         assert!(report.has_syslinux);
         assert_eq!(report.syslinux_version.as_deref(), Some("4.07"));
+    }
+
+    #[test]
+    fn kolibri_marker_reports_kolibrios() {
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            vec![(b"KOLIBRI.IMG;1".as_slice(), 22u32, 4, b"dos".to_vec())],
+            Vec::new(),
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.distro.as_deref(), Some("KolibriOS"));
+    }
+
+    #[test]
+    fn setupldr_marker_reports_reactos() {
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            vec![(b"SETUPLDR.SYS;1".as_slice(), 22u32, 4, b"dos".to_vec())],
+            Vec::new(),
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.distro.as_deref(), Some("ReactOS"));
+    }
+
+    #[test]
+    fn kernel_and_fdconfig_markers_report_freedos() {
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            vec![
+                (b"KERNEL.SYS;1".as_slice(), 22u32, 4, b"dos".to_vec()),
+                (b"FDCONFIG.SYS;1".as_slice(), 23u32, 4, b"dos".to_vec()),
+            ],
+            Vec::new(),
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.distro.as_deref(), Some("FreeDOS"));
+    }
+
+    #[test]
+    fn io_and_msdos_markers_report_msdos() {
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            vec![
+                (b"IO.SYS;1".as_slice(), 22u32, 4, b"dos".to_vec()),
+                (b"MSDOS.SYS;1".as_slice(), 23u32, 4, b"dos".to_vec()),
+            ],
+            Vec::new(),
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.distro.as_deref(), Some("MS-DOS"));
+    }
+
+    #[test]
+    fn dos_marker_beats_label_rule_and_disk_info() {
+        // A DOS marker, a table-hit label and a metadata file together:
+        // the marker wins over both later steps.
+        let info = "Ubuntu 24.04.1 LTS \"Noble Numbat\" - Release amd64 (20240827)\n";
+        let iso = multi_dir_iso(
+            "Rocky-9.3-x86_64",
+            vec![(b"KOLIBRI.IMG;1".as_slice(), 22u32, 4, b"dos".to_vec())],
+            vec![(
+                b".DISK".as_slice(),
+                vec![(
+                    b"INFO;1".as_slice(),
+                    23u32,
+                    info.len() as u32,
+                    info.as_bytes().to_vec(),
+                )],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.distro.as_deref(), Some("KolibriOS"));
     }
 }

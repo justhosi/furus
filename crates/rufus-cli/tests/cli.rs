@@ -331,6 +331,70 @@ fn analyze_detects_iso_magic_at_sector_16() {
     assert!(out.stdout.contains(FIXTURE_SHA256), "{}", out.stdout);
 }
 
+/// SHA-256 of 4096 `0xAA` bytes (the raw report fixture below), pinned
+/// like [`FIXTURE_SHA256`] so golden drift shows up as a failure.
+const RAW_SHA256: &str = "c622005493c4cb75f3e08eda4cc0bfe172e2c5eeca661ec4908c5490fc3d6994";
+
+#[test]
+fn analyze_report_matches_golden_for_raw_fixture() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let raw = dir.path().join("raw.bin");
+    std::fs::write(&raw, vec![0xAA; 4096]).expect("write raw fixture");
+
+    let out = run(&["analyze", "--json", raw.to_str().expect("path")]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    // The four pre-S16 keys are untouched.
+    assert_eq!(value["path"], raw.display().to_string());
+    assert_eq!(value["size_bytes"], 4096u64);
+    assert_eq!(value["sha256"], RAW_SHA256);
+    assert_eq!(value["kind"], "raw");
+    // The report object matches the golden exactly (whole-JSON
+    // equality, not substring matching).
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("golden/analyze-report.json")).expect("golden");
+    assert_eq!(value["report"], golden, "report drifted from the golden");
+}
+
+#[test]
+fn analyze_broken_iso_reports_null_without_error() {
+    // The stock fixture bytes: CD001 magic with a zero version byte, so
+    // the ISO reader refuses and the report degrades to null instead of
+    // failing the command.
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let iso = fixture(&dir.path().join("fixture.iso"));
+
+    let out = run(&["analyze", "--json", iso.to_str().expect("path")]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    // The four pre-S16 keys are unchanged (kind stays magic-only "iso").
+    assert_eq!(value["path"], iso.display().to_string());
+    assert_eq!(value["size_bytes"], 32_780u64);
+    assert_eq!(value["sha256"], FIXTURE_SHA256);
+    assert_eq!(value["kind"], "iso");
+    assert_eq!(value["report"], serde_json::Value::Null);
+}
+
+#[test]
+fn analyze_human_reports_report_line() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    // Report present: the raw fixture summarises to one line.
+    let raw = dir.path().join("raw.bin");
+    std::fs::write(&raw, vec![0xAA; 4096]).expect("write raw fixture");
+    let out = run(&["analyze", raw.to_str().expect("path")]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(out.stdout.contains("report: raw"), "{}", out.stdout);
+    // Report refused: the broken ISO fixture names the refusal.
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    let out = run(&["analyze", iso.to_str().expect("path")]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert!(
+        out.stdout.contains("report: analysis refused"),
+        "{}",
+        out.stdout
+    );
+}
+
 #[test]
 fn analyze_short_and_empty_files_never_panic() {
     let dir = tempfile::tempdir().expect("scratch dir");
@@ -1268,6 +1332,26 @@ fn analyze_device_reports_a_clean_usb_as_safe() {
 }
 
 #[test]
+fn analyze_device_fills_report_from_the_image() {
+    // The report comes from the image file on the device path too: a
+    // raw image yields a report object, not null.
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
+    let raw = dir.path().join("raw.bin");
+    std::fs::write(&raw, vec![0xAA; 4096]).expect("write raw fixture");
+
+    let mut args = analyze_device_args(&raw, &sysfs, &mountinfo, "/dev/sdb", &dev_file);
+    args.push("--json".to_string());
+    let out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
+    assert_eq!(value["kind"], "raw");
+    assert_eq!(value["report"]["kind"], "raw");
+    assert_eq!(value["report"]["truncated"], false);
+    assert!(value["device"].is_object(), "device half still present");
+}
+
+#[test]
 fn analyze_device_refuses_a_mounted_stick() {
     let dir = tempfile::tempdir().expect("scratch dir");
     let (sysfs, dev_file, mountinfo) = stick_fixture(dir.path());
@@ -1488,18 +1572,20 @@ fn analyze_device_without_a_device_key_keeps_the_s03_shape() {
     let out = run(&["analyze", "--json", iso.to_str().expect("path")]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("analyze json");
-    // Exactly the S03 four keys (the parsed `Value` sorts them; the
-    // declaration order on the wire is pinned by the leading `path`).
+    // The S03 four keys keep their names, order and values; `report` is
+    // additive (null here: the reader refuses the zero-version
+    // descriptor). The parsed `Value` sorts keys; the declaration order
+    // on the wire is pinned by the leading `path`.
     let keys = value
         .as_object()
         .expect("analyze object")
         .keys()
         .collect::<Vec<_>>();
-    assert_eq!(keys.len(), 4, "exactly the S03 keys: {keys:?}");
+    assert_eq!(keys.len(), 5, "the S03 keys plus report: {keys:?}");
     assert_eq!(
         keys,
-        ["kind", "path", "sha256", "size_bytes"],
-        "the four image keys, no more"
+        ["kind", "path", "report", "sha256", "size_bytes"],
+        "the four image keys, plus report"
     );
     assert!(value.get("device").is_none(), "no device key");
     assert!(
@@ -1508,14 +1594,14 @@ fn analyze_device_without_a_device_key_keeps_the_s03_shape() {
         out.stdout
     );
 
-    // And the human rendering stays byte-identical to the S03
-    // contract: exactly the four image lines.
+    // And the human rendering keeps the four S03 image lines byte for
+    // byte, with the one-line `report:` summary appended.
     let out = run(&["analyze", iso.to_str().expect("path")]);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(
         out.stdout,
         format!(
-            "image:  {}\nsize:   {} ({})\nkind:   {}\nsha256: {}\n",
+            "image:  {}\nsize:   {} ({})\nkind:   {}\nsha256: {}\nreport: analysis refused\n",
             iso.display(),
             32_780,
             rufus_core::human_bytes(32_780),
