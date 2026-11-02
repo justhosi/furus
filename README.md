@@ -50,6 +50,17 @@ write side is the most complete part:
   `crates/rufus-core/src/fs/tool.rs`; the version flag stays per family
   (`-V` for ext, `--version` for NTFS), UDF is probed by its usage
   banner instead, and each is passed at its call site.
+* An ISO9660 image reader (S14) in `crates/rufus-core/src/iso/` reads
+  the volume-descriptor sequence, the primary directory tree, Joliet
+  supplementary trees (preferred when present; the highest escape level
+  wins), multi-extent files joined in order, and — on the primary tree
+  alone — Rock Ridge/SUSP names, symlink targets, attributes and
+  `CL`/`PL`/`RE` relocated directories, plus the El Torito boot catalog.
+  `walk` lists a tree depth-first with absolute paths and never follows
+  symlinks. Images are read through the crate's `Volume` abstraction
+  with a 64 KiB sector cache rather than mmap — mmap needs `unsafe` or a
+  new dependency, both forbidden by the crate — so every access stays
+  bounds-checked against the store before any I/O.
 * Device discovery, introspection, the safety verdict, partition-table
   writers (MBR + GPT) and the privileged helper are implemented. The
   helper runs each external tool in its own process group and, on
@@ -76,7 +87,8 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
 * `rufus-core` - the safe, non-privileged foundation and the filesystem
   write side: error/config/paths/i18n/hash/units, MBR + GPT table
   readers and writers, the FAT32/exFAT/NTFS/ext2/3/4/UDF formatters,
-  superblock probing and the safety verdict.
+  the ISO9660/Joliet/Rock Ridge image reader (`iso/`), superblock
+  probing and the safety verdict.
 * `wimlib-sys` - FFI bindings to wimlib, for applying WIM/ESD images.
 * `rufus-linux` - the only crate that touches `/sys` and `/run/udev`:
   device discovery, mount/swap/holder introspection, and the
