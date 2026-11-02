@@ -9,12 +9,14 @@
 //! its caps. Anything unrecognised is `"raw"`, never an error — only a
 //! reader that fails on a volume that probed positive is a real error.
 //!
-//! Slices 2-6 fill the rest: slice 2 the Windows fields (`is_windows`,
-//! `windows_version`, `build`, `is_windows_to_go`, `wim_images`), slices
-//! 3-4 the distro and persistence fields, slice 5 the bootloader fields
-//! (`has_efi`, `has_bios`, `has_grub`, `has_syslinux` and the versions),
-//! and slice 6 the CLI wiring. Every one of those fields exists here
-//! already so [`ImageReport`] stays stable across the slices.
+//! Slices 2-6 fill the rest: slice 2 was the WIM reader (the header
+//! and XML resource behind [`WimReader`](crate::wim::WimReader)), slice
+//! 3 is Windows (this slice: `is_windows`, `windows_version`, `build`,
+//! `is_windows_to_go`, `wim_images`), slices 4-5 the distro and
+//! persistence fields and the bootloader fields (`has_efi`,
+//! `has_bios`, `has_grub`, `has_syslinux` and the versions), and slice
+//! 6 the CLI wiring. Every one of those fields exists here already so
+//! [`ImageReport`] stays stable across the slices.
 //!
 //! [`TreeIndex`] is the case-insensitive tree both readers share: later
 //! slices ask `has("/sources/boot.wim")`-style questions without
@@ -37,6 +39,7 @@ use crate::error::Result;
 use crate::fs::Volume;
 use crate::iso::IsoReader;
 use crate::udf::UdfReader;
+use crate::wim;
 
 /// Cap on indexed entries: past this the index stops growing and the
 /// report records [`truncated`](ImageReport::truncated) instead of
@@ -94,7 +97,7 @@ impl Labels {
     }
 }
 
-/// One Windows edition from a WIM XML: slice 2/6 fills these; the type
+/// One Windows edition from a WIM XML: slice 3/6 fills these; the type
 /// exists now so [`ImageReport`] is stable across the slices.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WimImage {
@@ -113,7 +116,8 @@ pub struct WimImage {
 
 /// What an image is, as plain data (serialisable for the golden JSON).
 /// Slice 1 fills `kind`, `is_iso`, `is_udf`, `labels` and `truncated`;
-/// slices 2-6 fill the rest, each documented on its field.
+/// this slice fills the Windows fields; slices 4-6 fill the rest, each
+/// documented on its field.
 ///
 /// `Default` exists for struct-update syntax only: it yields `kind: ""`,
 /// not `"raw"` — only [`analyze`] assigns the family label.
@@ -131,16 +135,18 @@ pub struct ImageReport {
     /// reads as ISO with this false and [`labels`](Self::labels)
     /// `udf` unset.
     pub is_udf: bool,
-    /// True when slice 2/6 proves a Windows payload (this slice: always
-    /// false).
+    /// True when slice 3/6 proves a Windows payload (path rules over
+    /// the tree index plus the WIM contents below).
     pub is_windows: bool,
-    /// Windows major version, e.g. `"11"` (slice 2/6 fills this).
+    /// Windows major version, e.g. `"11"` (slice 3/6 fills this from
+    /// the WIM XML).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows_version: Option<String>,
-    /// Windows build number, e.g. `22631` (slice 2/6 fills this).
+    /// Windows build number, e.g. `22631` (slice 3/6 fills this from
+    /// the WIM XML).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<u32>,
-    /// True for a Windows To Go layout (slice 2/6 fills this).
+    /// True for a Windows To Go layout (slice 3/6 fills this).
     pub is_windows_to_go: bool,
     /// True when an EFI boot path was seen (slice 5/6 fills this).
     pub has_efi: bool,
@@ -163,7 +169,7 @@ pub struct ImageReport {
     /// Persistence mode label (slice 4/6 fills this).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistence: Option<String>,
-    /// One entry per Windows edition from the WIM XML (slice 2/6 fills
+    /// One entry per Windows edition from the WIM XML (slice 3/6 fills
     /// this).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wim_images: Vec<WimImage>,
@@ -380,6 +386,315 @@ fn highest_joliet_label(reader: &IsoReader) -> Option<String> {
     best.map(|(_, label)| label.to_string())
 }
 
+/// WinPE/boot image: always present on a Windows install ISO.
+const BOOT_WIM: &str = "/sources/boot.wim";
+
+/// The edition payload as a plain WIM.
+const INSTALL_WIM: &str = "/sources/install.wim";
+
+/// The edition payload as a solid archive (ESD).
+const INSTALL_ESD: &str = "/sources/install.esd";
+
+/// BIOS boot manager at the root.
+const BOOTMGR: &str = "/bootmgr";
+
+/// Installer at the root.
+const SETUP_EXE: &str = "/setup.exe";
+
+/// XP/2003 era text-mode setup at the root.
+const TXTSETUP_SIF: &str = "/txtsetup.sif";
+
+/// XP/2003 era text-mode setup under the 32-bit tree (the decompiled
+/// `FUN_14001c640` builds `/%s/txtsetup.sif` from `i386`/`amd64`).
+const TXTSETUP_SIF_I386: &str = "/i386/txtsetup.sif";
+
+/// XP/2003 era text-mode setup under the 64-bit tree (see
+/// [`TXTSETUP_SIF_I386`]).
+const TXTSETUP_SIF_AMD64: &str = "/amd64/txtsetup.sif";
+
+/// A WinPE/minint tree rather than an install tree.
+const MININT: &str = "/minint";
+
+/// Earliest build that can host Windows To Go: Windows 8 (see
+/// [`classify_windows`]).
+const WINDOWS_TO_GO_MIN_BUILD: u32 = 9200;
+
+/// A readable window over a WIM file inside either family: the ISO
+/// handle borrows its reader (windows come from
+/// [`IsoReader::read_open_at`]), the UDF handle carries the walked
+/// entry (windows come from [`UdfReader::read_file_at`], which re-opens
+/// per call). The UDF length is read once at construction: [`len`](Self::len)
+/// is infallible by contract, and an entry whose length refuses to open
+/// is a real error, not a silent zero.
+enum WimFile<'a> {
+    Iso {
+        reader: &'a IsoReader,
+        file: crate::iso::OpenFile,
+    },
+    Udf {
+        reader: &'a UdfReader,
+        entry: crate::udf::Entry,
+        len: u64,
+    },
+}
+
+impl WimFile<'_> {
+    /// File length in bytes.
+    fn len(&self) -> u64 {
+        match self {
+            Self::Iso { file, .. } => u64::from(file.len()),
+            Self::Udf { len, .. } => *len,
+        }
+    }
+
+    /// Fill `buf` completely from `offset`: loops the short-read
+    /// `read_open_at`/`read_file_at` APIs and refuses a premature end,
+    /// naming the wanted and placed counts. An I/O refusal propagates:
+    /// the volume lied about its own bytes.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let wanted = buf.len();
+        let mut placed: usize = 0;
+        while placed < wanted {
+            let at = offset.checked_add(placed as u64).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "wim file read at offset {offset} overflows the byte offset arithmetic"
+                ))
+            })?;
+            let dest = buf.get_mut(placed..).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "wim file read window {placed}..{wanted} runs past the {wanted} byte buffer"
+                ))
+            })?;
+            let got = match self {
+                Self::Iso { reader, file } => reader.read_open_at(file, at, dest)?,
+                Self::Udf { reader, entry, .. } => reader.read_file_at(entry, at, dest)?,
+            };
+            if got == 0 {
+                return Err(CoreError::invalid(format!(
+                    "wim file read of {wanted} bytes at offset {offset} placed only {placed} \
+                     bytes: refusing a short read"
+                )));
+            }
+            placed = placed.checked_add(got).ok_or_else(|| {
+                CoreError::invalid("wim file read position overflows the offset arithmetic")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Read the WIM behind `file`: the 208-byte header at 0, then the XML
+/// resource it names.
+///
+/// An undersized file (fewer than [`HEADER_SIZE`](wim::HEADER_SIZE)
+/// bytes) is not a WIM and reads `Ok(None)`; a header that refuses to
+/// parse reads `Ok(None)` too, as does an XML extent that fails its
+/// range check — a bogus or truncated `boot.wim` degrades the report
+/// rather than failing the whole analysis (Rufus warns and continues).
+/// The XML range is cap-checked before any read and the buffer is grown
+/// with `try_reserve`, mirroring [`WimReader`](wim::WimReader); bytes
+/// that are not stored UTF-16 read `Ok(None)` through
+/// [`is_stored_xml`](wim::reader::is_stored_xml). An I/O error from
+/// [`read_at`](WimFile::read_at) propagates: the volume lied about its
+/// own bytes.
+fn read_wim(file: &WimFile<'_>) -> Result<Option<wim::WimXml>> {
+    if file.len() < u64::from(wim::HEADER_SIZE) {
+        return Ok(None);
+    }
+    let mut header_bytes = [0u8; wim::HEADER_SIZE as usize];
+    file.read_at(0, &mut header_bytes)?;
+    let header = match wim::WimHeader::parse(&header_bytes) {
+        Ok(header) => header,
+        Err(_) => return Ok(None),
+    };
+    // A wrong XML extent is the payload's own metadata being wrong, not
+    // I/O: degrade like a bogus header. (The bound below is the file
+    // length, not a volume end — the shared range check names a volume
+    // because it also serves whole-volume reads.)
+    let (offset, size) = match header.checked_xml_range(file.len()) {
+        Ok(range) => range,
+        Err(_) => return Ok(None),
+    };
+    let count = usize::try_from(size).map_err(|_| {
+        CoreError::invalid(format!(
+            "wim xml resource size {size} does not fit this machine's address space"
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve(count).map_err(|_| {
+        CoreError::invalid(format!("wim xml resource size {size} cannot be buffered"))
+    })?;
+    bytes.resize(count, 0);
+    file.read_at(offset, &mut bytes)?;
+    if !wim::reader::is_stored_xml(&bytes) {
+        return Ok(None);
+    }
+    Ok(Some(wim::xml::parse(&bytes)))
+}
+
+/// Windows classification: the path rules plus whatever the WIM
+/// payloads say.
+struct WindowsInfo {
+    is_windows: bool,
+    windows_version: Option<String>,
+    build: Option<u32>,
+    is_windows_to_go: bool,
+    wim_images: Vec<WimImage>,
+}
+
+/// The first `<WINDOWS><VERSION>` in `xml`, if any image carries one.
+fn first_version(xml: &wim::WimXml) -> Option<wim::WimVersion> {
+    xml.images.iter().find_map(|image| image.version)
+}
+
+/// Classify Windows from the tree index and the two WIM payloads.
+///
+/// `is_windows` is true when ANY of these hold, each documented where
+/// it is checked: [`BOOT_WIM`], [`INSTALL_WIM`], [`INSTALL_ESD`],
+/// [`BOOTMGR`] AND [`SETUP_EXE`] together, any `txtsetup.sif` variant
+/// ([`TXTSETUP_SIF`], [`TXTSETUP_SIF_I386`], [`TXTSETUP_SIF_AMD64`]),
+/// [`MININT`].
+///
+/// `windows_version`/`build` come from the WIM XML
+/// `<WINDOWS><VERSION><MAJOR>` (as a decimal string) and `<BUILD>` (as
+/// `u32`): the decompiled `FUN_140030930` prints `Detected: Windows %d
+/// ISO (Build %d.%d)` with `%d` the XML MAJOR and `%d.%d` BUILD.REVISION,
+/// and `FUN_140065150` refuses a report with no version info — so a
+/// missing VERSION simply leaves both fields empty. The first payload
+/// that yields a VERSION wins — `boot.wim` first, then the install
+/// payload — so a boot image without a `<WINDOWS>` block (what `wimlib`
+/// writes when it captures a plain directory) does not block the
+/// install payload's version. Within one payload, the first image
+/// carrying a VERSION wins (a WIM's images share one build in
+/// practice).
+///
+/// `wim_images` come from the install payload when it yielded at least
+/// one image, else from `boot.wim` when it did, in XML document order
+/// with nothing skipped. Each [`ImageXml`](wim::ImageXml) maps to
+/// [`WimImage`] field for field; an image with a missing DISPLAYNAME
+/// keeps `display_name: None` (slice 2 already records the parser's
+/// rule).
+///
+/// `is_windows_to_go` is `is_windows && build >= 9200 &&
+/// !wim_images.is_empty()`: Windows To Go needs Windows 8 (build 9200)
+/// or newer plus a WIM payload to deploy (the PLAN gives no rule, so
+/// this pins that reasoning). `FUN_1400660c0` shows WTG as choosing one
+/// installed image index by DISPLAYNAME (it logs `Will use '%s'
+/// (Build: %d, Index %s) for Windows To Go`): the report field answers
+/// "could this image be written in Windows To Go mode", not "is this a
+/// WTG drive".
+///
+/// Both payloads are read independently: a parse refusal in one degrades
+/// that payload to `None` (see [`read_wim`]) without touching the
+/// other. An I/O failure in either propagates.
+fn classify_windows(
+    index: &TreeIndex,
+    boot: Option<&WimFile<'_>>,
+    install: Option<&WimFile<'_>>,
+) -> Result<WindowsInfo> {
+    let has_txtsetup =
+        index.has(TXTSETUP_SIF) || index.has(TXTSETUP_SIF_I386) || index.has(TXTSETUP_SIF_AMD64);
+    // Each clause of the ANY below, in brief order: the WinPE/boot
+    // image, the edition payloads (WIM or solid ESD), the BIOS boot
+    // manager together with the installer, any text-mode setup marker,
+    // the WinPE/minint tree.
+    let is_windows = index.has(BOOT_WIM)
+        || index.has(INSTALL_WIM)
+        || index.has(INSTALL_ESD)
+        || (index.has(BOOTMGR) && index.has(SETUP_EXE))
+        || has_txtsetup
+        || index.has(MININT);
+    let boot_xml = match boot {
+        Some(file) => read_wim(file)?,
+        None => None,
+    };
+    let install_xml = match install {
+        Some(file) => read_wim(file)?,
+        None => None,
+    };
+    let version = boot_xml
+        .as_ref()
+        .and_then(first_version)
+        .or_else(|| install_xml.as_ref().and_then(first_version));
+    let (windows_version, build) = match version {
+        Some(found) => (Some(found.major.to_string()), Some(found.build)),
+        None => (None, None),
+    };
+    let edition_source = install_xml
+        .as_ref()
+        .filter(|xml| !xml.images.is_empty())
+        .or(boot_xml.as_ref().filter(|xml| !xml.images.is_empty()));
+    let mut wim_images = Vec::new();
+    if let Some(xml) = edition_source {
+        for image in xml.images.iter() {
+            wim_images.push(WimImage {
+                index: image.index,
+                name: image.name.clone(),
+                display_name: image.display_name.clone(),
+                description: image.description.clone(),
+            });
+        }
+    }
+    let is_windows_to_go = is_windows
+        && build.is_some_and(|found| found >= WINDOWS_TO_GO_MIN_BUILD)
+        && !wim_images.is_empty();
+    Ok(WindowsInfo {
+        is_windows,
+        windows_version,
+        build,
+        is_windows_to_go,
+        wim_images,
+    })
+}
+
+/// Open the indexed WIM at `marker` through the ISO reader, when the
+/// marker exists: `None` for a missing marker or a directory at the
+/// marker (a directory is not a WIM and degrades like a bogus file).
+/// The indexed node's own path opens the file, so the exact walked
+/// spelling resolves. Any other open failure propagates.
+fn open_iso_wim<'a>(
+    reader: &'a IsoReader,
+    index: &TreeIndex,
+    marker: &str,
+) -> Result<Option<WimFile<'a>>> {
+    let Some(node) = index.get(marker) else {
+        return Ok(None);
+    };
+    if node.is_dir {
+        return Ok(None);
+    }
+    let file = reader.open_file(&node.path)?;
+    Ok(Some(WimFile::Iso { reader, file }))
+}
+
+/// Open the UDF entry at `marker` from one `walk()` pass, when the
+/// marker exists: `None` for a missing marker or a directory at the
+/// marker (see [`open_iso_wim`]). The match is ASCII-case-insensitive
+/// over the walked absolute paths. The length is read once here so
+/// [`WimFile::len`] stays infallible; an entry whose length refuses to
+/// open propagates as a real error.
+fn open_udf_wim<'a>(
+    reader: &'a UdfReader,
+    walked: &[(String, crate::udf::Entry)],
+    marker: &str,
+) -> Result<Option<WimFile<'a>>> {
+    let Some((_, entry)) = walked
+        .iter()
+        .find(|(path, _)| path.eq_ignore_ascii_case(marker))
+    else {
+        return Ok(None);
+    };
+    if entry.is_directory {
+        return Ok(None);
+    }
+    let len = reader.open_file(entry).map(|file| file.len())?;
+    Ok(Some(WimFile::Udf {
+        reader,
+        entry: entry.clone(),
+        len,
+    }))
+}
+
 /// Analyse `volume`: probe ISO, then UDF, else report `"raw"`.
 ///
 /// A reader that fails on a volume that probed positive is a real
@@ -387,18 +702,31 @@ fn highest_joliet_label(reader: &IsoReader) -> Option<String> {
 /// Only ISO and UDF are in scope: a `.wim`, VHD or anything else
 /// unrecognised is `"raw"` for now, with every flag false.
 ///
-/// Cost note: the tree is walked here and the index then dropped, so a
-/// later slice that needs the index pays for the walk twice (on UDF
-/// that means an `open_file` per file, again). Slice 2 must decide
-/// between returning an `Analysis { report, index }` and a cached walk;
-/// the return type stays [`ImageReport`] until then.
+/// Cost note: the tree index is built, used in place for the Windows
+/// rules below, then dropped with the reader, so the return type stays
+/// [`ImageReport`]. A UDF volume carrying a WIM marker pays for one
+/// extra walk (see the UDF arm); a later slice that needs the index
+/// beyond [`analyze`] will return it alongside the report.
 pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
     if has_iso_magic(volume.as_ref())? {
         let reader = IsoReader::open(volume)?;
         let index = TreeIndex::from_iso(&reader);
+        let boot = open_iso_wim(&reader, &index, BOOT_WIM)?;
+        // The plain payload wins over the solid one when both mark.
+        let install = open_iso_wim(&reader, &index, INSTALL_WIM)?.or(open_iso_wim(
+            &reader,
+            &index,
+            INSTALL_ESD,
+        )?);
+        let windows = classify_windows(&index, boot.as_ref(), install.as_ref())?;
         return Ok(ImageReport {
             kind: "iso".to_string(),
             is_iso: true,
+            is_windows: windows.is_windows,
+            windows_version: windows.windows_version,
+            build: windows.build,
+            is_windows_to_go: windows.is_windows_to_go,
+            wim_images: windows.wim_images,
             labels: Labels {
                 primary: Some(reader.primary().label.clone()),
                 joliet: highest_joliet_label(&reader),
@@ -411,9 +739,33 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
     if crate::udf::anchor::probe(volume.as_ref()).is_ok() {
         let reader = UdfReader::open(volume)?;
         let index = TreeIndex::from_udf(&reader);
+        // The index drops the walked entries the WIM handles need, so a
+        // UDF volume marked with a WIM path (/sources/boot.wim,
+        // /sources/install.wim, /sources/install.esd) pays for one
+        // extra walk here; any other volume — including a
+        // bootmgr+setup.exe one with no WIM marker — never does.
+        let walked = if index.has(BOOT_WIM) || index.has(INSTALL_WIM) || index.has(INSTALL_ESD) {
+            Some(reader.walk()?)
+        } else {
+            None
+        };
+        let empty: &[(String, crate::udf::Entry)] = &[];
+        let walked = walked.as_deref().unwrap_or(empty);
+        let boot = open_udf_wim(&reader, walked, BOOT_WIM)?;
+        let install = open_udf_wim(&reader, walked, INSTALL_WIM)?.or(open_udf_wim(
+            &reader,
+            walked,
+            INSTALL_ESD,
+        )?);
+        let windows = classify_windows(&index, boot.as_ref(), install.as_ref())?;
         return Ok(ImageReport {
             kind: "udf".to_string(),
             is_udf: true,
+            is_windows: windows.is_windows,
+            windows_version: windows.windows_version,
+            build: windows.build,
+            is_windows_to_go: windows.is_windows_to_go,
+            wim_images: windows.wim_images,
             labels: Labels {
                 primary: None,
                 joliet: None,
@@ -673,6 +1025,87 @@ mod tests {
         volume
     }
 
+    /// Encode `text` as UTF-16LE with a `FF FE` BOM, the way real WIM
+    /// XML resources are stored (slice 2 measured this).
+    fn utf16le_bom(text: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    /// Whole WIM file bytes around `xml`: the slice-2 synthetic header
+    /// builder with the measured XPRESS flags.
+    fn wim_file(xml: &str) -> Vec<u8> {
+        crate::wim::header::wim_bytes(&utf16le_bom(xml), 0x20082)
+    }
+
+    /// Primary-only ISO with one subdirectory: the root at sector 20
+    /// holds `dir_name` (at sector 21) plus one record per
+    /// `(identifier, sector, bytes)` in `root_files`; the subdirectory
+    /// holds one record per entry in `sub_files`. Each file's bytes go
+    /// to its sector. Identifiers carry the `;1` version suffix, as
+    /// real mastering tools write them.
+    fn one_dir_iso(
+        dir_name: &[u8],
+        root_files: &[(&[u8], u32, &[u8])],
+        sub_files: &[(&[u8], u32, &[u8])],
+    ) -> Vec<u8> {
+        const DIR_SECTOR: u32 = 21;
+        let mut root = vec![
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(DIR_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, dir_name),
+        ];
+        let mut writes: Vec<(u32, Vec<u8>)> = vec![
+            (
+                16,
+                primary_sector("TESTVOL", ROOT_SECTOR, SECTOR_BYTES as u32).to_vec(),
+            ),
+            (17, terminator_sector().to_vec()),
+        ];
+        for (identifier, sector, bytes) in root_files {
+            root.push(encode_record(*sector, bytes.len() as u32, 0, identifier));
+            writes.push((*sector, bytes.to_vec()));
+        }
+        writes.push((ROOT_SECTOR, dir_sector(&root).to_vec()));
+        let mut sub = vec![
+            encode_record(DIR_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+        ];
+        for (identifier, sector, bytes) in sub_files {
+            sub.push(encode_record(*sector, bytes.len() as u32, 0, identifier));
+            writes.push((*sector, bytes.to_vec()));
+        }
+        writes.push((DIR_SECTOR, dir_sector(&sub).to_vec()));
+        image_with(&writes)
+    }
+
+    /// Boot WIM XML: one image, build 19041.
+    const BOOT_XML_19041: &str = "<WIM><TOTALBYTES>1</TOTALBYTES><IMAGE INDEX=\"1\"><NAME>Windows 10 Pro</NAME><DISPLAYNAME>Windows 10 Pro</DISPLAYNAME><WINDOWS><VERSION><MAJOR>10</MAJOR><MINOR>0</MINOR><BUILD>19041</BUILD><REVISION>1</REVISION></VERSION></WINDOWS></IMAGE></WIM>";
+
+    /// Install WIM XML: two images, builds 19041.
+    const INSTALL_XML_TWO: &str = "<WIM><TOTALBYTES>2</TOTALBYTES><IMAGE INDEX=\"1\"><NAME>Windows 10 Pro</NAME><DISPLAYNAME>Windows 10 Pro</DISPLAYNAME><WINDOWS><VERSION><MAJOR>10</MAJOR><MINOR>0</MINOR><BUILD>19041</BUILD></VERSION></WINDOWS></IMAGE><IMAGE INDEX=\"2\"><NAME>Windows 10 Home</NAME><DISPLAYNAME>Windows 10 Home</DISPLAYNAME><WINDOWS><VERSION><MAJOR>10</MAJOR><MINOR>0</MINOR><BUILD>19041</BUILD></VERSION></WINDOWS></IMAGE></WIM>";
+
+    /// Boot WIM XML: one image, build 7601 (Windows 7, pre-Windows To Go).
+    const BOOT_XML_7601: &str = "<WIM><TOTALBYTES>1</TOTALBYTES><IMAGE INDEX=\"1\"><NAME>Windows 7 Ultimate</NAME><DISPLAYNAME>Windows 7 Ultimate</DISPLAYNAME><WINDOWS><VERSION><MAJOR>6</MAJOR><MINOR>1</MINOR><BUILD>7601</BUILD></VERSION></WINDOWS></IMAGE></WIM>";
+
+    /// Install WIM XML: one image, build 7601.
+    const INSTALL_XML_7601: &str = "<WIM><TOTALBYTES>1</TOTALBYTES><IMAGE INDEX=\"1\"><NAME>Windows 7 Ultimate</NAME><DISPLAYNAME>Windows 7 Ultimate</DISPLAYNAME><WINDOWS><VERSION><MAJOR>6</MAJOR><MINOR>1</MINOR><BUILD>7601</BUILD></VERSION></WINDOWS></IMAGE></WIM>";
+
+    /// Boot WIM XML with no `<WINDOWS>` block: what `wimlib` writes
+    /// when it captures a plain directory, and what a repacked boot.wim
+    /// looks like.
+    const BOOT_XML_NO_WINDOWS: &str = "<WIM><TOTALBYTES>1</TOTALBYTES><IMAGE INDEX=\"1\"><NAME>Boot image</NAME><DISPLAYNAME>Boot image</DISPLAYNAME></IMAGE></WIM>";
+
+    /// Install WIM XML: two images, build 22631.
+    const INSTALL_XML_22631: &str = "<WIM><TOTALBYTES>2</TOTALBYTES><IMAGE INDEX=\"1\"><NAME>Windows 11 Pro</NAME><DISPLAYNAME>Windows 11 Pro</DISPLAYNAME><WINDOWS><VERSION><MAJOR>10</MAJOR><MINOR>0</MINOR><BUILD>22631</BUILD></VERSION></WINDOWS></IMAGE><IMAGE INDEX=\"2\"><NAME>Windows 11 Home</NAME><DISPLAYNAME>Windows 11 Home</DISPLAYNAME><WINDOWS><VERSION><MAJOR>10</MAJOR><MINOR>0</MINOR><BUILD>22631</BUILD></VERSION></WINDOWS></IMAGE></WIM>";
+
+    /// Install WIM XML with no images: parses cleanly but yields no
+    /// editions.
+    const INSTALL_XML_EMPTY: &str = "<WIM><TOTALBYTES>0</TOTALBYTES></WIM>";
+
     // `from_udf` and the `analyze` UDF arm have no coverage here: the
     // minimal UDF fixture builder lives private inside `udf/reader.rs`
     // tests, and duplicating it is out of scope. A shared UDF fixture
@@ -846,5 +1279,286 @@ mod tests {
         };
         assert_eq!(udf_only.best(), Some("U"));
         assert_eq!(Labels::default().best(), None);
+    }
+
+    #[test]
+    fn windows_iso_reports_version_build_and_editions() {
+        let boot = wim_file(BOOT_XML_19041);
+        let install = wim_file(INSTALL_XML_TWO);
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[],
+            &[
+                (b"BOOT.WIM;1".as_slice(), BOOT_WIM_SECTOR, boot.as_slice()),
+                (b"INSTALL.WIM;1".as_slice(), 23, install.as_slice()),
+            ],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.kind, "iso");
+        assert!(report.is_iso);
+        assert!(!report.is_udf);
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version.as_deref(), Some("10"));
+        assert_eq!(report.build, Some(19041));
+        assert_eq!(report.wim_images.len(), 2);
+        assert_eq!(
+            report.wim_images[0].display_name.as_deref(),
+            Some("Windows 10 Pro")
+        );
+        assert_eq!(
+            report.wim_images[1].display_name.as_deref(),
+            Some("Windows 10 Home")
+        );
+        assert!(report.is_windows_to_go);
+    }
+
+    #[test]
+    fn bootmgr_and_setup_alone_make_a_windows_image() {
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[
+                (b"BOOTMGR;1".as_slice(), 22, b"boot".as_slice()),
+                (b"SETUP.EXE;1".as_slice(), 23, b"setup".as_slice()),
+            ],
+            &[],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version, None);
+        assert_eq!(report.build, None);
+        assert!(report.wim_images.is_empty());
+        assert!(!report.is_windows_to_go);
+    }
+
+    #[test]
+    fn txtsetup_sif_marks_an_xp_image() {
+        // Uppercase spelling: the marker lookup is case-insensitive.
+        let iso = one_dir_iso(
+            b"I386",
+            &[],
+            &[(b"TXTSETUP.SIF;1".as_slice(), 22, b"[data]".as_slice())],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version, None);
+        assert_eq!(report.build, None);
+        assert!(report.wim_images.is_empty());
+    }
+
+    #[test]
+    fn a_plain_iso_is_not_windows() {
+        let iso = image_with(&[
+            (
+                16,
+                primary_sector("TESTVOL", ROOT_SECTOR, SECTOR_BYTES as u32).to_vec(),
+            ),
+            (17, terminator_sector().to_vec()),
+            (
+                ROOT_SECTOR,
+                dir_sector(&[
+                    encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                    encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                    encode_record(22, 9, 0, b"README.TXT;1"),
+                ])
+                .to_vec(),
+            ),
+            (22, b"plain txt".to_vec()),
+        ]);
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.kind, "iso");
+        assert!(!report.is_windows);
+        assert_eq!(report.windows_version, None);
+        assert_eq!(report.build, None);
+        assert!(!report.is_windows_to_go);
+        assert!(report.wim_images.is_empty());
+        let text = toml::to_string(&report).expect("the report serialises");
+        assert!(!text.contains("wim_images"), "{text}");
+    }
+
+    #[test]
+    fn old_build_is_not_windows_to_go() {
+        let boot = wim_file(BOOT_XML_7601);
+        let install = wim_file(INSTALL_XML_7601);
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[],
+            &[
+                (b"BOOT.WIM;1".as_slice(), BOOT_WIM_SECTOR, boot.as_slice()),
+                (b"INSTALL.WIM;1".as_slice(), 23, install.as_slice()),
+            ],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version.as_deref(), Some("6"));
+        assert_eq!(report.build, Some(7601));
+        assert_eq!(report.wim_images.len(), 1);
+        assert!(!report.is_windows_to_go);
+    }
+
+    #[test]
+    fn bootmgr_alone_is_not_windows() {
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[(b"BOOTMGR;1".as_slice(), 22, b"boot".as_slice())],
+            &[],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(!report.is_windows);
+        assert_eq!(report.windows_version, None);
+        assert_eq!(report.build, None);
+    }
+
+    #[test]
+    fn corrupt_boot_wim_degrades_without_error() {
+        // Right path, 40 bytes of garbage: the marker still proves a
+        // Windows payload, but no version or edition can come out of it.
+        let garbage = vec![0xABu8; 40];
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[],
+            &[(
+                b"BOOT.WIM;1".as_slice(),
+                BOOT_WIM_SECTOR,
+                garbage.as_slice(),
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("a bogus WIM never errors");
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version, None);
+        assert_eq!(report.build, None);
+        assert!(report.wim_images.is_empty());
+        assert!(!report.is_windows_to_go);
+    }
+
+    #[test]
+    fn version_falls_back_to_install_when_boot_is_corrupt() {
+        let garbage = vec![0xABu8; 40];
+        let install = wim_file(INSTALL_XML_TWO);
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[],
+            &[
+                (
+                    b"BOOT.WIM;1".as_slice(),
+                    BOOT_WIM_SECTOR,
+                    garbage.as_slice(),
+                ),
+                (b"INSTALL.WIM;1".as_slice(), 23, install.as_slice()),
+            ],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version.as_deref(), Some("10"));
+        assert_eq!(report.build, Some(19041));
+        assert_eq!(report.wim_images.len(), 2);
+        assert!(report.is_windows_to_go);
+    }
+
+    #[test]
+    fn wim_file_read_at_fills_exactly_and_names_short_reads() {
+        let reader = IsoReader::open(Box::new(memory_volume(&tree_fixture_bytes())))
+            .expect("the fixture opens");
+        let file = reader
+            .open_file("SOURCES/BOOT.WIM")
+            .expect("the file opens");
+        let wim = WimFile::Iso {
+            reader: &reader,
+            file,
+        };
+        assert_eq!(wim.len(), 12);
+        // The happy path: an exact fill returns the file bytes.
+        let mut exact = vec![0u8; 12];
+        wim.read_at(0, &mut exact).expect("the exact read fills");
+        assert_eq!(exact, b"wim-content!");
+        // Past the file end the refusal names the wanted and placed
+        // counts (10 wanted, 2 placed).
+        let mut short = vec![0u8; 10];
+        let error = wim
+            .read_at(10, &mut short)
+            .expect_err("a short read refuses");
+        let text = error.to_string();
+        assert!(text.contains("10"), "{text}");
+        assert!(text.contains('2'), "{text}");
+    }
+
+    #[test]
+    fn truncated_boot_wim_degrades_without_error() {
+        // Header intact, XML extent cut short: the file holds the first
+        // 300 bytes of a WIM whose XML runs past that, so the range
+        // check refuses and the report degrades instead of erroring.
+        let full = wim_file(BOOT_XML_19041);
+        assert!(
+            full.len() > 300,
+            "the fixture must actually truncate the XML extent"
+        );
+        let cut = full[..300].to_vec();
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[],
+            &[(b"BOOT.WIM;1".as_slice(), BOOT_WIM_SECTOR, cut.as_slice())],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("a truncated WIM never errors");
+        assert_eq!(report.kind, "iso");
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version, None);
+        assert_eq!(report.build, None);
+        assert!(report.wim_images.is_empty());
+        assert!(!report.is_windows_to_go);
+    }
+
+    #[test]
+    fn version_falls_back_to_install_when_boot_has_no_windows_block() {
+        // boot.wim parses cleanly but carries no VERSION (what wimlib
+        // writes for a plain directory capture): the version, build and
+        // Windows To Go answer come from install.wim instead.
+        let boot = wim_file(BOOT_XML_NO_WINDOWS);
+        let install = wim_file(INSTALL_XML_22631);
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[],
+            &[
+                (b"BOOT.WIM;1".as_slice(), BOOT_WIM_SECTOR, boot.as_slice()),
+                (b"INSTALL.WIM;1".as_slice(), 23, install.as_slice()),
+            ],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version.as_deref(), Some("10"));
+        assert_eq!(report.build, Some(22631));
+        assert!(report.is_windows_to_go);
+        assert_eq!(report.wim_images.len(), 2);
+        assert_eq!(
+            report.wim_images[0].display_name.as_deref(),
+            Some("Windows 11 Pro")
+        );
+        assert_eq!(
+            report.wim_images[1].display_name.as_deref(),
+            Some("Windows 11 Home")
+        );
+    }
+
+    #[test]
+    fn editions_fall_back_to_boot_when_install_is_empty() {
+        // install.wim parses cleanly but yields no images: the editions
+        // come from boot.wim instead of vanishing.
+        let boot = wim_file(BOOT_XML_19041);
+        let install = wim_file(INSTALL_XML_EMPTY);
+        let iso = one_dir_iso(
+            b"SOURCES",
+            &[],
+            &[
+                (b"BOOT.WIM;1".as_slice(), BOOT_WIM_SECTOR, boot.as_slice()),
+                (b"INSTALL.WIM;1".as_slice(), 23, install.as_slice()),
+            ],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.is_windows);
+        assert_eq!(report.windows_version.as_deref(), Some("10"));
+        assert_eq!(report.build, Some(19041));
+        assert_eq!(report.wim_images.len(), 1);
+        assert_eq!(
+            report.wim_images[0].display_name.as_deref(),
+            Some("Windows 10 Pro")
+        );
     }
 }

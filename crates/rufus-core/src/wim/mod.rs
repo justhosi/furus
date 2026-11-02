@@ -25,6 +25,7 @@ pub mod reader;
 pub mod xml;
 
 pub use header::Compression;
+pub use header::HEADER_SIZE;
 pub use header::ResourceHeader;
 pub use header::WimHeader;
 pub use reader::WimReader;

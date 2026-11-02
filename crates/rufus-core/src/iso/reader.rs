@@ -1047,6 +1047,123 @@ impl IsoReader {
         Ok(out)
     }
 
+    /// Read up to `buf.len()` bytes of the opened file at `offset`:
+    /// returns the bytes placed (0 at end of file). Refuses an offset past
+    /// the length, naming both; every window read is bounds-checked before
+    /// its I/O, and multi-extent files map the window across their parts.
+    ///
+    /// A window spanning extents reads each part in order: whole sectors
+    /// come through the sector cache and only the covered slice of each
+    /// sector is copied, so no call ever buffers the whole file.
+    pub fn read_open_at(&self, file: &OpenFile, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let size = u64::from(file.size);
+        if offset > size {
+            return Err(CoreError::invalid(format!(
+                "read at offset {offset} runs past the {size} byte file"
+            )));
+        }
+        if buf.is_empty() || offset == size {
+            return Ok(0);
+        }
+        let mut parts_total: u64 = 0;
+        for part in file.extents.iter() {
+            parts_total = parts_total.checked_add(u64::from(part.1)).ok_or_else(|| {
+                CoreError::invalid("file extent lengths overflow the byte arithmetic")
+            })?;
+        }
+        if parts_total != size {
+            return Err(CoreError::invalid(format!(
+                "file handle of {size} bytes disagrees with its extent parts totalling \
+                 {parts_total} bytes: refusing an inconsistent handle"
+            )));
+        }
+        let mut want = size.saturating_sub(offset).min(buf.len() as u64);
+        let mut skip = offset;
+        let mut placed: usize = 0;
+        for (extent_lba, part_len) in file.extents.iter().map(|part| (part.0, part.1)) {
+            if want == 0 {
+                break;
+            }
+            let part = u64::from(part_len);
+            if skip >= part {
+                skip = skip.saturating_sub(part);
+                continue;
+            }
+            let start = u64::from(extent_lba)
+                .checked_mul(SECTOR_BYTES_U64)
+                .ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "file extent {extent_lba} overflows the byte offset arithmetic"
+                    ))
+                })?;
+            let end = start.checked_add(part).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "file of {part} bytes at extent {extent_lba} overflows the byte offset arithmetic"
+                ))
+            })?;
+            if end > self.total_bytes {
+                return Err(CoreError::invalid(format!(
+                    "file of {part} bytes at extent {extent_lba} (bytes {start}..{end}) runs past \
+                     the {} byte volume end: the volume is truncated",
+                    self.total_bytes
+                )));
+            }
+            // Walk the sectors covering [`skip`, `part`): each cached
+            // sector contributes only its covered slice.
+            let mut pos = skip;
+            while pos < part && want > 0 {
+                let sector_index = u32::try_from(pos / SECTOR_BYTES_U64).map_err(|_| {
+                    CoreError::invalid(format!("file offset {pos} does not fit the sector number"))
+                })?;
+                let sector_no = extent_lba.checked_add(sector_index).ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "file extent {extent_lba} plus sector {sector_index} overflows the sector number"
+                    ))
+                })?;
+                let bytes = self.read_sector_cached(sector_no)?;
+                let sector_off = usize::try_from(pos % SECTOR_BYTES_U64).map_err(|_| {
+                    CoreError::invalid(format!("file offset {pos} does not fit the sector window"))
+                })?;
+                let take = (part.saturating_sub(pos))
+                    .min(SECTOR_BYTES_U64.saturating_sub(pos % SECTOR_BYTES_U64))
+                    .min(want);
+                let take_usize = usize::try_from(take).map_err(|_| {
+                    CoreError::invalid(format!(
+                        "file window of {take} bytes does not fit the buffer"
+                    ))
+                })?;
+                let src = bytes
+                    .get(sector_off..sector_off.saturating_add(take_usize))
+                    .ok_or_else(|| {
+                        CoreError::invalid(format!(
+                            "sector {sector_no} window {sector_off}..{} runs past the sector",
+                            sector_off.saturating_add(take_usize)
+                        ))
+                    })?;
+                let dest_end = placed.checked_add(take_usize).ok_or_else(|| {
+                    CoreError::invalid("file read position overflows the offset arithmetic")
+                })?;
+                let buffer_len = buf.len();
+                let dest = buf.get_mut(placed..dest_end).ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "file read window {placed}..{dest_end} runs past the {buffer_len} byte buffer"
+                    ))
+                })?;
+                dest.copy_from_slice(src);
+                placed = placed.saturating_add(take_usize);
+                pos = pos.saturating_add(take);
+                want = want.saturating_sub(take);
+            }
+            skip = 0;
+        }
+        if want > 0 {
+            return Err(CoreError::invalid(format!(
+                "file windows end {want} bytes before the requested read: refusing a short read"
+            )));
+        }
+        Ok(placed)
+    }
+
     /// Resolve `path` to its final record chain (one record for plain
     /// files and directories, the adjacent same-name run for
     /// multi-extent files), following `.`/`..` and descending into
@@ -2438,6 +2555,106 @@ mod tests {
         let listed = reader.read_dir("/").expect("the root lists the join once");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0], entry);
+        // A window spanning the join reads each part in order.
+        let mut window = vec![0u8; 20];
+        let placed = reader
+            .read_open_at(&open, 90, &mut window)
+            .expect("the join window reads");
+        assert_eq!(placed, 20);
+        assert!(
+            window[..10].iter().all(|byte| *byte == 0x41),
+            "the first part comes first"
+        );
+        assert!(
+            window[10..].iter().all(|byte| *byte == 0x42),
+            "then the second part"
+        );
+    }
+
+    #[test]
+    fn read_open_at_window_edges() {
+        // One 100-byte file of incrementing bytes at sector 28.
+        let mut image = image_with_root(&[
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(28, 100, 0, b"DATA.BIN;1"),
+        ]);
+        for (index, byte) in image
+            .iter_mut()
+            .skip(28 * SECTOR_BYTES)
+            .take(100)
+            .enumerate()
+        {
+            *byte = index as u8;
+        }
+        let reader = reader_over(&image).expect("descriptors still parse");
+        let open = reader.open_file("DATA.BIN").expect("the file opens");
+        assert_eq!(open.len(), 100);
+        let whole = reader.read_open(&open).expect("the whole file reads");
+        // A window starting mid-sector and ending mid-sector returns
+        // exactly those bytes.
+        let mut window = vec![0u8; 20];
+        let placed = reader
+            .read_open_at(&open, 7, &mut window)
+            .expect("the window reads");
+        assert_eq!(placed, 20);
+        assert_eq!(window, whole[7..27]);
+        // A window running past the file end is clamped: a short read,
+        // never zero-filled past the end.
+        let mut tail = vec![0xFFu8; 20];
+        let placed = reader
+            .read_open_at(&open, 90, &mut tail)
+            .expect("the tail reads");
+        assert_eq!(placed, 10);
+        assert_eq!(tail[..10], whole[90..100]);
+        assert!(
+            tail[10..].iter().all(|byte| *byte == 0xFF),
+            "no zero-fill past the end"
+        );
+        // An offset past the length refuses, naming both numbers.
+        let mut sink = vec![0u8; 4];
+        let error = reader
+            .read_open_at(&open, 101, &mut sink)
+            .expect_err("an offset past the length refuses");
+        let text = error.to_string();
+        assert!(text.contains("101"), "{text}");
+        assert!(text.contains("100"), "{text}");
+        // At end of file, and with an empty buffer, the read is a
+        // zero-length success.
+        let mut empty: Vec<u8> = Vec::new();
+        assert_eq!(
+            reader
+                .read_open_at(&open, 0, &mut empty)
+                .expect("an empty buffer reads"),
+            0
+        );
+        assert_eq!(
+            reader
+                .read_open_at(&open, 100, &mut sink)
+                .expect("offset at the length reads"),
+            0
+        );
+        assert_eq!(sink, vec![0u8; 4], "a zero-length read moves no bytes");
+    }
+
+    #[test]
+    fn read_open_at_truncated_extent_refuses() {
+        // The record points at sector 40, past the 32-sector image:
+        // opening only resolves records, so the truncation surfaces at
+        // the window read.
+        let image = image_with_root(&[
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(40, 10, 0, b"BAD.DAT;1"),
+        ]);
+        let reader = reader_over(&image).expect("descriptors still parse");
+        let open = reader.open_file("BAD.DAT").expect("the record resolves");
+        let mut sink = vec![0u8; 10];
+        let error = reader
+            .read_open_at(&open, 0, &mut sink)
+            .expect_err("a past-the-end extent refuses");
+        let text = error.to_string();
+        assert!(text.contains("truncated"), "{text}");
     }
 
     #[test]

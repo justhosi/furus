@@ -25,8 +25,10 @@ use crate::wim::xml::WimXml;
 
 /// True when `bytes` look like the plain (stored, uncompressed) XML
 /// resource: a UTF-16LE BOM (`FF FE`) or a `<` first byte (which also
-/// covers BOM-less UTF-16LE, whose first byte is `<`).
-fn starts_plain(bytes: &[u8]) -> bool {
+/// covers BOM-less UTF-16LE, whose first byte is `<`). Shared with the
+/// report layer, which reads the resource through file windows rather
+/// than a whole volume.
+pub(crate) fn is_stored_xml(bytes: &[u8]) -> bool {
     matches!(
         (bytes.first(), bytes.get(1)),
         (Some(0xFF), Some(0xFE)) | (Some(0x3C), _)
@@ -80,7 +82,7 @@ impl WimReader {
         })?;
         bytes.resize(len, 0);
         volume.read_exact_at(offset, &mut bytes)?;
-        if !starts_plain(&bytes) {
+        if !is_stored_xml(&bytes) {
             return Ok(None);
         }
         Ok(Some(xml::parse(&bytes)))
