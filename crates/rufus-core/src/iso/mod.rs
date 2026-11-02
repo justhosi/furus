@@ -1,5 +1,5 @@
 //! ISO9660 reader: volume descriptors, the chosen directory tree and
-//! multi-extent files (S14, slices 1-2 of 4).
+//! multi-extent files (S14, slices 1-3 of 4).
 //!
 //! PLAN's S14 asks for an ISO9660/Joliet/Rock Ridge reader over the image
 //! with the volume descriptors "mmap"ed for amortised reads. Two facts
@@ -49,10 +49,16 @@
 //!   `;1`/trailing-dot stripping for primary-tree (raw-byte) names.
 //! * [`reader`] — [`IsoReader`](reader::IsoReader): the chosen tree
 //!   ([`TreeKind`]), label, `root`, `lookup`, `read_dir`,
-//!   `open_file`/`read_file` with multi-extent joining.
+//!   `open_file`/`read_file` with multi-extent joining, and the Rock
+//!   Ridge names, symlinks, attributes and relocation the primary tree
+//!   carries on a SUSP volume.
+//! * [`rock`] — SUSP/Rock Ridge system-use parsing: `SP` detection,
+//!   `CE` continuations, `NM` names, `SL` targets, `PX`/`TF` metadata
+//!   and `CL`/`PL`/`RE` relocation (primary tree only; the Joliet tree
+//!   never consults SUSP).
 //!
-//! Deliberately left for later slices: Rock Ridge system-use parsing,
-//! path tables, El Torito boot handling, and recording-date decoding.
+//! Deliberately left for later slices: path tables, El Torito boot
+//! handling, and recording-date decoding.
 //! A directory whose data length is not a multiple of the sector size
 //! reads its last partial sector the way ECMA-119 allows (only the
 //! valid prefix carries records); anything cut mid-sector past the
@@ -87,6 +93,7 @@ pub mod descriptor;
 pub mod joliet;
 pub mod reader;
 pub mod record;
+pub mod rock;
 
 pub use cache::SectorCache;
 pub use descriptor::BootRecord;

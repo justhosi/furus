@@ -1,4 +1,4 @@
-//! Directory records of the primary tree (S14, slices 1-2).
+//! Directory records of the primary tree (S14, slices 1-3).
 //!
 //! *Measured* — ECMA-119 section 9.1: one length byte, one extended
 //! attribute length byte, the extent and data length as both-endian
@@ -6,10 +6,12 @@
 //! later slice), the flag byte, unit size and gap, the volume sequence
 //! number as a both-endian 16-bit word, the identifier length, the
 //! identifier, an alignment pad byte when the identifier length is even,
-//! and the system-use tail (Rock Ridge lives there; later slices own it,
-//! this one skips it). Records pack a directory's data back to back and
-//! never straddle a sector: a zero length byte ends the records of that
-//! sector and the next sector continues.
+//! and the system-use tail, kept raw here ([`DirRecord::system_use`])
+//! for [`rock`](crate::iso::rock) to parse (SUSP/Rock Ridge live there:
+//! `SP`/`CE` sharing, `NM` names, `SL` targets, `PX`/`TF` metadata,
+//! `CL`/`PL`/`RE` relocation). Records pack a directory's data back to
+//! back and never straddle a sector: a zero length byte ends the records
+//! of that sector and the next sector continues.
 //!
 //! *Inferred* — nothing beyond the layout: real mastering tools are
 //! expected to emit the same packing, and the slice report says plainly
@@ -52,8 +54,11 @@ const DOTDOT_ID: &[u8; 1] = b"\x01";
 const VERSION_SUFFIX: &[u8; 2] = b";1";
 
 /// One parsed directory record: the extent, the length, the raw date,
-/// the flag byte and the full identifier (version suffix included —
-/// callers strip with [`strip_version`] for display and matching).
+/// the flag byte, the full identifier (version suffix included —
+/// callers strip with [`strip_version`] for display and matching) and
+/// the raw system-use tail (Rock Ridge entries when the volume carries
+/// SUSP — see [`rock`](crate::iso::rock); empty for records with no
+/// tail, such as the 34-byte descriptor roots).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirRecord {
     /// Logical sector number of the file or directory data.
@@ -67,6 +72,9 @@ pub struct DirRecord {
     pub flags: u8,
     /// Full identifier bytes, exactly as stored (including any `;1`).
     pub identifier: Vec<u8>,
+    /// System-use tail bytes exactly as stored: everything after the
+    /// identifier and its alignment pad, up to the record length.
+    pub system_use: Vec<u8>,
 }
 
 impl DirRecord {
@@ -155,8 +163,9 @@ fn both32(record: &[u8], le_at: usize, be_at: usize, field: &str) -> Result<u32>
 /// extended attribute length (slice 1 has no extended-attribute support),
 /// disagreeing endian halves (both numbers named), a nonzero file unit
 /// size or interleave gap (interleaved files are not supported), and an
-/// identifier that does not fit the record length. The system-use tail is
-/// skipped: Rock Ridge parsing belongs to a later slice.
+/// identifier that does not fit the record length. The system-use tail
+/// is kept raw on [`DirRecord::system_use`]: Rock Ridge parsing belongs
+/// to [`rock`](crate::iso::rock).
 pub fn parse_record(record: &[u8]) -> Result<DirRecord> {
     let len = record.len();
     if len < RECORD_FIXED_LEN {
@@ -213,12 +222,24 @@ pub fn parse_record(record: &[u8]) -> Result<DirRecord> {
             ))
         })?
         .to_vec();
+    let tail_at = ident_end
+        .checked_add(pad)
+        .ok_or_else(|| CoreError::invalid("directory record identifier length overflows"))?;
+    let system_use = record
+        .get(tail_at..len)
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "directory record of {len} bytes ends inside its system use area at byte {tail_at}"
+            ))
+        })?
+        .to_vec();
     Ok(DirRecord {
         extent_lba,
         data_len,
         recorded,
         flags,
         identifier,
+        system_use,
     })
 }
 
@@ -335,6 +356,20 @@ mod tests {
         assert!(!record.is_dot());
         assert!(!record.is_parent());
         assert_eq!(record.identifier, b"DIR");
+    }
+
+    #[test]
+    fn system_use_tail_kept_raw() {
+        let mut bytes = encode_record(21, 11, 0, b"DIR");
+        // A four-byte system-use tail past the identifier and its pad
+        // (identifier length 3 is odd, so no pad byte applies).
+        bytes.extend_from_slice(&[0x53, 0x4C, 0x10, 0x01]);
+        bytes[0] = bytes.len() as u8;
+        let record = parse_record(&bytes).expect("the tailed record parses");
+        assert_eq!(record.system_use, vec![0x53, 0x4C, 0x10, 0x01]);
+        // No tail without one: the plain encoding keeps nothing.
+        let plain = parse_record(&encode_record(21, 11, 0, b"DIR")).expect("parses");
+        assert!(plain.system_use.is_empty());
     }
 
     #[test]

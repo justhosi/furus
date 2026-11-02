@@ -1,5 +1,5 @@
-//! ISO9660/Joliet reader: label, lookup, listings and file reads (S14,
-//! slices 1-2).
+//! ISO9660/Joliet/Rock Ridge reader: label, lookup, listings and file
+//! reads (S14, slices 1-3).
 //!
 //! *Measured* — everything here walks the structures [`descriptor`] and
 //! [`record`] parse, over sectors the [`SectorCache`](crate::iso::SectorCache)
@@ -11,13 +11,27 @@
 //! folding); `.`/`..` records never appear in listings but `..`
 //! traversal resolves; multi-extent files join their adjacent
 //! same-name records in order and read concatenated; and file bytes
-//! come from the recorded extents through the cache.
+//! come from the recorded extents through the cache. Rock Ridge rides
+//! the primary tree only: the root `.` record's SUSP `SP` marker (with
+//! its skip honoured) switches parsing on, and a wrong magic refuses
+//! naming the found bytes. `CE` continuations follow with a bounded
+//! depth and a bounded total (a self-reference, a loop and a read past
+//! the store refuse); `NM` alternate names — byte strings keeping raw
+//! non-ASCII bytes, never UCS-2 like Joliet — override the ISO name in
+//! listings and matching and join across continued entries and the
+//! run's records; `SL` targets rebuild onto their entry but are never
+//! followed; `PX`/`TF` decode to the exposed attributes and stamps; and
+//! `CL` relocates deep directories (followed on descent, `..` checked
+//! against `PL`, `RE` surfaced). Under Joliet, SUSP is never consulted.
 //!
 //! *Inferred* — that preferring the highest Joliet level is what users
-//! want (as libcdio does), and that loading a whole file into RAM in
-//! `read_file` stays acceptable (a streaming read belongs to a later
-//! slice; huge files fail gracefully through `try_reserve`, never with
-//! a panicking allocator call).
+//! want (as libcdio does), that the RRIP flag tables in
+//! [`rock`](crate::iso::rock) match what real mastering tools emit
+//! (the slice report says which shapes `xorriso` was seen to write),
+//! and that loading a whole file into RAM in `read_file` stays
+//! acceptable (a streaming read belongs to a later slice; huge files
+//! fail gracefully through `try_reserve`, never with a panicking
+//! allocator call).
 //!
 //! Refusals, not panics: a malformed Joliet name (odd length, unpaired
 //! surrogate, interior NUL) refuses naming the path and the byte
@@ -27,10 +41,14 @@
 //! refuses, empty path segments refuse, nesting past
 //! [`MAX_DIR_DEPTH`](crate::iso::MAX_DIR_DEPTH) refuses as a possible
 //! directory loop, and any extent running past the store extent refuses
-//! as truncation. A directory whose length is not a sector multiple
-//! reads its last partial sector (only the valid prefix carries
-//! records, per ECMA-119); a volume cut inside that sector refuses,
-//! because the sector is not fully present.
+//! as truncation. On a SUSP volume: a second complete alternate name, a
+//! name left continued past its run, an empty alternate name, a
+//! continued-into special `SL` component, a `..` step disagreeing with
+//! its record (`PL` when present), and opening or descending through a
+//! symlink all refuse naming the path. A directory whose length is not
+//! a sector multiple reads its last partial sector (only the valid
+//! prefix carries records, per ECMA-119); a volume cut inside that
+//! sector refuses, because the sector is not fully present.
 
 use std::cell::RefCell;
 
@@ -51,6 +69,12 @@ use crate::iso::joliet::strip_version as strip_joliet_version;
 use crate::iso::record::DirRecord;
 use crate::iso::record::parse_records;
 use crate::iso::record::strip_version;
+use crate::iso::rock::RockAttrs;
+use crate::iso::rock::RockPosix;
+use crate::iso::rock::RockTimes;
+use crate::iso::rock::detect_susp;
+use crate::iso::rock::parse_attrs;
+use crate::iso::rock::susp_stream;
 use crate::text::device_text;
 
 /// Which directory tree an [`IsoReader`] walks: the primary tree, or
@@ -66,7 +90,8 @@ pub enum TreeKind {
 }
 
 /// One directory entry: the raw identifier plus the decoded name, the
-/// ordered extents, the total length and the raw recording date.
+/// ordered extents, the total length, the raw recording date, and the
+/// Rock Ridge attributes when the primary tree carries SUSP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Full identifier bytes exactly as stored (including any `;1`
@@ -75,8 +100,9 @@ pub struct Entry {
     pub identifier: Vec<u8>,
     /// Display/matching form of the identifier: the primary tree
     /// strips `;1`/trailing-dot on the raw bytes, the Joliet tree on
-    /// the UCS-2BE-decoded text (UTF-8 bytes here). Read it with
-    /// [`Entry::file_name`].
+    /// the UCS-2BE-decoded text (UTF-8 bytes here), and a SUSP primary
+    /// tree prefers the Rock Ridge alternate name (raw bytes, never
+    /// UCS-2). Read it with [`Entry::file_name`].
     name: Vec<u8>,
     /// True for directories (flag bit 1), false for files.
     pub is_dir: bool,
@@ -91,6 +117,20 @@ pub struct Entry {
     /// Raw flag byte of the first record (hidden, associated and
     /// multi-extent bits survive here for later slices).
     pub flags: u8,
+    /// The `SL` symlink target (`None` for non-links and whenever the
+    /// reader walks the Joliet tree, which never consults SUSP).
+    /// Symlinks are listed and looked up like any entry but never
+    /// followed: [`IsoReader::open_file`] refuses them.
+    pub symlink_target: Option<String>,
+    /// The `PX` POSIX attributes (`None` when the record carries no
+    /// `PX`, or on the Joliet tree).
+    pub posix: Option<RockPosix>,
+    /// The `TF` time stamps (`None` when the record carries no `TF`,
+    /// or on the Joliet tree).
+    pub times: Option<RockTimes>,
+    /// True when `RE` or `CL` marks the record as relocated (a caller
+    /// that presents deep trees may warn on this).
+    pub relocated: bool,
 }
 
 impl Entry {
@@ -148,8 +188,9 @@ impl OpenFile {
 }
 
 /// One path component after splitting: `.`, `..`, or a name matched
-/// against display names (stripped raw bytes on the primary tree,
-/// decoded UCS-2BE on the Joliet tree).
+/// against display names (stripped raw bytes on the primary tree —
+/// Rock Ridge alternate names win on a SUSP volume — decoded UCS-2BE
+/// on the Joliet tree).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Component {
     /// `.`: stay in the current directory.
@@ -244,6 +285,10 @@ pub struct IsoReader {
     supplementary: Vec<SupplementaryDescriptor>,
     /// Boot records, retained and never executed.
     boot_records: Vec<BootRecord>,
+    /// The `SP` skip of the primary tree's SUSP area (`None` when the
+    /// root `.` record carries no `SP`, or when the reader walks the
+    /// Joliet tree, whose records never consult SUSP).
+    susp_skip: Option<u8>,
 }
 
 /// First record of a resolved chain: every chain is non-empty by
@@ -315,6 +360,11 @@ impl IsoReader {
     /// when one exists (the primary tree otherwise), and retain the
     /// primary, the supplementary descriptors and the boot records. Any
     /// malformed sequence refuses here, before any path is resolved.
+    /// On the primary tree the root `.` record is also read for the
+    /// SUSP `SP` marker: a malformed `SP` refuses the open, while an
+    /// unreadable root simply leaves Rock Ridge off — the first listing
+    /// refuses on the same bytes anyway, so no corrupt image ever reads
+    /// as clean.
     pub fn open(volume: Box<dyn Volume>) -> Result<Self> {
         let total_bytes = volume.total_bytes();
         let mut cache = SectorCache::new(volume);
@@ -343,7 +393,7 @@ impl IsoReader {
                 TreeKind::Primary,
             ),
         };
-        Ok(Self {
+        let mut reader = Self {
             cache: RefCell::new(cache),
             label,
             volume_space_size: set.primary.volume_space_size,
@@ -353,7 +403,244 @@ impl IsoReader {
             primary: set.primary,
             supplementary: set.supplementary,
             boot_records: set.boot_records,
-        })
+            susp_skip: None,
+        };
+        reader.susp_skip = reader.detect_primary_susp()?;
+        Ok(reader)
+    }
+
+    /// SUSP detection for the primary tree: the `SP` skip when the
+    /// root `.` record leads its system-use area with a valid `SP`,
+    /// `None` on the Joliet tree (never consulted there), when the
+    /// root has no `.` record, or when the root reads refuse — the
+    /// refusal then surfaces at first use, exactly as before. A
+    /// readable root with a malformed `SP` is a corrupt volume, and the
+    /// error refuses the open here.
+    fn detect_primary_susp(&self) -> Result<Option<u8>> {
+        if !matches!(self.tree, TreeKind::Primary) {
+            return Ok(None);
+        }
+        let records = match self.read_dir_records(&self.root_record) {
+            Ok(records) => records,
+            Err(_) => return Ok(None),
+        };
+        let dot = match records.iter().find(|record| record.is_dot()) {
+            Some(dot) => dot,
+            None => return Ok(None),
+        };
+        detect_susp(&dot.system_use)
+            .map_err(|error| CoreError::invalid(format!("root directory system use area: {error}")))
+    }
+
+    /// True when Rock Ridge applies: the primary tree with a detected
+    /// `SP`. The Joliet tree never consults SUSP, and without an `SP`
+    /// every record reads exactly as before (no name override, no
+    /// symlink, no relocation, no extra refusals).
+    fn susp_active(&self) -> bool {
+        matches!(self.tree, TreeKind::Primary) && self.susp_skip.is_some()
+    }
+
+    /// One record's Rock Ridge attributes (`None` on the Joliet tree or
+    /// without SUSP — callers keep the pre-SUSP behaviour then). Follows
+    /// `CE` continuations through the cache and parses the stream; any
+    /// malformed entry refuses. A record with no system-use bytes at all
+    /// carries no attributes (an empty area holds no entries whatever
+    /// the `SP` skip says — the skip only moves the start of a
+    /// non-empty area).
+    fn rock_attrs_of(&self, record: &DirRecord) -> Result<Option<RockAttrs>> {
+        if !matches!(self.tree, TreeKind::Primary) {
+            return Ok(None);
+        }
+        let skip = match self.susp_skip {
+            Some(skip) => skip,
+            None => return Ok(None),
+        };
+        if record.system_use.is_empty() {
+            return Ok(Some(RockAttrs {
+                names: Vec::new(),
+                symlink_target: None,
+                posix: None,
+                times: RockTimes::default(),
+                child_link: None,
+                parent_link: None,
+                relocated: false,
+            }));
+        }
+        let total = self.total_bytes;
+        let mut read = |sector: u32| self.read_sector_cached(sector);
+        let stream = susp_stream(&mut read, total, &record.system_use, skip)?;
+        Ok(Some(parse_attrs(
+            &stream,
+            record.is_dot(),
+            record.is_parent(),
+        )?))
+    }
+
+    /// The Rock Ridge alternate name for one adjacent same-name run:
+    /// every `NM` part concatenated in order, across the run's records
+    /// when the continue flag chains them there. `None` when no record
+    /// carries an `NM` (the caller falls back to the stripped ISO
+    /// name). Refuses a second complete name, a chain left open at the
+    /// run's end, and an empty joined name, naming the path.
+    fn rock_join_name(&self, run: &[DirRecord], path: &str) -> Result<Option<Vec<u8>>> {
+        let mut joined = Vec::new();
+        let mut seen_any = false;
+        let mut open = false;
+        let mut done = false;
+        for member in run {
+            let attrs = match self.rock_attrs_of(member)? {
+                Some(attrs) => attrs,
+                None => continue,
+            };
+            if done && !attrs.names.is_empty() {
+                return Err(CoreError::invalid(format!(
+                    "path `{}` carries a second alternate name after a complete one: \
+                     only continuations may follow",
+                    short_path(path)
+                )));
+            }
+            for part in &attrs.names {
+                seen_any = true;
+                joined.extend_from_slice(&part.bytes);
+                open = part.continues;
+                if !open {
+                    done = true;
+                }
+            }
+        }
+        if !seen_any {
+            return Ok(None);
+        }
+        if open {
+            return Err(CoreError::invalid(format!(
+                "path `{}` leaves its alternate name continued past the last record: \
+                 refusing a truncated alternate name",
+                short_path(path)
+            )));
+        }
+        if joined.is_empty() {
+            return Err(CoreError::invalid(format!(
+                "path `{}` carries an empty alternate name: refusing an empty name",
+                short_path(path)
+            )));
+        }
+        Ok(Some(joined))
+    }
+
+    /// Display/matching form of one adjacent same-name run: the Rock
+    /// Ridge alternate name on a SUSP primary tree (raw bytes, never
+    /// UCS-2 — non-ASCII bytes survive untouched, unlike Joliet
+    /// decoding), else the single-record form.
+    fn run_display_name(&self, run: &[DirRecord], path: &str) -> Result<Vec<u8>> {
+        if self.susp_active()
+            && let Some(name) = self.rock_join_name(run, path)?
+        {
+            return Ok(name);
+        }
+        self.display_name(first_record(run, path)?)
+    }
+
+    /// The directory record to read for `record`: `record` itself,
+    /// unless it carries a `CL` child link, in which case a copy with
+    /// the relocated directory's extent, length, flags and date (taken
+    /// from its `.` record, read through the cache). The identifier and
+    /// the system use stay the placeholder's, so the Rock Ridge name
+    /// and the relocated signal survive. Relocation is detected by `CL`
+    /// presence, not the flag byte — real placeholders clear the
+    /// directory flag. A `CL` on a non-directory still substitutes (the
+    /// target's `.` record decides what it is); a missing `.` record, a
+    /// nested `CL`, or an unreadable target refuses. Never consulted on
+    /// the Joliet tree.
+    fn effective_dir_record(&self, record: &DirRecord, path: &str) -> Result<DirRecord> {
+        let link = match self.rock_attrs_of(record)? {
+            Some(attrs) => match attrs.child_link {
+                Some(link) => link,
+                None => return Ok(record.clone()),
+            },
+            None => return Ok(record.clone()),
+        };
+        let bytes = self.read_sector_cached(link).map_err(|error| {
+            CoreError::invalid(format!(
+                "cannot resolve `{}`: relocated directory at extent {link} is unreadable \
+                 ({error})",
+                short_path(path)
+            ))
+        })?;
+        let targets = parse_records(&bytes, SECTOR_BYTES, link).map_err(|error| {
+            CoreError::invalid(format!(
+                "cannot resolve `{}`: relocated directory at extent {link}: {error}",
+                short_path(path)
+            ))
+        })?;
+        let dot = targets
+            .iter()
+            .find(|candidate| candidate.is_dot())
+            .ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "cannot resolve `{}`: relocated directory at extent {link} has no `.` record",
+                    short_path(path)
+                ))
+            })?;
+        if self
+            .rock_attrs_of(dot)?
+            .is_some_and(|attrs| attrs.child_link.is_some())
+        {
+            return Err(CoreError::invalid(format!(
+                "cannot resolve `{}`: relocated directory at extent {link} relocates again: \
+                 nested relocation is not supported",
+                short_path(path)
+            )));
+        }
+        let mut effective = record.clone();
+        effective.extent_lba = dot.extent_lba;
+        effective.data_len = dot.data_len;
+        effective.recorded = dot.recorded;
+        effective.flags = dot.flags;
+        Ok(effective)
+    }
+
+    /// Apply one `..` step in SUSP mode: the popped logical parent must
+    /// agree with the current directory's `..` record — the `PL` parent
+    /// link when present, else the `..` record's own extent (which still
+    /// points at the physical parent inside a relocated directory, so
+    /// this check is what makes `PL` load-bearing). Refuses a missing
+    /// or unreadable `..` record and a disagreeing parent, naming the
+    /// path. Outside SUSP mode the stack alone decides, exactly as
+    /// before.
+    fn checked_parent(
+        &self,
+        current: &DirRecord,
+        parent: &DirRecord,
+        path: &str,
+    ) -> Result<DirRecord> {
+        let records = self.read_dir_records(current).map_err(|error| {
+            CoreError::invalid(format!("cannot resolve `{}`: {error}", short_path(path)))
+        })?;
+        let dotdot = records
+            .iter()
+            .find(|record| record.is_parent())
+            .ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "path `{}` has no `..` record in its directory: refusing a parent step",
+                    short_path(path)
+                ))
+            })?;
+        let expected = match self.rock_attrs_of(dotdot)? {
+            Some(attrs) => match attrs.parent_link {
+                Some(link) => link,
+                None => dotdot.extent_lba,
+            },
+            None => dotdot.extent_lba,
+        };
+        if parent.extent_lba != expected {
+            return Err(CoreError::invalid(format!(
+                "path `{}` climbs to extent {} but the `..` record points at extent \
+                 {expected}: refusing a disagreeing parent",
+                short_path(path),
+                parent.extent_lba
+            )));
+        }
+        Ok(parent.clone())
     }
 
     /// Volume label of the chosen tree: the primary volume identifier,
@@ -403,6 +690,9 @@ impl IsoReader {
     }
 
     /// The root directory entry (empty identifier, always a directory).
+    /// Synthesised from the descriptor root, so it carries no Rock Ridge
+    /// attributes even on a SUSP volume: the on-disk root `.` record's
+    /// `SP` only switches parsing on for listed records.
     #[must_use]
     pub fn root(&self) -> Entry {
         Entry {
@@ -413,6 +703,10 @@ impl IsoReader {
             data_len: self.root_record.data_len,
             recorded: self.root_record.recorded,
             flags: self.root_record.flags,
+            symlink_target: None,
+            posix: None,
+            times: None,
+            relocated: false,
         }
     }
 
@@ -463,13 +757,26 @@ impl IsoReader {
             )));
         }
         let record = first_record(&chain, path)?;
+        if self
+            .rock_attrs_of(record)?
+            .is_some_and(|attrs| attrs.symlink_target.is_some())
+        {
+            return Err(CoreError::invalid(format!(
+                "cannot list `{}`: it is a symbolic link, not a directory: \
+                 symlinks are never followed",
+                short_path(path)
+            )));
+        }
         if !record.is_dir() {
             return Err(CoreError::invalid(format!(
                 "cannot list `{}`: it is a file, not a directory",
                 short_path(path)
             )));
         }
-        let records = self.read_dir_records(record).map_err(|error| {
+        // A relocated directory lists its target (a plain record reads
+        // through unchanged).
+        let dir_record = self.effective_dir_record(record, path)?;
+        let records = self.read_dir_records(&dir_record).map_err(|error| {
             CoreError::invalid(format!("cannot list `{}`: {error}", short_path(path)))
         })?;
         // Group adjacent same-identifier records: each run joins into
@@ -502,12 +809,24 @@ impl IsoReader {
     }
 
     /// Open the file at `path` for reading with [`IsoReader::read_open`].
-    /// Multi-extent files join their members in order. Refuses
+    /// Multi-extent files join their members in order. Symlinks are
+    /// never followed: an `SL` entry refuses here (it still lists and
+    /// looks up, with its target on [`Entry::symlink_target`]). Refuses
     /// directories, missing paths and broken chains, naming the path.
     pub fn open_file(&self, path: &str) -> Result<OpenFile> {
         let chain = self.resolve(path)?;
         let (parts, total) = join_extents(&chain, path)?;
         let first = first_record(&chain, path)?;
+        if self
+            .rock_attrs_of(first)?
+            .is_some_and(|attrs| attrs.symlink_target.is_some())
+        {
+            return Err(CoreError::invalid(format!(
+                "cannot open `{}`: it is a symbolic link, not a regular file: \
+                 symlinks are listed and looked up but never followed",
+                short_path(path)
+            )));
+        }
         if first.is_dir() {
             return Err(CoreError::invalid(format!(
                 "cannot open `{}`: it is a directory, not a file",
@@ -518,7 +837,7 @@ impl IsoReader {
             extents: parts,
             size: total,
             identifier: first.identifier.clone(),
-            name: self.display_name(first)?,
+            name: self.run_display_name(&chain, path)?,
         })
     }
 
@@ -630,7 +949,11 @@ impl IsoReader {
                 Component::Current => {}
                 Component::Parent => match stack.pop() {
                     Some(parent) => {
-                        current = parent;
+                        if self.susp_active() {
+                            current = self.checked_parent(&current, &parent, path)?;
+                        } else {
+                            current = parent;
+                        }
                     }
                     None => {
                         return Err(CoreError::invalid(format!(
@@ -643,13 +966,41 @@ impl IsoReader {
                     let chain = self.find_chain(&current, want.as_str(), path)?;
                     let last = index + 1 == total;
                     if last {
+                        // A relocated directory reads as its target (but
+                        // stays one entry, keeping the placeholder's
+                        // identifier and Rock Ridge name); anything else
+                        // — including symlinks, which are never followed
+                        // — reads as its own chain.
+                        let first = first_record(&chain, path)?;
+                        let relocates = self
+                            .rock_attrs_of(first)?
+                            .is_some_and(|attrs| attrs.child_link.is_some());
+                        if relocates {
+                            return Ok(vec![self.effective_dir_record(first, path)?]);
+                        }
                         return Ok(chain);
                     }
                     // Validate the chain even mid-path (fail-closed),
-                    // then require a plain directory to descend into.
+                    // then require a directory to descend into.
+                    // Symlinks refuse first: they are never followed,
+                    // even when they pose as directories.
                     join_extents(&chain, path)?;
                     let first = first_record(&chain, path)?;
-                    if !first.is_dir() {
+                    if self
+                        .rock_attrs_of(first)?
+                        .is_some_and(|attrs| attrs.symlink_target.is_some())
+                    {
+                        return Err(CoreError::invalid(format!(
+                            "path `{}` passes through a symbolic link: \
+                             symlinks are never followed",
+                            short_path(path)
+                        )));
+                    }
+                    if !first.is_dir()
+                        && !self
+                            .rock_attrs_of(first)?
+                            .is_some_and(|attrs| attrs.child_link.is_some())
+                    {
                         return Err(CoreError::invalid(format!(
                             "path `{}` passes through a file, not a directory",
                             short_path(path)
@@ -663,7 +1014,9 @@ impl IsoReader {
                             short_path(path)
                         )));
                     }
-                    current = first.clone();
+                    // Follows `CL` to the relocated directory (a plain
+                    // record clones through unchanged).
+                    current = self.effective_dir_record(first, path)?;
                 }
             }
         }
@@ -684,11 +1037,33 @@ impl IsoReader {
     }
 
     /// Build the directory entry for one adjacent same-name run:
-    /// joined extents with the total length, plus the decoded name.
+    /// joined extents with the total length, the Rock Ridge name when a
+    /// SUSP primary tree carries one (else the single-record form), and
+    /// the first record's `SL` target, `PX` attributes, `TF` stamps and
+    /// relocated signal (`RE` or `CL`). Later members of a
+    /// multi-extent run carry data, not metadata: only the `NM` join
+    /// looks past the first record. On the Joliet tree (or without
+    /// SUSP) the Rock Ridge fields stay empty.
     fn entry_from_chain(&self, chain: &[DirRecord], path: &str) -> Result<Entry> {
         let (parts, total) = join_extents(chain, path)?;
         let first = first_record(chain, path)?;
-        let name = self.display_name(first)?;
+        let name = self.run_display_name(chain, path)?;
+        let mut symlink_target = None;
+        let mut posix = None;
+        let mut times = None;
+        let mut relocated = false;
+        if let Some(attrs) = self.rock_attrs_of(first)? {
+            let has_times = attrs.times.creation.is_some()
+                || attrs.times.modification.is_some()
+                || attrs.times.access.is_some()
+                || attrs.times.attributes.is_some();
+            symlink_target = attrs.symlink_target;
+            posix = attrs.posix;
+            relocated = attrs.relocated;
+            if has_times {
+                times = Some(attrs.times);
+            }
+        }
         Ok(Entry {
             identifier: first.identifier.clone(),
             name,
@@ -697,38 +1072,58 @@ impl IsoReader {
             data_len: total,
             recorded: first.recorded,
             flags: first.flags,
+            symlink_target,
+            posix,
+            times,
+            relocated,
         })
     }
 
     /// Every record in directory `dir` matching `want`, as one
-    /// adjacent run (`.`/`..` records never match). Refuses naming the
-    /// path and the wanted name when absent, when the same name
-    /// appears outside the run (duplicates and split chains are
-    /// ambiguous), or when a name will not decode.
+    /// adjacent run (`.`/`..` records never match, and break runs the
+    /// way a mismatching record does). Names compare in display form:
+    /// the Rock Ridge alternate name on a SUSP primary tree, decoded
+    /// UCS-2BE on the Joliet tree. Refuses naming the path and the
+    /// wanted name when absent, when the same name appears outside the
+    /// run (duplicates and split chains are ambiguous), or when a name
+    /// will not decode.
     fn find_chain(&self, dir: &DirRecord, want: &str, path: &str) -> Result<Vec<DirRecord>> {
         let records = self.read_dir_records(dir).map_err(|error| {
             CoreError::invalid(format!("cannot resolve `{}`: {error}", short_path(path)))
         })?;
-        let mut chain = Vec::new();
-        let mut in_run = false;
-        let mut run_ended = false;
+        // Group adjacent same-identifier records first: each run joins
+        // into one chain (multi-extent files match once), and a Rock
+        // Ridge name continued across the run's records joins there too.
+        let mut runs: Vec<Vec<DirRecord>> = Vec::new();
+        let mut broken = false;
         for record in &records {
             if record.is_dot() || record.is_parent() {
-                if in_run {
-                    in_run = false;
-                    run_ended = true;
-                }
+                broken = true;
                 continue;
             }
-            let same = self
-                .display_name(record)
-                .map_err(|error| {
-                    CoreError::invalid(format!("cannot resolve `{}`: {error}", short_path(path)))
-                })?
-                .as_slice()
-                == want.as_bytes();
-            if same {
-                if run_ended {
+            let continues = !broken
+                && runs
+                    .last()
+                    .and_then(|run: &Vec<DirRecord>| run.first())
+                    .is_some_and(|first| {
+                        first.identifier.as_slice() == record.identifier.as_slice()
+                    });
+            broken = false;
+            if continues {
+                if let Some(run) = runs.last_mut() {
+                    run.push(record.clone());
+                }
+            } else {
+                runs.push(vec![record.clone()]);
+            }
+        }
+        let mut found: Option<Vec<DirRecord>> = None;
+        for run in &runs {
+            let name = self.run_display_name(run, path).map_err(|error| {
+                CoreError::invalid(format!("cannot resolve `{}`: {error}", short_path(path)))
+            })?;
+            if name.as_slice() == want.as_bytes() {
+                if found.is_some() {
                     return Err(CoreError::invalid(format!(
                         "path `{}` matches `{}` outside a single adjacent run: duplicate names \
                          and split multi-extent chains are refused",
@@ -736,21 +1131,16 @@ impl IsoReader {
                         short_segment(want)
                     )));
                 }
-                in_run = true;
-                chain.push(record.clone());
-            } else if in_run {
-                in_run = false;
-                run_ended = true;
+                found = Some(run.clone());
             }
         }
-        if chain.is_empty() {
-            return Err(CoreError::invalid(format!(
+        found.ok_or_else(|| {
+            CoreError::invalid(format!(
                 "path `{}` not found: no entry matches `{}`",
                 short_path(path),
                 short_segment(want)
-            )));
-        }
-        Ok(chain)
+            ))
+        })
     }
 
     /// Every record in directory `dir` (including `.`/`..` — callers
@@ -825,6 +1215,7 @@ mod tests {
     use crate::iso::record::FLAG_DIRECTORY;
     use crate::iso::record::FLAG_MULTI_EXTENT;
     use crate::iso::record::RECORD_FIXED_LEN;
+    use crate::iso::rock::RockTime;
 
     /// Sectors of the shared fixture image (32 sectors total).
     const ROOT_SECTOR: u32 = 20;
@@ -839,14 +1230,28 @@ mod tests {
 
     /// Encode one directory record, mirroring the on-disk layout the
     /// parser reads (both-endian words, zero date, sequence 1, the
-    /// even-length pad). Test-only encoding, not a second parser.
+    /// even-length pad, no system-use tail). Test-only encoding, not a
+    /// second parser.
     fn encode_record(extent: u32, data_len: u32, flags: u8, identifier: &[u8]) -> Vec<u8> {
+        encode_record_su(extent, data_len, flags, identifier, &[])
+    }
+
+    /// Encode one directory record with a raw system-use tail, mirroring
+    /// the on-disk layout the parser reads (the even-length pad, then
+    /// `system_use`). Test-only encoding, not a second parser.
+    fn encode_record_su(
+        extent: u32,
+        data_len: u32,
+        flags: u8,
+        identifier: &[u8],
+        system_use: &[u8],
+    ) -> Vec<u8> {
         let pad = if identifier.len().is_multiple_of(2) {
             1
         } else {
             0
         };
-        let len = RECORD_FIXED_LEN + identifier.len() + pad;
+        let len = RECORD_FIXED_LEN + identifier.len() + pad + system_use.len();
         let mut out = vec![0u8; len];
         out[0] = len as u8;
         out[2..6].copy_from_slice(&extent.to_le_bytes());
@@ -858,7 +1263,83 @@ mod tests {
         out[30..32].copy_from_slice(&1u16.to_be_bytes());
         out[32] = identifier.len() as u8;
         out[33..33 + identifier.len()].copy_from_slice(identifier);
+        let tail_at = RECORD_FIXED_LEN + identifier.len() + pad;
+        out[tail_at..tail_at + system_use.len()].copy_from_slice(system_use);
         out
+    }
+
+    /// Both-endian encoding of one `u32` (little half then big half),
+    /// mirroring the on-disk layout the parser reads. Test-only.
+    fn susp_both(value: u32) -> Vec<u8> {
+        let mut out = value.to_le_bytes().to_vec();
+        out.extend_from_slice(&value.to_be_bytes());
+        out
+    }
+
+    /// One SUSP entry with the computed length byte and version 1.
+    /// Test-only.
+    fn susp_entry(sig: &[u8; 2], payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![sig[0], sig[1], (4 + payload.len()) as u8, 1];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// `SP` with the given skip. Test-only.
+    fn susp_sp(skip: u8) -> Vec<u8> {
+        vec![b'S', b'P', 7, 1, 0xBE, 0xEF, skip]
+    }
+
+    /// `NM` with `flags` over the name bytes. Test-only.
+    fn susp_nm(flags: u8, name: &[u8]) -> Vec<u8> {
+        let mut payload = vec![flags];
+        payload.extend_from_slice(name);
+        susp_entry(b"NM", &payload)
+    }
+
+    /// `SL` with entry `flags` over `(component flags, text)` pairs.
+    /// Test-only.
+    fn susp_sl(flags: u8, comps: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut payload = vec![flags];
+        for (cflags, text) in comps {
+            payload.push(*cflags);
+            payload.push(text.len() as u8);
+            payload.extend_from_slice(text);
+        }
+        susp_entry(b"SL", &payload)
+    }
+
+    /// 36-byte `PX` (mode, links, uid, gid, no serial). Test-only.
+    fn susp_px(mode: u32, nlinks: u32, uid: u32, gid: u32) -> Vec<u8> {
+        let mut payload = susp_both(mode);
+        payload.extend_from_slice(&susp_both(nlinks));
+        payload.extend_from_slice(&susp_both(uid));
+        payload.extend_from_slice(&susp_both(gid));
+        susp_entry(b"PX", &payload)
+    }
+
+    /// `TF` with `flags` over the raw stamps. Test-only.
+    fn susp_tf(flags: u8, stamps: &[u8]) -> Vec<u8> {
+        let mut payload = vec![flags];
+        payload.extend_from_slice(stamps);
+        susp_entry(b"TF", &payload)
+    }
+
+    /// `CE` at block, byte offset and length. Test-only.
+    fn susp_ce(block: u32, offset: u32, length: u32) -> Vec<u8> {
+        let mut payload = susp_both(block);
+        payload.extend_from_slice(&susp_both(offset));
+        payload.extend_from_slice(&susp_both(length));
+        susp_entry(b"CE", &payload)
+    }
+
+    /// `CL`/`PL` with the LBA. Test-only.
+    fn susp_link(sig: &[u8; 2], lba: u32) -> Vec<u8> {
+        susp_entry(sig, &susp_both(lba))
+    }
+
+    /// `RE` (4 bytes). Test-only.
+    fn susp_re() -> Vec<u8> {
+        susp_entry(b"RE", &[])
     }
 
     /// Encode `text` as UCS-2BE bytes (BMP-only fixtures, so every
@@ -1205,6 +1686,31 @@ mod tests {
         for (index, descriptor) in descriptors.iter().enumerate() {
             let base = (16 + index) * SECTOR_BYTES;
             image[base..base + SECTOR_BYTES].copy_from_slice(*descriptor);
+        }
+        image
+    }
+
+    /// Primary-only SUSP image: descriptors at 16..18, `root_records`
+    /// packed as the root at sector 20, and `extra` as owned
+    /// (sector, bytes) writes for directory areas, `CE` areas and file
+    /// contents. 32 sectors. Synthetic layout only, claims nothing
+    /// about real mastering tools.
+    fn susp_image(root_records: &[Vec<u8>], extra: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut image = vec![0u8; IMAGE_SECTORS as usize * SECTOR_BYTES];
+        let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut image,
+            16,
+            &primary_sector("ROCK", ROOT_SECTOR, SECTOR_BYTES as u32),
+        );
+        put(&mut image, 17, &boot_sector());
+        put(&mut image, 18, &terminator_sector());
+        put(&mut image, ROOT_SECTOR, &dir_sector(root_records));
+        for (sector, bytes) in extra {
+            put(&mut image, *sector, bytes);
         }
         image
     }
@@ -1794,5 +2300,508 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("HUGE.DAT"), "{text}");
         assert!(text.contains("overflows"), "{text}");
+    }
+
+    #[test]
+    fn rock_sp_skip_honoured_and_names_override() {
+        // Root `.` carries `SP` with skip 4: every area starts four
+        // bytes in, so the file's padding is skipped and its `NM`
+        // applies. The Rock Ridge name wins in listings, lookup and
+        // reads; the ISO spelling no longer resolves.
+        let mut file_su = vec![9, 9, 9, 9];
+        file_su.extend_from_slice(&susp_nm(0, b"hi"));
+        let image = susp_image(
+            &[
+                encode_record_su(
+                    ROOT_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"\x00",
+                    &susp_sp(4),
+                ),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(28, 5, 0, b"FILE.TXT;1", &file_su),
+            ],
+            &[(28, b"hello".to_vec())],
+        );
+        let reader = reader_over(&image).expect("the SUSP image opens");
+        assert_eq!(reader.tree(), TreeKind::Primary);
+        let listed = reader.read_dir("/").expect("the root lists");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file_name(), b"hi");
+        assert_eq!(listed[0].identifier, b"FILE.TXT;1");
+        let entry = reader.lookup("hi").expect("the Rock Ridge name resolves");
+        assert_eq!(entry, listed[0]);
+        assert!(reader.lookup("FILE.TXT").is_none());
+        assert!(reader.lookup("HI").is_none());
+        assert_eq!(reader.read_file("hi").expect("the file reads"), b"hello");
+        let open = reader.open_file("hi").expect("the file opens");
+        assert_eq!(open.file_name(), b"hi".to_vec());
+    }
+
+    #[test]
+    fn rock_wrong_sp_magic_refuses_the_open() {
+        // `SP` with magic 0x12 0x34 instead of 0xBE 0xEF.
+        let bad_sp = vec![b'S', b'P', 7, 1, 0x12, 0x34, 0];
+        let image = susp_image(
+            &[
+                encode_record_su(
+                    ROOT_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"\x00",
+                    &bad_sp,
+                ),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            ],
+            &[],
+        );
+        let error = reader_over(&image).expect_err("the wrong magic refuses the open");
+        let text = error.to_string();
+        assert!(text.contains("0x12"), "{text}");
+        assert!(text.contains("0x34"), "{text}");
+        assert!(text.contains("BE"), "{text}");
+    }
+
+    #[test]
+    fn rock_ce_holds_an_nm_across_the_boundary() {
+        // The record's `NM` continues, and the `CE` area at sector 24
+        // holds the completing `NM`: the joined name wins.
+        let rest = susp_nm(0, b"name");
+        let mut head = susp_nm(1, b"long");
+        head.extend_from_slice(&susp_ce(24, 0, rest.len() as u32));
+        let image = susp_image(
+            &[
+                encode_record_su(
+                    ROOT_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"\x00",
+                    &susp_sp(0),
+                ),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(28, 5, 0, b"FILE.TXT;1", &head),
+            ],
+            &[(28, b"hello".to_vec()), (24, rest)],
+        );
+        let reader = reader_over(&image).expect("the CE image opens");
+        let listed = reader.read_dir("/").expect("the root lists");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file_name(), b"longname");
+        assert!(reader.lookup("longname").is_some());
+        assert!(reader.lookup("FILE.TXT").is_none());
+    }
+
+    #[test]
+    fn rock_ce_loop_refused() {
+        // Sector 24 points at itself: following it never terminates, so
+        // the refusal surfaces lazily at first use, not at open.
+        let area = susp_ce(24, 0, 28);
+        let image = susp_image(
+            &[
+                encode_record_su(
+                    ROOT_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"\x00",
+                    &susp_sp(0),
+                ),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(28, 5, 0, b"LOOP;1", &susp_ce(24, 0, 28)),
+            ],
+            &[(24, area)],
+        );
+        let reader = reader_over(&image).expect("the image opens: loops fail lazily");
+        assert!(reader.lookup("LOOP").is_none());
+        let error = reader.read_dir("/").expect_err("the loop refuses");
+        let text = error.to_string();
+        assert!(text.contains("cyclic"), "{text}");
+        assert!(text.contains("24"), "{text}");
+    }
+
+    #[test]
+    fn rock_nm_continued_across_two_records() {
+        // A two-member multi-extent file whose Rock Ridge name spans the
+        // members: the first carries the continued part, the second
+        // completes it, and the entries join both ways at once.
+        let image = susp_image(
+            &[
+                encode_record_su(
+                    ROOT_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"\x00",
+                    &susp_sp(0),
+                ),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(28, 5, FLAG_MULTI_EXTENT, b"SPLIT.DAT;1", &susp_nm(1, b"ab")),
+                encode_record_su(29, 5, 0, b"SPLIT.DAT;1", &susp_nm(0, b"cd")),
+            ],
+            &[(28, b"hello".to_vec()), (29, b"world".to_vec())],
+        );
+        let reader = reader_over(&image).expect("the image opens");
+        let listed = reader.read_dir("/").expect("the root lists the join once");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file_name(), b"abcd");
+        assert_eq!(listed[0].extents, vec![28, 29]);
+        assert_eq!(listed[0].data_len, 10);
+        assert_eq!(
+            reader.read_file("abcd").expect("the join reads"),
+            b"helloworld"
+        );
+        assert!(reader.lookup("SPLIT.DAT").is_none());
+    }
+
+    #[test]
+    fn rock_symlink_target_rebuilt_and_never_followed() {
+        // `SL` with a parent component (flag 0x04) and two plain ones
+        // rebuilds to `../sub/target.txt`. The entry lists and looks up
+        // with the target attached, but nothing follows it.
+        let link_su = susp_sl(0, &[(0x04, b""), (0, b"sub"), (0, b"target.txt")]);
+        let image = susp_image(
+            &[
+                encode_record_su(
+                    ROOT_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"\x00",
+                    &susp_sp(0),
+                ),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(28, 5, 0, b"TARGET.TXT;1", &susp_nm(0, b"target.txt")),
+                encode_record_su(0, 0, 0, b"LINK;1", &link_su),
+            ],
+            &[(28, b"hello".to_vec())],
+        );
+        let reader = reader_over(&image).expect("the image opens");
+        let entry = reader.lookup("LINK").expect("the link looks up");
+        assert!(entry.is_file());
+        assert_eq!(entry.symlink_target.as_deref(), Some("../sub/target.txt"));
+        assert_eq!(entry.posix, None);
+        assert_eq!(entry.times, None);
+        assert!(!entry.relocated);
+        let listed = reader.read_dir("/").expect("the root lists");
+        assert!(listed.contains(&entry), "the link lists like any entry");
+        let error = reader
+            .open_file("LINK")
+            .expect_err("opening a symlink refuses");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        let error = reader
+            .read_file("LINK")
+            .expect_err("reading a symlink refuses");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        let error = reader
+            .read_dir("LINK")
+            .expect_err("listing a symlink refuses");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert!(reader.lookup("LINK/inside").is_none());
+        let error = reader
+            .open_file("LINK/inside")
+            .expect_err("descent through a symlink refuses");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+    }
+
+    #[test]
+    fn rock_px_and_both_tf_forms_decoded_against_pinned_bytes() {
+        // Short form under flags 0x0e: modification 2023-05-06
+        // 07:08:09, then access and attribute-change beside it. Every
+        // byte below is pinned, not generated: the assertions decode
+        // them, never round-trip them.
+        let short_stamps = [
+            0x7b, 0x05, 0x06, 0x07, 0x08, 0x09, 0x00, 0x7e, 0x0b, 0x02, 0x06, 0x10, 0x36, 0x00,
+            0x7e, 0x0b, 0x02, 0x06, 0x12, 0x31, 0x00,
+        ];
+        let mut short_su = susp_px(0x81A4, 1, 1000, 100);
+        short_su.extend_from_slice(&susp_tf(0x0e, &short_stamps));
+        // Long form under 0x8e: `2023050607080900` at offset 0, then
+        // `2020110221223307` at -48 and at 0.
+        let mut long_stamps = b"2023050607080900".to_vec();
+        long_stamps.push(0x00);
+        long_stamps.extend_from_slice(b"2020110221223307");
+        long_stamps.push(0xD0);
+        long_stamps.extend_from_slice(b"2020110221223307");
+        long_stamps.push(0x00);
+        let mut long_su = susp_px(0x41ED, 2, 0, 0);
+        long_su.extend_from_slice(&susp_tf(0x8e, &long_stamps));
+        let image = susp_image(
+            &[
+                encode_record_su(
+                    ROOT_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"\x00",
+                    &susp_sp(0),
+                ),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(28, 3, 0, b"SHORT;1", &short_su),
+                encode_record_su(29, 3, 0, b"LONG;1", &long_su),
+            ],
+            &[(28, vec![1, 2, 3]), (29, vec![4, 5, 6])],
+        );
+        let reader = reader_over(&image).expect("the image opens");
+        let short = reader
+            .lookup("SHORT")
+            .expect("the short-form file resolves");
+        assert_eq!(
+            short.posix,
+            Some(RockPosix {
+                mode: 0x81A4,
+                nlinks: 1,
+                uid: 1000,
+                gid: 100,
+                serial: None,
+            })
+        );
+        assert_eq!(
+            short.times,
+            Some(RockTimes {
+                creation: None,
+                modification: Some(RockTime {
+                    year: 2023,
+                    month: 5,
+                    day: 6,
+                    hour: 7,
+                    minute: 8,
+                    second: 9,
+                    centiseconds: 0,
+                    offset_quarters: 0,
+                }),
+                access: Some(RockTime {
+                    year: 2026,
+                    month: 11,
+                    day: 2,
+                    hour: 6,
+                    minute: 16,
+                    second: 54,
+                    centiseconds: 0,
+                    offset_quarters: 0,
+                }),
+                attributes: Some(RockTime {
+                    year: 2026,
+                    month: 11,
+                    day: 2,
+                    hour: 6,
+                    minute: 18,
+                    second: 49,
+                    centiseconds: 0,
+                    offset_quarters: 0,
+                }),
+            })
+        );
+        let long = reader.lookup("LONG").expect("the long-form file resolves");
+        assert_eq!(long.posix.as_ref().expect("PX is present").serial, None);
+        let times = long.times.expect("TF is present");
+        assert_eq!(times.creation, None);
+        assert_eq!(
+            times.modification,
+            Some(RockTime {
+                year: 2023,
+                month: 5,
+                day: 6,
+                hour: 7,
+                minute: 8,
+                second: 9,
+                centiseconds: 0,
+                offset_quarters: 0,
+            })
+        );
+        assert_eq!(
+            times.access,
+            Some(RockTime {
+                year: 2020,
+                month: 11,
+                day: 2,
+                hour: 21,
+                minute: 22,
+                second: 33,
+                centiseconds: 7,
+                offset_quarters: -48,
+            })
+        );
+    }
+
+    /// Relocated-deep-tree image: root holds the `DEEP` placeholder
+    /// (`CL` to sector 22, Rock Ridge name `deep`), a `moved` file with
+    /// `RE`, and a plain `plain` file; sector 22 holds the relocated
+    /// directory (`.` with `RE`, `..` with `PL` to the root when
+    /// `with_pl`, `inner/` at sector 21); sector 21 holds `f.txt`. The
+    /// relocated `..` record keeps extent 29 (a physical parent that is
+    /// not the logical one), so `..` without `PL` must refuse.
+    /// Synthetic layout only, claims nothing about real mastering tools.
+    fn reloc_image(with_pl: bool) -> Vec<u8> {
+        const RELOC_SECTOR: u32 = 22;
+        const INNER_SECTOR: u32 = 21;
+        const FILE_SECTOR: u32 = 28;
+        const MOVED_SECTOR: u32 = 29;
+        const PLAIN_SECTOR: u32 = 30;
+        let mut placeholder_su = susp_link(b"CL", RELOC_SECTOR);
+        placeholder_su.extend_from_slice(&susp_nm(0, b"deep"));
+        let mut moved_su = susp_nm(0, b"moved");
+        moved_su.extend_from_slice(&susp_re());
+        let dotdot_su = if with_pl {
+            susp_link(b"PL", ROOT_SECTOR)
+        } else {
+            Vec::new()
+        };
+        let reloc_records = vec![
+            encode_record_su(
+                RELOC_SECTOR,
+                SECTOR_BYTES as u32,
+                FLAG_DIRECTORY,
+                b"\x00",
+                &susp_re(),
+            ),
+            encode_record_su(
+                MOVED_SECTOR,
+                SECTOR_BYTES as u32,
+                FLAG_DIRECTORY,
+                b"\x01",
+                &dotdot_su,
+            ),
+            encode_record_su(
+                INNER_SECTOR,
+                SECTOR_BYTES as u32,
+                FLAG_DIRECTORY,
+                b"INNER",
+                &susp_nm(0, b"inner"),
+            ),
+        ];
+        let inner_records = vec![
+            encode_record(INNER_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(RELOC_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record_su(FILE_SECTOR, 11, 0, b"F.TXT;1", &susp_nm(0, b"f.txt")),
+        ];
+        susp_image(
+            &[
+                encode_record_su(
+                    ROOT_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"\x00",
+                    &susp_sp(0),
+                ),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(0, 0, 0, b"DEEP", &placeholder_su),
+                encode_record_su(MOVED_SECTOR, 3, 0, b"MOVED;1", &moved_su),
+                encode_record_su(PLAIN_SECTOR, 3, 0, b"PLAIN;1", &susp_nm(0, b"plain")),
+            ],
+            &[
+                (RELOC_SECTOR, dir_sector(&reloc_records).to_vec()),
+                (INNER_SECTOR, dir_sector(&inner_records).to_vec()),
+                (FILE_SECTOR, b"hello world".to_vec()),
+                (MOVED_SECTOR, vec![7, 8, 9]),
+                (PLAIN_SECTOR, vec![1, 2, 3]),
+            ],
+        )
+    }
+
+    #[test]
+    fn rock_cl_relocated_directory_read_through_three_levels() {
+        let image = reloc_image(true);
+        let reader = reader_over(&image).expect("the relocated image opens");
+        // The placeholder reads as its target but keeps its own name.
+        let deep = reader
+            .lookup("deep")
+            .expect("the relocated directory resolves");
+        assert!(deep.is_dir);
+        assert!(deep.relocated);
+        assert_eq!(deep.file_name(), b"deep");
+        assert_eq!(deep.extents, vec![22]);
+        assert!(reader.lookup("DEEP").is_none());
+        // Three levels: deep/inner/f.txt.
+        let inner = reader
+            .lookup("deep/inner")
+            .expect("the second level resolves");
+        assert!(inner.is_dir);
+        assert_eq!(inner.file_name(), b"inner");
+        assert!(!inner.relocated);
+        let listed = reader
+            .read_dir("deep")
+            .expect("the relocated directory lists");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], inner);
+        assert_eq!(
+            reader
+                .read_file("deep/inner/f.txt")
+                .expect("the deep file reads"),
+            b"hello world"
+        );
+        // `RE` surfaces on the moved record; plain records stay clear.
+        let moved = reader.lookup("moved").expect("the moved file resolves");
+        assert!(moved.relocated);
+        assert_eq!(moved.identifier, b"MOVED;1");
+        let plain = reader.lookup("plain").expect("the plain file resolves");
+        assert!(!plain.relocated);
+        assert_eq!(plain.symlink_target, None);
+        // `..` inside the relocated tree climbs the logical parents.
+        assert_eq!(reader.lookup("deep/inner/.."), Some(deep.clone()));
+        assert_eq!(reader.lookup("deep/.."), Some(reader.root()));
+        assert_eq!(
+            reader
+                .lookup("deep/inner/../inner/f.txt")
+                .expect("up and down resolves")
+                .file_name(),
+            b"f.txt"
+        );
+        let up_names: Vec<Vec<u8>> = reader
+            .read_dir("deep/inner/..")
+            .expect("the logical parent lists")
+            .iter()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(up_names, vec![b"inner".to_vec()]);
+    }
+
+    #[test]
+    fn rock_dotdot_without_pl_refuses_inside_relocation() {
+        // Same tree but the relocated `..` record carries no `PL`: its
+        // extent (the physical parent 29) disagrees with the logical
+        // parent, so `..` refuses — proving the passing test above rode
+        // on `PL`, not the stack alone.
+        let image = reloc_image(false);
+        let reader = reader_over(&image).expect("the image opens");
+        // Descent still works; only the parent step fails.
+        assert!(reader.lookup("deep/inner/f.txt").is_some());
+        assert!(reader.lookup("deep/..").is_none());
+        let error = reader
+            .read_dir("deep/..")
+            .expect_err("the disagreeing parent refuses");
+        let text = error.to_string();
+        assert!(text.contains("disagreeing parent"), "{text}");
+        assert!(text.contains("29"), "{text}");
+    }
+
+    #[test]
+    fn rock_joliet_tree_ignores_susp() {
+        // Joliet records carrying `NM` system-use tails: the Joliet tree
+        // never consults SUSP, so the trap name stays invisible and the
+        // Rock Ridge fields stay empty.
+        let trap = susp_nm(0, b"trap");
+        let image = joliet_image_with_root(&[
+            encode_record(
+                JOLIET_ROOT_SECTOR,
+                SECTOR_BYTES as u32,
+                FLAG_DIRECTORY,
+                b"\x00",
+            ),
+            encode_record(
+                JOLIET_ROOT_SECTOR,
+                SECTOR_BYTES as u32,
+                FLAG_DIRECTORY,
+                b"\x01",
+            ),
+            encode_record_su(FILE_B_SECTOR, 11, 0, &ucs2("b.txt;1"), &trap),
+        ]);
+        let reader = reader_over(&image).expect("descriptors still parse");
+        assert_eq!(reader.tree(), TreeKind::Joliet { level: 3 });
+        let listed = reader.read_dir("/").expect("the root lists");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].file_name(), b"b.txt");
+        assert_eq!(listed[0].symlink_target, None);
+        assert_eq!(listed[0].posix, None);
+        assert_eq!(listed[0].times, None);
+        assert!(!listed[0].relocated);
+        assert!(reader.lookup("trap").is_none());
+        assert!(reader.lookup("b.txt").is_some());
     }
 }
