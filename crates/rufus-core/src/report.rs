@@ -12,12 +12,13 @@
 //! Slices 2-6 fill the rest: slice 2 was the WIM reader (the header
 //! and XML resource behind [`WimReader`](crate::wim::WimReader)), slice
 //! 3 was Windows (`is_windows`, `windows_version`, `build`,
-//! `is_windows_to_go`, `wim_images`), slice 4 is the Linux
-//! distro/persistence classification (this slice: `distro`,
-//! `persistence`), slice 5 the bootloader fields (`has_efi`,
-//! `has_bios`, `has_grub`, `has_syslinux` and the versions), and slice
-//! 6 the CLI wiring. Every one of those fields exists here already so
-//! [`ImageReport`] stays stable across the slices.
+//! `is_windows_to_go`, `wim_images`), slice 4 the Linux
+//! distro/persistence classification (`distro`, `persistence`), slice 5
+//! is boot capability (this slice: `has_efi`, `has_bios`, `has_grub`,
+//! `grub_version`, `has_syslinux`, `syslinux_version`, plus the
+//! [`BootMode`] recommendation), and slice 6 the CLI wiring. Every one
+//! of those fields exists here already so [`ImageReport`] stays stable
+//! across the slices.
 //!
 //! [`ImageReport`] carries no `dd_mode` field: the DD-mode rule behind
 //! [`forces_dd`](crate::distro::forces_dd) stays a free function until
@@ -42,6 +43,7 @@ use serde::Serialize;
 use crate::error::CoreError;
 use crate::error::Result;
 use crate::fs::Volume;
+use crate::iso::BootCatalog;
 use crate::iso::IsoReader;
 use crate::udf::UdfReader;
 use crate::wim;
@@ -188,6 +190,35 @@ pub struct ImageReport {
     /// then means "not seen within the cap", never "proven absent".
     /// This is the honest analogue of Rufus, which walks with no cap.
     pub truncated: bool,
+}
+
+/// The boot recommendation the PLAN asks to "expose to the plan":
+/// which firmware families the image can boot. Computed from
+/// [`has_bios`](ImageReport::has_bios)/[`has_efi`](ImageReport::has_efi),
+/// so [`ImageReport`]'s field list stays fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootMode {
+    /// Neither BIOS nor UEFI boot paths were seen.
+    None,
+    /// BIOS only.
+    Bios,
+    /// UEFI only.
+    Uefi,
+    /// Both families: a dual BIOS/UEFI image.
+    Both,
+}
+
+impl ImageReport {
+    /// The boot recommendation from `has_bios`/`has_efi`.
+    #[must_use]
+    pub fn boot_mode(&self) -> BootMode {
+        match (self.has_bios, self.has_efi) {
+            (true, true) => BootMode::Both,
+            (true, false) => BootMode::Bios,
+            (false, true) => BootMode::Uefi,
+            (false, false) => BootMode::None,
+        }
+    }
 }
 
 /// One indexed tree entry: the absolute path plus the shape the later
@@ -456,6 +487,79 @@ const GRUB_CFG: &str = "/boot/grub/grub.cfg";
 /// hundred bytes, so anything larger is not one of ours and reads
 /// `Ok(None)` rather than making the report allocate.
 const MAX_TEXT_BYTES: u64 = 64 * 1024;
+
+/// Cap on bootloader binary scans in bytes (1 MiB): a scanned file
+/// larger than this is skipped (`Ok(None)`), so a hostile image cannot
+/// make the report allocate a crafted multi-GiB `isolinux.bin`. Reads
+/// go through the index's size first — never read then discard.
+const MAX_BINARY_SCAN: u64 = 1024 * 1024;
+
+/// Cap on a banner-scan version take in characters: real versions are a
+/// handful (`6.04-pre1`, `2.06`), so a longer run is hostile input and
+/// is cut rather than carried into the report.
+const MAX_VERSION_CHARS: usize = 64;
+
+/// El Torito platform id for 80x86 BIOS boot entries.
+const PLATFORM_BIOS: u8 = 0x00;
+
+/// El Torito platform id for EFI boot entries.
+const PLATFORM_EFI: u8 = 0xEF;
+
+/// Syslinux/Isolinux presence markers (see [`classify_boot`]).
+const SYSLINUX_MARKERS: &[&str] = &[
+    "/isolinux/isolinux.bin",
+    "/isolinux/isolinux.cfg",
+    "/isolinux/ldlinux.c32",
+    "/boot/isolinux/isolinux.bin",
+    "/boot/isolinux/isolinux.cfg",
+    "/syslinux/syslinux.cfg",
+    "/boot/syslinux/syslinux.cfg",
+    "/isolinux/vesamenu.c32",
+];
+
+/// The `ldlinux.c32` probe behind the embedded-version fallback: `6.04`
+/// ships with it, `4.07` without (see [`classify_boot`]).
+const LDLINUX_C32: &str = "/isolinux/ldlinux.c32";
+
+/// Syslinux version-scan binaries in path order: the first present file
+/// whose banner parses wins (see [`classify_boot`]).
+const SYSLINUX_BINS: &[&str] = &[
+    "/isolinux/isolinux.bin",
+    "/boot/isolinux/isolinux.bin",
+    "/syslinux/syslinux.bin",
+    "/boot/syslinux/syslinux.bin",
+];
+
+/// GRUB presence markers (see [`classify_boot`]).
+const GRUB_MARKERS: &[&str] = &[
+    "/boot/grub/grub.cfg",
+    "/boot/grub2/grub.cfg",
+    "/grub/grub.cfg",
+    "/boot/grub/i386-pc/normal.mod",
+    "/boot/grub2/i386-pc/normal.mod",
+];
+
+/// GRUB version-scan binaries in path order: the per-architecture
+/// `normal.mod` files first, then the core images (see
+/// [`classify_boot`]).
+const GRUB_BINS: &[&str] = &[
+    "/boot/grub/x86_64-efi/normal.mod",
+    "/boot/grub/i386-pc/normal.mod",
+    "/boot/grub2/x86_64-efi/normal.mod",
+    "/boot/grub/core.img",
+    "/boot/grub2/core.img",
+];
+
+/// EFI file fallback for [`classify_boot`]: with no usable catalog
+/// entry, any of these in the index proves a UEFI boot path.
+const EFI_FILES: &[&str] = &[
+    "/efi/boot/bootx64.efi",
+    "/efi/boot/bootia32.efi",
+    "/efi/boot/bootaa64.efi",
+    "/efi.img",
+    "/efiboot.img",
+    "/boot/efi.img",
+];
 
 /// A readable window over a WIM file inside either family: the ISO
 /// handle borrows its reader (windows come from
@@ -983,11 +1087,401 @@ fn read_udf_text(
     }
 }
 
+/// A readable bootloader binary inside either family, in the shape of
+/// the existing [`WimFile`]/[`TextFile`] enums: the ISO handle carries
+/// the indexed path, the UDF handle carries the walked entry. The open
+/// helpers refuse directories, unknown lengths and files larger than
+/// [`MAX_BINARY_SCAN`] up front (see [`MAX_BINARY_SCAN`]), so by the
+/// time [`read_bin`] buffers, the read is already known small.
+enum BinFile<'a> {
+    Iso {
+        reader: &'a IsoReader,
+        path: String,
+    },
+    Udf {
+        reader: &'a UdfReader,
+        entry: crate::udf::Entry,
+    },
+}
+
+/// Open the indexed binary at `marker` through the ISO reader, when the
+/// marker exists: `None` for a missing marker, a directory at the
+/// marker, a file whose length is unknown, or a file larger than
+/// [`MAX_BINARY_SCAN`]. The indexed node's own path opens the file, so
+/// the exact walked spelling resolves.
+fn open_bin_iso<'a>(reader: &'a IsoReader, index: &TreeIndex, marker: &str) -> Option<BinFile<'a>> {
+    let node = index.get(marker)?;
+    if node.is_dir {
+        return None;
+    }
+    let size = node.size?;
+    if size > MAX_BINARY_SCAN {
+        return None;
+    }
+    Some(BinFile::Iso {
+        reader,
+        path: node.path.clone(),
+    })
+}
+
+/// Open the UDF entry at `marker` from one `walk()` pass, when the
+/// marker exists: `None` for a missing marker, a directory at the
+/// marker, an entry whose length refuses to open, or a file larger than
+/// [`MAX_BINARY_SCAN`]. The match is ASCII-case-insensitive over the
+/// walked absolute paths.
+fn open_bin_udf<'a>(
+    reader: &'a UdfReader,
+    walked: &[(String, crate::udf::Entry)],
+    marker: &str,
+) -> Option<BinFile<'a>> {
+    let (_, entry) = walked
+        .iter()
+        .find(|(path, _)| path.eq_ignore_ascii_case(marker))?;
+    if entry.is_directory {
+        return None;
+    }
+    let size = reader.open_file(entry).map(|file| file.len()).ok()?;
+    if size > MAX_BINARY_SCAN {
+        return None;
+    }
+    Some(BinFile::Udf {
+        reader,
+        entry: entry.clone(),
+    })
+}
+
+/// Read the whole binary: version probes are opportunistic, so an
+/// unreadable file degrades to `Ok(None)` while a raw I/O error
+/// ([`CoreError::Io`](crate::CoreError)) propagates, exactly like
+/// [`read_text`].
+fn read_bin(file: &BinFile<'_>) -> Result<Option<Vec<u8>>> {
+    match file {
+        BinFile::Iso { reader, path, .. } => match reader.read_file(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error @ CoreError::Io { .. }) => Err(error),
+            Err(_) => Ok(None),
+        },
+        BinFile::Udf { reader, entry, .. } => match reader.read_file(entry) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error @ CoreError::Io { .. }) => Err(error),
+            Err(_) => Ok(None),
+        },
+    }
+}
+
+/// First index of `needle` in `bytes` at or after `from`, if any.
+fn find_sub(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut at = from;
+    while at < bytes.len() {
+        let mut hits = true;
+        for (offset, &want) in needle.iter().enumerate() {
+            if bytes.get(at.saturating_add(offset)) != Some(&want) {
+                hits = false;
+                break;
+            }
+        }
+        if hits {
+            return Some(at);
+        }
+        at = at.saturating_add(1);
+    }
+    None
+}
+
+/// True when `bytes` holds `needle` at `at`.
+fn starts_with_at(bytes: &[u8], at: usize, needle: &[u8]) -> bool {
+    match bytes.get(at..at.saturating_add(needle.len())) {
+        Some(window) => window == needle,
+        None => false,
+    }
+}
+
+/// Parse ASCII decimal digits to `u32`, refusing empty input,
+/// non-digits and overflow.
+fn parse_decimal(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: u32 = 0;
+    for byte in digits.iter() {
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte.saturating_sub(b'0')),
+            _ => return None,
+        };
+        value = value.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+/// Scan `bytes` for a Syslinux banner per `0x1400561b0`: `ISOLINUX ` or
+/// `SYSLINUX ` (the `LINUX ` tail with an `ISO`/`SYS` head), then a
+/// decimal major, a `.`, a decimal minor (each below 256), then the run
+/// of characters after the minor up to the first space when it starts
+/// with `-` (`6.04-pre1` survives). The digits display raw (`04` stays
+/// `04`); the numeric value only gates the below-256 rule. Divergence
+/// note: the reference formats `%d.%02d` and treats a zero version as
+/// not detected — kept raw here instead, which only differs for banners
+/// no producer emits. `<`, `>`, `:`, `|` and `*` become `_`; trailing
+/// spaces and `*` trim. Each banner candidate is tried in order and the
+/// first that fully parses wins; the suffix run is capped at
+/// [`MAX_VERSION_CHARS`] past the minor. The scan window is the whole
+/// buffer, while the C starts at `0x40` and stops at `len - 0x40`/`len -
+/// 0x20`.
+fn syslinux_banner(bytes: &[u8]) -> Option<String> {
+    let mut from = 0usize;
+    while from < bytes.len() {
+        let start = find_sub(bytes, from, b"LINUX ")?;
+        let head = match start.checked_sub(3).and_then(|head| bytes.get(head..start)) {
+            Some(head) => head,
+            None => {
+                from = start.saturating_add(1);
+                continue;
+            }
+        };
+        if head != b"ISO" && head != b"SYS" {
+            from = start.saturating_add(1);
+            continue;
+        }
+        let mut cursor = start.saturating_add(6);
+        let major_start = cursor;
+        while matches!(bytes.get(cursor), Some(b'0'..=b'9')) {
+            cursor = cursor.saturating_add(1);
+        }
+        // The digits stay raw for display (`04` in `6.04`); the numeric
+        // value only gates the < 256 rule.
+        let Some(major_text) = bytes
+            .get(major_start..cursor)
+            .filter(|digits| !digits.is_empty())
+        else {
+            from = start.saturating_add(1);
+            continue;
+        };
+        if !matches!(parse_decimal(major_text), Some(major) if major < 256) {
+            from = start.saturating_add(1);
+            continue;
+        }
+        if bytes.get(cursor) != Some(&b'.') {
+            from = start.saturating_add(1);
+            continue;
+        }
+        cursor = cursor.saturating_add(1);
+        let minor_start = cursor;
+        while matches!(bytes.get(cursor), Some(b'0'..=b'9')) {
+            cursor = cursor.saturating_add(1);
+        }
+        let Some(minor_text) = bytes
+            .get(minor_start..cursor)
+            .filter(|digits| !digits.is_empty())
+        else {
+            from = start.saturating_add(1);
+            continue;
+        };
+        if !matches!(parse_decimal(minor_text), Some(minor) if minor < 256) {
+            from = start.saturating_add(1);
+            continue;
+        }
+        let mut suffix_end = cursor;
+        if bytes.get(cursor) == Some(&b'-') {
+            let cap = cursor.saturating_add(MAX_VERSION_CHARS);
+            suffix_end = cursor.saturating_add(1);
+            while suffix_end < cap {
+                match bytes.get(suffix_end) {
+                    Some(b' ') | None => break,
+                    Some(_) => suffix_end = suffix_end.saturating_add(1),
+                }
+            }
+        }
+        let mut version = String::from_utf8_lossy(major_text).into_owned();
+        version.push('.');
+        version.push_str(&String::from_utf8_lossy(minor_text));
+        if let Some(suffix) = bytes.get(cursor..suffix_end) {
+            version.push_str(&String::from_utf8_lossy(suffix));
+        }
+        let clean: String = version
+            .chars()
+            .map(|next| match next {
+                '<' | '>' | ':' | '|' | '*' => '_',
+                _ => next,
+            })
+            .collect();
+        return Some(clean.trim_end_matches([' ', '*']).to_string());
+    }
+    None
+}
+
+/// Scan `bytes` for a GRUB banner per `0x14001c200`, which memcmps 16
+/// bytes against `"GRUB  version %s"` (two spaces, `%s` included) or 15
+/// against `"GRUB version %s"`, then takes the string past the
+/// literal's own NUL (`start + 0x11`, `+0x10` for the single-space
+/// form) up to the next NUL, trimmed. The earliest banner wins; an
+/// empty take keeps scanning. The take is capped at
+/// [`MAX_VERSION_CHARS`], the same hostile-input defense as
+/// [`syslinux_banner`].
+///
+/// One linear pass: both literals are tested at each position and the
+/// scan advances past the candidate — past the taken NUL, or past the
+/// literal when the take is empty — rather than re-scanning the tail,
+/// so a buffer of repeated banners costs one walk, not a quadratic one.
+fn grub_banner(bytes: &[u8]) -> Option<String> {
+    const TWO: &[u8] = b"GRUB  version %s";
+    const ONE: &[u8] = b"GRUB version %s";
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let width = if starts_with_at(bytes, at, TWO) {
+            TWO.len()
+        } else if starts_with_at(bytes, at, ONE) {
+            ONE.len()
+        } else {
+            at = at.saturating_add(1);
+            continue;
+        };
+        // Skip the literal's own NUL, then take to the next NUL.
+        let mut end = at.saturating_add(width).saturating_add(1);
+        let cap = end.saturating_add(MAX_VERSION_CHARS);
+        while end < cap {
+            match bytes.get(end) {
+                Some(0) | None => break,
+                Some(_) => end = end.saturating_add(1),
+            }
+        }
+        let version = match bytes.get(at.saturating_add(width).saturating_add(1)..end) {
+            Some(raw) => String::from_utf8_lossy(raw).trim().to_string(),
+            None => String::new(),
+        };
+        if !version.is_empty() {
+            return Some(version);
+        }
+        // Empty take: resume past the literal (its NUL included), so the
+        // scan never re-walks ground it already covered.
+        at = end.saturating_add(1);
+    }
+    None
+}
+
+/// Boot capability: the El Torito catalog plus the bootloader file
+/// rules.
+struct BootInfo {
+    has_efi: bool,
+    has_bios: bool,
+    has_syslinux: bool,
+    syslinux_version: Option<String>,
+    has_grub: bool,
+    grub_version: Option<String>,
+}
+
+/// Classify boot capability from the tree index, the El Torito catalog
+/// (if any) and a binary source for the version scans.
+///
+/// `has_bios` is true when the catalog holds a bootable entry under
+/// platform `0x00`: the initial entry (which sits under the validation
+/// platform) or any section entry under its own `0x00` platform. There
+/// is deliberately no file fallback — a `bootmgr` or `isolinux.bin`
+/// file is not proof the BIOS entry point works; the catalog is.
+///
+/// `has_efi` is true for a bootable entry under platform `0xEF`, or —
+/// when no usable catalog entry says so — for any of [`EFI_FILES`] in
+/// the index.
+///
+/// `has_syslinux` is true for any of [`SYSLINUX_MARKERS`] in the index.
+/// `syslinux_version` banner-scans the first present of
+/// [`SYSLINUX_BINS`] (first hit in that path order wins); when none
+/// yields a version but `has_syslinux` holds, it falls back to `"6.04"`
+/// with [`LDLINUX_C32`] present and `"4.07"` without — the
+/// embedded-version fallback of `0x14001c640.c:420-495`, which Rufus
+/// announces with `Warning: Could not detect Isolinux version -
+/// Forcing to %s (embedded)`. Rufus logs `Found conflicting Isolinux
+/// versions` when binaries disagree; the report has no log channel, so
+/// first hit wins instead. (The version binaries extend beyond the
+/// marker list, so a version can surface without `has_syslinux`.)
+///
+/// `has_grub` is true for any of [`GRUB_MARKERS`] in the index.
+/// `grub_version` banner-scans the first present of [`GRUB_BINS`] (same
+/// first-hit rule); with no hit it stays `None`, like Rufus's `Could
+/// not detect Grub version`.
+///
+/// The binary source reads through the index-gated handles, so
+/// oversized files and directories never buffer; a binary that refuses
+/// to read degrades to absent (see [`read_bin`]).
+fn classify_boot(
+    index: &TreeIndex,
+    catalog: Option<&BootCatalog>,
+    bin: &dyn Fn(&str) -> Result<Option<Vec<u8>>>,
+) -> Result<BootInfo> {
+    let mut catalog_bios = false;
+    let mut catalog_efi = false;
+    if let Some(catalog) = catalog {
+        if catalog.initial.bootable {
+            match catalog.validation.platform {
+                PLATFORM_BIOS => catalog_bios = true,
+                PLATFORM_EFI => catalog_efi = true,
+                _ => {}
+            }
+        }
+        for section in catalog.sections.iter() {
+            for entry in section.entries.iter() {
+                if entry.bootable {
+                    match section.platform {
+                        PLATFORM_BIOS => catalog_bios = true,
+                        PLATFORM_EFI => catalog_efi = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let has_bios = catalog_bios;
+    let has_efi = catalog_efi || EFI_FILES.iter().any(|marker| index.has(marker));
+    let has_syslinux = SYSLINUX_MARKERS.iter().any(|marker| index.has(marker));
+    let mut syslinux_version = None;
+    for marker in SYSLINUX_BINS {
+        let bytes = match bin(marker)? {
+            Some(bytes) => bytes,
+            None => continue,
+        };
+        if let Some(version) = syslinux_banner(&bytes) {
+            syslinux_version = Some(version);
+            break;
+        }
+    }
+    if syslinux_version.is_none() && has_syslinux {
+        let embedded = if index.has(LDLINUX_C32) {
+            "6.04"
+        } else {
+            "4.07"
+        };
+        syslinux_version = Some(embedded.to_string());
+    }
+    let has_grub = GRUB_MARKERS.iter().any(|marker| index.has(marker));
+    let mut grub_version = None;
+    for marker in GRUB_BINS {
+        let bytes = match bin(marker)? {
+            Some(bytes) => bytes,
+            None => continue,
+        };
+        if let Some(version) = grub_banner(&bytes) {
+            grub_version = Some(version);
+            break;
+        }
+    }
+    Ok(BootInfo {
+        has_efi,
+        has_bios,
+        has_syslinux,
+        syslinux_version,
+        has_grub,
+        grub_version,
+    })
+}
+
 /// True when the UDF arm must walk for entries: a WIM payload, a distro
-/// text file, or a persistence config past its marker gate (see
-/// [`classify_persistence`]) is marked in the index. Anything else —
-/// including a persistence tree with no config marker — never pays for
-/// the extra walk.
+/// text file, a persistence config past its marker gate (see
+/// [`classify_persistence`]), or a bootloader version binary (see
+/// [`classify_boot`]) is marked in the index. Anything else — including
+/// a persistence tree with no config marker — never pays for the extra
+/// walk.
 fn udf_wants_entries(index: &TreeIndex) -> bool {
     index.has(BOOT_WIM)
         || index.has(INSTALL_WIM)
@@ -999,6 +1493,8 @@ fn udf_wants_entries(index: &TreeIndex) -> bool {
             || index.has(LIVE_SQUASHFS)
             || index.has(LIVE_KERNEL))
             && (index.has(ISOLINUX_CFG) || index.has(GRUB_CFG)))
+        || SYSLINUX_BINS.iter().any(|marker| index.has(marker))
+        || GRUB_BINS.iter().any(|marker| index.has(marker))
 }
 
 /// Open the indexed WIM at `marker` through the ISO reader, when the
@@ -1099,6 +1595,22 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
         };
         let persistence =
             classify_persistence(&index, isolinux_cfg.as_deref(), grub_cfg.as_deref());
+        // The catalog only exists when a boot record names it; a corrupt
+        // catalog degrades to "no catalog" so the file-based EFI
+        // fallback below still runs — a broken catalog never fails the
+        // report.
+        let catalog = if reader.boot_records().is_empty() {
+            None
+        } else {
+            reader.boot_catalog().ok()
+        };
+        let bin_iso = |marker: &str| -> Result<Option<Vec<u8>>> {
+            match open_bin_iso(&reader, &index, marker) {
+                Some(file) => read_bin(&file),
+                None => Ok(None),
+            }
+        };
+        let boot_info = classify_boot(&index, catalog.as_ref(), &bin_iso)?;
         return Ok(ImageReport {
             kind: "iso".to_string(),
             is_iso: true,
@@ -1109,6 +1621,12 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
             wim_images: windows.wim_images,
             distro,
             persistence,
+            has_efi: boot_info.has_efi,
+            has_bios: boot_info.has_bios,
+            has_grub: boot_info.has_grub,
+            grub_version: boot_info.grub_version,
+            has_syslinux: boot_info.has_syslinux,
+            syslinux_version: boot_info.syslinux_version,
             labels,
             truncated: index.is_truncated(),
             ..ImageReport::default()
@@ -1119,10 +1637,12 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
         let index = TreeIndex::from_udf(&reader);
         // The index drops the walked entries the file handles need, so
         // a marked volume pays for one extra walk here (see
-        // [`udf_wants_entries`]); any other volume never does. This is
-        // the second extra walk overall — the first was slice 3's WIM
-        // walk, whose trigger set this extends — and a shared
-        // entry-carrying index is owed by a later slice.
+        // [`udf_wants_entries`]); any other volume never does. One extra
+        // walk total, serving the WIM, text/distro/persistence and
+        // binary reasons together — capped here, never one walk per
+        // reason. This is the second extra walk overall — the first was
+        // slice 3's WIM-only walk, whose trigger set this extends — and
+        // a shared entry-carrying index is owed by a later slice.
         let walked = if udf_wants_entries(&index) {
             Some(reader.walk()?)
         } else {
@@ -1161,6 +1681,15 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
         };
         let persistence =
             classify_persistence(&index, isolinux_cfg.as_deref(), grub_cfg.as_deref());
+        // UDF carries no El Torito catalog: on this arm EFI comes from
+        // the file fallback alone (see [`classify_boot`]).
+        let bin_udf = |marker: &str| -> Result<Option<Vec<u8>>> {
+            match open_bin_udf(&reader, walked, marker) {
+                Some(file) => read_bin(&file),
+                None => Ok(None),
+            }
+        };
+        let boot_info = classify_boot(&index, None, &bin_udf)?;
         return Ok(ImageReport {
             kind: "udf".to_string(),
             is_udf: true,
@@ -1171,6 +1700,12 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
             wim_images: windows.wim_images,
             distro,
             persistence,
+            has_efi: boot_info.has_efi,
+            has_bios: boot_info.has_bios,
+            has_grub: boot_info.has_grub,
+            grub_version: boot_info.grub_version,
+            has_syslinux: boot_info.has_syslinux,
+            syslinux_version: boot_info.syslinux_version,
             labels,
             truncated: index.is_truncated(),
             ..ImageReport::default()
@@ -2138,5 +2673,410 @@ mod tests {
         let report = analyze(Box::new(memory_volume(&iso))).expect("an oversize file never errors");
         assert_eq!(report.distro, None);
         assert_eq!(report.persistence, None);
+    }
+
+    /// One boot entry, bootable when asked, zeroed otherwise.
+    fn boot_entry(bootable: bool) -> crate::iso::BootEntry {
+        crate::iso::BootEntry {
+            bootable,
+            media: crate::iso::MediaType::NoEmulation,
+            load_segment: 0,
+            system_type: 0,
+            sector_count: 4,
+            load_rba: 34,
+        }
+    }
+
+    /// A catalog with `validation_platform`, a bootable-when-asked
+    /// initial entry, and one bootable-when-asked entry per
+    /// `(platform, bootable)` section.
+    fn catalog_with(
+        validation_platform: u8,
+        initial_bootable: bool,
+        sections: &[(u8, bool)],
+    ) -> BootCatalog {
+        BootCatalog {
+            validation: crate::iso::ValidationEntry {
+                platform: validation_platform,
+                id_string: String::new(),
+            },
+            initial: boot_entry(initial_bootable),
+            sections: sections
+                .iter()
+                .map(|(platform, bootable)| crate::iso::BootSection {
+                    is_final: true,
+                    platform: *platform,
+                    id_string: String::new(),
+                    entries: vec![boot_entry(*bootable)],
+                })
+                .collect(),
+        }
+    }
+
+    /// No binaries: the path-keyed source for catalog-only tests.
+    fn no_bins(_: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// The report carrying `info`'s BIOS/EFI answers, for `boot_mode`.
+    fn report_with(info: &BootInfo) -> ImageReport {
+        ImageReport {
+            has_bios: info.has_bios,
+            has_efi: info.has_efi,
+            ..ImageReport::default()
+        }
+    }
+
+    #[test]
+    fn catalog_bios_initial_reports_bios_mode() {
+        let catalog = catalog_with(0x00, true, &[]);
+        let info = classify_boot(&TreeIndex::default(), Some(&catalog), &no_bins)
+            .expect("a catalog classifies");
+        assert!(info.has_bios);
+        assert!(!info.has_efi);
+        assert_eq!(report_with(&info).boot_mode(), BootMode::Bios);
+    }
+
+    #[test]
+    fn catalog_efi_section_reports_uefi_mode() {
+        // Validation platform BIOS with a non-bootable initial: only
+        // the bootable 0xEF section entry counts.
+        let catalog = catalog_with(0x00, false, &[(0xEF, true)]);
+        let info = classify_boot(&TreeIndex::default(), Some(&catalog), &no_bins)
+            .expect("a catalog classifies");
+        assert!(!info.has_bios);
+        assert!(info.has_efi);
+        assert_eq!(report_with(&info).boot_mode(), BootMode::Uefi);
+    }
+
+    #[test]
+    fn catalog_with_both_platforms_reports_dual_mode() {
+        let catalog = catalog_with(0x00, true, &[(0xEF, true)]);
+        let info = classify_boot(&TreeIndex::default(), Some(&catalog), &no_bins)
+            .expect("a catalog classifies");
+        assert!(info.has_bios);
+        assert!(info.has_efi);
+        assert_eq!(report_with(&info).boot_mode(), BootMode::Both);
+    }
+
+    #[test]
+    fn catalog_with_no_bootable_entry_reports_neither() {
+        let catalog = catalog_with(0x00, false, &[(0xEF, false)]);
+        let info = classify_boot(&TreeIndex::default(), Some(&catalog), &no_bins)
+            .expect("a catalog classifies");
+        assert!(!info.has_bios);
+        assert!(!info.has_efi);
+        assert_eq!(report_with(&info).boot_mode(), BootMode::None);
+    }
+
+    #[test]
+    fn non_bootable_efi_entry_is_not_uefi() {
+        let catalog = catalog_with(0xEF, false, &[(0xEF, false)]);
+        let info = classify_boot(&TreeIndex::default(), Some(&catalog), &no_bins)
+            .expect("a catalog classifies");
+        assert!(!info.has_bios);
+        assert!(!info.has_efi);
+    }
+
+    #[test]
+    fn config_without_tree_is_not_persistence() {
+        // isolinux.cfg asks for casper, but with no persistence tree the
+        // gate keeps the file unread: persistence stays None (while the
+        // marker still proves Syslinux).
+        let cfg = "DEFAULT linux\nAPPEND boot=casper quiet\n";
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b"ISOLINUX".as_slice(),
+                vec![(
+                    b"ISOLINUX.CFG;1".as_slice(),
+                    23u32,
+                    cfg.len() as u32,
+                    cfg.as_bytes().to_vec(),
+                )],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.has_syslinux);
+        assert_eq!(report.persistence, None);
+    }
+
+    #[test]
+    fn live_tree_with_casper_config_prefers_casper() {
+        // A live tree with a casper kernel option: casper wins.
+        let cfg = "DEFAULT linux\nAPPEND boot=casper quiet\n";
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![
+                (
+                    b"LIVE".as_slice(),
+                    vec![(b"VMLINUZ;1".as_slice(), 23u32, 6, b"kernel".to_vec())],
+                ),
+                (
+                    b"ISOLINUX".as_slice(),
+                    vec![(
+                        b"ISOLINUX.CFG;1".as_slice(),
+                        24u32,
+                        cfg.len() as u32,
+                        cfg.as_bytes().to_vec(),
+                    )],
+                ),
+            ],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.persistence.as_deref(), Some("casper"));
+    }
+
+    #[test]
+    fn disk_info_beats_diskdefines() {
+        // Both metadata files: the middle precedence step wins.
+        let info = "Ubuntu 24.04.1 LTS \"Noble Numbat\" - Release amd64 (20240827)\n";
+        let defines = "#define DISKNAME  Debian GNU/Linux 12.5.0 \"Bookworm\" - Official amd64 NETINST with firmware\n";
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            vec![(
+                b"README.DISKDEFINES;1".as_slice(),
+                22u32,
+                defines.len() as u32,
+                defines.as_bytes().to_vec(),
+            )],
+            vec![(
+                b".DISK".as_slice(),
+                vec![(
+                    b"INFO;1".as_slice(),
+                    23u32,
+                    info.len() as u32,
+                    info.as_bytes().to_vec(),
+                )],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(
+            report.distro.as_deref(),
+            Some("Ubuntu 24.04.1 LTS \"Noble Numbat\"")
+        );
+    }
+
+    #[test]
+    fn isolinux_banner_reports_major_minor() {
+        let bin = b"\x00\x00ISOLINUX 6.04 0x00000000 extra".to_vec();
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b"ISOLINUX".as_slice(),
+                vec![(b"ISOLINUX.BIN;1".as_slice(), 23u32, bin.len() as u32, bin)],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.has_syslinux);
+        assert_eq!(report.syslinux_version.as_deref(), Some("6.04"));
+        assert!(!report.has_grub);
+    }
+
+    #[test]
+    fn syslinux_prerelease_suffix_survives() {
+        let bin = b"SYSLINUX 4.07-pre3 0x00000000".to_vec();
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b"ISOLINUX".as_slice(),
+                vec![(b"ISOLINUX.BIN;1".as_slice(), 23u32, bin.len() as u32, bin)],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.has_syslinux);
+        assert_eq!(report.syslinux_version.as_deref(), Some("4.07-pre3"));
+    }
+
+    #[test]
+    fn bannerless_syslinux_falls_back_to_embedded() {
+        // No banner anywhere: 6.04 with ldlinux.c32, 4.07 without.
+        let bin = b"no banner here".to_vec();
+        let with_c32 = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b"ISOLINUX".as_slice(),
+                vec![
+                    (
+                        b"ISOLINUX.BIN;1".as_slice(),
+                        23u32,
+                        bin.len() as u32,
+                        bin.clone(),
+                    ),
+                    (b"LDLINUX.C32;1".as_slice(), 24u32, 4, b"tiny".to_vec()),
+                ],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&with_c32))).expect("the fixture analyses");
+        assert!(report.has_syslinux);
+        assert_eq!(report.syslinux_version.as_deref(), Some("6.04"));
+        let without_c32 = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b"ISOLINUX".as_slice(),
+                vec![(b"ISOLINUX.BIN;1".as_slice(), 23u32, bin.len() as u32, bin)],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&without_c32))).expect("the fixture analyses");
+        assert!(report.has_syslinux);
+        assert_eq!(report.syslinux_version.as_deref(), Some("4.07"));
+    }
+
+    #[test]
+    fn grub_mod_banner_reports_version() {
+        // /boot/grub/i386-pc/normal.mod plus its grub.cfg, hand-laid
+        // because the GRUB paths nest two deep. The module bytes mirror
+        // the measured real layout: the `version %s` literal with its
+        // NUL, then the version string with its own NUL.
+        let normal_mod =
+            b"normal/main.c\x00GNU GRUB  version %s\x002:2.16-1\x00prefix\x00".to_vec();
+        let cfg = b"# grub\n".to_vec();
+        let iso = image_with(&[
+            (
+                16,
+                primary_sector("TESTVOL", ROOT_SECTOR, SECTOR_BYTES as u32).to_vec(),
+            ),
+            (17, terminator_sector().to_vec()),
+            (
+                ROOT_SECTOR,
+                dir_sector(&[
+                    encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                    encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                    encode_record(21, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"BOOT"),
+                ])
+                .to_vec(),
+            ),
+            (
+                21,
+                dir_sector(&[
+                    encode_record(21, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                    encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                    encode_record(22, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"GRUB"),
+                ])
+                .to_vec(),
+            ),
+            (
+                22,
+                dir_sector(&[
+                    encode_record(22, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                    encode_record(21, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                    encode_record(23, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"I386-PC"),
+                    encode_record(25, cfg.len() as u32, 0, b"GRUB.CFG;1"),
+                ])
+                .to_vec(),
+            ),
+            (
+                23,
+                dir_sector(&[
+                    encode_record(23, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                    encode_record(22, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                    encode_record(24, normal_mod.len() as u32, 0, b"NORMAL.MOD;1"),
+                ])
+                .to_vec(),
+            ),
+            (24, normal_mod),
+            (25, cfg),
+        ]);
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.has_grub);
+        assert_eq!(report.grub_version.as_deref(), Some("2:2.16-1"));
+        assert!(!report.has_syslinux);
+        assert_eq!(report.syslinux_version, None);
+    }
+
+    #[test]
+    fn grub_banner_forms_and_empty_takes() {
+        // Single-space literal with a version.
+        assert_eq!(
+            grub_banner(b"xxGRUB version %s\x001.2\x00"),
+            Some("1.2".to_string())
+        );
+        // An empty take keeps scanning past the literal (double NUL:
+        // the take between the literal's NUL and the next is empty).
+        assert_eq!(
+            grub_banner(b"GRUB  version %s\x00\x00GRUB  version %s\x003.4\x00"),
+            Some("3.4".to_string())
+        );
+        // No banner at all.
+        assert_eq!(grub_banner(b"nothing here"), None);
+    }
+
+    #[test]
+    fn repeated_empty_grub_banners_stay_linear() {
+        // The adversarial shape for a re-scanning loop: a cap-sized
+        // buffer of empty-take banners (`%s` literal, NUL, NUL). The
+        // single pass walks it once, so this returns in the suite's
+        // normal runtime with no version found — no timing assert, just
+        // the result (a quadratic loop would time the suite out here).
+        let unit = b"GRUB  version %s\x00\x00";
+        let mut bytes = Vec::new();
+        while bytes.len().saturating_add(unit.len()) <= MAX_BINARY_SCAN as usize {
+            bytes.extend_from_slice(unit);
+        }
+        assert_eq!(grub_banner(&bytes), None);
+    }
+
+    #[test]
+    fn efi_file_alone_reports_uefi_without_bios() {
+        // No catalog section at all: the file fallback proves UEFI.
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b"BOOT".as_slice(),
+                vec![(b"EFI.IMG;1".as_slice(), 23u32, 8, b"fatimage".to_vec())],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(report.has_efi);
+        assert!(!report.has_bios);
+        assert_eq!(report.boot_mode(), BootMode::Uefi);
+    }
+
+    #[test]
+    fn plain_iso_has_no_boot_paths() {
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            vec![(b"README.TXT;1".as_slice(), 22u32, 9, b"plain txt".to_vec())],
+            Vec::new(),
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(!report.has_efi);
+        assert!(!report.has_bios);
+        assert!(!report.has_grub);
+        assert_eq!(report.grub_version, None);
+        assert!(!report.has_syslinux);
+        assert_eq!(report.syslinux_version, None);
+        assert_eq!(report.boot_mode(), BootMode::None);
+    }
+
+    #[test]
+    fn oversize_isolinux_bin_falls_back_without_reading() {
+        // The record claims past MAX_BINARY_SCAN while the sector holds
+        // almost nothing: the size gate skips the read, and the
+        // embedded fallback still answers (no ldlinux.c32, so 4.07).
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b"ISOLINUX".as_slice(),
+                vec![(
+                    b"ISOLINUX.BIN;1".as_slice(),
+                    23u32,
+                    (MAX_BINARY_SCAN as u32).saturating_add(1),
+                    b"tiny".to_vec(),
+                )],
+            )],
+        );
+        let report =
+            analyze(Box::new(memory_volume(&iso))).expect("an oversize binary never errors");
+        assert!(report.has_syslinux);
+        assert_eq!(report.syslinux_version.as_deref(), Some("4.07"));
     }
 }

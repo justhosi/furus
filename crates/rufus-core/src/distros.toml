@@ -18,23 +18,13 @@ distro = "AlmaLinux"
 forces_dd = true
 
 [[rule]]
-label = "CentOS*-[8-9]*"
-distro = "CentOS"
-forces_dd = true
-
-[[rule]]
-label = "OL-[8-9]*"
-distro = "OL"
-forces_dd = true
-
-[[rule]]
-label = "Rocky-[8-9]*"
-distro = "Rocky"
-forces_dd = true
-
-[[rule]]
 label = "Fedora*-3[3-9]*"
 distro = "Fedora"
+forces_dd = true
+
+[[rule]]
+label = "CentOS*-[8-9]*"
+distro = "CentOS"
 forces_dd = true
 
 [[rule]]
@@ -43,8 +33,18 @@ distro = "Circle"
 forces_dd = true
 
 [[rule]]
+label = "OL-[8-9]*"
+distro = "OL"
+forces_dd = true
+
+[[rule]]
 label = "RHEL-[8-9]*"
 distro = "RHEL"
+forces_dd = true
+
+[[rule]]
+label = "Rocky-[8-9]*"
+distro = "Rocky"
 forces_dd = true
 
 [[rule]]
