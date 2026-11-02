@@ -6,9 +6,9 @@
 //! on short files. [`open_image`] opens a regular file read-only,
 //! detects it, validates the container header for the families that
 //! carry one (VHD, VHDX, FFU, qcow2) and returns the [`Image`]: the
-//! kind, the file size and the reader slice 4 will expose the
-//! container's contents through. Reading those bodies is slice 4's job;
-//! this slice stops after the header.
+//! kind, the virtual size and the logical contents (a fixed VHD
+//! presents file bytes `0..current_size`, without its footer; every
+//! other family maps its blocks or clusters the same way).
 //!
 //! The probe order below is deliberate and pinned by tests: VHDX
 //! (`vhdxfile` at 0), FFU (`ImageFlash` at 0, or the security header
@@ -98,18 +98,17 @@
 //!
 //! What this slice owns, file by file:
 //!
-//! * [`vhd`] — the VHD footer and the dynamic header (`cxsparse`).
+//! * [`vhd`] — the VHD footer, the dynamic header (`cxsparse`) and the
+//!   logical reader (fixed disks as `0..current_size`, dynamic disks
+//!   through the BAT and the per-block sector bitmaps).
 //! * [`vhdx`] — the VHDX file identifier, both headers, the region
-//!   table, and the local CRC-32C (Castagnoli) the format checksums
-//!   with — the crate's existing CRC-32 (IEEE, used by GPT) is the
-//!   wrong polynomial, so it is not reused.
-//! * [`ffu`] — the FFU header triple in both file orders.
-//! * [`qcow2`] — the qcow2 header.
-//!
-//! Deliberately left for slice 4: container bodies (the VHD block
-//! bitmap and BAT payloads, the VHDX BAT and metadata region, the FFU
-//! payload chunks and their hash-table verification, the qcow2 L1/L2
-//! and refcount tables), and every reader that exposes them.
+//!   table, the metadata table and the BAT reader, plus the local
+//!   CRC-32C (Castagnoli) the format checksums with — the crate's
+//!   existing CRC-32 (IEEE, used by GPT) is the wrong polynomial, so
+//!   it is not reused.
+//! * [`ffu`] — the FFU header triple in both file orders and the
+//!   store-table reader (inferred: no sample exists on this host).
+//! * [`qcow2`] — the qcow2 header and the L1/L2 cluster reader.
 
 use std::path::Path;
 
@@ -245,9 +244,12 @@ pub fn detect(volume: &dyn Volume) -> Result<ImageKind> {
 
 /// An opened, detected and header-validated image.
 ///
-/// Slice 3 validates the container header for VHD, VHDX, FFU and
-/// qcow2; every other kind is detection-only. Slice 4 reads the
-/// container bodies through [`volume`](Image::volume).
+/// For the container families with a logical reader (VHD, VHDX, FFU
+/// and qcow2) the volume is the container's *contents* and the size
+/// its *virtual* size — a dynamic VHD's virtual size lives in its
+/// footer, far below the file length. Every other kind is
+/// detection-only: the volume is the file itself and the size its
+/// length.
 pub struct Image {
     kind: ImageKind,
     size_bytes: u64,
@@ -272,17 +274,20 @@ impl Image {
         self.kind.clone()
     }
 
-    /// The file length in bytes (the on-disk size, not the container's
-    /// virtual size: a dynamic VHD's virtual size lives in its footer
-    /// and slice 4 reports it with the contents).
+    /// The virtual size in bytes for the container families with a
+    /// logical reader (the VHD current size, the VHDX virtual disk
+    /// size, the qcow2 virtual size, the FFU final-table extent) and
+    /// the file length for every other kind.
     #[must_use]
     pub fn size_bytes(&self) -> u64 {
         self.size_bytes
     }
 
-    /// The underlying reader, positioned for slice 4's container
-    /// readers (no bytes have been consumed: every probe reads
-    /// positionally).
+    /// The logical contents: the container reader for VHD, VHDX, FFU
+    /// and qcow2 (a fixed VHD presents file bytes `0..current_size`,
+    /// without its footer), the file itself for every other kind. No
+    /// bytes have been consumed: every probe and header reads
+    /// positionally.
     #[must_use]
     pub fn volume(&self) -> &dyn Volume {
         &*self.volume
@@ -296,7 +301,8 @@ impl Image {
 }
 
 /// Open the regular file at `path` read-only, detect its container
-/// kind and validate the container header.
+/// kind, validate the container header and expose the logical
+/// contents.
 ///
 /// A file whose magic commits to VHD, VHDX, FFU or qcow2 but whose
 /// header is truncated or self-contradictory fails here with the field
@@ -306,11 +312,23 @@ pub fn open_image(path: &Path) -> Result<Image> {
     let volume = FileVolume::open(path)?;
     let total = volume.total_bytes();
     let kind = detect(&volume)?;
-    match kind {
-        ImageKind::Vhd => vhd::validate(&volume, total)?,
-        ImageKind::Vhdx => vhdx::validate(&volume, total)?,
-        ImageKind::Ffu => ffu::validate(&volume, total)?,
-        ImageKind::Qcow2 => qcow2::validate(&volume, total)?,
+    let (size_bytes, volume): (u64, Box<dyn Volume>) = match kind {
+        ImageKind::Vhd => {
+            let reader = vhd::open(Box::new(volume), total)?;
+            (reader.total_bytes(), Box::new(reader))
+        }
+        ImageKind::Vhdx => {
+            let reader = vhdx::open(Box::new(volume), total)?;
+            (reader.total_bytes(), Box::new(reader))
+        }
+        ImageKind::Ffu => {
+            let reader = ffu::open(Box::new(volume), total)?;
+            (reader.total_bytes(), Box::new(reader))
+        }
+        ImageKind::Qcow2 => {
+            let reader = qcow2::open(Box::new(volume), total)?;
+            (reader.total_bytes(), Box::new(reader))
+        }
         ImageKind::Iso
         | ImageKind::Wim
         | ImageKind::Gzip
@@ -319,12 +337,12 @@ pub fn open_image(path: &Path) -> Result<Image> {
         | ImageKind::Zstd
         | ImageKind::Pe
         | ImageKind::Raw
-        | ImageKind::Unknown => {}
-    }
+        | ImageKind::Unknown => (total, Box::new(volume)),
+    };
     Ok(Image {
         kind,
-        size_bytes: total,
-        volume: Box::new(volume),
+        size_bytes,
+        volume,
     })
 }
 
