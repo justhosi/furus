@@ -52,6 +52,9 @@
 //! * [`hash`] — [`Algo`](hash::Algo) selection plus streaming
 //!   [`hash_reader`](hash::hash_reader) / [`hash_file`](hash::hash_file)
 //!   digests (MD5/SHA-1/SHA-256/SHA-512) over a 1 MiB buffer.
+//! * [`image`] — container detection and header validation (S15, slice
+//!   3 of 4): magic probes over any [`Volume`](fs::Volume) plus the
+//!   VHD/VHDX/FFU/qcow2 header checks behind [`open_image`](image::open_image).
 //! * [`part`] — write-side MBR and GPT table builders (S08): the
 //!   sector-0 MBR image and the full protective-MBR/primary/backup GPT
 //!   image, next to their parsers (which moved here from
@@ -94,6 +97,7 @@ pub mod fs;
 pub mod fsprobe;
 pub mod hash;
 pub mod i18n;
+pub mod image;
 pub mod iso;
 pub mod log;
 pub mod part;

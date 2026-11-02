@@ -165,13 +165,15 @@ fn write_mode(image: &Path, kind: &ImageKind) -> WriteMode {
             }
         }
         // Every other sniffed container needs its reader/copier (WIM
-        // through wimlib in S21, VHD/VHDX/FFU through their parsers, a
-        // gzip/xz/bzip2 stream decompressed first in S15, PE files as
+        // through wimlib in S21, VHD/VHDX/FFU through their parsers, qcow2
+        // through its reader in S15, a gzip/xz/bzip2 stream decompressed
+        // first in S15, PE files as
         // payload parts).
         ImageKind::Wim
         | ImageKind::Vhd
         | ImageKind::Vhdx
         | ImageKind::Ffu
+        | ImageKind::Qcow2
         | ImageKind::Gzip
         | ImageKind::Xz
         | ImageKind::Bzip2
@@ -270,6 +272,7 @@ mod tests {
             ("image.iso", ImageKind::Xz, WriteMode::Copy),
             ("archive.gz", ImageKind::Gzip, WriteMode::Copy),
             ("disk.vhd", ImageKind::Vhd, WriteMode::Copy),
+            ("disk.qcow2", ImageKind::Qcow2, WriteMode::Copy),
             // Unknown content: the extension is the only hint.
             ("FIXED.ISO", ImageKind::Unknown, WriteMode::Dd),
             ("image.img", ImageKind::Unknown, WriteMode::Dd),

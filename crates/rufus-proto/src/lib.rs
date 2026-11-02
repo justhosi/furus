@@ -196,6 +196,8 @@ pub enum ImageKind {
     Zstd,
     /// Windows PE (`MZ` at 0).
     Pe,
+    /// qcow2 (`QFI\xfb` at 0).
+    Qcow2,
     /// Raw disk image (no container magic).
     Raw,
     /// Unidentifiable (e.g. empty or too short to hold any magic).
@@ -367,6 +369,7 @@ impl fmt::Display for ImageKind {
             Self::Bzip2 => "bzip2",
             Self::Zstd => "zstd",
             Self::Pe => "pe",
+            Self::Qcow2 => "qcow2",
             Self::Raw => "raw",
             Self::Unknown => "unknown",
         })
@@ -633,6 +636,7 @@ mod tests {
             (ImageKind::Bzip2, "bzip2"),
             (ImageKind::Zstd, "zstd"),
             (ImageKind::Pe, "pe"),
+            (ImageKind::Qcow2, "qcow2"),
             (ImageKind::Raw, "raw"),
             (ImageKind::Unknown, "unknown"),
         ] {

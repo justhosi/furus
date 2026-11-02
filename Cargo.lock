@@ -389,6 +389,7 @@ name = "rufus-core"
 version = "0.1.0"
 dependencies = [
  "md-5",
+ "rufus-proto",
  "serde",
  "sha1",
  "sha2",

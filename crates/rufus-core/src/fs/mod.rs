@@ -34,6 +34,11 @@
 //!   ever panics: all byte addressing goes through the same checked
 //!   helpers the byte-array and file implementations share.
 
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+use std::path::Path;
+use std::path::PathBuf;
+
 use crate::error::CoreError;
 use crate::error::Result;
 
@@ -193,6 +198,80 @@ impl Volume for VecVolume {
     }
 }
 
+/// The read-only file-backed [`Volume`]: a regular image file opened
+/// once, read positionally, never written.
+///
+/// The read side of `rufus-core` (the ISO9660, UDF and image-container
+/// readers) needs exactly this: random access to a file whose length is
+/// fixed at open time. The total extent comes from the opened file's own
+/// metadata (so a concurrent truncation surfaces as a bounds refusal,
+/// not a short read), every [`read_exact_at`](Volume::read_exact_at)
+/// goes through the same [`checked_window`] bounds check the other
+/// implementations share and then through a seek-free positional read,
+/// and any [`write_all_at`](Volume::write_all_at) is refused with the
+/// path named — a read-only volume must say so rather than silently
+/// dropping bytes. [`flush`] has nothing to do (no writes, no cache)
+/// and the sector size stays the [`Volume`] default of 512: an image
+/// file is not a formatted volume, so no geometry is claimed.
+#[derive(Debug)]
+pub struct FileVolume {
+    file: File,
+    path: PathBuf,
+    total_bytes: u64,
+}
+
+impl FileVolume {
+    /// Open the regular file at `path` read-only for positional reads.
+    ///
+    /// Anything that is not a regular file (a directory, a device, a
+    /// missing path) is refused with the path named, mirroring the
+    /// CLI's image-size check: an image is a file, never a directory
+    /// or a device node.
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).map_err(|source| CoreError::io(path, source))?;
+        let meta = file
+            .metadata()
+            .map_err(|source| CoreError::io(path, source))?;
+        if !meta.is_file() {
+            return Err(CoreError::invalid(format!(
+                "'{}' is not a regular file",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            total_bytes: meta.len(),
+        })
+    }
+}
+
+impl Volume for FileVolume {
+    fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let _ = checked_window(self.total_bytes, offset, buf.len(), "read")?;
+        self.file
+            .read_exact_at(buf, offset)
+            .map_err(|source| CoreError::io(&self.path, source))
+    }
+
+    fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+        Err(CoreError::invalid(format!(
+            "refusing to write {} bytes at offset {}: '{}' is a read-only image volume",
+            buf.len(),
+            offset,
+            self.path.display()
+        )))
+    }
+
+    fn sector_size(&self) -> u32 {
+        512
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +320,52 @@ mod tests {
         volume
             .read_exact_at(1020, &mut sink)
             .expect("window ending exactly on the volume end fits");
+    }
+
+    #[test]
+    fn file_volume_reads_a_regular_file_and_refuses_writes() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("image.bin");
+        std::fs::write(&path, b"RUFUS-readonly").expect("the fixture file");
+        let mut volume = FileVolume::open(&path).expect("a regular file opens");
+        assert_eq!(volume.total_bytes(), 14);
+        assert_eq!(volume.sector_size(), 512);
+        let mut out = [0u8; 8];
+        volume
+            .read_exact_at(6, &mut out)
+            .expect("read inside the file");
+        assert_eq!(&out, b"readonly");
+        // a read past the end names both numbers, like every Volume
+        let mut past = [0u8; 4];
+        let error = volume.read_exact_at(12, &mut past).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("12"), "{text}");
+        assert!(text.contains("14"), "{text}");
+
+        // writes are refused with the path named, never silently dropped
+        let error = volume.write_all_at(0, b"x").unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("read-only"), "{text}");
+        assert!(text.contains("image.bin"), "{text}");
+        assert_eq!(
+            std::fs::read(&path).expect("the file on disk"),
+            b"RUFUS-readonly",
+            "the refused write changed nothing"
+        );
+        // flushing a read-only volume is a no-op, never an error
+        volume.flush().expect("flush has nothing to do");
+    }
+
+    #[test]
+    fn file_volume_refuses_non_regular_paths() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let error = FileVolume::open(dir.path()).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("not a regular file"), "{text}");
+
+        let missing = dir.path().join("absent.bin");
+        let error = FileVolume::open(&missing).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("absent.bin"), "{text}");
     }
 }

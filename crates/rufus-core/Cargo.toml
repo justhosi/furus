@@ -16,6 +16,9 @@ md-5 = { workspace = true }
 # planner (S08-B) generates the per-partition unique GUIDs with
 # `Uuid::new_v4()`.
 uuid = { workspace = true }
+# S15: the image container module reports the shared `ImageKind` (one
+# definition, owned by `rufus-proto`).
+rufus-proto = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
