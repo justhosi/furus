@@ -1,0 +1,68 @@
+# The distro label table: replaces the hard-coded anchored regexes and
+# literal prefixes in 0x140031220.c:47-58.
+#
+# Each rule matches the volume label against `label` (a glob, anchored
+# at both ends — see distro.rs) and reports `distro` on the first match
+# in file order. `forces_dd = true` is Rufus's "not ISO mode compatible"
+# rule: a hit sets only the enforce-DD-image-mode flag, which later logs
+# `Note: DD image mode enforced since this ISOHybrid is not ISO mode
+# compatible.` and clears the ISO-mode flag.
+#
+# `distro` is the short identifier derived from the rule's literal
+# prefix (AlmaLinux, CentOS, ...); the three SUSE rules carry their
+# longer release names instead.
+
+[[rule]]
+label = "AlmaLinux-[8-9]*"
+distro = "AlmaLinux"
+forces_dd = true
+
+[[rule]]
+label = "CentOS*-[8-9]*"
+distro = "CentOS"
+forces_dd = true
+
+[[rule]]
+label = "OL-[8-9]*"
+distro = "OL"
+forces_dd = true
+
+[[rule]]
+label = "Rocky-[8-9]*"
+distro = "Rocky"
+forces_dd = true
+
+[[rule]]
+label = "Fedora*-3[3-9]*"
+distro = "Fedora"
+forces_dd = true
+
+[[rule]]
+label = "Circle*-[8-9]*"
+distro = "Circle"
+forces_dd = true
+
+[[rule]]
+label = "RHEL-[8-9]*"
+distro = "RHEL"
+forces_dd = true
+
+[[rule]]
+label = "MIRACLE-LINUX-[8-9]*"
+distro = "MIRACLE-LINUX"
+forces_dd = true
+
+[[rule]]
+label = "Install-SUSE*"
+distro = "SUSE"
+forces_dd = true
+
+[[rule]]
+label = "Install-LEAP*"
+distro = "openSUSE Leap"
+forces_dd = true
+
+[[rule]]
+label = "openSUSE-Tumbleweed*"
+distro = "openSUSE Tumbleweed"
+forces_dd = true

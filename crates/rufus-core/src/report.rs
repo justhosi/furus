@@ -11,12 +11,17 @@
 //!
 //! Slices 2-6 fill the rest: slice 2 was the WIM reader (the header
 //! and XML resource behind [`WimReader`](crate::wim::WimReader)), slice
-//! 3 is Windows (this slice: `is_windows`, `windows_version`, `build`,
-//! `is_windows_to_go`, `wim_images`), slices 4-5 the distro and
-//! persistence fields and the bootloader fields (`has_efi`,
+//! 3 was Windows (`is_windows`, `windows_version`, `build`,
+//! `is_windows_to_go`, `wim_images`), slice 4 is the Linux
+//! distro/persistence classification (this slice: `distro`,
+//! `persistence`), slice 5 the bootloader fields (`has_efi`,
 //! `has_bios`, `has_grub`, `has_syslinux` and the versions), and slice
 //! 6 the CLI wiring. Every one of those fields exists here already so
 //! [`ImageReport`] stays stable across the slices.
+//!
+//! [`ImageReport`] carries no `dd_mode` field: the DD-mode rule behind
+//! [`forces_dd`](crate::distro::forces_dd) stays a free function until
+//! the CLI/write slices decide where to surface it.
 //!
 //! [`TreeIndex`] is the case-insensitive tree both readers share: later
 //! slices ask `has("/sources/boot.wim")`-style questions without
@@ -162,8 +167,9 @@ pub struct ImageReport {
     /// Syslinux version text, when known (slice 5/6 fills this).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub syslinux_version: Option<String>,
-    /// Linux distribution identifier, e.g. `"ubuntu"` (slices 3-4/6
-    /// fill this).
+    /// Linux distribution identifier, e.g. `"Ubuntu 24.04.1 LTS
+    /// \"Noble Numbat\""` (slice 4/6 fills this: label table first,
+    /// then `.disk/info`, then `README.diskdefines`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distro: Option<String>,
     /// Persistence mode label (slice 4/6 fills this).
@@ -419,6 +425,38 @@ const MININT: &str = "/minint";
 /// [`classify_windows`]).
 const WINDOWS_TO_GO_MIN_BUILD: u32 = 9200;
 
+/// Ubuntu-style release metadata: the first non-empty line names the
+/// image.
+const DISK_INFO: &str = "/.disk/info";
+
+/// Debian-style release metadata: the `#define DISKNAME` value names
+/// the image.
+const README_DISKDEFINES: &str = "/README.diskdefines";
+
+/// Ubuntu persistence tree: a directory here (or its kernel below)
+/// means the `casper` family.
+const CASPER_DIR: &str = "/casper";
+
+/// Ubuntu persistence kernel.
+const CASPER_KERNEL: &str = "/casper/vmlinuz";
+
+/// Debian-live persistence payload.
+const LIVE_SQUASHFS: &str = "/live/filesystem.squashfs";
+
+/// Debian-live persistence kernel.
+const LIVE_KERNEL: &str = "/live/vmlinuz";
+
+/// Syslinux boot config, grepped for the persistence kernel options.
+const ISOLINUX_CFG: &str = "/isolinux/isolinux.cfg";
+
+/// GRUB boot config, grepped for the persistence kernel options.
+const GRUB_CFG: &str = "/boot/grub/grub.cfg";
+
+/// Cap on distro/config text reads in bytes: these files are a few
+/// hundred bytes, so anything larger is not one of ours and reads
+/// `Ok(None)` rather than making the report allocate.
+const MAX_TEXT_BYTES: u64 = 64 * 1024;
+
 /// A readable window over a WIM file inside either family: the ISO
 /// handle borrows its reader (windows come from
 /// [`IsoReader::read_open_at`]), the UDF handle carries the walked
@@ -530,6 +568,167 @@ fn read_wim(file: &WimFile<'_>) -> Result<Option<wim::WimXml>> {
         return Ok(None);
     }
     Ok(Some(wim::xml::parse(&bytes)))
+}
+
+/// A readable small text file inside either family, reusing the shape
+/// of [`WimFile`]: the ISO handle carries the indexed path (opened with
+/// [`IsoReader::read_file`]), the UDF handle carries the walked entry
+/// (opened with [`UdfReader::read_file`], which re-opens per call).
+/// Both sides carry the size so [`read_text`] can refuse an oversized
+/// file before buffering it.
+enum TextFile<'a> {
+    Iso {
+        reader: &'a IsoReader,
+        path: String,
+        size: u64,
+    },
+    Udf {
+        reader: &'a UdfReader,
+        entry: crate::udf::Entry,
+        size: u64,
+    },
+}
+
+/// Read the whole text file, decoded as UTF-8 lossily with a BOM
+/// stripped and trailing whitespace/newlines trimmed; the caller takes
+/// whatever lines it needs. Refuse nothing: an oversized file is
+/// `Ok(None)` (see [`MAX_TEXT_BYTES`]), and an unreadable file is
+/// `Ok(None)` too. A raw I/O error ([`CoreError::Io`](crate::CoreError))
+/// propagates — on ISO the readers let storage errors through
+/// unwrapped, while on UDF the reader wraps every refusal with file
+/// context, so there every read refusal degrades instead.
+fn read_text(file: &TextFile<'_>) -> Result<Option<String>> {
+    let size = match file {
+        TextFile::Iso { size, .. } => *size,
+        TextFile::Udf { size, .. } => *size,
+    };
+    if size > MAX_TEXT_BYTES {
+        return Ok(None);
+    }
+    let bytes = match file {
+        TextFile::Iso { reader, path, .. } => match reader.read_file(path) {
+            Ok(bytes) => bytes,
+            Err(error @ CoreError::Io { .. }) => return Err(error),
+            Err(_) => return Ok(None),
+        },
+        TextFile::Udf { reader, entry, .. } => match reader.read_file(entry) {
+            Ok(bytes) => bytes,
+            Err(error @ CoreError::Io { .. }) => return Err(error),
+            Err(_) => return Ok(None),
+        },
+    };
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    let stripped = text.strip_prefix('\u{FEFF}').map(str::to_string);
+    if let Some(clean) = stripped {
+        text = clean;
+    }
+    Ok(Some(text.trim_end().to_string()))
+}
+
+/// Cut a trailing ` - ` metadata segment: at the last ` - `, keeping
+/// the longest name when several appear.
+fn cut_trailing_dash(text: &str) -> &str {
+    match text.rfind(" - ") {
+        Some(at) => match text.get(..at) {
+            Some(head) => head.trim_end(),
+            None => text,
+        },
+        None => text,
+    }
+}
+
+/// Cut a trailing parenthesised segment (`(20240827)`): only when the
+/// trimmed line ends with `)` and holds a matching `(`.
+fn cut_trailing_paren(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    if !trimmed.ends_with(')') {
+        return trimmed;
+    }
+    match trimmed.rfind('(') {
+        Some(at) => match trimmed.get(..at) {
+            Some(head) => head.trim_end(),
+            None => trimmed,
+        },
+        None => trimmed,
+    }
+}
+
+/// Strip one pair of surrounding double quotes, if both are there.
+fn strip_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes.first() == Some(&b'"') && bytes.last() == Some(&b'"') {
+        match value.get(1..bytes.len().saturating_sub(1)) {
+            Some(inner) => inner,
+            None => value,
+        }
+    } else {
+        value
+    }
+}
+
+/// Parse `.disk/info` text: the first non-empty trimmed line, minus a
+/// trailing ` - ` segment, minus a trailing parenthesised date segment
+/// if any (`Ubuntu 24.04.1 LTS "Noble Numbat" - Release amd64
+/// (20240827)` becomes `Ubuntu 24.04.1 LTS "Noble Numbat"`).
+fn parse_disk_info(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let name = cut_trailing_paren(cut_trailing_dash(line));
+        if name.is_empty() {
+            continue;
+        }
+        return Some(name.to_string());
+    }
+    None
+}
+
+/// Parse `README.diskdefines` text: the `#define DISKNAME` value (after
+/// one or more spaces), with surrounding double quotes stripped, then
+/// the same ` - ` cut as [`.disk/info`](parse_disk_info). Only a line
+/// starting with `#define` (past leading whitespace) counts, and only
+/// the exact `DISKNAME` key; values may contain `//` or `#` inside
+/// quotes — comments are never stripped mid-value. An empty value keeps
+/// scanning later lines.
+fn parse_diskdefines(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let after = match line.trim_start().strip_prefix("#define") {
+            Some(after) => after,
+            None => continue,
+        };
+        // Exactly the preprocessor shape: whitespace, key, whitespace,
+        // value — so `#defineDISKNAME` never matches.
+        if !after.starts_with([' ', '\t']) {
+            continue;
+        }
+        let mut words = after.split_ascii_whitespace();
+        let key = match words.next() {
+            Some(key) => key,
+            None => continue,
+        };
+        if key != "DISKNAME" {
+            continue;
+        }
+        let at = match after.find(key) {
+            Some(at) => at.saturating_add(key.len()),
+            None => continue,
+        };
+        let raw = match after.get(at..) {
+            Some(rest) => rest.trim_start(),
+            None => continue,
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let value = cut_trailing_dash(strip_quotes(raw));
+        if value.is_empty() {
+            continue;
+        }
+        return Some(value.to_string());
+    }
+    None
 }
 
 /// Windows classification: the path rules plus whatever the WIM
@@ -647,6 +846,161 @@ fn classify_windows(
     })
 }
 
+/// Classify the distro name from the volume label and the release
+/// metadata files. Precedence, highest first:
+///
+/// 1. a [`DistroTable`](crate::distro::DistroTable) rule matching the
+///    label — the faithful port of `0x140031220.c`, checked against
+///    [`best`](Labels::best()), else the UDF label;
+/// 2. the parsed [`.disk/info`](parse_disk_info) name;
+/// 3. the parsed [`README.diskdefines`](parse_diskdefines) name.
+///
+/// Steps 2-3 are this project's addition: Rufus's report has no distro
+/// name at all.
+fn classify_distro(
+    labels: &Labels,
+    disk_info: Option<&str>,
+    diskdefines: Option<&str>,
+) -> Option<String> {
+    if let Some(label) = labels.best().or(labels.udf.as_deref())
+        && let Some(rule) = crate::distro::DistroTable::embedded().match_label(label)
+    {
+        return Some(rule.distro.clone());
+    }
+    if let Some(name) = disk_info.and_then(parse_disk_info) {
+        return Some(name);
+    }
+    if let Some(name) = diskdefines.and_then(parse_diskdefines) {
+        return Some(name);
+    }
+    None
+}
+
+/// Classify the persistence method family (`Some("casper")` or
+/// `Some("live")`), not the write-time option:
+///
+/// * `"casper"` when the index holds [`CASPER_DIR`] as a directory or
+///   [`CASPER_KERNEL`], or when either boot config text contains
+///   `boot=casper` (per `0x1400190e0.c`, `boot=casper` later gains the
+///   `persistent` option, with `/casper/vmlinuz` as the fallback path
+///   probe);
+/// * `"live"` when it holds [`LIVE_SQUASHFS`] or [`LIVE_KERNEL`], or
+///   when either boot config text contains `boot=live` (which later
+///   gains `persistence`);
+/// * casper wins when both appear (Ubuntu carries both trees);
+///   `None` otherwise.
+///
+/// The config texts are only consulted when the caller read them, which
+/// happens solely past the marker gate (see the `analyze` arms): no
+/// image pays for config reads without a persistence tree. The write
+/// slices will append `persistent`/`persistence` per `0x1400190e0.c`;
+/// this field only names the family.
+fn classify_persistence(
+    index: &TreeIndex,
+    isolinux_cfg: Option<&str>,
+    grub_cfg: Option<&str>,
+) -> Option<String> {
+    let casper_tree =
+        index.get(CASPER_DIR).is_some_and(|node| node.is_dir) || index.has(CASPER_KERNEL);
+    let casper_option = isolinux_cfg.is_some_and(|text| text.contains("boot=casper"))
+        || grub_cfg.is_some_and(|text| text.contains("boot=casper"));
+    if casper_tree || casper_option {
+        return Some("casper".to_string());
+    }
+    let live_tree = index.has(LIVE_SQUASHFS) || index.has(LIVE_KERNEL);
+    let live_option = isolinux_cfg.is_some_and(|text| text.contains("boot=live"))
+        || grub_cfg.is_some_and(|text| text.contains("boot=live"));
+    if live_tree || live_option {
+        return Some("live".to_string());
+    }
+    None
+}
+
+/// Open the indexed text file at `marker` through the ISO reader, when
+/// the marker exists: `None` for a missing marker, a directory at the
+/// marker, or a file whose length is unknown. The indexed node's own
+/// path opens the file, so the exact walked spelling resolves.
+fn open_text_iso<'a>(
+    reader: &'a IsoReader,
+    index: &TreeIndex,
+    marker: &str,
+) -> Option<TextFile<'a>> {
+    let node = index.get(marker)?;
+    if node.is_dir {
+        return None;
+    }
+    let size = node.size?;
+    Some(TextFile::Iso {
+        reader,
+        path: node.path.clone(),
+        size,
+    })
+}
+
+/// Open the UDF entry at `marker` from one `walk()` pass, when the
+/// marker exists: `None` for a missing marker, a directory at the
+/// marker, or an entry whose length refuses to open. The match is
+/// ASCII-case-insensitive over the walked absolute paths.
+fn open_text_udf<'a>(
+    reader: &'a UdfReader,
+    walked: &[(String, crate::udf::Entry)],
+    marker: &str,
+) -> Option<TextFile<'a>> {
+    let (_, entry) = walked
+        .iter()
+        .find(|(path, _)| path.eq_ignore_ascii_case(marker))?;
+    if entry.is_directory {
+        return None;
+    }
+    let size = reader.open_file(entry).map(|file| file.len()).ok()?;
+    Some(TextFile::Udf {
+        reader,
+        entry: entry.clone(),
+        size,
+    })
+}
+
+/// Read the text file at `marker` through the ISO reader (`Ok(None)`
+/// when absent); see [`read_text`] for the cap and error contract.
+fn read_iso_text(reader: &IsoReader, index: &TreeIndex, marker: &str) -> Result<Option<String>> {
+    match open_text_iso(reader, index, marker) {
+        Some(file) => read_text(&file),
+        None => Ok(None),
+    }
+}
+
+/// Read the text file at `marker` from one UDF `walk()` pass
+/// (`Ok(None)` when absent); see [`read_text`] for the cap and error
+/// contract.
+fn read_udf_text(
+    reader: &UdfReader,
+    walked: &[(String, crate::udf::Entry)],
+    marker: &str,
+) -> Result<Option<String>> {
+    match open_text_udf(reader, walked, marker) {
+        Some(file) => read_text(&file),
+        None => Ok(None),
+    }
+}
+
+/// True when the UDF arm must walk for entries: a WIM payload, a distro
+/// text file, or a persistence config past its marker gate (see
+/// [`classify_persistence`]) is marked in the index. Anything else —
+/// including a persistence tree with no config marker — never pays for
+/// the extra walk.
+fn udf_wants_entries(index: &TreeIndex) -> bool {
+    index.has(BOOT_WIM)
+        || index.has(INSTALL_WIM)
+        || index.has(INSTALL_ESD)
+        || index.has(DISK_INFO)
+        || index.has(README_DISKDEFINES)
+        || ((index.has(CASPER_DIR)
+            || index.has(CASPER_KERNEL)
+            || index.has(LIVE_SQUASHFS)
+            || index.has(LIVE_KERNEL))
+            && (index.has(ISOLINUX_CFG) || index.has(GRUB_CFG)))
+}
+
 /// Open the indexed WIM at `marker` through the ISO reader, when the
 /// marker exists: `None` for a missing marker or a directory at the
 /// marker (a directory is not a WIM and degrades like a bogus file).
@@ -719,6 +1073,32 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
             INSTALL_ESD,
         )?);
         let windows = classify_windows(&index, boot.as_ref(), install.as_ref())?;
+        let labels = Labels {
+            primary: Some(reader.primary().label.clone()),
+            joliet: highest_joliet_label(&reader),
+            udf: None,
+        };
+        let disk_info = read_iso_text(&reader, &index, DISK_INFO)?;
+        let diskdefines = read_iso_text(&reader, &index, README_DISKDEFINES)?;
+        let distro = classify_distro(&labels, disk_info.as_deref(), diskdefines.as_deref());
+        // Config greps stay behind the marker gate: no persistence tree,
+        // no config reads.
+        let track_markers = index.has(CASPER_DIR)
+            || index.has(CASPER_KERNEL)
+            || index.has(LIVE_SQUASHFS)
+            || index.has(LIVE_KERNEL);
+        let isolinux_cfg = if track_markers {
+            read_iso_text(&reader, &index, ISOLINUX_CFG)?
+        } else {
+            None
+        };
+        let grub_cfg = if track_markers {
+            read_iso_text(&reader, &index, GRUB_CFG)?
+        } else {
+            None
+        };
+        let persistence =
+            classify_persistence(&index, isolinux_cfg.as_deref(), grub_cfg.as_deref());
         return Ok(ImageReport {
             kind: "iso".to_string(),
             is_iso: true,
@@ -727,11 +1107,9 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
             build: windows.build,
             is_windows_to_go: windows.is_windows_to_go,
             wim_images: windows.wim_images,
-            labels: Labels {
-                primary: Some(reader.primary().label.clone()),
-                joliet: highest_joliet_label(&reader),
-                udf: None,
-            },
+            distro,
+            persistence,
+            labels,
             truncated: index.is_truncated(),
             ..ImageReport::default()
         });
@@ -739,12 +1117,13 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
     if crate::udf::anchor::probe(volume.as_ref()).is_ok() {
         let reader = UdfReader::open(volume)?;
         let index = TreeIndex::from_udf(&reader);
-        // The index drops the walked entries the WIM handles need, so a
-        // UDF volume marked with a WIM path (/sources/boot.wim,
-        // /sources/install.wim, /sources/install.esd) pays for one
-        // extra walk here; any other volume — including a
-        // bootmgr+setup.exe one with no WIM marker — never does.
-        let walked = if index.has(BOOT_WIM) || index.has(INSTALL_WIM) || index.has(INSTALL_ESD) {
+        // The index drops the walked entries the file handles need, so
+        // a marked volume pays for one extra walk here (see
+        // [`udf_wants_entries`]); any other volume never does. This is
+        // the second extra walk overall — the first was slice 3's WIM
+        // walk, whose trigger set this extends — and a shared
+        // entry-carrying index is owed by a later slice.
+        let walked = if udf_wants_entries(&index) {
             Some(reader.walk()?)
         } else {
             None
@@ -758,6 +1137,30 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
             INSTALL_ESD,
         )?);
         let windows = classify_windows(&index, boot.as_ref(), install.as_ref())?;
+        let labels = Labels {
+            primary: None,
+            joliet: None,
+            udf: Some(reader.volume_label().to_string()),
+        };
+        let disk_info = read_udf_text(&reader, walked, DISK_INFO)?;
+        let diskdefines = read_udf_text(&reader, walked, README_DISKDEFINES)?;
+        let distro = classify_distro(&labels, disk_info.as_deref(), diskdefines.as_deref());
+        let track_markers = index.has(CASPER_DIR)
+            || index.has(CASPER_KERNEL)
+            || index.has(LIVE_SQUASHFS)
+            || index.has(LIVE_KERNEL);
+        let isolinux_cfg = if track_markers {
+            read_udf_text(&reader, walked, ISOLINUX_CFG)?
+        } else {
+            None
+        };
+        let grub_cfg = if track_markers {
+            read_udf_text(&reader, walked, GRUB_CFG)?
+        } else {
+            None
+        };
+        let persistence =
+            classify_persistence(&index, isolinux_cfg.as_deref(), grub_cfg.as_deref());
         return Ok(ImageReport {
             kind: "udf".to_string(),
             is_udf: true,
@@ -766,11 +1169,9 @@ pub fn analyze(volume: Box<dyn Volume>) -> Result<ImageReport> {
             build: windows.build,
             is_windows_to_go: windows.is_windows_to_go,
             wim_images: windows.wim_images,
-            labels: Labels {
-                primary: None,
-                joliet: None,
-                udf: Some(reader.volume_label().to_string()),
-            },
+            distro,
+            persistence,
+            labels,
             truncated: index.is_truncated(),
             ..ImageReport::default()
         });
@@ -1041,45 +1442,88 @@ mod tests {
         crate::wim::header::wim_bytes(&utf16le_bom(xml), 0x20082)
     }
 
-    /// Primary-only ISO with one subdirectory: the root at sector 20
-    /// holds `dir_name` (at sector 21) plus one record per
-    /// `(identifier, sector, bytes)` in `root_files`; the subdirectory
-    /// holds one record per entry in `sub_files`. Each file's bytes go
-    /// to its sector. Identifiers carry the `;1` version suffix, as
-    /// real mastering tools write them.
+    /// One fixture file: identifier, sector, record length, bytes.
+    type FixtureFile<'a> = (&'a [u8], u32, u32, Vec<u8>);
+
+    /// Primary-only ISO with subdirectories: the root at sector 20
+    /// holds one record per [`FixtureFile`] in `root_files`; each
+    /// `(dir_name, files)` in `dirs` becomes a subdirectory (at sectors
+    /// 21 and up, in order) holding one record per file the same way.
+    /// Each file's `bytes` go to its sector while the record carries
+    /// `length`, so a test can lie about a length (for the oversize-text
+    /// test the content stays tiny). Identifiers carry the `;1` version
+    /// suffix, as real mastering tools write them.
+    fn multi_dir_iso(
+        label: &str,
+        root_files: Vec<FixtureFile<'_>>,
+        dirs: Vec<(&[u8], Vec<FixtureFile<'_>>)>,
+    ) -> Vec<u8> {
+        let mut root = vec![
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+        ];
+        let mut writes: Vec<(u32, Vec<u8>)> = vec![
+            (
+                16,
+                primary_sector(label, ROOT_SECTOR, SECTOR_BYTES as u32).to_vec(),
+            ),
+            (17, terminator_sector().to_vec()),
+        ];
+        for (identifier, sector, length, bytes) in root_files {
+            root.push(encode_record(sector, length, 0, identifier));
+            writes.push((sector, bytes));
+        }
+        let mut dir_sector_no = 21u32;
+        let mut dir_writes = Vec::new();
+        for (dir_name, files) in dirs {
+            root.push(encode_record(
+                dir_sector_no,
+                SECTOR_BYTES as u32,
+                FLAG_DIRECTORY,
+                dir_name,
+            ));
+            let mut dir = vec![
+                encode_record(dir_sector_no, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            ];
+            for (identifier, sector, length, bytes) in files {
+                dir.push(encode_record(sector, length, 0, identifier));
+                writes.push((sector, bytes));
+            }
+            dir_writes.push((dir_sector_no, dir_sector(&dir).to_vec()));
+            dir_sector_no = dir_sector_no.saturating_add(1);
+        }
+        writes.push((ROOT_SECTOR, dir_sector(&root).to_vec()));
+        writes.extend(dir_writes);
+        image_with(&writes)
+    }
+
+    /// Primary-only ISO with one subdirectory at sector 21: the same
+    /// layout as [`multi_dir_iso`] with the `TESTVOL` label, kept so the
+    /// Windows fixtures above stay untouched.
     fn one_dir_iso(
         dir_name: &[u8],
         root_files: &[(&[u8], u32, &[u8])],
         sub_files: &[(&[u8], u32, &[u8])],
     ) -> Vec<u8> {
-        const DIR_SECTOR: u32 = 21;
-        let mut root = vec![
-            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
-            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
-            encode_record(DIR_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, dir_name),
-        ];
-        let mut writes: Vec<(u32, Vec<u8>)> = vec![
-            (
-                16,
-                primary_sector("TESTVOL", ROOT_SECTOR, SECTOR_BYTES as u32).to_vec(),
-            ),
-            (17, terminator_sector().to_vec()),
-        ];
-        for (identifier, sector, bytes) in root_files {
-            root.push(encode_record(*sector, bytes.len() as u32, 0, identifier));
-            writes.push((*sector, bytes.to_vec()));
-        }
-        writes.push((ROOT_SECTOR, dir_sector(&root).to_vec()));
-        let mut sub = vec![
-            encode_record(DIR_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
-            encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
-        ];
-        for (identifier, sector, bytes) in sub_files {
-            sub.push(encode_record(*sector, bytes.len() as u32, 0, identifier));
-            writes.push((*sector, bytes.to_vec()));
-        }
-        writes.push((DIR_SECTOR, dir_sector(&sub).to_vec()));
-        image_with(&writes)
+        multi_dir_iso(
+            "TESTVOL",
+            root_files
+                .iter()
+                .map(|(identifier, sector, bytes)| {
+                    (*identifier, *sector, bytes.len() as u32, bytes.to_vec())
+                })
+                .collect(),
+            vec![(
+                dir_name,
+                sub_files
+                    .iter()
+                    .map(|(identifier, sector, bytes)| {
+                        (*identifier, *sector, bytes.len() as u32, bytes.to_vec())
+                    })
+                    .collect(),
+            )],
+        )
     }
 
     /// Boot WIM XML: one image, build 19041.
@@ -1560,5 +2004,139 @@ mod tests {
             report.wim_images[0].display_name.as_deref(),
             Some("Windows 10 Pro")
         );
+    }
+
+    #[test]
+    fn disk_info_and_casper_tree_classify_ubuntu() {
+        let info = "Ubuntu 24.04.1 LTS \"Noble Numbat\" - Release amd64 (20240827)\n";
+        let iso = multi_dir_iso(
+            "Ubuntu 24.04.1 LTS amd64",
+            Vec::new(),
+            vec![
+                (
+                    b".DISK".as_slice(),
+                    vec![(
+                        b"INFO;1".as_slice(),
+                        23u32,
+                        info.len() as u32,
+                        info.as_bytes().to_vec(),
+                    )],
+                ),
+                (
+                    b"CASPER".as_slice(),
+                    vec![(b"VMLINUZ;1".as_slice(), 24u32, 6, b"kernel".to_vec())],
+                ),
+            ],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(!report.is_windows);
+        assert_eq!(
+            report.distro.as_deref(),
+            Some("Ubuntu 24.04.1 LTS \"Noble Numbat\"")
+        );
+        assert_eq!(report.persistence.as_deref(), Some("casper"));
+    }
+
+    #[test]
+    fn diskdefines_classifies_debian() {
+        let defines = "#define ARCH amd64\n#define DISKNAME  Debian GNU/Linux 12.5.0 \"Bookworm\" - Official amd64 NETINST with firmware\n";
+        let iso = multi_dir_iso(
+            "Debian 12.5.0 amd64",
+            vec![(
+                b"README.DISKDEFINES;1".as_slice(),
+                22u32,
+                defines.len() as u32,
+                defines.as_bytes().to_vec(),
+            )],
+            Vec::new(),
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(!report.is_windows);
+        assert_eq!(
+            report.distro.as_deref(),
+            Some("Debian GNU/Linux 12.5.0 \"Bookworm\"")
+        );
+        assert_eq!(report.persistence, None);
+    }
+
+    #[test]
+    fn label_rule_classifies_rocky_without_metadata_files() {
+        let iso = multi_dir_iso("Rocky-9.3-x86_64", Vec::new(), Vec::new());
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(!report.is_windows);
+        assert_eq!(report.distro.as_deref(), Some("Rocky"));
+        assert_eq!(report.persistence, None);
+    }
+
+    #[test]
+    fn live_tree_means_live_persistence() {
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b"LIVE".as_slice(),
+                vec![(
+                    b"FILESYSTEM.SQUASHFS;1".as_slice(),
+                    23u32,
+                    6,
+                    b"squash".to_vec(),
+                )],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.distro, None);
+        assert_eq!(report.persistence.as_deref(), Some("live"));
+    }
+
+    #[test]
+    fn plain_iso_has_no_distro_or_persistence() {
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            vec![(b"README.TXT;1".as_slice(), 22u32, 9, b"plain txt".to_vec())],
+            Vec::new(),
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert!(!report.is_windows);
+        assert_eq!(report.distro, None);
+        assert_eq!(report.persistence, None);
+    }
+
+    #[test]
+    fn label_rule_beats_disk_info() {
+        // Both a table hit and a metadata file: the table wins.
+        let info = "Ubuntu 24.04.1 LTS \"Noble Numbat\" - Release amd64 (20240827)\n";
+        let iso = multi_dir_iso(
+            "Rocky-9.3-x86_64",
+            Vec::new(),
+            vec![(
+                b".DISK".as_slice(),
+                vec![(
+                    b"INFO;1".as_slice(),
+                    23u32,
+                    info.len() as u32,
+                    info.as_bytes().to_vec(),
+                )],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("the fixture analyses");
+        assert_eq!(report.distro.as_deref(), Some("Rocky"));
+    }
+
+    #[test]
+    fn oversize_disk_info_is_skipped_without_error() {
+        // The record claims 100 KiB while the sector holds almost
+        // nothing: the cap refuses before any read, so the missing
+        // content is never touched and the analysis succeeds.
+        let iso = multi_dir_iso(
+            "TESTVOL",
+            Vec::new(),
+            vec![(
+                b".DISK".as_slice(),
+                vec![(b"INFO;1".as_slice(), 23u32, 100 * 1024, b"tiny".to_vec())],
+            )],
+        );
+        let report = analyze(Box::new(memory_volume(&iso))).expect("an oversize file never errors");
+        assert_eq!(report.distro, None);
+        assert_eq!(report.persistence, None);
     }
 }

@@ -35,6 +35,11 @@
 //! * [`config`] — [`Config`](config::Config): serde/TOML settings with
 //!   forward-compatible parsing, atomic save, and corrupt-file recovery
 //!   ([`LoadedConfig`](config::LoadedConfig)).
+//! * [`distro`] — the S16 distro rule table (slice 4 of 6): glob
+//!   [`DistroRule`](distro::DistroRule)s from the embedded
+//!   `distros.toml` (plus an optional user override file) matched
+//!   against the volume label, with the DD-mode rule behind
+//!   [`forces_dd`](distro::forces_dd).
 //! * [`paths`] — XDG directories without the `dirs` crate, asset-dir
 //!   resolution (`$RUFUS_ASSETS`, AppImage `$APPDIR`, FHS install), and
 //!   portable-mode (`./rufus.toml`) discovery.
@@ -101,6 +106,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod distro;
 pub mod error;
 pub mod fs;
 pub mod fsprobe;
