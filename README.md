@@ -45,6 +45,20 @@ write side is the most complete part:
   descriptor, TEA01) at byte 32768 of the image; the label is read back
   with `udfinfo`. A native UDF writer is out of scope (see
   `crates/rufus-core/src/fs/udf.rs`).
+* A read-only UDF reader (S15) in `crates/rufus-core/src/udf/` reads a
+  UDF volume back through the same `Volume` abstraction the writer
+  produces: the anchor pointer at logical sector 256 (probed at block
+  size 2048, then 512), the descriptor sequence (primary, partition,
+  logical volume with its type-1 partition maps, the file set
+  descriptor), the root file entry and every file identifier descriptor,
+  then any regular file's bytes through its extents and allocation
+  descriptors, and the whole tree through a depth-bounded `walk`.
+  Type-2 partition maps, extended allocation descriptors, compression
+  ids other than 8 and 16, and every non-file ICB type (symlinks,
+  FIFOs, sockets, devices, VAT/metadata entries) refuse by name, never
+  by fabricating bytes; file reads are capped at 64 MiB and 4096
+  extents so a hostile entry cannot demand unbounded work, and the
+  reader never writes.
 * NTFS, ext and UDF share one external-tool probe (PATH scan,
   executable check, version probe, busy-exec retry) in
   `crates/rufus-core/src/fs/tool.rs`; the version flag stays per family
@@ -61,6 +75,22 @@ write side is the most complete part:
   with a 64 KiB sector cache rather than mmap — mmap needs `unsafe` or a
   new dependency, both forbidden by the crate — so every access stays
   bounds-checked against the store before any I/O.
+* An image container layer (S15) in `crates/rufus-core/src/image/`
+  detects the container family by magic over any `Volume`
+  (`ImageKind`), opens a regular file read-only and validates its header
+  (`open_image`), then presents the *logical* disk as a read-only
+  `Volume` whose size is the container's virtual size rather than the
+  file length. Fixed and dynamic VHD, VHDX, FFU and qcow2 all get a
+  reader: fixed VHD presents file bytes `0..current_size` without the
+  footer, dynamic VHD walks the BAT, VHDX resolves the BAT with its
+  state machine, qcow2 resolves L1→L2 over 64 KiB clusters, and FFU
+  maps store blocks to payload windows. FFU has no real sample on the
+  host, so its layout is inferred rather than measured. Writes are
+  refused — the containers are read-only — and the payload acceptance
+  suite (`tests/image_readers.rs`) is `#[ignore]`d because it installs
+  `qemu-img` inside `archlinux:latest`, which needs docker and network;
+  CI runs with `--network none`, so the suite must not depend on Arch
+  mirrors.
 * Device discovery, introspection, the safety verdict, partition-table
   writers (MBR + GPT) and the privileged helper are implemented. The
   helper runs each external tool in its own process group and, on
@@ -87,8 +117,9 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
 * `rufus-core` - the safe, non-privileged foundation and the filesystem
   write side: error/config/paths/i18n/hash/units, MBR + GPT table
   readers and writers, the FAT32/exFAT/NTFS/ext2/3/4/UDF formatters,
-  the ISO9660/Joliet/Rock Ridge image reader (`iso/`), superblock
-  probing and the safety verdict.
+  the ISO9660/Joliet/Rock Ridge image reader (`iso/`), the read-only
+  UDF reader (`udf/`) and the image container layer (`image/`),
+  superblock probing and the safety verdict.
 * `wimlib-sys` - FFI bindings to wimlib, for applying WIM/ESD images.
 * `rufus-linux` - the only crate that touches `/sys` and `/run/udev`:
   device discovery, mount/swap/holder introspection, and the
