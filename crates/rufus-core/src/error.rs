@@ -77,6 +77,18 @@ pub enum CoreError {
         /// What is missing, e.g. `"bootloader installation (S19)"`.
         what: &'static str,
     },
+    /// Read-back verification failed: the bytes on the target do not
+    /// match the plan digest. The message names the first differing
+    /// byte offset when the loop could locate it cheaply, and always
+    /// both digests. Like every in-run error except `NotImplemented`
+    /// it is wrapped in [`Step`](Self::Step), so the step name still
+    /// appears.
+    #[error("image verification failed: {message}")]
+    Verify {
+        /// What differed: first differing offset plus expected and
+        /// actual digests.
+        message: String,
+    },
     /// One pipeline step failed: the step name plus the underlying
     /// error, kept (not flattened) so exit mapping still sees an inner
     /// I/O failure through the wrapper.

@@ -835,6 +835,119 @@ fn write_compressed_gzip_end_to_end_over_the_device_file_seam() {
     assert!(got[payload.len()..aligned].iter().all(|&byte| byte == 0));
 }
 
+/// A `plan --dry-run --json` invocation with `--verify` on:
+/// `plan_args` builds the fixed switch set, so the flag is appended
+/// here rather than threading a parameter through every caller.
+fn verify_plan_args(image: &std::path::Path, device: &str) -> Vec<String> {
+    let mut args = plan_args(image, device, true, true);
+    args.push("--verify".to_string());
+    args
+}
+
+#[test]
+fn write_verify_passes_over_the_device_file_seam() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let image = raw_image(&dir.path().join("image.iso"), 32 * 1024 + 17);
+    let seam_path = seam(&dir.path().join("stick.img"), 64 * 1024 * 1024, 0xAA);
+    let args = verify_plan_args(&dir.path().join("image.iso"), "/dev/null");
+    let plan_out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let plan_file = runnable_plan(dir.path(), &plan_out.stdout, "plan.json");
+
+    let out = run(&[
+        "write",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "{:?}", out);
+    let got = std::fs::read(&seam_path).expect("read seam");
+    assert_eq!(&got[..image.len()], &image[..]);
+    assert!(out.stderr.contains("verified"), "{}", out.stderr);
+}
+
+#[test]
+fn write_verify_failure_maps_to_exit_4() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    raw_image(&dir.path().join("image.iso"), 32 * 1024 + 17);
+    let seam_path = seam(&dir.path().join("stick.img"), 64 * 1024 * 1024, 0xAA);
+    let args = verify_plan_args(&dir.path().join("image.iso"), "/dev/null");
+    let plan_out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    // Corrupt the plan, not the seam: reseal with a digest the bytes
+    // can never match, so the read-back deterministically fails.
+    let mut plan: Plan = serde_json::from_str(&plan_out.stdout).expect("plan parses");
+    plan.steps
+        .retain(|step| !matches!(step, rufus_proto::Step::Bootloader { .. }));
+    plan.image.sha256 = "0".repeat(64);
+    plan.confirm = plan.confirm().expect("confirm recomputes");
+    let plan_file = dir.path().join("lying.json");
+    std::fs::write(
+        &plan_file,
+        serde_json::to_string(&plan).expect("plan serialises"),
+    )
+    .expect("save plan");
+
+    // Human mode: exit 4, the failure on stderr.
+    let out = run(&[
+        "write",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 4, "{:?}", out);
+    assert!(out.stderr.contains("verification failed"), "{}", out.stderr);
+
+    // `--json` mode: the same exit and kind, with stdout still pure
+    // JSONL (every line parses) and the error object on stderr.
+    let out = run(&[
+        "write",
+        "--json",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 4, "{:?}", out);
+    let values = stdout_json(&out.stdout);
+    assert!(!values.is_empty(), "events streamed before the refusal");
+    let error: serde_json::Value =
+        serde_json::from_str(out.stderr.trim()).expect("stderr error parses");
+    assert_eq!(error["error"], "verify");
+}
+
+#[test]
+fn write_verify_json_streams_verify_progress() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    raw_image(&dir.path().join("image.iso"), 32 * 1024 + 17);
+    let seam_path = seam(&dir.path().join("stick.img"), 64 * 1024 * 1024, 0xAA);
+    let args = verify_plan_args(&dir.path().join("image.iso"), "/dev/null");
+    let plan_out = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let plan_file = runnable_plan(dir.path(), &plan_out.stdout, "plan.json");
+
+    let out = run(&[
+        "write",
+        "--json",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "{:?}", out);
+    let values = stdout_json(&out.stdout);
+    assert!(
+        values
+            .iter()
+            .any(|value| value["event"] == "progress" && value["step"] == "verify"),
+        "a verify throughput sample: {values:?}"
+    );
+    assert_eq!(values[0]["event"], "step_started");
+    assert_eq!(values.last().expect("a final event")["event"], "finished");
+}
+
 #[test]
 fn write_json_streams_one_object_per_line() {
     let dir = tempfile::tempdir().expect("scratch dir");

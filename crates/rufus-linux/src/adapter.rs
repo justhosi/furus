@@ -519,12 +519,13 @@ impl Opener for FileOpener {
     }
 }
 
-/// At most this many `SEEK_DATA`/`SEEK_HOLE` round trips per query: a
-/// sane filesystem yields one data range per trip, so a file needing
-/// more is pathologically fragmented (or the kernel stopped making
-/// progress) — the query then falls back to `None` (whole file as
-/// data, always correct) rather than looping forever.
-const MAX_RANGES: usize = 1024 * 1024;
+/// At most this many `SEEK_DATA`/`SEEK_HOLE` round trips per query:
+/// 64 K ranges cover far more fragmentation than a real image file
+/// ever shows (each trip is two syscalls, so the walk stays cheap),
+/// while a file needing more is pathological — or the kernel stopped
+/// making progress — and the query then falls back to `None` (whole
+/// file as data, always correct) rather than looping forever.
+const MAX_RANGES: usize = 64 * 1024;
 
 /// Hole map of the regular file at `path` through `SEEK_DATA`/
 /// `SEEK_HOLE` (`rustix`, no new `unsafe`): ascending,
@@ -535,6 +536,11 @@ const MAX_RANGES: usize = 1024 * 1024;
 /// `ENOTSUP`/`EOPNOTSUPP`); `Some(vec![])` when the query succeeds on
 /// a file with no data at all (including the zero-length file). Any
 /// other failure is a genuine I/O error naming the path.
+///
+/// A non-regular path (FIFO, device node, directory, anything but a
+/// file) is an unknown map, so `Ok(None)` and the caller streams it:
+/// opening a FIFO would block forever and a node has no length to
+/// clamp to, and neither can hold holes worth discovering.
 fn data_ranges_of_file(path: &Path) -> Result<Option<Vec<(u64, u64)>>> {
     /// A `SEEK_DATA`/`SEEK_HOLE` refusal the caller cannot answer
     /// with: fall back to the whole file as data. (`rustix` reports
@@ -544,13 +550,17 @@ fn data_ranges_of_file(path: &Path) -> Result<Option<Vec<(u64, u64)>>> {
         raw == libc::EINVAL || raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP
     }
 
+    // Stat first: a FIFO must never reach `open` (it would block
+    // forever), and only a regular file has a length to clamp to and
+    // holes worth discovering. One stat call, no second open.
+    let meta = std::fs::metadata(path).map_err(|error| CoreError::io(path, error))?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let len = meta.len();
     // Read-only, no exclusive claim: this runs alongside the open
     // read-write handle without disturbing it.
     let file = std::fs::File::open(path).map_err(|error| CoreError::io(path, error))?;
-    let len = file
-        .metadata()
-        .map_err(|error| CoreError::io(path, error))?
-        .len();
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     let mut off = 0u64;
     while off < len {
@@ -828,10 +838,12 @@ mod tests {
         file.set_len(8 * 1024 * 1024).expect("sparse file sizes");
         drop(file);
         let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
-        let ranges = opener
-            .data_ranges(&path)
-            .expect("the query runs")
-            .expect("tmpfs answers hole queries");
+        // A filesystem without hole queries answers `None`: accept
+        // that explicitly (nothing to pin then) instead of assuming
+        // tmpfs/ext4/overlayfs semantics everywhere.
+        let Some(ranges) = opener.data_ranges(&path).expect("the query runs") else {
+            return;
+        };
         assert_eq!(ranges, [(0, 4096), (6 * 1024 * 1024, 4096)]);
         // The holes read back as zeros, and nothing is reported past
         // the length.
@@ -853,10 +865,12 @@ mod tests {
         let path = dir.path().join("dense.img");
         std::fs::write(&path, vec![0x5Au8; 1024 * 1024]).expect("dense file writes");
         let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
-        let ranges = opener
-            .data_ranges(&path)
-            .expect("the query runs")
-            .expect("tmpfs answers hole queries");
+        // A filesystem without hole queries answers `None`: accept
+        // that explicitly (nothing to pin then) instead of assuming
+        // tmpfs/ext4/overlayfs semantics everywhere.
+        let Some(ranges) = opener.data_ranges(&path).expect("the query runs") else {
+            return;
+        };
         assert_eq!(ranges, [(0, 1024 * 1024)]);
     }
 
@@ -868,10 +882,12 @@ mod tests {
         let path = dir.path().join("empty.img");
         std::fs::write(&path, []).expect("empty file writes");
         let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
-        let ranges = opener
-            .data_ranges(&path)
-            .expect("the query runs")
-            .expect("tmpfs answers hole queries");
+        // A filesystem without hole queries answers `None`: accept
+        // that explicitly (nothing to pin then) instead of assuming
+        // tmpfs/ext4/overlayfs semantics everywhere.
+        let Some(ranges) = opener.data_ranges(&path).expect("the query runs") else {
+            return;
+        };
         assert!(ranges.is_empty(), "{ranges:?}");
     }
 

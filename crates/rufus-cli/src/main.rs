@@ -104,16 +104,19 @@ pub struct Fail {
 }
 
 impl Fail {
-    /// Map a [`CoreError`] onto the exit table: I/O → 4, cancellation
-    /// → 6, unimplemented steps → 7, anything else is a validation
-    /// failure → 1; the error `Display` names the path. Pipeline step
-    /// wrappers are transparent: classification recurses into the
-    /// wrapped error, so a device I/O failure inside a step still exits
-    /// 4 while the message keeps its step prefix.
+    /// Map a [`CoreError`] onto the exit table: I/O and verification
+    /// failures → 4, cancellation → 6, unimplemented steps → 7,
+    /// anything else is a validation failure → 1; the error `Display`
+    /// names the path. Verification is a device-integrity failure
+    /// (the bytes did not survive the round trip), not a usage error.
+    /// Pipeline step wrappers are transparent: classification recurses
+    /// into the wrapped error, so a device I/O failure inside a step
+    /// still exits 4 while the message keeps its step prefix.
     fn from_core(err: CoreError) -> Self {
         fn exit_of(err: &CoreError) -> (Exit, &'static str) {
             match err {
                 CoreError::Io { .. } => (Exit::Io, "io"),
+                CoreError::Verify { .. } => (Exit::Io, "verify"),
                 CoreError::Cancelled => (Exit::Cancelled, "cancelled"),
                 CoreError::NotImplemented { .. } => (Exit::NotImplemented, "not_implemented"),
                 CoreError::Step { source, .. } => exit_of(source),
@@ -1249,8 +1252,8 @@ fn table_kind(scheme: &Scheme) -> TableKind {
 
 /// Run `plan` against `opener` under the SIGINT `cancel` flag,
 /// reporting per `json`. A clean run exits 0; every pipeline refusal
-/// maps through [`Fail::from_core`] (I/O → 4, cancelled → 6,
-/// unimplemented → 7, anything else → 1).
+/// maps through [`Fail::from_core`] (I/O and verification → 4,
+/// cancelled → 6, unimplemented → 7, anything else → 1).
 fn run_plan(
     plan: &Plan,
     opener: &dyn rufus_core::pipeline::Opener,
@@ -1758,6 +1761,28 @@ mod tests {
         assert_eq!(fail.exit, Exit::NotImplemented);
         assert_eq!(fail.exit.code(), 7);
         assert_eq!(fail.kind, "not_implemented");
+    }
+
+    /// Verification failures map to exit 4 with kind `verify`, bare
+    /// and through the step wrapper — a device-integrity failure, not
+    /// a usage error. Same terms: code plus kind, no message text.
+    #[test]
+    fn from_core_maps_verify_to_exit_4() {
+        let fail = Fail::from_core(CoreError::Verify {
+            message: "first differing byte at offset 3".to_string(),
+        });
+        assert_eq!(fail.exit, Exit::Io);
+        assert_eq!(fail.exit.code(), 4);
+        assert_eq!(fail.kind, "verify");
+        let fail = Fail::from_core(CoreError::Step {
+            step: "write",
+            source: Box::new(CoreError::Verify {
+                message: "first differing byte at offset 3".to_string(),
+            }),
+        });
+        assert_eq!(fail.exit, Exit::Io);
+        assert_eq!(fail.exit.code(), 4);
+        assert_eq!(fail.kind, "verify");
     }
 
     /// The pre-existing classes are unchanged by the new arms: I/O

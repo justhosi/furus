@@ -75,7 +75,9 @@ impl FromStr for Algo {
 }
 
 /// Lowercase hex; small enough that no `hex` crate dependency is justified.
-fn hex(buf: &[u8]) -> String {
+/// Shared with the write step's read-back verify, which formats its own
+/// digest the same way.
+pub(crate) fn hex(buf: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(buf.len() * 2);
     for &b in buf {

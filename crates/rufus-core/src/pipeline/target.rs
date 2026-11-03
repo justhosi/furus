@@ -68,7 +68,6 @@ pub trait Target {
             return Err(CoreError::invalid("cannot zero a zero-length window"));
         }
         const PIECE: u64 = 4 * 1024 * 1024;
-        let zeros = vec![0u8; PIECE as usize];
         let mut pos = offset;
         let mut remaining = len;
         while remaining > 0 {
@@ -76,10 +75,10 @@ pub trait Target {
                 return Err(CoreError::Cancelled);
             }
             let piece = remaining.min(PIECE);
-            let window = zeros
-                .get(..piece as usize)
-                .ok_or_else(|| CoreError::invalid("zero chunk window runs past its buffer"))?;
-            let written = self.write_all_at_cancellable(pos, window, PIECE as usize, cancelled)?;
+            // Allocated per piece, not once up front: a small tail
+            // window must not cost a full 4 MiB buffer.
+            let zeros = vec![0u8; piece as usize];
+            let written = self.write_all_at_cancellable(pos, &zeros, PIECE as usize, cancelled)?;
             if written < piece {
                 return Err(CoreError::Cancelled);
             }

@@ -24,7 +24,7 @@
 //! device node. The CLI inspects (size, hash) the path before planning
 //! and the loop re-checks the length at open, but a swapped or
 //! streaming source between those checks is outside what this step can
-//! see; the read-back verify pass (slice 7) is what catches it.
+//! see; the read-back verify pass is what catches it.
 
 use std::fs::File;
 use std::io::Read;
@@ -231,7 +231,7 @@ fn check_image(
 /// Write one `chunk` at `done` through the cancellable primitive,
 /// folding the sample into `ema`: a short count reads as cancellation
 /// (a target that reports full while swallowing bytes cannot be
-/// detected here, which is why the verify pass in slice 7 exists —
+/// detected here, which is why the read-back verify exists —
 /// the honest form of Rufus's `Wrote %d bytes, expected %d bytes`
 /// check), a count past the chunk as a faulty target refusing by name
 /// with both numbers. Shared by the straight and sparse loops so the
@@ -260,12 +260,16 @@ fn write_piece(
     Ok(written)
 }
 
-/// Emit one [`Progress`](Event::Progress) unless throttled: at most
-/// every [`PROGRESS_INTERVAL`], plus always when `force` (the final
-/// sample of a loop). `total` rides along unchanged — `Some` length
-/// for sized streams, `None` while a decoded size is still unknown.
+/// Emit one [`Progress`](Event::Progress) for `step` unless
+/// throttled: at most every [`PROGRESS_INTERVAL`], plus always when
+/// `force` (the final sample of a loop). `total` rides along unchanged
+/// — `Some` length for sized streams, `None` while a decoded size is
+/// still unknown. `step` is usually `"write"`; the read-back verify
+/// reports `"verify"`, an event-level pseudo-step that is not a plan
+/// step (see [`step_name`](super::step_name), which stays unchanged).
 fn emit_progress(
     ctx: &mut RunContext<'_>,
+    step: &'static str,
     done: u64,
     total: Option<u64>,
     ema: &RateEma,
@@ -277,7 +281,7 @@ fn emit_progress(
     }
     *last_emit = Instant::now();
     ctx.reporter.event(Event::Progress {
-        step: "write",
+        step,
         done,
         total,
         bytes_per_second: ema.bytes_per_second(),
@@ -357,6 +361,7 @@ fn pump(
         done = done.saturating_add(written);
         emit_progress(
             ctx,
+            "write",
             done,
             total,
             &ema,
@@ -392,9 +397,46 @@ fn finish_write(
     Ok(())
 }
 
+/// Fill `buf` from `file` at `offset`: a short read before EOF is
+/// the Rufus `Read error` shape, naming path and offset. Shared by
+/// the sparse data runs and the verify mismatch locator.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64, path: &str) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let window = buf
+            .get_mut(filled..)
+            .ok_or_else(|| CoreError::invalid("sparse read window runs past its buffer"))?;
+        match file.read_at(window, offset + filled as u64) {
+            Ok(0) => {
+                return Err(CoreError::io(
+                    path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("read error at image offset {offset}: unexpected end of file"),
+                    ),
+                ));
+            }
+            Ok(read) => filled += read,
+            Err(error) => {
+                return Err(CoreError::io(
+                    path,
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("read error at image offset {offset}: {error}"),
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run the write step for `mode` over `image`: `Dd` streams through
 /// [`raw`] (every other [`ImageKind`] stays raw) or through
-/// [`compressed`] when [`tool_for`] names a host decompressor;
+/// [`compressed`] when [`tool_for`] names a host decompressor, then —
+/// for raw images only — reads the bytes back when `verify` is set;
 /// anything else refuses (see [`run`]).
 pub(crate) fn run(
     ctx: &mut RunContext<'_>,
@@ -404,28 +446,160 @@ pub(crate) fn run(
 ) -> Result<()> {
     match mode {
         WriteMode::Dd => {
-            if verify {
-                // Slice 7 replaces this with the real read-back check; until
-                // then the flag warns instead of vanishing silently. One
-                // warning per run, whichever source the kind selects.
-                ctx.reporter.event(Event::Message {
-                    level: "warn",
-                    text: "verify requested but verification is not implemented yet (slice 7): continuing without it"
-                        .to_string(),
-                });
-            }
             let size = ctx.device()?.size();
             let tool = tool_for(&image.kind);
             let len = check_image(ctx, image, size, tool.is_some())?;
             match tool {
-                Some(tool) => compressed::run(ctx, image, tool, size),
-                None => raw::run(ctx, image, len, size),
+                Some(tool) => {
+                    if verify {
+                        // The plan digest covers the archive, not the
+                        // decoded stream, so there is nothing honest to
+                        // compare: one warning, then the write as usual.
+                        ctx.reporter.event(Event::Message {
+                            level: "warn",
+                            text: format!(
+                                "verify of a {} image is skipped: the plan digest covers the compressed archive, not the decoded stream",
+                                super::decompress::kind_name(&image.kind)
+                            ),
+                        });
+                    }
+                    compressed::run(ctx, image, tool, size)
+                }
+                None => {
+                    raw::run(ctx, image, len, size)?;
+                    if verify {
+                        verify_target(ctx, image)?;
+                    }
+                    Ok(())
+                }
             }
         }
         WriteMode::Copy => Err(CoreError::NotImplemented {
             what: "write mode 'copy' (file-tree copying arrives in slice 18)",
         }),
     }
+}
+
+/// Read the first `image.size_bytes` bytes back off the target in
+/// [`CHUNK`]-sized pieces, hash them (SHA-256, lowercase hex, like the
+/// plan digest), and compare case-insensitively. Sparse writes verify
+/// the same way: the target holds the image's logical bytes (holes
+/// zeroed), so the digest matches the file's own bytes. A plan with an
+/// empty digest refuses up front — there is nothing to compare against
+/// (`rufus plan` always fills it, so this is a hand-written plan).
+/// The mismatch locator never opens a path that is not a regular file
+/// (see [`locate_mismatch`]). Progress runs
+/// under the event-level `"verify"` pseudo-step — not a plan step (see
+/// [`step_name`](super::step_name)) — at the usual cadence plus one
+/// final event; a `Message` opens and closes the pass. Cancellation is
+/// checked between chunks and honoured, never reporting success.
+fn verify_target(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
+    use sha2::Digest as _;
+
+    if image.sha256.is_empty() {
+        return Err(CoreError::invalid(
+            "plan carries no digest to verify against: refusing to compare",
+        ));
+    }
+    let len = image.size_bytes;
+    ctx.reporter.event(Event::Message {
+        level: "info",
+        text: format!("verifying {len} bytes against the plan digest"),
+    });
+    if len == 0 {
+        // As in the write arms: one zero event, so "done instantly"
+        // reads apart from "never reported".
+        ctx.reporter.event(Event::Progress {
+            step: "verify",
+            done: 0,
+            total: Some(0),
+            bytes_per_second: 0,
+            eta_seconds: None,
+        });
+    }
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; CHUNK];
+    let mut ema = RateEma::new();
+    let mut last_emit = Instant::now();
+    let mut done = 0u64;
+    while done < len {
+        let cancelled = ctx.cancelled;
+        if cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+        let want = (len - done).min(CHUNK as u64) as usize;
+        let chunk = buf
+            .get_mut(..want)
+            .ok_or_else(|| CoreError::invalid("verify chunk window runs past its buffer"))?;
+        let chunk_started = Instant::now();
+        ctx.device()?.read_at(done, chunk)?;
+        hasher.update(chunk);
+        done += want as u64;
+        ema.observe(want as u64, chunk_started.elapsed());
+        emit_progress(
+            ctx,
+            "verify",
+            done,
+            Some(len),
+            &ema,
+            &mut last_emit,
+            done >= len,
+        );
+    }
+    let actual = crate::hash::hex(&hasher.finalize());
+    if actual.eq_ignore_ascii_case(&image.sha256) {
+        ctx.reporter.event(Event::Message {
+            level: "info",
+            text: format!("verified {len} bytes"),
+        });
+        return Ok(());
+    }
+    // Digests differ: locate the first differing byte cheaply by
+    // re-reading file and target side by side (the digest alone cannot
+    // name an offset). Any trouble reading names the digests instead —
+    // the refusal never lies about what it knows.
+    let message = match locate_mismatch(ctx, image, len) {
+        Some(offset) => format!(
+            "first differing byte at offset {offset}: expected digest {}, read digest {actual}",
+            image.sha256
+        ),
+        None => format!("expected digest {}, read digest {actual}", image.sha256),
+    };
+    Err(CoreError::Verify { message })
+}
+
+/// First offset where the target bytes differ from the image file, or
+/// `None` when either side cannot be read (the caller then reports the
+/// digests). Compares in [`CHUNK`] pieces without retaining them: on a
+/// mismatch it re-reads the whole image and the whole target — two
+/// extra passes, but only on failure, so the cost is predictable.
+/// Never opens a path that is not a regular file (a FIFO would block
+/// in `open` with no writer, the defect the hole query already avoids).
+fn locate_mismatch(ctx: &mut RunContext<'_>, image: &ImageRef, len: u64) -> Option<u64> {
+    let meta = std::fs::metadata(&image.path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let file = File::open(&image.path).ok()?;
+    let mut expected = vec![0u8; CHUNK];
+    let mut actual = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    while done < len {
+        let want = (len - done).min(CHUNK as u64) as usize;
+        let want_buf = expected.get_mut(..want)?;
+        read_exact_at(&file, want_buf, done, &image.path).ok()?;
+        let got_buf = actual.get_mut(..want)?;
+        ctx.device().ok()?.read_at(done, got_buf).ok()?;
+        if let Some(position) = want_buf
+            .iter()
+            .zip(got_buf.iter())
+            .position(|(want, got)| want != got)
+        {
+            return Some(done + position as u64);
+        }
+        done += want as u64;
+    }
+    None
 }
 
 /// Straight-through raw writing, sparse-aware: the opener's
@@ -486,7 +660,9 @@ mod raw {
     /// Validate a `data_ranges` answer against the plan image size:
     /// ascending, non-overlapping, no empty entries, nothing past the
     /// image — a map contradicting `plan.image.size_bytes` is refused
-    /// naming both, before any byte moves.
+    /// naming both, before any byte moves. The map itself is trusted:
+    /// an under-reporting opener silently zeroes real data, and only
+    /// this slice's read-back verify catches that afterwards.
     fn check_ranges(ranges: &[(u64, u64)], len: u64) -> Result<()> {
         let mut prev_end = 0u64;
         for (offset, rlen) in ranges {
@@ -511,41 +687,6 @@ mod raw {
                 )));
             }
             prev_end = end;
-        }
-        Ok(())
-    }
-
-    /// Fill `buf` from `file` at `offset`: a short read before EOF is
-    /// the Rufus `Read error` shape, naming path and offset.
-    fn read_exact_at(file: &File, buf: &mut [u8], offset: u64, path: &str) -> Result<()> {
-        use std::os::unix::fs::FileExt as _;
-
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            let window = buf
-                .get_mut(filled..)
-                .ok_or_else(|| CoreError::invalid("sparse read window runs past its buffer"))?;
-            match file.read_at(window, offset + filled as u64) {
-                Ok(0) => {
-                    return Err(CoreError::io(
-                        path,
-                        std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("read error at image offset {offset}: unexpected end of file"),
-                        ),
-                    ));
-                }
-                Ok(read) => filled += read,
-                Err(error) => {
-                    return Err(CoreError::io(
-                        path,
-                        std::io::Error::new(
-                            error.kind(),
-                            format!("read error at image offset {offset}: {error}"),
-                        ),
-                    ));
-                }
-            }
         }
         Ok(())
     }
@@ -605,12 +746,20 @@ mod raw {
                 let chunk = buf
                     .get_mut(..want)
                     .ok_or_else(|| CoreError::invalid("write chunk window runs past its buffer"))?;
-                read_exact_at(file, chunk, at, &image.path)?;
+                super::read_exact_at(file, chunk, at, &image.path)?;
                 let written = super::write_piece(ctx, chunk, at, cancelled, &mut ema)?;
                 at += written;
                 rest -= written;
                 done += written;
-                super::emit_progress(ctx, done, Some(len), &ema, &mut last_emit, done == len);
+                super::emit_progress(
+                    ctx,
+                    "write",
+                    done,
+                    Some(len),
+                    &ema,
+                    &mut last_emit,
+                    done == len,
+                );
             }
             pos = *offset + *rlen;
         }
@@ -645,7 +794,7 @@ mod raw {
         }
         ctx.device()?.zero_range(from, to - from, cancelled)?;
         let done = done + (to - from);
-        super::emit_progress(ctx, done, Some(len), ema, last_emit, done == len);
+        super::emit_progress(ctx, "write", done, Some(len), ema, last_emit, done == len);
         Ok(done)
     }
 
@@ -741,5 +890,117 @@ mod compressed {
         let cancelled = ctx.cancelled;
         super::finish_write(ctx, done, size, cancelled)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::VecVolume;
+    use crate::fs::Volume;
+    use crate::log::Level;
+    use crate::log::Logger;
+    use crate::pipeline::event::VecReporter;
+    use crate::pipeline::opener::Opener;
+    use crate::pipeline::steps::RunContext;
+    use crate::pipeline::target::Target;
+    use crate::pipeline::target::VecTarget;
+
+    use rufus_proto::ImageKind;
+
+    /// Minimal [`Opener`] serving one [`VecTarget`]: the locator test
+    /// below never touches partitions or hole maps.
+    #[derive(Debug, Clone)]
+    struct LocatorOpener {
+        target: VecTarget,
+    }
+
+    impl Opener for LocatorOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    #[test]
+    fn locate_mismatch_never_opens_a_non_regular_path() {
+        // A FIFO image with a mismatching digest: the old code blocked
+        // forever in `open` with no writer attached. The guard returns
+        // `None` promptly instead — the test finishing at all is the
+        // regression proof (no timing assertion; without the fix the
+        // suite would stall here). `mkfifo(1)` is a host tool like the
+        // `gzip` the pipeline tests already shell out to.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let fifo = scratch.path().join("image.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("the host mkfifo runs");
+        assert!(status.success(), "mkfifo creates the node");
+        let opener = LocatorOpener {
+            target: VecTarget::new(4096, 512).expect("fixture target fits"),
+        };
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        let mut ctx = RunContext {
+            opener: &opener,
+            target: None,
+            table: None,
+            partitioned: false,
+            logger: Logger::new(Level::Info),
+            reporter: &mut reporter,
+            cancelled: &never,
+        };
+        let image = ImageRef {
+            path: fifo.to_str().expect("scratch path is UTF-8").to_string(),
+            size_bytes: 1024,
+            sha256: "0".repeat(64),
+            kind: ImageKind::Raw,
+        };
+        assert_eq!(locate_mismatch(&mut ctx, &image, 1024), None);
+    }
+
+    #[test]
+    fn locate_mismatch_names_a_real_difference() {
+        // A regular file vs a target holding other bytes: the first
+        // differing offset comes back, proving the guard above did not
+        // swallow the normal path.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let path = scratch.path().join("image.bin");
+        std::fs::write(&path, [0x11u8; 2048]).expect("fixture image writes");
+        let opener = LocatorOpener {
+            target: VecTarget::new(4096, 512).expect("fixture target fits"),
+        };
+        opener
+            .target
+            .write_all_at(0, &[0x22u8; 2048])
+            .expect("target fills");
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        let mut ctx = RunContext {
+            opener: &opener,
+            target: None,
+            table: None,
+            partitioned: false,
+            logger: Logger::new(Level::Info),
+            reporter: &mut reporter,
+            cancelled: &never,
+        };
+        let image = ImageRef {
+            path: path.to_str().expect("scratch path is UTF-8").to_string(),
+            size_bytes: 2048,
+            sha256: "0".repeat(64),
+            kind: ImageKind::Raw,
+        };
+        assert_eq!(locate_mismatch(&mut ctx, &image, 2048), Some(0));
     }
 }

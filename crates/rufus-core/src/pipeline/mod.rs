@@ -40,15 +40,19 @@ use crate::error::Result;
 use crate::log::Level;
 use crate::log::Logger;
 
-/// Run options. `verify` (read-back check, slice 7) and `badblocks`
-/// (surface scan, slice 9) are carried now and honoured then; passing
-/// them today keeps the CLI signature stable. Accepted without acting.
+/// Run options. `verify` reads the written bytes back and compares
+/// them to the plan digest; `badblocks` (surface scan, slice 9) is
+/// carried now and honoured then — passing it today keeps the CLI
+/// signature stable. Accepted without acting.
 /// The format label does not live here: it comes from the plan step,
 /// and image-derived label defaults stay future work (the formatter
 /// default applies).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunOptions {
-    /// Read back and verify the written image (honoured from slice 7).
+    /// Read back and verify the written image against the plan
+    /// digest. Runs without a write step (say `[Wipe]` alone) verify
+    /// nothing and warn about nothing: there are no written bytes to
+    /// compare.
     pub verify: bool,
     /// Scan the surface for bad blocks (honoured from slice 9).
     pub badblocks: bool,
@@ -157,7 +161,8 @@ pub fn run(
     reporter: &mut dyn Reporter,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<RunReport> {
-    // Carried for slice 7/9; the write step reads `verify` today.
+    // `badblocks` is carried for slice 9; the write step reads
+    // `verify` today.
     let run_started = Instant::now();
     let total = plan.steps.len();
     let mut ctx = steps::RunContext {
@@ -230,6 +235,8 @@ mod tests {
     use super::*;
     use crate::fs::VecVolume;
     use crate::fs::Volume;
+    use crate::hash::Algo;
+    use crate::hash::hash_file_with;
     use crate::pipeline::event::VecReporter;
     use crate::pipeline::target::Target;
     use crate::pipeline::target::VecTarget;
@@ -435,6 +442,23 @@ mod tests {
             verify: false,
             badblocks: false,
         }
+    }
+
+    /// [`run_options`] with the read-back check on.
+    fn verify_options() -> RunOptions {
+        RunOptions {
+            verify: true,
+            badblocks: false,
+        }
+    }
+
+    /// A plan carrying `steps` over the image file at `path`, sealed
+    /// with the file's real SHA-256: verify tests must describe the
+    /// digest the read-back compares against.
+    fn test_plan_verified(steps: Vec<Step>, path: &std::path::Path, size: u64) -> Plan {
+        let mut plan = test_plan_image(steps, path, size);
+        plan.image.sha256 = hash_file_with(Algo::Sha256, path).expect("fixture hashes");
+        plan
     }
 
     /// 16 MiB layout target with the data partition at the 1 MiB grid
@@ -2332,6 +2356,68 @@ mod tests {
             opener.target.bytes().iter().all(|&byte| byte == 0),
             "nothing written"
         );
+        // A zero-length entry: refused naming its offset.
+        let opener = SparseOpener {
+            target: CountTarget::new(6 * MIB),
+            ranges: Some(vec![(MIB, MIB), (2 * MIB, 0)]),
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an empty entry refuses");
+        let text = error.to_string();
+        assert!(text.contains("2097152"), "{text}");
+        assert!(
+            opener.target.bytes().iter().all(|&byte| byte == 0),
+            "nothing written"
+        );
+        // An unsorted pair: the second range starts at 0, before the
+        // first range's 1..2 MiB.
+        let opener = SparseOpener {
+            target: CountTarget::new(6 * MIB),
+            ranges: Some(vec![(MIB, MIB), (0, MIB)]),
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an unsorted pair refuses");
+        let text = error.to_string();
+        assert!(text.contains("2097152"), "{text}");
+        assert!(
+            opener.target.bytes().iter().all(|&byte| byte == 0),
+            "nothing written"
+        );
+        // An `offset + len` overflow: refused naming the range, never
+        // wrapped around into the image.
+        let opener = SparseOpener {
+            target: CountTarget::new(6 * MIB),
+            ranges: Some(vec![(u64::MAX - 10, 20)]),
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an overflowing range refuses");
+        let text = error.to_string();
+        assert!(text.contains("18446744073709551605"), "{text}");
+        assert!(
+            opener.target.bytes().iter().all(|&byte| byte == 0),
+            "nothing written"
+        );
     }
 
     #[test]
@@ -2399,6 +2485,474 @@ mod tests {
         assert_eq!(
             progresses(&reporter).last().copied(),
             Some((2 * MIB, Some(2 * MIB)))
+        );
+    }
+
+    /// A [`Target`] flipping the byte at `flip_at` on every read,
+    /// delegating everything else to an inner [`VecTarget`]: the
+    /// corrupted byte behind the verify-mismatch test. Writes are
+    /// unaffected, so the write lands and only the read-back differs.
+    #[derive(Debug, Clone)]
+    struct FlipTarget {
+        inner: VecTarget,
+        flip_at: u64,
+    }
+
+    impl Target for FlipTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)?;
+            if self.flip_at >= offset
+                && let Some(byte) = buf.get_mut((self.flip_at - offset) as usize)
+            {
+                *byte ^= 0xFF;
+            }
+            Ok(())
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`FlipTarget`].
+    #[derive(Debug, Clone)]
+    struct FlipOpener {
+        target: FlipTarget,
+    }
+
+    impl Opener for FlipOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    /// A [`Target`] whose reads fail past 512 KiB while writes succeed:
+    /// the short device behind the verify short-read test.
+    #[derive(Debug, Clone)]
+    struct ShortReadTarget {
+        inner: VecTarget,
+    }
+
+    impl Target for ShortReadTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| CoreError::invalid("test read overflows"))?;
+            if end > 512 * 1024 {
+                return Err(CoreError::io(
+                    "test-device",
+                    std::io::Error::other(format!(
+                        "short read: bytes past {} are unreadable",
+                        512 * 1024
+                    )),
+                ));
+            }
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`ShortReadTarget`].
+    #[derive(Debug, Clone)]
+    struct ShortReadOpener {
+        target: ShortReadTarget,
+    }
+
+    impl Opener for ShortReadOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    /// Every `Message` text, in emission order.
+    fn messages(reporter: &VecReporter) -> Vec<&str> {
+        reporter
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `Progress` event as `(step, done, total)`, in order.
+    fn stepped_progress(reporter: &VecReporter) -> Vec<(&str, u64, Option<u64>)> {
+        reporter
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Progress {
+                    step, done, total, ..
+                } => Some((*step, *done, *total)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn verify_accepts_a_correct_write() {
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let report = run(
+            &test_plan_verified(vec![write_dd()], &path, size),
+            &opener,
+            &verify_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a correct write verifies");
+        // The step list is unchanged: verification is a pass inside
+        // the write step, not a plan step.
+        assert_eq!(report.steps.len(), 1);
+        assert_eq!(report.steps[0].step, "write");
+        // One message before and after the pass.
+        assert_eq!(
+            messages(&reporter),
+            [
+                "verifying 1048576 bytes against the plan digest",
+                "verified 1048576 bytes"
+            ]
+        );
+        // Verify progress ends at done == total.
+        let verify: Vec<(u64, Option<u64>)> = stepped_progress(&reporter)
+            .into_iter()
+            .filter(|(step, _, _)| *step == "verify")
+            .map(|(_, done, total)| (done, total))
+            .collect();
+        assert!(!verify.is_empty(), "the pass reports progress");
+        assert_eq!(verify.last().copied(), Some((size, Some(size))));
+    }
+
+    #[test]
+    fn verify_refuses_a_corrupted_byte() {
+        // 600 000 bytes span three chunks; the flip at 300 000 sits in
+        // the middle one, so the locator must look past the first.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(600_000);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = FlipOpener {
+            target: FlipTarget {
+                inner: VecTarget::new(8 * MIB, 512).expect("fixture target fits"),
+                flip_at: 300_000,
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_verified(vec![write_dd()], &path, size),
+            &opener,
+            &verify_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a corrupted byte refuses");
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("300000"), "{text}");
+        assert!(text.contains("expected digest"), "{text}");
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { .. })),
+            "no success is reported: {:?}",
+            reporter.events()
+        );
+    }
+
+    #[test]
+    fn verify_never_lies_on_a_short_device() {
+        // The 1 MiB image writes whole, but reads fail past 512 KiB:
+        // the pass refuses instead of hashing a prefix as success.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = ShortReadOpener {
+            target: ShortReadTarget {
+                inner: VecTarget::new(8 * MIB, 512).expect("fixture target fits"),
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_verified(vec![write_dd()], &path, size),
+            &opener,
+            &verify_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a short device refuses");
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("short"), "{error:?}");
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { .. })),
+            "no success is reported: {:?}",
+            reporter.events()
+        );
+    }
+
+    #[test]
+    fn verify_is_skipped_for_compressed_images() {
+        // The plan digest covers the archive, not the decoded stream,
+        // so there is nothing honest to compare: one warning, then the
+        // write as usual — and no read-back.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let payload = pattern_bytes(50_000);
+        let (path, size) = compressed_image(&scratch, "image.gz", "gzip", &payload);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_compressed(vec![write_dd()], &path, size, ImageKind::Gzip),
+            &opener,
+            &verify_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a compressed write runs without verifying");
+        let found = warnings(&reporter);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("skipped"), "{}", found[0]);
+        assert!(
+            stepped_progress(&reporter)
+                .iter()
+                .all(|(step, _, _)| *step != "verify"),
+            "no read-back ran: {:?}",
+            reporter.events()
+        );
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert_eq!(&bytes[..payload.len()], &payload[..]);
+    }
+
+    #[test]
+    fn verify_cancelled_mid_read_is_not_success() {
+        // A 256 KiB image: three probe consultations precede the
+        // verify loop (the step boundary, the one write chunk, the
+        // target's own piece check), so the fourth — the read loop's
+        // first, seeing count 3 — cancels before a byte is hashed.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(256 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let calls = Cell::new(0u32);
+        let error = run(
+            &test_plan_verified(vec![write_dd()], &path, size),
+            &opener,
+            &verify_options(),
+            &mut reporter,
+            &|| {
+                let seen = calls.get();
+                calls.set(seen + 1);
+                seen >= 3
+            },
+        )
+        .expect_err("a mid-read cancel refuses");
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "cancellation surfaces wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("cancelled"), "{error:?}");
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { .. })),
+            "no success is reported: {:?}",
+            reporter.events()
+        );
+    }
+
+    #[test]
+    fn verify_refuses_a_plan_without_a_digest() {
+        // A hand-written plan with an empty digest: the write lands,
+        // then verification refuses up front — there is nothing to
+        // compare against. Usage error, not a device failure.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let mut plan = test_plan_image(vec![write_dd()], &path, size);
+        plan.image.sha256 = String::new();
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let error = run(&plan, &opener, &verify_options(), &mut reporter, &|| false)
+            .expect_err("a digestless plan refuses");
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("no digest"), "{text}");
+    }
+
+    #[test]
+    fn verify_is_skipped_without_a_write_step() {
+        // A `[Wipe]`-only plan with verification on: nothing written,
+        // nothing to compare — no warning, no verify progress.
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan(vec![Step::Wipe]),
+            &opener,
+            &verify_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("wipe runs");
+        assert!(
+            warnings(&reporter)
+                .iter()
+                .all(|warning| !warning.contains("verify")),
+            "no verify warning: {:?}",
+            reporter.events()
+        );
+        assert!(
+            stepped_progress(&reporter)
+                .iter()
+                .all(|(step, _, _)| *step != "verify"),
+            "no read-back ran: {:?}",
+            reporter.events()
+        );
+    }
+
+    #[test]
+    fn verify_hashes_the_logical_image_when_sparse() {
+        use std::io::Seek as _;
+        use std::io::Write as _;
+
+        // A real sparse file: a hole over [0, 1 MiB), data over
+        // [1 MiB, 2 MiB). The digest covers the logical bytes (holes
+        // read as zeros), and so does the target after the run — the
+        // hole window was zeroed, not skipped.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let path = scratch.path().join("sparse.bin");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("sparse file creates");
+        file.seek(std::io::SeekFrom::Start(MIB))
+            .expect("hole seeks");
+        file.write_all(&pattern_bytes(MIB as usize))
+            .expect("tail writes");
+        file.set_len(2 * MIB).expect("sparse file sizes");
+        drop(file);
+        let mut plan = test_plan_image(vec![write_dd()], &path, 2 * MIB);
+        plan.image.sha256 = hash_file_with(Algo::Sha256, &path).expect("fixture hashes");
+        let opener = SparseOpener {
+            target: CountTarget::new(2 * MIB),
+            ranges: Some(vec![(MIB, MIB)]),
+        };
+        opener
+            .target
+            .inner
+            .write_all_at(0, &vec![0xAAu8; 2 * MIB as usize])
+            .expect("prefill writes");
+        let mut reporter = VecReporter::new();
+        run(&plan, &opener, &verify_options(), &mut reporter, &|| false)
+            .expect("a sparse write verifies against its logical bytes");
+        assert!(
+            messages(&reporter)
+                .iter()
+                .any(|message| message.contains("verified 2097152 bytes")),
+            "the pass closes: {:?}",
+            reporter.events()
         );
     }
 
