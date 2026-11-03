@@ -14,8 +14,14 @@
 //!   `--dry-run` device-check relaxation and S04 device enrichment;
 //! * `list` — S04 device discovery (sysfs + udev data), with the
 //!   `--sysfs-root`/`--mountinfo` test hooks of PLAN §9-S04;
-//! * `write` — arguments validated, then honestly *not implemented*
-//!   (exit 7) until S06/S17.
+//! * `write` — validates the plan file (schema version + confirm
+//!   hash) and runs it through the S17 pipeline against the planned
+//!   device, or against the `--device-file` seam in tests; exit 7 only
+//!   for the steps no slice implements yet (bootloader, copy). `write`
+//!   is the one command whose failure goes to stderr in both modes:
+//!   `--json` streams one `Event` object per stdout line, so the
+//!   failure object (one compact JSON line, same `{"error","message"}`)
+//!   goes to stderr to keep stdout pure JSONL.
 //!
 //! Exit codes: 0 ok, 1 usage, 2 device, 3 safety, 4 I/O, 5 unsupported
 //! image, 6 cancelled, 7 not implemented — see [`Exit`]. clap errors are
@@ -25,12 +31,15 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use clap::Parser;
 use clap::Subcommand;
 use rufus_core::error::CoreError;
 use rufus_core::hash::Algo;
 use rufus_core::partition::TableKind;
+use rufus_core::pipeline::Event;
 use rufus_core::safety::SafetyVerdict;
 use rufus_core::text::device_text;
 use rufus_linux::MountTable;
@@ -51,11 +60,13 @@ mod plan;
 // Exit codes and failure reporting
 // ---------------------------------------------------------------------------
 
-/// Exit codes (PLAN §9-S03 table, plus `NotImplemented` for the stubs this
-/// slice ships). Not every class is reachable yet; the contract above is
-/// authoritative for callers, hence the `dead_code` allowance.
+/// Exit codes (PLAN §9-S03 table, plus `NotImplemented` for the plan
+/// steps no slice implements yet — bootloader, copy). `UnsupportedImage`
+/// has no producer yet (images the executor cannot serve arrive with a
+/// later slice); the contract above is authoritative for callers, hence
+/// the `dead_code` allowance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Cancelled/UnsupportedImage return with their slices
+#[allow(dead_code)] // UnsupportedImage returns with its slice
 pub enum Exit {
     /// Success.
     Ok = 0,
@@ -93,15 +104,18 @@ pub struct Fail {
 }
 
 impl Fail {
-    /// Map a [`CoreError`] onto the exit table: I/O → 4, anything else is
-    /// a validation failure → 1; the error `Display` names the path.
-    /// Pipeline step wrappers are transparent: classification recurses
-    /// into the wrapped error, so a device I/O failure inside a step
-    /// still exits 4 while the message keeps its step prefix.
+    /// Map a [`CoreError`] onto the exit table: I/O → 4, cancellation
+    /// → 6, unimplemented steps → 7, anything else is a validation
+    /// failure → 1; the error `Display` names the path. Pipeline step
+    /// wrappers are transparent: classification recurses into the
+    /// wrapped error, so a device I/O failure inside a step still exits
+    /// 4 while the message keeps its step prefix.
     fn from_core(err: CoreError) -> Self {
         fn exit_of(err: &CoreError) -> (Exit, &'static str) {
             match err {
                 CoreError::Io { .. } => (Exit::Io, "io"),
+                CoreError::Cancelled => (Exit::Cancelled, "cancelled"),
+                CoreError::NotImplemented { .. } => (Exit::NotImplemented, "not_implemented"),
                 CoreError::Step { source, .. } => exit_of(source),
                 _ => (Exit::Usage, "invalid_input"),
             }
@@ -576,9 +590,14 @@ enum Command {
 
     /// Execute a previously saved plan file.
     ///
-    /// With --plan the file is checked (schema version + confirm hash);
-    /// mismatches exit 1. Executing the plan arrives with S06 (helper) and
-    /// S17 (pipeline), so a valid plan today ends with exit 7.
+    /// With --plan the file is checked (schema version + confirm hash)
+    /// and then run through the S17 pipeline: wipe, table, partition,
+    /// format, write, finalize. Mismatches exit 1; steps no slice
+    /// implements yet (bootloader, copy) exit 7. `--device-file` runs
+    /// the same plan against a regular file instead of the planned
+    /// device (a test seam; the planned device is never opened then).
+    /// Failures report on stderr in both modes, so `--json` stdout
+    /// stays one parseable `Event` object per line.
     Write {
         /// Plan JSON file produced by `rufus plan`.
         #[arg(long, value_name = "FILE")]
@@ -708,6 +727,66 @@ fn cmd_checksum(json: bool, path: &Path, algo: Algo) -> Result<Exit, Fail> {
 /// requested path, a partition path) are device-class errors: exit 2,
 /// kind "device", with the `{"error","message"}` object in `--json`
 /// mode. A partition path names its whole disk in the refusal.
+/// Select the graded device from an enumeration: first match in the
+/// name-sorted enumeration order, by the discovered node path, the
+/// sysfs path, one shared canonical path (both sides must exist — two
+/// failed lookups never mean "the same path") or the bare kernel name.
+/// Shared by `analyze --device` and `write` so the two cannot disagree
+/// on what a path names; nothing infers a device from a file's name.
+///
+/// Refusals are device class (exit 2): a partition path names its whole
+/// disk (tables are read from the whole disk), unknown paths keep the
+/// plain message.
+fn find_device(
+    devices: &[rufus_linux::Device],
+    requested: &Path,
+) -> Result<rufus_linux::Device, Fail> {
+    let selected = devices.iter().find(|candidate| {
+        Path::new(&candidate.dev_path) == requested
+            || Path::new(&candidate.sysfs) == requested
+            || Path::new(&candidate.name) == requested
+            || {
+                match (
+                    std::fs::canonicalize(Path::new(&candidate.dev_path)),
+                    std::fs::canonicalize(requested),
+                ) {
+                    (Ok(real), Ok(given)) => real == given,
+                    _ => false,
+                }
+            }
+    });
+    let Some(selected) = selected else {
+        // A partition path is the common miss worth naming: tables are
+        // read from the whole disk, so say which disk owns the name.
+        // Unknown paths keep the plain message.
+        let base = requested.file_name();
+        let owner = base.and_then(|base| {
+            devices.iter().find(|disk| {
+                disk.partitions
+                    .iter()
+                    .any(|part| std::ffi::OsStr::new(&part.name) == base)
+            })
+        });
+        return Err(match owner {
+            Some(disk) => Fail {
+                exit: Exit::Device,
+                kind: "device",
+                message: format!(
+                    "{} is a partition of {} - select the whole disk",
+                    requested.display(),
+                    disk.dev_path
+                ),
+            },
+            None => Fail {
+                exit: Exit::Device,
+                kind: "device",
+                message: format!("no block device found for {}", requested.display()),
+            },
+        });
+    };
+    Ok(selected.clone())
+}
+
 fn cmd_analyze(
     json: bool,
     image_path: &Path,
@@ -764,63 +843,18 @@ fn cmd_analyze(
         message: core.to_string(),
     })?;
 
-    // Selection: first match in the name-sorted enumeration order, by
-    // the discovered node path, the sysfs path, one shared canonical
-    // path (both sides must exist — two failed lookups never mean "the
-    // same path") or the bare kernel name. The graded device is always
-    // the discovered one, and the node that gets sampled is always its
-    // own `/dev/<name>` (fixture tests redirect that with
-    // `--device-file`); nothing infers a device from a file's name.
-    let selected = devices.iter().find(|candidate| {
-        Path::new(&candidate.dev_path) == requested
-            || Path::new(&candidate.sysfs) == requested
-            || Path::new(&candidate.name) == requested
-            || {
-                match (
-                    std::fs::canonicalize(Path::new(&candidate.dev_path)),
-                    std::fs::canonicalize(requested),
-                ) {
-                    (Ok(real), Ok(given)) => real == given,
-                    _ => false,
-                }
-            }
-    });
-    let Some(selected) = selected else {
-        // A partition path is the common miss worth naming: tables are
-        // read from the whole disk, so say which disk owns the name.
-        // Unknown paths keep the plain message.
-        let base = requested.file_name();
-        let owner = base.and_then(|base| {
-            devices.iter().find(|disk| {
-                disk.partitions
-                    .iter()
-                    .any(|part| std::ffi::OsStr::new(&part.name) == base)
-            })
-        });
-        return Err(match owner {
-            Some(disk) => Fail {
-                exit: Exit::Device,
-                kind: "device",
-                message: format!(
-                    "{} is a partition of {} - select the whole disk",
-                    requested.display(),
-                    disk.dev_path
-                ),
-            },
-            None => Fail {
-                exit: Exit::Device,
-                kind: "device",
-                message: format!("no block device found for {}", requested.display()),
-            },
-        });
-    };
-
+    // Selection: first match in the name-sorted enumeration order (see
+    // `find_device`). The graded device is always the discovered one,
+    // and the node that gets sampled is always its own `/dev/<name>`
+    // (fixture tests redirect that with `--device-file`); nothing
+    // infers a device from a file's name.
+    let selected = find_device(&devices, requested)?;
     // S05 test hook: `--device-file` redirects only the file the
     // sampling half opens. The graded device (name, size, serial,
     // mounts, holders — every verdict fact) stays the discovered one,
     // and without the flag the discovered `/dev/<name>` node is
     // sampled, so the graded device and the read bytes never diverge.
-    let mut selected = selected.clone();
+    let mut selected = selected;
     if let Some(file) = paths.device_file.as_deref() {
         selected.dev_path = file.display().to_string();
     }
@@ -1105,7 +1139,7 @@ fn cmd_plan(
     Ok(Exit::Ok)
 }
 
-fn cmd_write(json: bool, plan_path: &Path) -> Result<Exit, Fail> {
+fn cmd_write(json: bool, plan_path: &Path, paths: &HostPaths) -> Result<Exit, Fail> {
     let text = std::fs::read_to_string(plan_path)
         .map_err(|source| Fail::from_core(CoreError::io(plan_path, source)))?;
     let parsed: Plan = serde_json::from_str(&text).map_err(|err| Fail {
@@ -1143,17 +1177,201 @@ fn cmd_write(json: bool, plan_path: &Path) -> Result<Exit, Fail> {
             ),
         });
     }
-    // The plan verifies; dispatch is S06, the pipeline is S17.
-    eprintln!(
-        "write: plan verifies (device {}, image {}); writing is not implemented yet (S06/S17)",
-        parsed.device.path, parsed.image.path
-    );
-    if json {
-        let object = serde_json::json!({ "error": "not_implemented", "slice": "S06/S17" });
-        println!("{}", to_pretty(&object)?);
+    // The plan verifies; run it through the S17 pipeline.
+    // The opener's partition window is derived from the plan steps,
+    // not from `options.scheme`: `Mklabel`/`Mkpart` are what `Mkpart`
+    // stamps, so a plan whose options disagree with its steps still
+    // formats the stamped partition (see `opener_table_kind`).
+    let table = opener_table_kind(&parsed)?;
+    let cancel = rufus_linux::Cancel::new();
+    cancel.install().map_err(Fail::from_core)?;
+    if let Some(file) = paths.device_file.as_deref() {
+        // Test seam: the plan's device path is never opened in this
+        // mode, so a graded device cannot be written by accident — only
+        // the seam file is touched.
+        let opener = rufus_linux::FileOpener::open(file, table).map_err(Fail::from_core)?;
+        run_plan(&parsed, &opener, &cancel, json)
+    } else {
+        let sysfs = paths.sysfs();
+        let devices = rufus_linux::enumerate(&sysfs).map_err(|core| Fail {
+            exit: Exit::Device,
+            kind: "device",
+            message: core.to_string(),
+        })?;
+        let device = find_device(&devices, Path::new(&parsed.device.path))?;
+        let opener = rufus_linux::DeviceOpener::new(&device, table, sysfs);
+        run_plan(&parsed, &opener, &cancel, json)
     }
-    Ok(Exit::NotImplemented)
 }
+
+/// The [`TableKind`] the opener plans its partition window for: read
+/// off the plan's `Mklabel`/`Mkpart` steps — the authority for what
+/// [`Mkpart`](rufus_proto::Step::Mkpart) stamps — never off
+/// `options.scheme`, which is the planner's intent, not the stamped
+/// table. A plan whose options disagree with its steps still runs
+/// against the stamped partition; a plan whose steps disagree with
+/// each other refuses here, before touching the device, with the same
+/// exit class the in-run refusal would map to.
+fn opener_table_kind(plan: &Plan) -> Result<TableKind, Fail> {
+    let mut label: Option<Scheme> = None;
+    let mut part: Option<Scheme> = None;
+    for step in &plan.steps {
+        match step {
+            Step::Mklabel { scheme } => label = Some(scheme.clone()),
+            Step::Mkpart { scheme } => part = Some(scheme.clone()),
+            _ => {}
+        }
+    }
+    match (label, part) {
+        (Some(label), Some(part)) if label != part => Err(Fail {
+            exit: Exit::Usage,
+            kind: "invalid_plan",
+            message: format!(
+                "plan steps disagree: mklabel asks for '{}' but mkpart asks for '{}': refusing before touching the device",
+                human_scheme(&label),
+                human_scheme(&part),
+            ),
+        }),
+        (Some(scheme), _) | (None, Some(scheme)) => Ok(table_kind(&scheme)),
+        (None, None) => Ok(table_kind(&plan.options.scheme)),
+    }
+}
+
+/// The [`TableKind`] a plan [`Scheme`] asks for: the same mapping the
+/// pipeline's `Mklabel`/`Mkpart` run with, so the opener's partition
+/// window is planned for the table the steps stamp.
+fn table_kind(scheme: &Scheme) -> TableKind {
+    match scheme {
+        Scheme::Mbr => TableKind::Mbr,
+        Scheme::Gpt => TableKind::Gpt,
+    }
+}
+
+/// Run `plan` against `opener` under the SIGINT `cancel` flag,
+/// reporting per `json`. A clean run exits 0; every pipeline refusal
+/// maps through [`Fail::from_core`] (I/O → 4, cancelled → 6,
+/// unimplemented → 7, anything else → 1).
+fn run_plan(
+    plan: &Plan,
+    opener: &dyn rufus_core::pipeline::Opener,
+    cancel: &rufus_linux::Cancel,
+    json: bool,
+) -> Result<Exit, Fail> {
+    let options = rufus_core::pipeline::RunOptions {
+        verify: plan.options.verify,
+        badblocks: plan.options.bad_blocks,
+    };
+    let probe = cancel.as_fn();
+    if json {
+        let mut reporter = JsonReporter;
+        rufus_core::pipeline::run(plan, opener, &options, &mut reporter, &probe)
+            .map_err(Fail::from_core)?;
+    } else {
+        let mut reporter = HumanReporter::new();
+        match rufus_core::pipeline::run(plan, opener, &options, &mut reporter, &probe) {
+            Ok(_) => {}
+            Err(error) => {
+                // Close the carriage-return progress line so the error
+                // below starts on its own line.
+                eprintln!();
+                return Err(Fail::from_core(error));
+            }
+        }
+    }
+    Ok(Exit::Ok)
+}
+
+/// Streams every pipeline [`Event`] as one JSON line on stdout, flushed
+/// per line, with no wrapper object: the wire shape is exactly
+/// [`Event`]'s serde shape. Serialisation of an event is infallible in
+/// practice (all fields are JSON-native); a failure drops that one line
+/// rather than aborting the run mid-stream.
+struct JsonReporter;
+
+impl rufus_core::pipeline::Reporter for JsonReporter {
+    fn event(&mut self, event: Event) {
+        if let Ok(line) = serde_json::to_string(&event) {
+            println!("{line}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+}
+
+/// Human progress on stderr: one carriage-return line throttled to
+/// about 1 Hz, one line per `Message`, and a final newline on
+/// `Finished`. All ASCII, all whole numbers — totals, rates and ETAs
+/// render by hand (absent when unknown), never with `{:?}`, so no
+/// `Some`/`None` can leak.
+struct HumanReporter {
+    last_emit: Instant,
+}
+
+impl HumanReporter {
+    /// A reporter whose first sample always prints: `last_emit` starts
+    /// an hour back, so even a sub-second run shows its 100 %.
+    fn new() -> Self {
+        Self {
+            last_emit: Instant::now() - Duration::from_secs(3600),
+        }
+    }
+
+    /// Render one throughput sample. The final sample always prints;
+    /// the rest at most once a second.
+    fn progress(&mut self, step: &str, done: u64, total: Option<u64>, rate: u64, eta: Option<u64>) {
+        let now = Instant::now();
+        let final_sample = total.is_some_and(|total| done >= total);
+        if !final_sample && now.duration_since(self.last_emit) < Duration::from_secs(1) {
+            return;
+        }
+        self.last_emit = now;
+        let mut line = match total {
+            Some(total) if total > 0 => {
+                let pct = (done.saturating_mul(100) / total).min(100);
+                format!("{step}: {pct}% {done}/{total} bytes")
+            }
+            _ => format!("{step}: {done} bytes"),
+        };
+        if rate > 0 {
+            line.push_str(&format!(", {}/s", rufus_core::human_bytes(rate)));
+        }
+        if let Some(eta) = eta {
+            line.push_str(&format!(", ETA {eta}s"));
+        }
+        eprint!("{line}\r");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
+impl rufus_core::pipeline::Reporter for HumanReporter {
+    fn event(&mut self, event: Event) {
+        match event {
+            Event::Progress {
+                step,
+                done,
+                total,
+                bytes_per_second,
+                eta_seconds,
+            } => self.progress(step, done, total, bytes_per_second, eta_seconds),
+            Event::Message { level, text } => {
+                // The progress line has no trailing newline, so a bare
+                // `eprintln!` would glue the message onto it: clear the
+                // line first (carriage return, spaces, carriage return).
+                eprint!("\r{:width$}\r", "", width = CLEAR_WIDTH);
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                eprintln!("{level}: {text}");
+            }
+            Event::Finished { .. } => {
+                eprintln!();
+            }
+            Event::StepStarted { .. } | Event::StepFinished { .. } => {}
+        }
+    }
+}
+
+/// Spaces the [`HumanReporter`] clears before a `Message`: wider than
+/// any progress line it prints (step name plus numbers, rate and ETA),
+/// so no stale characters survive.
+const CLEAR_WIDTH: usize = 80;
 
 fn cmd_log(json: bool, lines: usize) -> Result<Exit, Fail> {
     let path = rufus_core::paths::state_dir().join("rufus.log");
@@ -1433,7 +1651,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
                 },
             )
         }
-        Command::Write { plan } => cmd_write(json, plan),
+        Command::Write { plan } => cmd_write(json, plan, paths),
         Command::Log { lines } => cmd_log(json, *lines),
     }
 }
@@ -1474,19 +1692,91 @@ fn main() {
     match dispatch(&cli, &paths) {
         Ok(exit) => std::process::exit(exit.code()),
         Err(fail) => {
-            // `--json` error objects go to stdout; if even that formatting
-            // fails (practically impossible), restore the human line on
-            // stderr so the failure is never silently dropped.
-            let json_line = if cli.json {
-                to_pretty(&json_error(fail.kind, &fail.message)).ok()
+            // `write` failures go to stderr in both modes: `--json`
+            // streams one `Event` object per stdout line, and a
+            // pretty-printed error object on stdout would break that
+            // stream (see the module docs). Every other command keeps
+            // the `--json` error object on stdout. A failure to render
+            // the object itself (practically impossible) restores the
+            // human line on stderr so the failure is never dropped.
+            let is_write = matches!(cli.command, Command::Write { .. });
+            if is_write {
+                if cli.json {
+                    match serde_json::to_string(&json_error(fail.kind, &fail.message)) {
+                        Ok(line) => eprintln!("{line}"),
+                        Err(_) => eprintln!("rufus: {}", fail.message),
+                    }
+                } else {
+                    eprintln!("rufus: {}", fail.message);
+                }
             } else {
-                None
-            };
-            match json_line {
-                Some(text) => println!("{text}"),
-                None => eprintln!("rufus: {}", fail.message),
+                let json_line = if cli.json {
+                    to_pretty(&json_error(fail.kind, &fail.message)).ok()
+                } else {
+                    None
+                };
+                match json_line {
+                    Some(text) => println!("{text}"),
+                    None => eprintln!("rufus: {}", fail.message),
+                }
             }
             std::process::exit(fail.exit.code());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cancellation maps to exit 6 with kind `cancelled`, bare and
+    /// through the step wrapper. No message text is matched: the
+    /// contract is the code plus the kind.
+    #[test]
+    fn from_core_maps_cancellation_to_exit_6() {
+        let fail = Fail::from_core(CoreError::Cancelled);
+        assert_eq!(fail.exit, Exit::Cancelled);
+        assert_eq!(fail.exit.code(), 6);
+        assert_eq!(fail.kind, "cancelled");
+        let fail = Fail::from_core(CoreError::Step {
+            step: "write",
+            source: Box::new(CoreError::Cancelled),
+        });
+        assert_eq!(fail.exit, Exit::Cancelled);
+        assert_eq!(fail.exit.code(), 6);
+        assert_eq!(fail.kind, "cancelled");
+    }
+
+    /// Unimplemented steps map to exit 7 with kind `not_implemented`,
+    /// bare (the pipeline never wraps this variant). Same terms: code
+    /// plus kind, no message text.
+    #[test]
+    fn from_core_maps_unimplemented_to_exit_7() {
+        let fail = Fail::from_core(CoreError::NotImplemented {
+            what: "bootloader installation (S19)",
+        });
+        assert_eq!(fail.exit, Exit::NotImplemented);
+        assert_eq!(fail.exit.code(), 7);
+        assert_eq!(fail.kind, "not_implemented");
+    }
+
+    /// The pre-existing classes are unchanged by the new arms: I/O
+    /// (bare and step-wrapped) stays exit 4, validation stays exit 1.
+    #[test]
+    fn from_core_keeps_io_and_usage_classes() {
+        let fail = Fail::from_core(CoreError::io("disk", std::io::Error::other("media error")));
+        assert_eq!(fail.exit, Exit::Io);
+        assert_eq!(fail.exit.code(), 4);
+        assert_eq!(fail.kind, "io");
+        let fail = Fail::from_core(CoreError::Step {
+            step: "wipe",
+            source: Box::new(CoreError::io("disk", std::io::Error::other("media error"))),
+        });
+        assert_eq!(fail.exit, Exit::Io);
+        assert_eq!(fail.kind, "io");
+        let fail = Fail::from_core(CoreError::invalid("bad value"));
+        assert_eq!(fail.exit, Exit::Usage);
+        assert_eq!(fail.exit.code(), 1);
+        assert_eq!(fail.kind, "invalid_input");
     }
 }

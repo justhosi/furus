@@ -3,13 +3,15 @@
 //!
 //! [`RunContext`] threads the run state through the steps so slices 3+
 //! can add fields without re-plumbing every signature. One convention
-//! the step modules follow: cancellation inside a step reports just
-//! `"the write was cancelled"` — [`run`](super::run) wraps every step
-//! error with the step name, so naming it inside too would stutter.
-//! (The boundary check in [`run`](super::run) keeps its own
-//! `"before step"` wording.) Step-name literals in messages and
+//! the step modules follow: cancellation inside a step reports bare
+//! [`Cancelled`](crate::error::CoreError::Cancelled) — [`run`](super::run)
+//! wraps every step error with the step name, so naming it inside too
+//! would stutter. (The boundary check in [`run`](super::run) keeps its
+//! own wrapper for the same reason.) Step-name literals in messages and
 //! [`Event`] payloads must match [`step_name`](super::step_name)
-//! exactly.
+//! exactly. [`NotImplemented`](crate::error::CoreError::NotImplemented)
+//! is the one exception to the wrapper: its `what` already names the
+//! step, so wrapping it would stutter instead.
 
 use std::sync::Arc;
 
@@ -68,13 +70,30 @@ impl<'a> RunContext<'a> {
             None => Err(CoreError::invalid("pipeline device vanished after opening")),
         }
     }
+
+    /// Release the whole-disk handle for the external formatters: flush
+    /// what is buffered, drop the open handle, and tell the opener to
+    /// forget its cached handle too, so the next [`device`](RunContext::device)
+    /// reopens from scratch. The tool-based `Mkfs` arms (`mke2fs`,
+    /// `mkntfs`, `mkudffs`) call this immediately before asking for the
+    /// partition node path: those tools want their own exclusive claim
+    /// on the node, which conflicts with the pipeline's open whole-disk
+    /// handle on a real device. A flush failure still drops the handle
+    /// (nothing is lost by closing) and reports the flush error.
+    pub(crate) fn release_device(&mut self) -> Result<()> {
+        let taken = self.target.take();
+        if let Some(target) = taken {
+            target.flush()?;
+        }
+        self.opener.release()
+    }
 }
 
-/// Fail when the run is cancelled. The message names no step: [`run`]
+/// Fail when the run is cancelled. The error names no step: [`run`]
 /// (super::run) wraps every step error with its step already.
 pub(crate) fn check_cancelled(ctx: &RunContext<'_>) -> Result<()> {
     if (ctx.cancelled)() {
-        return Err(CoreError::invalid("the write was cancelled"));
+        return Err(CoreError::Cancelled);
     }
     Ok(())
 }

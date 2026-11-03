@@ -4,9 +4,10 @@
 //! CLI's JSONL stream speaks these lines in slice 4 and the GUI channel
 //! carries the same payload in S24, so variant and field names are
 //! frozen once shipped — rename with a version bump, never silently.
-//! The throughput fields (`bytes_per_second`, `eta_seconds`) are present
-//! from the start but stay zero until the write loop fills them in slice
-//! 3; `total: None` means "unknown, indeterminate".
+//! The throughput fields (`bytes_per_second`, `eta_seconds`) are filled
+//! by the write loop; zero/`None` only while no sample exists (a fast
+//! run's single final event, a zero-byte image, the sub-second table
+//! stamp). `total: None` means "unknown, indeterminate".
 //!
 //! [`Reporter`] is the only sink: [`NullReporter`] drops everything for
 //! runs nobody watches, and tests collect with the test reporter. No
@@ -37,8 +38,8 @@ pub enum Event {
         /// Step wall time in milliseconds.
         millis: u64,
     },
-    /// Throughput sample. Slice 3 fills the rate fields; until then
-    /// they read zero.
+    /// Throughput sample. The rate fields are filled by the write
+    /// loop; zero/`None` only while no sample exists.
     Progress {
         /// Snake-case step identifier (see `step_name`).
         step: &'static str,
@@ -46,10 +47,9 @@ pub enum Event {
         done: u64,
         /// Total bytes, or `None` when unknown (indeterminate).
         total: Option<u64>,
-        /// Bytes per second (zero until slice 3).
+        /// Bytes per second (zero only while no sample exists).
         bytes_per_second: u64,
-        /// Seconds remaining: `None` until the write loop in slice 3
-        /// fills it in.
+        /// Seconds remaining: `None` only while no sample exists.
         eta_seconds: Option<u64>,
     },
     /// A log-grade line. The text is already sanitised ASCII when the

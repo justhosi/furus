@@ -284,7 +284,10 @@ fn device_swap_sources(device: &Device, options: &Options<'_>) -> Vec<SwapEntry>
 /// partition with that number when present, else the plain-digit form of
 /// the disk name (S04 lists with the same rule, and `p`-separated disks
 /// such as `nvme0n1` get the `p` form their kernel uses).
-fn partition_name(device: &Device, index: u32) -> String {
+///
+/// Public since S17: the write adapter resolves the partition node for
+/// the external formatters through it, so core never invents the name.
+pub fn partition_name(device: &Device, index: u32) -> String {
     if let Some(part) = device
         .partitions
         .iter()

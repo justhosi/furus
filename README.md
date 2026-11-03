@@ -97,9 +97,13 @@ write side is the most complete part:
   cancel, SIGKILLs the whole group rather than just the child, so a
   shell that forks (dash's `sh -c` leaves a `sleep` grandchild) cannot
   keep the output pipes open and stall the cancel.
-* The end-to-end write path is the least complete part: the CLI's
-  `write` command validates its arguments and then honestly reports
-  "not implemented" (exit 7), pending the later executor slices.
+* The end-to-end write path runs: the CLI's `write` command validates
+  its plan file (schema version + confirm hash) and executes it through
+  the pipeline — wipe, table, partition, format, raw write, finalize —
+  with per-event JSON (`--json`) or a throttled progress line, Ctrl-C
+  cancellation (exit 6), and typed refusals (exit 7 only for the steps
+  no slice implements yet: bootloader installation and file-tree copy).
+  `--device-file` runs the same plan against a regular file for tests.
 * The GUI is still a stub: it prints version/help and otherwise reports
   "GUI arrives in S24".
 
@@ -162,9 +166,11 @@ depends on `rufus-linux` (see `crates/rufus-core/src/fs/mod.rs`).
 
 Safety and dependencies: every crate root carries
 `#![forbid(unsafe_code)]`, and the workspace denies unsafe code, with
-exactly one allowance - the four block ioctls
+exactly two allowances - the four block ioctls
 (BLKZEROOUT/BLKDISCARD/BLKRRPART/BLKFLSBUF) in
-`crates/rufus-linux/src/ioctl.rs` that rustix does not wrap.
+`crates/rufus-linux/src/ioctl.rs` that rustix does not wrap, and the one
+SIGINT handler install in `crates/rufus-linux/src/signal.rs` (one atomic
+store, nothing else).
 `rufus-core` is dependency-light by design: no async runtime, no logging
 framework, no regex.
 

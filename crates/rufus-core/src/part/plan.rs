@@ -294,6 +294,85 @@ impl Rendered {
 // Planning
 // ---------------------------------------------------------------------------
 
+/// Build the `Single`-layout request [`Mkpart`](crate::pipeline::mkpart)
+/// stamps: one Microsoft Basic Data partition over the whole usable
+/// disk. Shared by the stamper and the platform opener's window math,
+/// so the two cannot disagree on inputs — both feed the same table,
+/// sector size and byte size into the same [`plan`].
+///
+/// `size_bytes` is the whole-disk extent; `last_lba` derives as
+/// `floor(size / sector) - 1`, leaving a trailing partial sector unused
+/// by construction. A zero sector size or a disk smaller than one
+/// sector refuses, naming the numbers (the stamper's wording, kept so
+/// both sides report the same refusal).
+pub fn single_request(table: TableKind, sector_size: u32, size_bytes: u64) -> Result<PlanRequest> {
+    let sectors = size_bytes
+        .checked_div(u64::from(sector_size))
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "target of {size_bytes} bytes has sector size {sector_size}: refusing a zero sector size"
+            ))
+        })?;
+    if sectors == 0 {
+        return Err(CoreError::invalid(format!(
+            "target of {size_bytes} bytes is smaller than one {sector_size} byte sector"
+        )));
+    }
+    Ok(PlanRequest {
+        kind: LayoutKind::Single,
+        table,
+        sector_size,
+        last_lba: sectors - 1,
+        data_type: DataType::MicrosoftBasicData,
+        esp_bytes: 0,
+        persistence_bytes: 0,
+    })
+}
+
+/// The byte window `(offset, len)` of the `Single` layout's data
+/// partition for `table` on a `size_bytes` disk with `sector_size`-byte
+/// sectors: what the platform opener formats and verifies. Planned
+/// through the same [`single_request`] plus [`plan`] the stamper runs,
+/// so the window is the partition the table describes by construction —
+/// not a second computation that could drift. The first (`data`)
+/// partition wins; an empty plan (unreachable through [`plan`] today)
+/// refuses instead of indexing blindly.
+pub fn single_data_window(
+    table: TableKind,
+    sector_size: u32,
+    size_bytes: u64,
+) -> Result<(u64, u64)> {
+    let request = single_request(table, sector_size, size_bytes)?;
+    let planned = plan(&request)?;
+    let partition = planned
+        .partitions
+        .first()
+        .ok_or_else(|| CoreError::invalid("the single layout planned no partitions".to_string()))?;
+    let sector = u64::from(sector_size);
+    let offset = partition.start_lba.checked_mul(sector).ok_or_else(|| {
+        CoreError::invalid(format!(
+            "partition start lba {} times sector size {sector_size} overflows the byte arithmetic",
+            partition.start_lba
+        ))
+    })?;
+    let sectors = partition
+        .last_lba
+        .checked_sub(partition.start_lba)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "partition lba range {}..={} overflows the byte arithmetic",
+                partition.start_lba, partition.last_lba
+            ))
+        })?;
+    let len = sectors.checked_mul(sector).ok_or_else(|| {
+        CoreError::invalid(format!(
+            "partition sector count {sectors} times sector size {sector_size} overflows the byte arithmetic"
+        ))
+    })?;
+    Ok((offset, len))
+}
+
 /// Plan a whole-disk layout: [`PlanRequest`] in, checked geometry plus
 /// fresh GUIDs out.
 ///

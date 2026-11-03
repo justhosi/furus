@@ -43,39 +43,60 @@
 //!   table, [`wait_for_partitions`](wipe::wait_for_partitions) polls
 //!   sysfs for the expected partition nodes within
 //!   [`PARTITION_POLL_TIMEOUT`](wipe::PARTITION_POLL_TIMEOUT).
+//! * [`adapter`] — the S17 write adapters: [`SinkTarget`](adapter::SinkTarget)
+//!   (core `Target` over a block `Sink`), [`SinkVolume`](adapter::SinkVolume)
+//!   (the partition window over the same open handle — a second `O_EXCL`
+//!   claim on one disk fails, so the partition never re-opens), plus the
+//!   [`DeviceOpener`](adapter::DeviceOpener) and [`FileOpener`](adapter::FileOpener)
+//!   store suppliers with the release/reopen protocol the external
+//!   formatters need.
+//!
+//! * [`signal`] — the S17 Ctrl-C flag: [`Cancel`](signal::Cancel)
+//!   owns a per-run flag plus the process-global SIGINT arrival bit,
+//!   with exactly one async-signal-safe handler install.
 //!
 //! The crate is dependency-light by design (rustix for syscalls, serde
 //! for the model, `rufus-core` for errors): no libudev, no async, no
 //! subprocesses — see PLAN §4/§5. The single exception is `libc`, and
 //! only for the S07 ioctl shim above (rustix wraps nothing else the
-//! block layer needs).
+//! block layer needs) plus the S17 SIGINT install (one `signal` call).
 
-// Unsafe policy (S07): the workspace lint is `deny` and this crate
-// inherits it; the single `#[allow(unsafe_code)]` of the whole tree
-// lives on the `ioctl_raw` shim inside `crate::ioctl` (see that module
-// header for what is allowed and why). There must be no second unsafe
-// use anywhere — the other crates still carry crate-level
-// `#![forbid(unsafe_code)]`.
+// Unsafe policy (S07, extended S17): the workspace lint is `deny` and
+// this crate inherits it; exactly two `#[allow(unsafe_code)]` sites
+// exist in the whole tree — the `ioctl_raw` shim inside `crate::ioctl`
+// (see that module header for what is allowed and why) and the SIGINT
+// install inside `crate::signal` (see that module charter). There must
+// be no third unsafe use anywhere — the other crates still carry
+// crate-level `#![forbid(unsafe_code)]`.
 
+pub mod adapter;
 pub mod block;
 pub mod inspect;
 mod ioctl;
 pub mod model;
 pub mod mounts;
+pub mod signal;
 pub mod sysfs;
 pub mod udev_db;
 pub mod watch;
 pub mod wipe;
 
+pub use adapter::DeviceOpener;
+pub use adapter::FileOpener;
+pub use adapter::FileTarget;
+pub use adapter::SinkTarget;
+pub use adapter::SinkVolume;
 pub use block::{AlignedBuf, BlockDevice, MemorySink, Sink, SparseFile};
 pub use inspect::Inspected;
 pub use inspect::inspect;
+pub use inspect::partition_name;
 pub use model::Device;
 pub use model::Partition;
 pub use model::Transport;
 pub use mounts::MountEntry;
 pub use mounts::MountTable;
 pub use mounts::SwapEntry;
+pub use signal::Cancel;
 pub use sysfs::Filter;
 pub use sysfs::SysfsRoot;
 pub use sysfs::enumerate;

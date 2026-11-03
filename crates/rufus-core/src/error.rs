@@ -63,6 +63,20 @@ pub enum CoreError {
         /// What was wrong.
         message: String,
     },
+    /// The run was cancelled, at a step boundary or inside a step. No
+    /// source: cancellation carries no underlying failure, and the
+    /// `Display` text names no step — [`run`](crate::pipeline::run)
+    /// wraps it with the step that never ran or stopped early.
+    #[error("the write was cancelled")]
+    Cancelled,
+    /// A planned step has no implementation yet. The `what` names it in
+    /// plain words (it already names its own step, so unlike every
+    /// other step error it is never wrapped in [`Step`](Self::Step)).
+    #[error("not implemented yet: {what}")]
+    NotImplemented {
+        /// What is missing, e.g. `"bootloader installation (S19)"`.
+        what: &'static str,
+    },
     /// One pipeline step failed: the step name plus the underlying
     /// error, kept (not flattened) so exit mapping still sees an inner
     /// I/O failure through the wrapper.

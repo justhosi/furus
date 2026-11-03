@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use rufus_proto::Plan;
+use rufus_proto::Scheme;
+use rufus_proto::Step;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -672,34 +674,447 @@ fn plan_device_safety_exits_without_dry_run() {
 }
 
 // ---------------------------------------------------------------------------
-// write (validation + not-implemented)
+// write (real runs over the --device-file seam)
 // ---------------------------------------------------------------------------
 
+/// The plan JSON at `plan_json` (from `plan --dry-run`), resealed
+/// without its `Bootloader` step: no slice installs one yet, so the
+/// end-to-end plans drop it and re-seal the confirm hash through the
+/// typed `Plan` (never by string surgery).
+fn runnable_plan(dir: &std::path::Path, plan_json: &str, name: &str) -> PathBuf {
+    let mut plan: Plan = serde_json::from_str(plan_json).expect("plan parses");
+    plan.steps
+        .retain(|step| !matches!(step, rufus_proto::Step::Bootloader { .. }));
+    let recomputed = plan.confirm().expect("confirm recomputes");
+    plan.confirm = recomputed;
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        serde_json::to_string(&plan).expect("plan serialises"),
+    )
+    .expect("save plan");
+    path
+}
+
+/// A `len`-byte ISO-sniffed image (`CD001` at 0x8001 over a patterned
+/// body, so the planner picks `Dd` by content, not by name).
+fn raw_image(path: &std::path::Path, len: usize) -> Vec<u8> {
+    let mut bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    bytes[0x8001..0x8006].copy_from_slice(b"CD001");
+    std::fs::write(path, &bytes).expect("write image");
+    bytes
+}
+
+/// A `--device-file` seam of `len` bytes, prefilled with `fill` so
+/// assertions see what the run changed, not sparse zeros.
+fn seam(path: &std::path::Path, len: u64, fill: u8) -> PathBuf {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create seam");
+    file.set_len(len).expect("size seam");
+    std::fs::write(path, vec![fill; len as usize]).expect("fill seam");
+    path.to_path_buf()
+}
+
+/// A sparse (unfilled) seam of `len` bytes: instant to create, sized
+/// from its own length by the opener.
+fn sparse_seam(path: &std::path::Path, len: u64) -> PathBuf {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create seam");
+    file.set_len(len).expect("size seam");
+    path.to_path_buf()
+}
+
+/// Every stdout line of a `write --json` run parsed as JSON:
+/// stdout is pure JSONL (the failure object lives on stderr), so one
+/// unparsable line fails the test. Code plus kind only — no message
+/// text is matched.
+fn stdout_json(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each stdout line parses"))
+        .collect()
+}
+
 #[test]
-fn write_validates_then_refuses_with_exit_7() {
+fn write_runs_end_to_end_over_the_device_file_seam() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    // 32 KiB + 17 bytes: smaller than the 1 MiB partition base (the raw
+    // write at the target start leaves the formatted BPB intact) and
+    // unaligned (the sector tail past the image must zero).
+    let image = raw_image(&dir.path().join("image.iso"), 32 * 1024 + 17);
+    let seam_path = seam(&dir.path().join("stick.img"), 64 * 1024 * 1024, 0xAA);
+    let plan_out = plan_run(&dir.path().join("image.iso"), "/dev/null", true);
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let plan_file = runnable_plan(dir.path(), &plan_out.stdout, "plan.json");
+
+    let out = run(&[
+        "write",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "{:?}", out);
+    let got = std::fs::read(&seam_path).expect("read seam");
+    // The image bytes land at the target start.
+    assert_eq!(&got[..image.len()], &image[..]);
+    // The sector tail past the image zeroes (the prefill proves it).
+    let aligned = image.len().div_ceil(512) * 512;
+    assert!(got[image.len()..aligned].iter().all(|&byte| byte == 0));
+    // The FAT32 BPB the Mkfs step wrote survives at the 1 MiB base.
+    const BASE: usize = 1024 * 1024;
+    assert_eq!(&got[BASE + 82..BASE + 90], b"FAT32   ");
+    // Human progress shows a percentage line and leaks no `Option`.
+    assert!(out.stderr.contains('%'), "{}", out.stderr);
+    assert!(out.stderr.contains("bytes"), "{}", out.stderr);
+    assert!(!out.stderr.contains("Some("), "{}", out.stderr);
+    assert!(!out.stderr.contains("None"), "{}", out.stderr);
+}
+
+#[test]
+fn write_json_streams_one_object_per_line() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    raw_image(&dir.path().join("image.iso"), 32 * 1024 + 17);
+    let seam_path = seam(&dir.path().join("stick.img"), 64 * 1024 * 1024, 0xAA);
+    let plan_out = plan_run(&dir.path().join("image.iso"), "/dev/null", true);
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let plan_file = runnable_plan(dir.path(), &plan_out.stdout, "plan.json");
+
+    let out = run(&[
+        "write",
+        "--json",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "{:?}", out);
+    // Every line is one well-formed JSON object, no wrapper.
+    let values: Vec<serde_json::Value> = out
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line parses"))
+        .collect();
+    assert!(
+        values.len() >= 8,
+        "event per step plus progress: {values:?}"
+    );
+    let kinds: Vec<&str> = values
+        .iter()
+        .map(|value| value["event"].as_str().expect("event tag"))
+        .collect();
+    assert_eq!(kinds[0], "step_started");
+    assert_eq!(*kinds.last().expect("a final event"), "finished");
+    // The six steps start in plan order, each finishes, progress flows.
+    let started: Vec<&str> = values
+        .iter()
+        .filter(|value| value["event"] == "step_started")
+        .map(|value| value["step"].as_str().expect("step name"))
+        .collect();
+    assert_eq!(
+        started,
+        ["wipe", "mklabel", "mkpart", "mkfs", "write", "finalize"]
+    );
+    for step in started {
+        assert!(
+            values
+                .iter()
+                .any(|value| value["event"] == "step_finished" && value["step"] == step),
+            "no finish for {step}"
+        );
+    }
+    assert!(kinds.contains(&"progress"), "no throughput samples");
+}
+
+#[test]
+fn write_sigint_cancels_with_exit_6() {
+    use std::io::BufRead as _;
+
+    let dir = tempfile::tempdir().expect("scratch dir");
+    // 192 MiB of sparse zeros (`.iso` so the planner picks `Dd`): a
+    // full-surface format plus this much streaming keeps the run alive
+    // for hundreds of milliseconds — long enough to catch mid-run, far
+    // below tmpfs pressure.
+    let image_path = dir.path().join("big.iso");
+    let image = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&image_path)
+        .expect("create image");
+    image.set_len(192 * 1024 * 1024).expect("size image");
+    drop(image);
+    let seam_path = sparse_seam(&dir.path().join("stick.img"), 256 * 1024 * 1024);
+    let plan_out = plan_run(&image_path, "/dev/null", true);
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let plan_file = runnable_plan(dir.path(), &plan_out.stdout, "plan.json");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rufus"))
+        .args([
+            "write",
+            "--json",
+            "--plan",
+            plan_file.to_str().expect("path"),
+            "--device-file",
+            seam_path.to_str().expect("path"),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rufus");
+    let pid = child.id();
+    // The first event proves the run started — and the SIGINT handler
+    // installs before any event — so every signal below lands mid-run
+    // by construction, never before the install.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    let first = lines
+        .next()
+        .expect("first event arrives")
+        .expect("readable first event");
+    assert!(first.contains("step_started"), "{first}");
+    let mut waited = 0;
+    while child.try_wait().expect("poll child").is_none() {
+        let _ = Command::new("sh")
+            .args(["-c", &format!("kill -INT {pid}")])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        waited += 1;
+        assert!(waited < 400, "the run should cancel within 10 s");
+    }
+    // Drain the event pipe, then reap: the code is the verdict. The
+    // pipe holds events only — the failure object went to stderr, so
+    // every line here must parse.
+    let mut events = vec![first];
+    for line in lines.by_ref() {
+        events.push(line.expect("readable event"));
+    }
+    let status = child.wait().expect("reap child");
+    assert_eq!(status.code(), Some(6), "SIGINT cancels the run");
+    for line in &events {
+        serde_json::from_str::<serde_json::Value>(line).expect("each stdout line parses");
+    }
+    // The cancellation is one compact JSON object on stderr.
+    let mut err_text = String::new();
+    std::io::Read::read_to_string(
+        &mut child.stderr.take().expect("piped stderr"),
+        &mut err_text,
+    )
+    .expect("readable stderr");
+    let error: serde_json::Value =
+        serde_json::from_str(err_text.trim()).expect("stderr error parses");
+    assert_eq!(error["error"], "cancelled");
+}
+
+#[test]
+fn write_bootloader_maps_to_exit_7() {
+    // The full plan keeps its `Bootloader` step here (no stripping):
+    // the pipeline refuses it by name without touching the device.
     let dir = tempfile::tempdir().expect("scratch dir");
     let iso = fixture(&dir.path().join("fixture.iso"));
     let plan_out = plan_run(&iso, "/dev/null", true);
     assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
     let plan_file = dir.path().join("plan.json");
     std::fs::write(&plan_file, &plan_out.stdout).expect("save plan");
+    let seam_path = sparse_seam(&dir.path().join("stick.img"), 64 * 1024 * 1024);
 
-    // A verifying plan reaches the honest not-implemented stub.
-    let out = run(&["write", "--plan", plan_file.to_str().expect("path")]);
-    assert_eq!(out.code, 7, "{:?}", out);
-    assert!(out.stderr.contains("not implemented"), "{}", out.stderr);
-
-    // Exit 7 keeps its {"error","slice"} object in --json mode.
+    // Code plus kind only — no message-text matching. The run emits
+    // its `step_started` events on stdout first; the compact error
+    // object the pipeline refusal maps to goes to stderr, so stdout
+    // stays pure JSONL.
     let out = run(&[
         "write",
         "--json",
         "--plan",
         plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
     ]);
-    assert_eq!(out.code, 7);
-    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
-    assert_eq!(value["error"], "not_implemented");
-    assert_eq!(value["slice"], "S06/S17");
+    assert_eq!(out.code, 7, "{:?}", out);
+    let values = stdout_json(&out.stdout);
+    // The refused step announces itself before refusing: one
+    // `step_started` names `bootloader` (the earlier steps ran first).
+    let announced = values
+        .iter()
+        .any(|value| value["event"] == "step_started" && value["step"] == "bootloader");
+    assert!(announced, "bootloader step started: {values:?}");
+    let error: serde_json::Value =
+        serde_json::from_str(out.stderr.trim()).expect("stderr error parses");
+    assert_eq!(error["error"], "not_implemented");
+}
+
+#[test]
+fn write_too_small_device_file_names_sizes() {
+    // 64 MiB of device, 96 MiB of image: every step before the write
+    // fits, then the write refuses before moving a byte. Validation, so
+    // exit 1 — with both sizes named.
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let image_path = dir.path().join("image.iso");
+    let image = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&image_path)
+        .expect("create image");
+    image.set_len(96 * 1024 * 1024).expect("size image");
+    drop(image);
+    let seam_path = sparse_seam(&dir.path().join("stick.img"), 64 * 1024 * 1024);
+    let plan_out = plan_run(&image_path, "/dev/null", true);
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let plan_file = runnable_plan(dir.path(), &plan_out.stdout, "plan.json");
+
+    let out = run(&[
+        "write",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 1, "{:?}", out);
+    assert!(out.stderr.contains("100663296"), "{}", out.stderr);
+    assert!(out.stderr.contains("67108864"), "{}", out.stderr);
+}
+
+/// Reseal `plan` after a test-only mutation (options or steps):
+/// recompute the confirm hash through the typed `Plan`, never by
+/// string surgery, and save it as `name` under `dir`.
+fn resealed_plan(dir: &std::path::Path, plan: &Plan, name: &str) -> PathBuf {
+    let mut plan = plan.clone();
+    let recomputed = plan.confirm().expect("confirm recomputes");
+    plan.confirm = recomputed;
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        serde_json::to_string(&plan).expect("plan serialises"),
+    )
+    .expect("save plan");
+    path
+}
+
+#[test]
+fn write_derives_partition_table_from_steps_not_options() {
+    use rufus_core::part::TableKind;
+    use rufus_core::part::plan::single_data_window;
+
+    let dir = tempfile::tempdir().expect("scratch dir");
+    raw_image(&dir.path().join("image.iso"), 32 * 1024 + 17);
+    let plan_out = plan_run(&dir.path().join("image.iso"), "/dev/null", true);
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    // The planner emits mbr throughout: steps and options agree here.
+    // The bootloader step is dropped like `runnable_plan` drops it: no
+    // slice installs one, and these runs pin the table derivation.
+    let mut plan: Plan = serde_json::from_str(&plan_out.stdout).expect("plan parses");
+    assert_eq!(plan.options.scheme, Scheme::Mbr);
+    plan.steps
+        .retain(|step| !matches!(step, Step::Bootloader { .. }));
+
+    // options=gpt against mbr steps: the opener follows the steps, so
+    // the run succeeds and the BPB lands at the stamped mbr window —
+    // not 33 sectors short of it.
+    let mut flipped = plan.clone();
+    flipped.options.scheme = Scheme::Gpt;
+    let plan_file = resealed_plan(dir.path(), &flipped, "flipped.json");
+    let seam_path = seam(&dir.path().join("mbr.img"), 64 * 1024 * 1024, 0xAA);
+    let out = run(&[
+        "write",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "{:?}", out);
+    let (offset, _) =
+        single_data_window(TableKind::Mbr, 512, 64 * 1024 * 1024).expect("mbr window plans");
+    let got = std::fs::read(&seam_path).expect("read seam");
+    let win_base = offset as usize;
+    assert_eq!(&got[win_base + 82..win_base + 90], b"FAT32   ");
+
+    // options=mbr against gpt steps: the opener follows the steps, so
+    // the window matches the stamped gpt partition and the backup GPT
+    // header the run wrote survives the format.
+    let mut gpt_steps = plan.clone();
+    for step in &mut gpt_steps.steps {
+        match step {
+            Step::Mklabel { scheme } | Step::Mkpart { scheme } => *scheme = Scheme::Gpt,
+            _ => {}
+        }
+    }
+    assert_eq!(gpt_steps.options.scheme, Scheme::Mbr);
+    let plan_file = resealed_plan(dir.path(), &gpt_steps, "gpt.json");
+    let seam_path = seam(&dir.path().join("gpt.img"), 64 * 1024 * 1024, 0xAA);
+    let out = run(&[
+        "write",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "{:?}", out);
+    let (offset, _) =
+        single_data_window(TableKind::Gpt, 512, 64 * 1024 * 1024).expect("gpt window plans");
+    let got = std::fs::read(&seam_path).expect("read seam");
+    let win_base = offset as usize;
+    assert_eq!(&got[win_base + 82..win_base + 90], b"FAT32   ");
+    const LAST_LBA: usize = (64 * 1024 * 1024) / 512 - 1;
+    assert_eq!(
+        &got[LAST_LBA * 512..LAST_LBA * 512 + 8],
+        b"EFI PART",
+        "the backup GPT header survives the format"
+    );
+}
+
+#[test]
+fn write_refuses_steps_that_disagree_on_scheme() {
+    // Mklabel mbr against Mkpart gpt: the plan contradicts itself, so
+    // `write` refuses before touching the device — exit 1, kind
+    // `invalid_plan` on stderr, and the prefilled seam is untouched.
+    let dir = tempfile::tempdir().expect("scratch dir");
+    raw_image(&dir.path().join("image.iso"), 32 * 1024 + 17);
+    let plan_out = plan_run(&dir.path().join("image.iso"), "/dev/null", true);
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let mut plan: Plan = serde_json::from_str(&plan_out.stdout).expect("plan parses");
+    plan.steps
+        .retain(|step| !matches!(step, Step::Bootloader { .. }));
+    let mut saw_part = false;
+    for step in &mut plan.steps {
+        if let Step::Mkpart { scheme } = step {
+            *scheme = Scheme::Gpt;
+            saw_part = true;
+        }
+    }
+    assert!(saw_part, "the plan carries an mkpart step");
+    let plan_file = resealed_plan(dir.path(), &plan, "split.json");
+    let seam_path = seam(&dir.path().join("stick.img"), 64 * 1024 * 1024, 0xAA);
+
+    let out = run(&[
+        "write",
+        "--json",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 1, "{:?}", out);
+    assert!(out.stdout.is_empty(), "nothing streams: {:?}", out.stdout);
+    let error: serde_json::Value =
+        serde_json::from_str(out.stderr.trim()).expect("stderr error parses");
+    assert_eq!(error["error"], "invalid_plan");
+    let message = error["message"].as_str().expect("message text");
+    assert!(message.contains("mbr"), "{message}");
+    assert!(message.contains("gpt"), "{message}");
+    let got = std::fs::read(&seam_path).expect("read seam");
+    assert!(
+        got[..16].iter().all(|&byte| byte == 0xAA),
+        "no wipe ran before the refusal"
+    );
 }
 
 #[test]
@@ -723,7 +1138,10 @@ fn write_refuses_tampered_plans() {
     );
     let out = run(&["write", "--json", "--plan", file.to_str().expect("path")]);
     assert_eq!(out.code, 1);
-    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    // `write --json` failures report on stderr (stdout stays empty),
+    // as one compact JSON line.
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    let value: serde_json::Value = serde_json::from_str(out.stderr.trim()).expect("json");
     assert_eq!(value["error"], "confirm_mismatch");
 
     // 2) version bump on the wire -> unsupported, exit 1 (before confirm).
@@ -742,14 +1160,16 @@ fn write_refuses_tampered_plans() {
     std::fs::write(&junk, "{not json").expect("save junk");
     let out = run(&["write", "--json", "--plan", junk.to_str().expect("path")]);
     assert_eq!(out.code, 1, "{:?}", out);
-    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    let value: serde_json::Value = serde_json::from_str(out.stderr.trim()).expect("json");
     assert_eq!(value["error"], "invalid_plan");
 
     // 4) missing plan file -> io, exit 4.
     let missing = dir.path().join("absent.json");
     let out = run(&["write", "--json", "--plan", missing.to_str().expect("path")]);
     assert_eq!(out.code, 4, "{:?}", out);
-    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    let value: serde_json::Value = serde_json::from_str(out.stderr.trim()).expect("json");
     assert_eq!(value["error"], "io");
 }
 

@@ -8,8 +8,9 @@ publish.workspace = true
 # S04 (PLAN §4): safe syscalls for the watcher (inotify, poll) — no libc,
 # no unsafe, no subprocesses.
 # S07 adds `libc` on top, but only `src/ioctl.rs` (the module doc there
-# is the policy: exactly four block ioctls rustix does not wrap) may sit
-# under its umbrella; everything else stays on rustix.
+# is the policy: exactly four block ioctls rustix does not wrap) and
+# `src/signal.rs` (one SIGINT handler install, see that module charter)
+# may sit under its umbrella; everything else stays on rustix.
 rustix = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
@@ -19,6 +20,7 @@ rufus-core = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
-# Inherit the workspace-wide `unsafe_code = "deny"`; the single
-# `#[allow(unsafe_code)]` of the workspace lives in src/ioctl.rs.
+# Inherit the workspace-wide `unsafe_code = "deny"`; the two
+# `#[allow(unsafe_code)]` sites of the workspace live in src/ioctl.rs
+# (the raw ioctl shim) and src/signal.rs (the SIGINT install).
 workspace = true

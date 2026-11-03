@@ -22,8 +22,6 @@ use rufus_proto::Scheme;
 use crate::error::CoreError;
 use crate::error::Result;
 use crate::part::plan;
-use crate::part::plan::DataType;
-use crate::part::plan::LayoutKind;
 use crate::part::plan::PlanRequest;
 use crate::pipeline::event::Event;
 use crate::pipeline::steps::RunContext;
@@ -47,27 +45,12 @@ pub(crate) fn run(ctx: &mut RunContext<'_>, scheme: &Scheme) -> Result<()> {
     }
     let size = ctx.device()?.size();
     let sector_size = ctx.device()?.sector_size();
-    let sectors = size.checked_div(u64::from(sector_size)).ok_or_else(|| {
-        CoreError::invalid(format!(
-            "target of {size} bytes has sector size {sector_size}: refusing a zero sector size"
-        ))
-    })?;
-    if sectors == 0 {
-        return Err(CoreError::invalid(format!(
-            "target of {size} bytes is smaller than one {sector_size} byte sector"
-        )));
-    }
-    let request = PlanRequest {
-        kind: LayoutKind::Single,
-        table: kind,
-        sector_size,
-        last_lba: sectors - 1,
-        data_type: DataType::MicrosoftBasicData,
-        esp_bytes: 0,
-        persistence_bytes: 0,
-    };
+    // The request the platform opener re-derives for its partition
+    // window (see `single_data_window`): one constructor, so the
+    // stamped table and the formatted window cannot disagree.
+    let request: PlanRequest = plan::single_request(kind, sector_size, size)?;
     let table_plan = plan::plan(&request)?;
-    let rendered = plan::render(&table_plan, sector_size, sectors - 1)?;
+    let rendered = plan::render(&table_plan, sector_size, request.last_lba)?;
     let total = rendered.byte_len();
     let mut placed: u64 = 0;
     for write in rendered.writes.iter() {
@@ -91,7 +74,7 @@ pub(crate) fn run(ctx: &mut RunContext<'_>, scheme: &Scheme) -> Result<()> {
             cancelled,
         )?;
         if written != write.bytes.len() as u64 {
-            return Err(CoreError::invalid("the write was cancelled"));
+            return Err(CoreError::Cancelled);
         }
         placed = placed.saturating_add(written);
         ctx.reporter.event(Event::Progress {

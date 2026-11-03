@@ -14,6 +14,13 @@
 //! layout) mapped onto [`CoreError`] refusals that name their numbers.
 //! `0x140010830` bounds a fill buffer at 64 KiB sectors and 1 GiB total;
 //! sparse and compressed writing are slices 5 and 6, not this one.
+//!
+//! Trust boundary: the image path comes from the plan, and it names
+//! whatever the planner was pointed at — a regular file, a FIFO, or a
+//! device node. The CLI inspects (size, hash) the path before planning
+//! and the loop re-checks the length at open, but a swapped or
+//! streaming source between those checks is outside what this step can
+//! see; the read-back verify pass (slice 7) is what catches it.
 
 use std::fs::File;
 use std::io::Read;
@@ -53,9 +60,9 @@ pub(crate) fn run(
 ) -> Result<()> {
     match mode {
         WriteMode::Dd => raw::run(ctx, image, verify),
-        WriteMode::Copy => Err(CoreError::invalid(
-            "write mode 'copy' is not implemented yet: file-tree copying arrives in slice 18",
-        )),
+        WriteMode::Copy => Err(CoreError::NotImplemented {
+            what: "write mode 'copy' (file-tree copying arrives in slice 18)",
+        }),
     }
 }
 
@@ -167,6 +174,18 @@ mod raw {
                 text: warning,
             });
         }
+        if len == 0 {
+            // An empty image still reports itself: without this the run
+            // emits no Progress at all and a consumer cannot tell "done
+            // instantly" from "never reported".
+            ctx.reporter.event(Event::Progress {
+                step: "write",
+                done: 0,
+                total: Some(0),
+                bytes_per_second: 0,
+                eta_seconds: None,
+            });
+        }
         let mut buf = vec![0u8; super::CHUNK];
         let mut done = 0u64;
         let mut ema = RateEma::new();
@@ -185,13 +204,21 @@ mod raw {
             let written =
                 ctx.device()?
                     .write_all_at_cancellable(done, chunk, super::CHUNK, cancelled)?;
-            if written != want as u64 {
+            if written < want as u64 {
                 // The contract reads a short count as cancellation: a
                 // target that reports full while swallowing bytes cannot
                 // be detected here, which is why the verify pass
                 // (slice 7) exists. This is the honest form of Rufus's
                 // `Wrote %d bytes, expected %d bytes` check.
-                return Err(CoreError::invalid("the write was cancelled"));
+                return Err(CoreError::Cancelled);
+            }
+            if written > want as u64 {
+                // Impossible by contract (no more than the chunk went
+                // in): a target that claims otherwise is faulty, not
+                // cancelled, so it refuses by name with both numbers.
+                return Err(CoreError::invalid(format!(
+                    "target reported {written} bytes written for a {want} byte chunk at offset {done}: refusing an impossible count"
+                )));
             }
             done = done.saturating_add(written);
             ema.observe(want as u64, chunk_started.elapsed());

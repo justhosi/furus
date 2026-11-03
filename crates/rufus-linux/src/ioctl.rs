@@ -50,13 +50,15 @@ const BLKRRPART: libc::c_ulong = 0x125F;
 /// `BLKFLSBUF` — `_IO(0x12, 97)`: flush the device's in-kernel buffers.
 const BLKFLSBUF: libc::c_ulong = 0x1261;
 
-/// The raw `ioctl(2)` shim and the only unsafe block in the workspace.
+/// The raw `ioctl(2)` shim and one of the two unsafe blocks in the
+/// workspace (the other is the SIGINT install in `crate::signal`).
 ///
-/// The single `#[allow(unsafe_code)]` of the tree lives *here* — on
-/// this one function — and nowhere else: the workspace lint is
-/// `deny`, every other module inherits it, and the module charter
-/// above describes exactly what this body may do (one `ioctl` call,
-/// four requests, caller-owned stack arguments).
+/// One of the two `#[allow(unsafe_code)]` sites of the tree lives
+/// *here* — on this one function — and nowhere else besides
+/// `crate::signal`: the workspace lint is `deny`, every other module
+/// inherits it, and the module charter above describes exactly what
+/// this body may do (one `ioctl` call, four requests, caller-owned
+/// stack arguments).
 #[allow(unsafe_code)]
 fn ioctl_raw(fd: RawFd, request: libc::c_ulong, arg: *mut libc::c_void) -> io::Result<()> {
     // SAFETY: one variadic `ioctl(2)` call; the file descriptor is

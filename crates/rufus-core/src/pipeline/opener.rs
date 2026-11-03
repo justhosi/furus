@@ -28,4 +28,19 @@ pub trait Opener {
     /// created it, and a test hands out a scratch file. `Result`
     /// because the partition may not be openable yet.
     fn partition_path(&self) -> Result<std::path::PathBuf>;
+
+    /// Give up the whole-disk handle opened so far, if any: flush it,
+    /// close it, and forget it so the next [`device`](Opener::device)
+    /// reopens from scratch. The tool-based `Mkfs` arms call this
+    /// through
+    /// [`RunContext::release_device`](super::steps::RunContext::release_device)
+    /// immediately before [`partition_path`](Opener::partition_path):
+    /// the external formatters want their own exclusive claim on the
+    /// partition node, and on a real device that claim conflicts with
+    /// the pipeline's open whole-disk handle. Test openers keep the
+    /// default no-op; forgetting is observable through a reordered
+    /// open, never through lost bytes (everything is flushed first).
+    fn release(&self) -> Result<()> {
+        Ok(())
+    }
 }

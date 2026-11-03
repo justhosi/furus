@@ -1,16 +1,14 @@
-//! The S17 write pipeline (slice 1 of 10): the step machine that turns
-//! a [`Plan`] into block I/O with progress,
-//! cancellation and an honest refusal contract.
+//! The S17 write pipeline: the step machine that turns a [`Plan`]
+//! into block I/O with progress, cancellation and an honest refusal
+//! contract.
 //!
 //! The machine walks `plan.steps` in order through [`run`], emitting
-//! [`Event`]s to a [`Reporter`] and timing every step. Step coverage
-//! this slice is [`Finalize`](rufus_proto::Step::Finalize) only; every
-//! other step refuses by name (see [`run`]). Later slices fill the
-//! machine without changing its shape:
-//!
-//! * slice 2: wipe, mklabel, mkpart, mkfs;
-//! * slice 3: write (and with it mid-step cancellation);
-//! * S19: bootloader.
+//! [`Event`]s to a [`Reporter`] and timing every step. Five of the
+//! seven steps run: wipe, mklabel, mkpart, mkfs and finalize, plus the
+//! [`Dd`](rufus_proto::WriteMode::Dd) write path. Two refuse by name:
+//! [`Bootloader`](rufus_proto::Step::Bootloader) (no installer until
+//! S19) and [`Copy`](rufus_proto::WriteMode::Copy) (file-tree copying
+//! arrives in slice 18).
 //!
 //! [`step_name`] is the one shared snake_case vocabulary for step
 //! identifiers, so the CLI and the machine cannot drift apart.
@@ -45,7 +43,8 @@ use crate::log::Logger;
 /// (surface scan, slice 9) are carried now and honoured then; passing
 /// them today keeps the CLI signature stable. Accepted without acting.
 /// The format label does not live here: it comes from the plan step,
-/// and image-derived label defaults are slice 4's job.
+/// and image-derived label defaults stay future work (the formatter
+/// default applies).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunOptions {
     /// Read back and verify the written image (honoured from slice 7).
@@ -98,8 +97,10 @@ pub fn step_name(step: &Step) -> &'static str {
 }
 
 /// Run one step through the run context: wipe, label, partition,
-/// filesystem and write stages live in their own modules; later slices
-/// add arms here without touching [`run`].
+/// filesystem and write stages live in their own modules; the
+/// bootloader arm refuses until S19. The match is exhaustive, so a new
+/// [`Step`] variant fails to compile here (and in [`step_name`]) until
+/// it is handled.
 fn run_step(
     plan: &Plan,
     step: &Step,
@@ -117,6 +118,9 @@ fn run_step(
             quick,
         } => mkfs::run(ctx, filesystem, label, cluster_bytes, *quick),
         Step::Write { mode } => write::run(ctx, mode, &plan.image, options.verify),
+        Step::Bootloader { .. } => Err(CoreError::NotImplemented {
+            what: "bootloader installation (S19)",
+        }),
         Step::Finalize => {
             let size = ctx.device()?.size();
             ctx.device()?.flush()?;
@@ -127,30 +131,24 @@ fn run_step(
             });
             Ok(())
         }
-        other => Err(CoreError::invalid(format!(
-            "pipeline step '{}' is not implemented yet",
-            step_name(other)
-        ))),
     }
 }
-
-/// Run `plan.steps` in order against `opener`'s stores, reporting to
-/// `reporter`.
 ///
 /// Per step the machine emits [`Event::StepStarted`], runs the step,
 /// emits [`Event::StepFinished`] and records a [`StepTiming`]; a clean
 /// run ends with [`Event::Finished`] and a [`RunReport`]. Cancellation
-/// is checked at every step boundary and reports
-/// `CoreError::invalid("the write was cancelled before step '<name>'")`
-/// with the step named; mid-step cancellation (at most 200 ms between
-/// checks) arrives with the write loop in slice 3, the only
-/// long-running step. Refusing is the honest contract throughout: an
-/// unimplemented step errors by name rather than silently skipping, so
-/// no plan can ship a half-written stick, and unknown/future plan steps
-/// refuse at parse time (serde) rather than guessing here. Flush
-/// policy: only `Finalize` flushes today, so a plan whose later step
-/// fails is not flushed afterwards; the write step will flush before
-/// reporting its own failure from slice 3.
+/// is checked at every step boundary; a boundary hit refuses wrapped in
+/// [`Step`](CoreError::Step) like every in-run error, so the pending
+/// step is named. Mid-step cancellation is checked between chunks in
+/// the only long-running steps (the write loop, the full-format zero
+/// pass). Refusing is the honest contract throughout: an unimplemented
+/// step errors by name rather than silently skipping, so no plan can
+/// ship a half-written stick, and unknown/future plan steps refuse at
+/// parse time (serde) rather than guessing here. Flush policy: write,
+/// mkpart and finalize flush before reporting `Ok` (the native
+/// formatters flush their volume too); wipe deliberately does not —
+/// `Finalize` owns the run's flush there. A step that fails leaves its
+/// buffers unflushed, and no later step flushes on its behalf.
 pub fn run(
     plan: &Plan,
     opener: &dyn Opener,
@@ -173,10 +171,12 @@ pub fn run(
     let mut steps = Vec::new();
     for (index, step) in plan.steps.iter().enumerate() {
         if (ctx.cancelled)() {
-            return Err(CoreError::invalid(format!(
-                "the write was cancelled before step '{}'",
-                step_name(step)
-            )));
+            // Wrapped like every in-run error below, so the step that
+            // never started is named too.
+            return Err(CoreError::Step {
+                step: step_name(step),
+                source: Box::new(CoreError::Cancelled),
+            });
         }
         ctx.reporter.event(Event::StepStarted {
             index,
@@ -184,11 +184,16 @@ pub fn run(
             step: step_name(step),
         });
         let step_started = Instant::now();
-        // Every step error carries its step: the JSONL consumer can
-        // otherwise only infer it from the last `step_started`.
-        run_step(plan, step, &mut ctx, options).map_err(|error| CoreError::Step {
-            step: step_name(step),
-            source: Box::new(error),
+        // Every step error carries its step — except `NotImplemented`,
+        // whose `what` already names the step (wrapping it would
+        // stutter): the JSONL consumer can otherwise only infer the
+        // step from the last `step_started`.
+        run_step(plan, step, &mut ctx, options).map_err(|error| match error {
+            CoreError::NotImplemented { .. } => error,
+            other => CoreError::Step {
+                step: step_name(step),
+                source: Box::new(other),
+            },
         })?;
         let millis = step_started.elapsed().as_millis() as u64;
         ctx.reporter.event(Event::StepFinished {
@@ -541,6 +546,79 @@ mod tests {
         target: ShortTarget,
     }
 
+    /// A [`Target`] reporting one byte *more* than every cancellable
+    /// write moved: the impossible count behind the over-count refusal,
+    /// delegating everything else to an inner [`VecTarget`].
+    #[derive(Debug, Clone)]
+    struct OverTarget {
+        inner: VecTarget,
+    }
+
+    impl Target for OverTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            let done = self
+                .inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)?;
+            Ok(done.saturating_add(1))
+        }
+
+        fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
+            self.inner.zero_range(offset, len)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`OverTarget`].
+    #[derive(Debug, Clone)]
+    struct OverOpener {
+        target: OverTarget,
+    }
+
+    impl Opener for OverOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
     impl Opener for ShortOpener {
         fn device(&self) -> Result<Box<dyn Target>> {
             Ok(Box::new(self.target.clone()))
@@ -803,6 +881,61 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("cancelled"), "{text}");
         assert!(text.contains("write"), "{text}");
+    }
+
+    #[test]
+    fn over_count_write_is_refused_as_impossible() {
+        // The faulty target reports one byte more than the chunk holds:
+        // that is a broken target, not a cancellation, so the run
+        // refuses naming both numbers.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = OverOpener {
+            target: OverTarget {
+                inner: VecTarget::new(8 * MIB, 512).expect("fixture target fits"),
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an over count refuses");
+        assert!(
+            matches!(error, CoreError::Step { .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("1025"), "{text}");
+        assert!(text.contains("1024"), "{text}");
+        assert!(text.contains("write"), "{text}");
+    }
+
+    #[test]
+    fn empty_image_emits_one_zero_progress() {
+        // A zero-byte image has no chunks to report, but the run still
+        // emits exactly one `done: 0, total: Some(0)` progress event —
+        // "done instantly" must be distinguishable from "never
+        // reported".
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let (path, size) = image_file(&scratch, "empty.bin", &[]);
+        assert_eq!(size, 0);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("an empty image writes nothing and succeeds");
+        let progress = progresses(&reporter);
+        assert_eq!(progress, [(0, Some(0))]);
     }
 
     #[test]

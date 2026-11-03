@@ -1,9 +1,11 @@
 //! The mkfs step: format the stamped data partition.
 //!
 //! The partition must exist: without a prior `Mkpart` the step refuses
-//! by name before opening anything. The open happens once through
-//! [`Opener::partition`](crate::pipeline::opener::Opener::partition)
-//! and the box is kept for the whole step.
+//! by name before opening anything. The native engines open one
+//! partition view each and drop it before returning; the tool-based
+//! engines (NTFS, ext2/3/4, UDF) release the whole-disk handle first
+//! (see [`RunContext::release_device`](super::steps::RunContext::release_device))
+//! so the external formatter can claim the partition node itself.
 //!
 //! `quick == false` is a full surface format (the Rufus "quick format"
 //! distinction): the partition zeroes first, in cancellable 1 MiB
@@ -106,8 +108,12 @@ pub(crate) fn run(
         ));
     }
     check_cancelled(ctx)?;
-    let mut partition = ctx.opener.partition()?;
+    // The partition view lives only inside this block: the tool-based
+    // arms below must hold no open handle (not even a window view over
+    // the shared device) when the external formatter claims the node,
+    // so the box is dropped before they run.
     if !quick {
+        let mut partition = ctx.opener.partition()?;
         ctx.reporter.event(Event::Message {
             level: "info",
             text: format!(
@@ -120,6 +126,7 @@ pub(crate) fn run(
     check_cancelled(ctx)?;
     match filesystem {
         Filesystem::Fat32 => {
+            let mut partition = ctx.opener.partition()?;
             let options = fat32::format::FormatOptions {
                 label: label.as_deref(),
                 volume_id: fresh_serial("fat32")?,
@@ -129,6 +136,7 @@ pub(crate) fn run(
             Ok(())
         }
         Filesystem::Exfat => {
+            let mut partition = ctx.opener.partition()?;
             let mut options = exfat::format::FormatOptions::new(fresh_serial("exfat")?);
             options.label = label.clone();
             options.cluster_bytes = *cluster_bytes;
@@ -140,15 +148,30 @@ pub(crate) fn run(
             if let Some(bytes) = cluster_bytes {
                 options = options.with_cluster_bytes(*bytes)?;
             }
+            // Release first: the tool wants its own exclusive claim on
+            // the partition node (see `release_device`).
+            ctx.release_device()?;
             format_with_tool(ctx, &|path, logger| {
                 ntfs::format(path, &options, logger)?;
                 Ok(())
             })
         }
-        Filesystem::Ext2 => format_ext(ctx, ext::Flavour::Ext2, label),
-        Filesystem::Ext3 => format_ext(ctx, ext::Flavour::Ext3, label),
-        Filesystem::Ext4 => format_ext(ctx, ext::Flavour::Ext4, label),
+        Filesystem::Ext2 => {
+            ctx.release_device()?;
+            format_ext(ctx, ext::Flavour::Ext2, label)
+        }
+        Filesystem::Ext3 => {
+            ctx.release_device()?;
+            format_ext(ctx, ext::Flavour::Ext3, label)
+        }
+        Filesystem::Ext4 => {
+            ctx.release_device()?;
+            format_ext(ctx, ext::Flavour::Ext4, label)
+        }
         Filesystem::Udf => {
+            // Read the sector size first (this opens the device when
+            // nothing has yet), then release before the tool claims the
+            // node — same protocol as the arms above.
             let block = match ctx.device()?.sector_size() {
                 512 => udf::BlockSize::Bytes512,
                 // 2048-byte blocks are the tool's largest: 4Kn media
@@ -164,6 +187,7 @@ pub(crate) fn run(
             if let Some(name) = label {
                 options = options.with_label(name.clone())?;
             }
+            ctx.release_device()?;
             format_with_tool(ctx, &|path, logger| {
                 udf::format(path, &options, logger)?;
                 Ok(())
