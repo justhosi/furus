@@ -47,10 +47,12 @@ impl DestDir {
     /// as a real directory (the resumed-copy policy — re-running into
     /// a partial destination picks up where it stopped), refuse
     /// anything else in the way (a file, a symlink, anything but a
-    /// directory: symlinks are never traversed, and a swap after the
-    /// check fails closed with the I/O error below). Parents already
-    /// exist: the walk creates top-down, so `create_dir_all` would
-    /// only mask a caller bug.
+    /// directory: symlinks are never traversed). This check-then-act
+    /// trusts the destination for the duration of the pass — a swap
+    /// after the check is out of scope here; an `openat`-per-component
+    /// walker is a later hardening item, not this slice. Parents
+    /// already exist: the walk creates top-down, so `create_dir_all`
+    /// would only mask a caller bug.
     pub fn create_dir(&self, path: &Path) -> Result<()> {
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::invalid(format!(
@@ -69,8 +71,9 @@ impl DestDir {
         }
     }
 
-    /// Create the file at `path`, refusing one that already exists (a
-    /// second copy over the first would silently merge trees).
+    /// Create the file at `path`, refusing one that already exists:
+    /// the first-creation half of the pair with [`replace_file`](DestDir::replace_file)
+    /// (a second copy over the first would silently merge trees).
     pub fn create_file(&self, path: &Path) -> Result<File> {
         OpenOptions::new()
             .write(true)

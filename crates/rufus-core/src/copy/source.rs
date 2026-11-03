@@ -406,6 +406,7 @@ mod tests {
                 directories: 2,
                 files: 2,
                 bytes: 13,
+                renamed: 0,
             }
         );
         assert_eq!(
@@ -421,6 +422,91 @@ mod tests {
                 .expect("B lists")
                 .count()
                 == 0
+        );
+    }
+
+    /// Second fixture image: root at 20 holding `DOC.;12` and
+    /// `SUB.;2` (multi-digit versions the reader does NOT strip — only
+    /// exact `;1` strips there — so the walk's own rules fire), `SUB.;2`
+    /// at 25 holding `F.TXT;1`, contents after. Synthetic layout only,
+    /// claims nothing about real mastering tools.
+    fn version_dot_fixture_bytes() -> Vec<u8> {
+        const SUB_SECTOR: u32 = 25;
+        const FILE_DOC_SECTOR: u32 = 26;
+        const FILE_F_SECTOR: u32 = 27;
+        let mut image = vec![0u8; IMAGE_SECTORS as usize * SECTOR_BYTES];
+        let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut image,
+            16,
+            &primary_sector("LABEL", ROOT_SECTOR, SECTOR_BYTES as u32),
+        );
+        put(&mut image, 17, &boot_sector());
+        put(&mut image, 18, &terminator_sector());
+        put(
+            &mut image,
+            ROOT_SECTOR,
+            &dir_sector(&[
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record(FILE_DOC_SECTOR, 3, 0, b"DOC.;12"),
+                encode_record(SUB_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"SUB.;2"),
+            ]),
+        );
+        put(
+            &mut image,
+            SUB_SECTOR,
+            &dir_sector(&[
+                encode_record(SUB_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(SUB_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record(FILE_F_SECTOR, 5, 0, b"F.TXT;1"),
+            ]),
+        );
+        put(&mut image, FILE_DOC_SECTOR, b"doc");
+        put(&mut image, FILE_F_SECTOR, b"data!");
+        image
+    }
+
+    #[test]
+    fn copies_versioned_and_dotted_iso_names_sanitised() {
+        // End to end through the reader: `DOC.;12` stores as `DOC`
+        // (version stripped past the reader's exact-`;1` rule, then
+        // the trailing dot trimmed) and `SUB.;2/` as `SUB`, with
+        // contents intact and both entries counted as renamed.
+        // `F.TXT;1` arrives pre-stripped by the reader, so the walk
+        // stores it unchanged.
+        let bytes = version_dot_fixture_bytes();
+        let total = bytes.len() as u64;
+        let mut volume = VecVolume::new(total, 512).expect("the fixture fits in RAM");
+        volume.write_all_at(0, &bytes).expect("the fixture writes");
+        let source = IsoSource::new(IsoReader::open(Box::new(volume)).expect("the fixture opens"));
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let summary = super::super::walk(
+            &source,
+            scratch.path(),
+            &super::super::CopyOptions { free_bytes: None },
+            &mut Sink,
+        )
+        .expect("the dotted tree copies");
+        assert_eq!(
+            summary,
+            super::super::Summary {
+                directories: 1,
+                files: 2,
+                bytes: 8,
+                renamed: 2,
+            }
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("DOC")).expect("stripped reads back"),
+            b"doc"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("SUB").join("F.TXT")).expect("nested reads back"),
+            b"data!"
         );
     }
 

@@ -46,6 +46,7 @@ pub use source::IsoSource;
 pub use source::Source;
 pub use source::UdfSource;
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
@@ -54,6 +55,7 @@ use std::path::PathBuf;
 
 use crate::error::CoreError;
 use crate::error::Result;
+use crate::text::device_text;
 
 /// Fixed copy buffer in bytes (128 KiB): every file streams through
 /// this one allocation, so even a huge file costs no more RAM.
@@ -81,13 +83,17 @@ pub struct CopyOptions {
 /// What one [`walk`] moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Summary {
-    /// Directories created under the destination (the destination
-    /// root itself pre-exists and is not counted).
+    /// Directories ensured under the destination (created or reused;
+    /// the destination root itself pre-exists and is not counted).
     pub directories: u64,
     /// Regular files written.
     pub files: u64,
     /// File payload bytes copied.
     pub bytes: u64,
+    /// Entries whose destination name differs from the source name:
+    /// any sanitising rule or collision suffix applied (see
+    /// [`walk`]).
+    pub renamed: u64,
 }
 
 /// Progress sink for [`walk`]: `done_bytes` of `total_bytes` copied
@@ -97,11 +103,33 @@ pub struct Summary {
 pub trait Progress {
     /// Report progress: `done_bytes` of `total_bytes` copied so far.
     fn report(&mut self, done_bytes: u64, total_bytes: u64);
+
+    /// Report a warning line (an over-long name the walk shortens,
+    /// today): the default body drops it, so the one-method trait
+    /// stays source-compatible for implementors that only meter
+    /// bytes. Warning texts are ASCII by construction (see the name
+    /// rules).
+    fn warn(&mut self, _text: &str) {}
 }
 
 /// Copy `source` under the existing directory `dest`: depth-first,
 /// children sorted by name bytes at every level, files streamed
 /// through one fixed buffer. Returns the [`Summary`] counts.
+///
+/// The copy merges, it does not mirror: entries already in the
+/// destination from an earlier, different tree persist as orphans,
+/// and an assigned name occupied by a directory or symlink refuses
+/// (a regular file is removed and rewritten — see the replacement
+/// policy above).
+///
+/// Destination names are sanitised per component (version suffixes,
+/// separators, trailing dots and spaces, length) and de-collided per
+/// directory (case-insensitive `~N` suffixes); [`Summary::renamed`]
+/// counts every entry stored under a different name, and truncations
+/// warn through [`Progress::warn`]. The replacement policy is
+/// remove-and-rewrite — a matching-name regular file in the
+/// destination is removed and rewritten, while a symlink or any other
+/// kind in either slot refuses.
 ///
 /// Order of checks: the destination must exist as a directory, then
 /// the tree's declared total is summed (a second traversal — sources
@@ -134,10 +162,12 @@ pub fn walk(
             directories: 0,
             files: 0,
             bytes: 0,
+            renamed: 0,
         },
         done: 0,
         total,
         progress,
+        taken: HashSet::new(),
     };
     copier.progress.report(0, total);
     let mut rel = Vec::new();
@@ -180,10 +210,215 @@ fn check_depth(rel: &[Vec<u8>], depth: usize) -> Result<()> {
     Ok(())
 }
 
+/// Highest `~N` collision suffix probed in one directory before
+/// refusing: three digits of overflow room past any plausible
+/// duplicate run, while a hostile listing cannot make the walk probe
+/// forever.
+const MAX_COLLISION_SUFFIX: u32 = 999;
+
+/// Longest destination component in bytes: the FAT/exFAT 255-byte
+/// ceiling, the tightest common limit, wins over any one target's
+/// larger allowance so one tree copies everywhere.
+const MAX_COMPONENT_LEN: usize = 255;
+
+/// Refuse the exact reserved names — empty, `.`, `..` — before
+/// sanitising: mapping must never launder these into something
+/// storable (a `..` rewritten as `_` would hide a traversal attempt
+/// instead of reporting it). Names holding `/` are NOT refused here:
+/// the sanitiser maps the separator away (see rule 2 below), which
+/// defuses traversal — one flat `_` cannot climb — while refusing
+/// would brick whole trees over one hostile entry. [`check_name`]
+/// still guards the sanitised output (see below).
+fn check_reserved(name: &[u8]) -> Result<()> {
+    if name.is_empty() {
+        return Err(CoreError::invalid(
+            "copy refuses an entry with an empty name".to_string(),
+        ));
+    }
+    if name == b"." || name == b".." {
+        return Err(CoreError::invalid(format!(
+            "copy refuses the reserved entry name '{}'",
+            String::from_utf8_lossy(name)
+        )));
+    }
+    Ok(())
+}
+
+/// One sanitised destination component: the name plus whether the
+/// length rule cut it (and from what), so the caller can warn with
+/// both ends.
+struct Sanitised {
+    name: Vec<u8>,
+    truncated_from: Option<Vec<u8>>,
+}
+
+/// Sanitize one source name for the destination component, leaving
+/// the source path untouched. In order, each with its why:
+///
+/// 1. Version suffix: drop a trailing `;[0-9]+` — ISO9660 versions
+///    are a container artefact, and the readers already strip exact
+///    `;1` for display; the destination must not resurrect versions
+///    as filename noise. Only a trailing digit run counts, so a
+///    legal Rock Ridge name like `my;file.txt` survives
+///    byte-identical.
+/// 2. Control bytes and separators: every byte below `0x20` and `/`
+///    becomes `_` — control bytes are unrepresentable on Windows
+///    targets and in most GUI tooling, and `/` must stay the
+///    component separator, or one entry becomes several (or an
+///    escape) on disk.
+/// 3. Trailing dots and spaces: trimmed from the end — Windows and
+///    FAT strip them silently, so keeping them would make two names
+///    for one file across platforms.
+/// 4. Empty result: a name that sanitises to nothing becomes `_` —
+///    every entry needs a name, and `_` collides honestly (through
+///    the collision rule) instead of vanishing.
+/// 5. Length: truncate to [`MAX_COMPONENT_LEN`] bytes without ever
+///    splitting a multi-byte sequence (see [`clean_cut_len`]) — the
+///    tightest common filesystem ceiling wins over any one target.
+///    The trim and the empty fallback run again after the cut: a cut
+///    can expose a trailing dot or space, and the result must satisfy
+///    every rule above, not just the length.
+fn sanitise(name: &[u8]) -> Sanitised {
+    let mut out: Vec<u8> = strip_version_suffix(name).to_vec();
+    for byte in out.iter_mut() {
+        if *byte < 0x20 || *byte == b'/' {
+            *byte = b'_';
+        }
+    }
+    trim_trailing_dots_spaces(&mut out);
+    let mut truncated_from = None;
+    if out.len() > MAX_COMPONENT_LEN {
+        let full = std::mem::take(&mut out);
+        let cut = clean_cut_len(&full, MAX_COMPONENT_LEN);
+        out.extend(full.iter().take(cut).copied());
+        truncated_from = Some(full);
+    }
+    trim_trailing_dots_spaces(&mut out);
+    if out.is_empty() {
+        out.push(b'_');
+    }
+    Sanitised {
+        name: out,
+        truncated_from,
+    }
+}
+
+/// Split off a trailing `;[0-9]+` version suffix, if present —
+/// otherwise the name unchanged. Only a digit run at the very end
+/// counts (checked without indexing, so no window can overrun).
+fn strip_version_suffix(name: &[u8]) -> &[u8] {
+    let Some(semi) = name.iter().rposition(|byte| *byte == b';') else {
+        return name;
+    };
+    let digits = match name.get(semi + 1..) {
+        // Unreachable (`semi` indexes the name, so `semi + 1` is in
+        // bounds) — `get` still refuses to assume.
+        Some(digits) => digits,
+        None => return name,
+    };
+    if digits.is_empty() || !digits.iter().all(|byte| byte.is_ascii_digit()) {
+        return name;
+    }
+    match name.get(..semi) {
+        // Unreachable for the same reason: `semi` indexes the name.
+        Some(head) => head,
+        None => name,
+    }
+}
+
+/// Trim trailing dots and spaces (rule 3 of [`sanitise`], shared
+/// with the collision room-cut below).
+fn trim_trailing_dots_spaces(out: &mut Vec<u8>) {
+    while matches!(out.last(), Some(b'.') | Some(b' ')) {
+        out.pop();
+    }
+}
+
+/// Byte length usable under `max` without splitting a multi-byte
+/// UTF-8 sequence: the rule for over-long names whether valid or
+/// not.
+///
+/// For valid UTF-8 this is exactly a character boundary (a cut inside
+/// a sequence backs up to its lead). For invalid UTF-8 the cut backs
+/// over at most one incomplete tail sequence to its lead and keeps
+/// everything before it byte-identical — stray bytes elsewhere are
+/// preserved (only the cut point must not create a NEW split), and a
+/// tail of undecodable continuations with no lead in reach keeps the
+/// cut: cutting anywhere inside pure garbage is equal, so the rule
+/// prefers keeping bytes. `max` past the length is the length.
+fn clean_cut_len(bytes: &[u8], max: usize) -> usize {
+    let mut end = bytes.len().min(max);
+    // Back over trailing continuation bytes to the sequence lead (at
+    // most three steps: UTF-8 sequences are at most four bytes).
+    let mut back = 0usize;
+    while back < 4 && back < end {
+        let byte = match bytes.get(end - 1 - back) {
+            Some(byte) => *byte,
+            None => break,
+        };
+        if !is_utf8_continuation(byte) {
+            // Lead (or ASCII) `back + 1` bytes from the cut: drop the
+            // sequence when it overruns the cut, keep it when it fits.
+            if back + 1 < utf8_sequence_len(byte) {
+                end -= back + 1;
+            }
+            break;
+        }
+        back += 1;
+    }
+    end
+}
+
+/// True for UTF-8 continuation bytes (`10xxxxxx`).
+fn is_utf8_continuation(byte: u8) -> bool {
+    matches!(byte, 0x80..0xC0)
+}
+
+/// Expected sequence length for a lead byte (1 for ASCII and for
+/// bytes that can never lead — cutting before those is always
+/// clean).
+fn utf8_sequence_len(lead: u8) -> usize {
+    match lead {
+        0x00..0x80 => 1,
+        0xC0..0xE0 => 2,
+        0xE0..0xF0 => 3,
+        0xF0..0xF8 => 4,
+        _ => 1,
+    }
+}
+
+/// ASCII-lowercased copy for collision keys: only `A`-`Z` fold (FAT
+/// and NTFS compare case-insensitively over ASCII; anything else
+/// compares byte-exact, so non-ASCII bytes pass through untouched).
+fn ascii_lower(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().map(|byte| byte.to_ascii_lowercase()).collect()
+}
+
+/// Split a sanitised name into stem and extension at the last `.`
+/// (the extension keeps its dot): collision suffixes go between
+/// them. A leading dot is not an extension marker (`.hidden` keeps
+/// no extension), so dotfiles suffix at the end.
+fn split_ext(name: &[u8]) -> (&[u8], &[u8]) {
+    match name.iter().rposition(|byte| *byte == b'.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
+        _ => (name, b""),
+    }
+}
+
+/// Render bytes for messages: lossy text through the ASCII device
+/// sanitiser, so warning lines stay ASCII no matter what the image
+/// names hold (a raw newline in a log line would break line-oriented
+/// consumers just as badly as a control byte on disk).
+fn display_name(name: &[u8]) -> String {
+    device_text(&String::from_utf8_lossy(name))
+}
+
 /// Refuse entry names that could escape the destination or confuse
 /// the walk: empty names, `.`/`..`, and anything holding `/` (one
-/// component must stay one component). A NUL byte needs no rule here
-/// — the OS refuses it as an I/O error naming the path.
+/// component must stay one component). Applied to sanitised names as
+/// an invariant — sanitising must never output one of these, so this
+/// always passes today and guards future rule edits. A NUL byte needs
+/// no rule here — the OS refuses it as an I/O error naming the path.
 fn check_name(name: &[u8]) -> Result<()> {
     if name.is_empty() {
         return Err(CoreError::invalid(
@@ -215,26 +450,130 @@ struct Copier<'a> {
     done: u64,
     total: u64,
     progress: &'a mut dyn Progress,
+    /// Destination names taken in the current directory (ASCII
+    /// lowercase keys): cleared on entry to every directory and
+    /// saved/restored around each descent, so collisions never leak
+    /// across directories in either direction.
+    taken: HashSet<Vec<u8>>,
+}
+
+/// What placing one name decided: the destination name plus the
+/// over-long candidate when the collision room rule shortened the
+/// stem, so the caller warns at most once per entry whatever the
+/// causes (a truncated-then-collided entry warns once, not once per
+/// reason).
+struct PlacedName {
+    dest: Vec<u8>,
+    shortened_from: Option<Vec<u8>>,
 }
 
 impl Copier<'_> {
+    /// Assign the destination name for one sanitised component in the    /// current directory: first-come keeps its name (entries arrive
+    /// byte-sorted, so this is deterministic); a taken name (ASCII
+    /// case-insensitive — see [`ascii_lower`]) earns `~N` before the
+    /// extension, `N` from 1 to [`MAX_COLLISION_SUFFIX`], then refuses
+    /// naming the source entry. The room rule trims a stem the suffix
+    /// would overflow (same trailing-dot trim as sanitising, so no
+    /// candidate ends dirty); the caller warns at most once per entry
+    /// from the returned [`PlacedName`].
+    fn assign_unique(&mut self, source: &[u8], sanitised: &[u8]) -> Result<PlacedName> {
+        let mut key = ascii_lower(sanitised);
+        if !self.taken.contains(&key) {
+            self.taken.insert(key);
+            return Ok(PlacedName {
+                dest: sanitised.to_vec(),
+                shortened_from: None,
+            });
+        }
+        let (stem, ext) = split_ext(sanitised);
+        for n in 1..=MAX_COLLISION_SUFFIX {
+            let suffix = format!("~{n}");
+            let room = MAX_COMPONENT_LEN
+                .saturating_sub(suffix.len())
+                .saturating_sub(ext.len());
+            let mut stem_part = stem.to_vec();
+            let shortened = stem_part.len() > room;
+            if shortened {
+                let cut = clean_cut_len(&stem_part, room);
+                stem_part.truncate(cut);
+                trim_trailing_dots_spaces(&mut stem_part);
+            }
+            let mut candidate = stem_part;
+            candidate.extend_from_slice(suffix.as_bytes());
+            candidate.extend_from_slice(ext);
+            key = ascii_lower(&candidate);
+            if !self.taken.contains(&key) {
+                self.taken.insert(key);
+                let shortened_from = if shortened {
+                    let mut overlong = stem.to_vec();
+                    overlong.extend_from_slice(suffix.as_bytes());
+                    overlong.extend_from_slice(ext);
+                    Some(overlong)
+                } else {
+                    None
+                };
+                return Ok(PlacedName {
+                    dest: candidate,
+                    shortened_from,
+                });
+            }
+        }
+        Err(CoreError::invalid(format!(
+            "copy refuses '{}': more than {MAX_COLLISION_SUFFIX} case-insensitive collisions in one directory",
+            display_name(source),
+        )))
+    }
+
     /// Copy the directory at `rel` (name bytes from the source root)
     /// into `abs`: create each child directory and recurse, stream
     /// each file through the fixed buffer. `depth` counts descents
     /// from the root for [`check_depth`].
     fn copy_dir(&mut self, rel: &mut Vec<Vec<u8>>, abs: &mut PathBuf, depth: usize) -> Result<()> {
         check_depth(rel, depth)?;
+        self.taken.clear();
         for child in sorted_children(self.source, rel)? {
-            check_name(&child.name)?;
+            check_reserved(&child.name)?;
+            let sanitised = sanitise(&child.name);
+            let placed = self.assign_unique(&child.name, &sanitised.name)?;
+            // One warning per renamed entry at most: the room
+            // shortening wins when both rules fired, else the length
+            // truncation; pure collisions stay silent.
+            if let Some(overlong) = placed.shortened_from {
+                self.progress.warn(&format!(
+                    "copy shortens '{}' to '{}' to fit the collision suffix",
+                    display_name(&overlong),
+                    display_name(&placed.dest),
+                ));
+            } else if let Some(original) = sanitised.truncated_from {
+                self.progress.warn(&format!(
+                    "copy shortens over-long '{}' to '{}'",
+                    display_name(&original),
+                    display_name(&placed.dest),
+                ));
+            }
+            let dest_name = placed.dest;
+            check_name(&dest_name)?;
             rel.push(child.name.clone());
-            abs.push(OsStr::from_bytes(&child.name));
+            abs.push(OsStr::from_bytes(&dest_name));
+            if dest_name.as_slice() != child.name.as_slice() {
+                self.summary.renamed = self.summary.renamed.checked_add(1).ok_or_else(|| {
+                    CoreError::invalid("copy rename count overflows the counter".to_string())
+                })?;
+            }
             if child.is_dir {
                 self.dest.create_dir(abs)?;
                 self.summary.directories =
                     self.summary.directories.checked_add(1).ok_or_else(|| {
                         CoreError::invalid("copy directory count overflows the counter".to_string())
                     })?;
-                self.copy_dir(rel, abs, depth.saturating_add(1))?;
+                // The child's pool must not replace this directory's:
+                // save it aside, scan the child with a fresh pool, and
+                // restore afterwards — otherwise the parent loses its
+                // names to the child (or inherits them back).
+                let taken = std::mem::take(&mut self.taken);
+                let result = self.copy_dir(rel, abs, depth.saturating_add(1));
+                self.taken = taken;
+                result?;
             } else {
                 let mut file = self.dest.replace_file(abs)?;
                 let mut offset = 0u64;
@@ -294,7 +633,11 @@ fn total_bytes(source: &dyn Source) -> Result<u64> {
         check_depth(dir, depth)?;
         let mut total = 0u64;
         for child in sorted_children(source, dir)? {
-            check_name(&child.name)?;
+            // Reserved names refuse here exactly like the copy pass
+            // (see `copy_dir`): sizing never touches the destination,
+            // so only the traversal-blocking rules apply, not the
+            // sanitiser.
+            check_reserved(&child.name)?;
             if child.is_dir {
                 dir.push(child.name.clone());
                 let sub = sum(source, dir, depth.saturating_add(1))?;
@@ -421,15 +764,21 @@ mod tests {
         }
     }
 
-    /// A recording [`Progress`]: every `(done, total)` report in order.
+    /// A recording [`Progress`]: every `(done, total)` report and
+    /// every warning line, in order.
     #[derive(Debug, Default)]
     struct Recorder {
         reports: Vec<(u64, u64)>,
+        warns: Vec<String>,
     }
 
     impl Progress for Recorder {
         fn report(&mut self, done_bytes: u64, total_bytes: u64) {
             self.reports.push((done_bytes, total_bytes));
+        }
+
+        fn warn(&mut self, text: &str) {
+            self.warns.push(text.to_string());
         }
     }
 
@@ -481,6 +830,7 @@ mod tests {
                 directories: 2,
                 files: 2,
                 bytes: 13,
+                renamed: 0,
             }
         );
         assert_eq!(
@@ -568,6 +918,431 @@ mod tests {
         let error = walk(&source, scratch.path(), &no_limit(), &mut progress)
             .expect_err("a dot-dot entry refuses");
         assert!(error.to_string().contains(".."), "{error:?}");
+        assert_eq!(
+            std::fs::read_dir(scratch.path())
+                .expect("the destination lists")
+                .count(),
+            0,
+            "no entry is created"
+        );
+    }
+
+    /// One file under the root with `name`: the small-name tests share
+    /// this shape (one entry, one assertion family).
+    fn one_file_source(name: Vec<u8>, bytes: Vec<u8>) -> MemSource {
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile { name, bytes });
+        source
+    }
+
+    #[test]
+    fn strips_version_suffixes_and_trailing_dots() {
+        // `README.TXT;1` stores as `README.TXT`, `DIR.;1/` as `DIR`:
+        // the version dies at the first `;`, then the trailing dot
+        // trims. Both differ from their source names, so both count
+        // as renamed.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"README.TXT;1".to_vec(),
+            bytes: b"readme".to_vec(),
+        });
+        source.dir(&[]).dirs.push(b"DIR.;1".to_vec());
+        source.dir(&[b"DIR.;1".to_vec()]);
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("strips copy");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 1,
+                files: 1,
+                bytes: 6,
+                renamed: 2,
+            }
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("README.TXT")).expect("stripped reads back"),
+            b"readme"
+        );
+        assert!(
+            scratch.path().join("DIR").is_dir(),
+            "the dotted directory stores dotless"
+        );
+    }
+
+    #[test]
+    fn replaces_separators_and_control_bytes() {
+        // `/`, SOH and a tab all become `_`: one flat component that
+        // cannot climb out of the destination.
+        let source = one_file_source(b"a/b\x01c\td".to_vec(), b"data".to_vec());
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("mapped copy");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 1,
+                bytes: 4,
+                renamed: 1,
+            }
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("a_b_c_d")).expect("mapped reads back"),
+            b"data"
+        );
+    }
+
+    #[test]
+    fn keeps_legal_semicolons_that_are_not_versions() {
+        // Only a trailing `;[0-9]+` strips: `my;file.txt` is a legal
+        // Rock Ridge name and survives byte-identical (and uncounted),
+        // while `v;2` strips to `v`.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"my;file.txt".to_vec(),
+            bytes: b"kept".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"v;2".to_vec(),
+            bytes: b"stripped".to_vec(),
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("versions copy");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 2,
+                bytes: 12,
+                renamed: 1,
+            }
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("my;file.txt")).expect("kept reads back"),
+            b"kept"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("v")).expect("stripped reads back"),
+            b"stripped"
+        );
+    }
+
+    #[test]
+    fn empty_after_sanitising_becomes_underscore() {
+        // `...` trims to nothing: the entry stores as `_`. (A lone
+        // `;` is kept as-is — only a trailing `;[0-9]+` version strips.)
+        let source = one_file_source(b"...".to_vec(), b"data".to_vec());
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("empty maps");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 1,
+                bytes: 4,
+                renamed: 1,
+            }
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("_")).expect("underscore reads back"),
+            b"data"
+        );
+    }
+
+    #[test]
+    fn truncates_long_components_and_warns() {
+        // A 300-byte name stores 255 bytes, warns naming both ends,
+        // and counts as renamed.
+        let long = vec![b'A'; 300];
+        let source = one_file_source(long.clone(), b"data".to_vec());
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("truncated copy");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 1,
+                bytes: 4,
+                renamed: 1,
+            }
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("A".repeat(255))).expect("truncated reads back"),
+            b"data"
+        );
+        assert_eq!(progress.warns.len(), 1, "one truncation warns");
+        assert!(
+            progress.warns[0].contains(&"A".repeat(300)),
+            "the warning names the original: {}",
+            progress.warns[0]
+        );
+        assert!(
+            progress.warns[0].contains(&"A".repeat(255)),
+            "the warning names the result: {}",
+            progress.warns[0]
+        );
+    }
+
+    #[test]
+    fn sanitise_truncates_on_character_boundaries() {
+        // Direct unit pins for the rule-5 cutter the walk relies on:
+        // ASCII cuts at 255, multi-byte cuts back to the lead, and
+        // invalid tails keep every byte the cut does not split.
+        assert_eq!(sanitise(&vec![b'A'; 300]).name.len(), 255);
+        let mut wide = vec![b'A'; 200];
+        for _ in 0..60 {
+            wide.extend_from_slice(&[0xC3, 0xA9]);
+        }
+        let cut = sanitise(&wide);
+        assert_eq!(cut.name.len(), 254);
+        assert!(
+            std::str::from_utf8(&cut.name).is_ok(),
+            "a valid sequence never splits"
+        );
+        let mut ragged = vec![b'A'; 253];
+        ragged.extend_from_slice(&[0xE3, 0x81, b'*']);
+        let cut = sanitise(&ragged);
+        assert_eq!(cut.name.len(), 253);
+        let mut stray = vec![b'A'; 253];
+        stray.extend_from_slice(&[0x80, 0x80, b'*']);
+        let cut = sanitise(&stray);
+        assert_eq!(cut.name.len(), 255);
+    }
+
+    #[test]
+    fn case_collisions_get_numbered_suffixes() {
+        // `FILE.TXT`, `file.txt`, `File.Txt` share one lowercase key.
+        // Byte sort orders them `FILE.TXT`, `File.Txt`, `file.txt`,
+        // so the first keeps its name and the rest earn `~1`/`~2`
+        // before the extension with their own case intact — and their
+        // own bytes.
+        let mut source = MemSource::default();
+        for (name, bytes) in [
+            (b"FILE.TXT".to_vec(), b"upper".to_vec()),
+            (b"file.txt".to_vec(), b"lower".to_vec()),
+            (b"File.Txt".to_vec(), b"mixed".to_vec()),
+        ] {
+            source.dir(&[]).files.push(MemFile { name, bytes });
+        }
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("collisions copy");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 3,
+                bytes: 15,
+                renamed: 2,
+            }
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("FILE.TXT")).expect("first reads back"),
+            b"upper"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("File~1.Txt")).expect("second reads back"),
+            b"mixed"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("file~2.txt")).expect("third reads back"),
+            b"lower"
+        );
+    }
+
+    #[test]
+    fn collision_cap_refuses() {
+        // 1001 names sanitising to `DUP.TXT` (`DUP.TXT` plus
+        // zero-padded `DUP.TXT;0001`..`;1000`, so sort order is
+        // numeric): suffixes `~1`..`~999` fill, and the last entry
+        // refuses naming itself and the cap.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"DUP.TXT".to_vec(),
+            bytes: Vec::new(),
+        });
+        for n in 1..=1000u32 {
+            source.dir(&[]).files.push(MemFile {
+                name: format!("DUP.TXT;{n:04}").into_bytes(),
+                bytes: Vec::new(),
+            });
+        }
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let error = walk(&source, scratch.path(), &no_limit(), &mut progress)
+            .expect_err("the 1001st collision refuses");
+        let text = error.to_string();
+        assert!(text.contains("999"), "{text}");
+        assert!(text.contains("DUP.TXT;1000"), "{text}");
+    }
+
+    #[test]
+    fn collision_sets_do_not_leak_across_directories() {
+        // Root holds file `X`, dir `a/` (child file `inside`), dir
+        // `b/` (child file `zz`) and file `x`, plus root file `zz`:
+        // the two root `x` collide case-insensitively (`x~1`,
+        // counted) while `a/inside` and `b/zz` never collide with
+        // root `zz` — without save/restore the parent inherits the
+        // child's pool and one of the two shapes misnames.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"X".to_vec(),
+            bytes: b"big-x".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"x".to_vec(),
+            bytes: b"small-x".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"zz".to_vec(),
+            bytes: b"root-zz".to_vec(),
+        });
+        source.dir(&[]).dirs.push(b"a".to_vec());
+        source.dir(&[]).dirs.push(b"b".to_vec());
+        source.dir(&[b"a".to_vec()]).files.push(MemFile {
+            name: b"inside".to_vec(),
+            bytes: b"in-a".to_vec(),
+        });
+        source.dir(&[b"b".to_vec()]).files.push(MemFile {
+            name: b"zz".to_vec(),
+            bytes: b"b-zz".to_vec(),
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("scoped copy");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 2,
+                files: 5,
+                bytes: 27,
+                renamed: 1,
+            }
+        );
+        for (name, bytes) in [
+            ("X", b"big-x".as_slice()),
+            ("x~1", b"small-x".as_slice()),
+            ("zz", b"root-zz".as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(scratch.path().join(name)).expect("root file reads back"),
+                bytes,
+                "{name} holds its own bytes"
+            );
+        }
+        assert_eq!(
+            std::fs::read(scratch.path().join("a").join("inside")).expect("a/inside reads back"),
+            b"in-a"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("b").join("zz")).expect("b/zz reads back"),
+            b"b-zz"
+        );
+    }
+
+    #[test]
+    fn truncation_retrims_trailing_dots() {
+        // 254 `a`s, one `.`, ten `b`s (265 bytes): the cut lands on
+        // the dot, and the re-trim takes it back off — the stored
+        // name is 254 `a`s, never dot-terminated.
+        let mut name = vec![b'a'; 254];
+        name.push(b'.');
+        name.extend([b'b'; 10]);
+        let source = one_file_source(name, b"data".to_vec());
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("retrimmed copy");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 1,
+                bytes: 4,
+                renamed: 1,
+            }
+        );
+        let names: Vec<String> = std::fs::read_dir(scratch.path())
+            .expect("the destination lists")
+            .map(|entry| {
+                entry
+                    .expect("entries read")
+                    .file_name()
+                    .into_string()
+                    .expect("the name is UTF-8")
+            })
+            .collect();
+        assert_eq!(names, ["a".repeat(254)]);
+        assert_eq!(progress.warns.len(), 1, "one truncation warns");
+    }
+
+    #[test]
+    fn collision_candidate_trims_dot_terminated_stems() {
+        // Two entries colliding where the room cut lands on a dot:
+        // `G`*248 + `.H.TXT` keeps its name, while lowercase twin
+        // `g`*248 + `.h.txt` earns a suffix whose stem is trimmed back
+        // past the dot (`g`*248 + `~1.txt`, not `g`*248 + `.~1.txt`).
+        let mut upper = b"G".repeat(248);
+        upper.extend_from_slice(b".H.TXT");
+        let mut lower = b"g".repeat(248);
+        lower.extend_from_slice(b".h.txt");
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: upper.clone(),
+            bytes: b"kept".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: lower.clone(),
+            bytes: b"moved".to_vec(),
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("dotted collision");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 2,
+                bytes: 9,
+                renamed: 1,
+            }
+        );
+        let upper_name = String::from_utf8(upper).expect("upper is UTF-8");
+        assert_eq!(
+            std::fs::read(scratch.path().join(&upper_name)).expect("first reads back"),
+            b"kept"
+        );
+        let suffixed = "g".repeat(248) + "~1.txt";
+        assert_eq!(
+            std::fs::read(scratch.path().join(&suffixed)).expect("second reads back"),
+            b"moved"
+        );
+    }
+
+    #[test]
+    fn sanitising_never_bypasses_reserved_names() {
+        // A source entry named `..` refuses even though sanitising
+        // would map other names: reserved names fail before mapping,
+        // never through it.
+        let mut source = MemSource::default();
+        source.dir(&[]).dirs.push(b"..".to_vec());
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let error = walk(&source, scratch.path(), &no_limit(), &mut progress)
+            .expect_err("a dot-dot entry refuses");
+        assert!(error.to_string().contains("reserved"), "{error:?}");
         assert_eq!(
             std::fs::read_dir(scratch.path())
                 .expect("the destination lists")
