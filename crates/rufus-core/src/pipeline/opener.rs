@@ -21,4 +21,11 @@ pub trait Opener {
     /// The data partition as the filesystem formatters'
     /// [`Volume`].
     fn partition(&self) -> Result<Box<dyn Volume>>;
+
+    /// The node path the external-tool formatters (`mke2fs`, `mkntfs`,
+    /// `mkudffs`) run against. Core never invents the name: the CLI
+    /// resolves the partition node (say `/dev/sdb1`) once `Mkpart` has
+    /// created it, and a test hands out a scratch file. `Result`
+    /// because the partition may not be openable yet.
+    fn partition_path(&self) -> Result<std::path::PathBuf>;
 }

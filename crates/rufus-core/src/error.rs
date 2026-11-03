@@ -63,6 +63,17 @@ pub enum CoreError {
         /// What was wrong.
         message: String,
     },
+    /// One pipeline step failed: the step name plus the underlying
+    /// error, kept (not flattened) so exit mapping still sees an inner
+    /// I/O failure through the wrapper.
+    #[error("step '{step}': {source}")]
+    Step {
+        /// Snake-case step that failed.
+        step: &'static str,
+        /// The underlying step error (never discarded).
+        #[source]
+        source: Box<CoreError>,
+    },
     /// No asset directory or asset file could be resolved.
     #[error("cannot resolve asset '{name}': {reason}")]
     AssetResolution {
@@ -138,6 +149,19 @@ mod tests {
         assert!(text.contains("r.loc"), "{text}");
         assert!(text.contains("12"), "{text}");
         assert!(text.contains("unterminated string"), "{text}");
+    }
+
+    #[test]
+    fn step_keeps_display_and_source() {
+        let inner = CoreError::io("disk", io::Error::other("media error"));
+        let err = CoreError::Step {
+            step: "wipe",
+            source: Box::new(inner),
+        };
+        let text = err.to_string();
+        assert!(text.contains("step 'wipe'"), "{text}");
+        assert!(text.contains("media error"), "{text}");
+        assert!(err.source().is_some());
     }
 
     #[test]

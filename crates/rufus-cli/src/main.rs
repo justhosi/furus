@@ -95,11 +95,18 @@ pub struct Fail {
 impl Fail {
     /// Map a [`CoreError`] onto the exit table: I/O → 4, anything else is
     /// a validation failure → 1; the error `Display` names the path.
+    /// Pipeline step wrappers are transparent: classification recurses
+    /// into the wrapped error, so a device I/O failure inside a step
+    /// still exits 4 while the message keeps its step prefix.
     fn from_core(err: CoreError) -> Self {
-        let (exit, kind) = match &err {
-            CoreError::Io { .. } => (Exit::Io, "io"),
-            _ => (Exit::Usage, "invalid_input"),
-        };
+        fn exit_of(err: &CoreError) -> (Exit, &'static str) {
+            match err {
+                CoreError::Io { .. } => (Exit::Io, "io"),
+                CoreError::Step { source, .. } => exit_of(source),
+                _ => (Exit::Usage, "invalid_input"),
+            }
+        }
+        let (exit, kind) = exit_of(&err);
         Self {
             exit,
             kind,

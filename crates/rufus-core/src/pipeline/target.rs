@@ -55,6 +55,13 @@ pub trait Target {
     /// Zero out `[offset, offset + len)`. A zero `len` is invalid.
     fn zero_range(&self, offset: u64, len: u64) -> Result<()>;
 
+    /// Suggest that `[offset, offset + len)` be deallocated. Best effort
+    /// by contract: no support means the data stays and the call still
+    /// reports `Ok`. Wipe uses it as a hint before zeroing.
+    fn discard(&self, _offset: u64, _len: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Push buffered state down.
     fn flush(&self) -> Result<()>;
 
@@ -116,6 +123,8 @@ struct VecTargetInner {
     flushes: Cell<u64>,
     /// Completed [`reread_partitions`](Target::reread_partitions) calls.
     rereads: Cell<u64>,
+    /// Offered [`discard`](Target::discard) windows, in call order.
+    discards: RefCell<Vec<(u64, u64)>>,
 }
 
 #[cfg(test)]
@@ -129,6 +138,7 @@ impl VecTarget {
                 sector_size,
                 flushes: Cell::new(0),
                 rereads: Cell::new(0),
+                discards: RefCell::new(Vec::new()),
             }),
         })
     }
@@ -141,6 +151,14 @@ impl VecTarget {
     /// Completed partition re-reads across all handles.
     pub(crate) fn rereads(&self) -> u64 {
         self.inner.rereads.get()
+    }
+
+    /// Offered discard windows across all handles, in call order.
+    pub(crate) fn discards(&self) -> Vec<(u64, u64)> {
+        match self.inner.discards.try_borrow() {
+            Ok(windows) => windows.clone(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// A copy of the current bytes, for content assertions.
@@ -244,6 +262,19 @@ impl Target for VecTarget {
             .map_err(|_| CoreError::invalid("test target is already borrowed"))?;
         volume.flush()?;
         self.inner.flushes.set(self.inner.flushes.get() + 1);
+        Ok(())
+    }
+
+    fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        if self
+            .inner
+            .discards
+            .try_borrow_mut()
+            .map(|mut windows| windows.push((offset, len)))
+            .is_err()
+        {
+            return Err(CoreError::invalid("test target is already borrowed"));
+        }
         Ok(())
     }
 
