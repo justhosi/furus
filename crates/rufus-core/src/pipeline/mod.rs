@@ -23,6 +23,7 @@ pub mod opener;
 pub mod steps;
 pub mod target;
 pub mod wipe;
+pub mod write;
 
 pub use event::Event;
 pub use event::NullReporter;
@@ -96,10 +97,15 @@ pub fn step_name(step: &Step) -> &'static str {
     }
 }
 
-/// Run one step through the run context: wipe, label, partition and
-/// filesystem stages live in their own modules; later slices add arms
-/// here without touching [`run`].
-fn run_step(step: &Step, ctx: &mut steps::RunContext<'_>) -> Result<()> {
+/// Run one step through the run context: wipe, label, partition,
+/// filesystem and write stages live in their own modules; later slices
+/// add arms here without touching [`run`].
+fn run_step(
+    plan: &Plan,
+    step: &Step,
+    ctx: &mut steps::RunContext<'_>,
+    options: &RunOptions,
+) -> Result<()> {
     match step {
         Step::Wipe => wipe::run(ctx),
         Step::Mklabel { scheme } => mklabel::run(ctx, scheme),
@@ -110,6 +116,7 @@ fn run_step(step: &Step, ctx: &mut steps::RunContext<'_>) -> Result<()> {
             cluster_bytes,
             quick,
         } => mkfs::run(ctx, filesystem, label, cluster_bytes, *quick),
+        Step::Write { mode } => write::run(ctx, mode, &plan.image, options.verify),
         Step::Finalize => {
             let size = ctx.device()?.size();
             ctx.device()?.flush()?;
@@ -151,8 +158,7 @@ pub fn run(
     reporter: &mut dyn Reporter,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<RunReport> {
-    // Carried for slice 7/9; accepted without acting this slice.
-    let _ = options;
+    // Carried for slice 7/9; the write step reads `verify` today.
     let run_started = Instant::now();
     let total = plan.steps.len();
     let mut ctx = steps::RunContext {
@@ -180,7 +186,7 @@ pub fn run(
         let step_started = Instant::now();
         // Every step error carries its step: the JSONL consumer can
         // otherwise only infer it from the last `step_started`.
-        run_step(step, &mut ctx).map_err(|error| CoreError::Step {
+        run_step(plan, step, &mut ctx, options).map_err(|error| CoreError::Step {
             step: step_name(step),
             source: Box::new(error),
         })?;
@@ -379,7 +385,7 @@ mod tests {
     }
 
     /// A plan carrying exactly `steps`; device, image and options are
-    /// fixed dummy values (the skeleton never reads them).
+    /// fixed dummy values (only the write step reads the image).
     fn test_plan(steps: Vec<Step>) -> Plan {
         Plan {
             version: rufus_proto::PLAN_VERSION,
@@ -451,6 +457,447 @@ mod tests {
             .target
             .write_all_at(0, &vec![byte; LAYOUT_LEN as usize])
             .expect("prefill writes");
+    }
+
+    /// Deterministic patterned bytes: byte `i` holds `i % 251`.
+    fn pattern_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Write `bytes` to a temp file; returns its path and length.
+    fn image_file(
+        scratch: &tempfile::TempDir,
+        name: &str,
+        bytes: &[u8],
+    ) -> (std::path::PathBuf, u64) {
+        let path = scratch.path().join(name);
+        std::fs::write(&path, bytes).expect("fixture image writes");
+        (path, bytes.len() as u64)
+    }
+
+    /// A plan carrying `steps` over the image file at `path` (`size`
+    /// bytes): write tests point it at temp files.
+    fn test_plan_image(steps: Vec<Step>, path: &std::path::Path, size: u64) -> Plan {
+        let mut plan = test_plan(steps);
+        plan.image.path = path.to_str().expect("scratch path is UTF-8").to_string();
+        plan.image.size_bytes = size;
+        plan
+    }
+
+    /// A [`Target`] reporting one byte short of every cancellable write
+    /// without cancelling: the faulty device behind the short-count
+    /// test, delegating everything else to an inner [`VecTarget`].
+    #[derive(Debug, Clone)]
+    struct ShortTarget {
+        inner: VecTarget,
+    }
+
+    impl Target for ShortTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            let done = self
+                .inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)?;
+            Ok(done.saturating_sub(1))
+        }
+
+        fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
+            self.inner.zero_range(offset, len)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`ShortTarget`].
+    #[derive(Debug, Clone)]
+    struct ShortOpener {
+        target: ShortTarget,
+    }
+
+    impl Opener for ShortOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    /// A [`Target`] reporting `size` while storing into a small shared
+    /// [`VecTarget`]: the stand-in for a multi-gigabyte device no test
+    /// may allocate. All I/O must stay inside the backing store; the
+    /// tests only ever touch the image window.
+    #[derive(Debug, Clone)]
+    struct BigTarget {
+        inner: VecTarget,
+        size: u64,
+    }
+
+    impl Target for BigTarget {
+        fn size(&self) -> u64 {
+            self.size
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
+            self.inner.zero_range(offset, len)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`BigTarget`].
+    #[derive(Debug, Clone)]
+    struct BigOpener {
+        target: BigTarget,
+    }
+
+    impl Opener for BigOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    /// Collect `(done, total)` from every `Progress` event, in order.
+    fn progresses(reporter: &VecReporter) -> Vec<(u64, Option<u64>)> {
+        reporter
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Progress { done, total, .. } => Some((*done, *total)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collect the texts of every warning `Message`, in order.
+    fn warnings(reporter: &VecReporter) -> Vec<&str> {
+        reporter
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Message {
+                    level: "warn",
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn write_dd() -> Step {
+        Step::Write {
+            mode: WriteMode::Dd,
+        }
+    }
+
+    #[test]
+    fn raw_write_copies_the_image_and_reports_full_progress() {
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(5 * MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let report = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("raw write runs");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert_eq!(&bytes[..size as usize], &content[..]);
+        assert_eq!(report.steps.len(), 1);
+        assert_eq!(report.steps[0].step, "write");
+        let progress = progresses(&reporter);
+        assert!(!progress.is_empty(), "a fast write still reports 100%");
+        let (last_done, last_total) = progress.last().copied().expect("a final progress event");
+        assert_eq!((last_done, last_total), (size, Some(size)));
+        assert!(
+            progress.iter().all(|(done, _)| *done <= size),
+            "no progress past the total"
+        );
+    }
+
+    #[test]
+    fn raw_write_refuses_an_image_larger_than_the_target() {
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(4 * MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = TestOpener::new(2 * MIB);
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an oversize image refuses before writing");
+        let text = error.to_string();
+        assert!(text.contains("4194304"), "{text}");
+        assert!(text.contains("2097152"), "{text}");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert!(bytes.iter().all(|&byte| byte == 0), "zero bytes written");
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { .. })),
+            "no step finished: {:?}",
+            reporter.events()
+        );
+    }
+
+    #[test]
+    fn raw_write_refuses_a_plan_size_that_disagrees_with_the_file() {
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size + 1),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a disagreeing plan size refuses");
+        let text = error.to_string();
+        assert!(text.contains(&size.to_string()), "{text}");
+        assert!(text.contains(&(size + 1).to_string()), "{text}");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert!(
+            bytes.iter().all(|&byte| byte == 0),
+            "refused before writing"
+        );
+    }
+
+    #[test]
+    fn raw_write_zeroes_only_the_partial_tail_sector() {
+        // 2 sectors plus 17 bytes at 512-byte sectors: the tail zeroes
+        // up to byte 1536, and byte 1536 keeps its old pattern.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(2 * 512 + 17);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        assert_eq!(size, 1041);
+        let opener = TestOpener::new(8 * MIB);
+        opener
+            .target
+            .write_all_at(0, &vec![0xAAu8; 8 * MIB as usize])
+            .expect("prefill writes");
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("raw write runs");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert_eq!(&bytes[..size as usize], &content[..]);
+        assert!(
+            bytes[size as usize..1536].iter().all(|&byte| byte == 0),
+            "the tail zeroes to the sector boundary"
+        );
+        assert_eq!(bytes[1536], 0xAA, "past the boundary the pattern survives");
+    }
+
+    #[test]
+    fn short_cancellable_write_is_reported_as_cancelled() {
+        // The faulty target reports one byte short without cancelling:
+        // the run must refuse with the cancellation wording rather than
+        // reporting success.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(2 * 256 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = ShortOpener {
+            target: ShortTarget {
+                inner: VecTarget::new(8 * MIB, 512).expect("fixture target fits"),
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a short count refuses");
+        let text = error.to_string();
+        assert!(text.contains("cancelled"), "{text}");
+        assert!(text.contains("write"), "{text}");
+    }
+
+    #[test]
+    fn large_device_warns_and_small_device_does_not() {
+        use crate::pipeline::write::LARGE_DRIVE_SLACK;
+
+        let image_len = MIB;
+        // Exactly at the boundary: no warning.
+        let opener = BigOpener {
+            target: BigTarget {
+                inner: VecTarget::new(8 * MIB, 512).expect("fixture target fits"),
+                size: image_len + LARGE_DRIVE_SLACK,
+            },
+        };
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let (path, size) = image_file(&scratch, "image.bin", &pattern_bytes(image_len as usize));
+        assert_eq!(size, image_len);
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("boundary write runs");
+        assert!(
+            warnings(&reporter).is_empty(),
+            "exactly 4 GiB of slack stays quiet"
+        );
+        // One byte over: one warning naming the untouched remainder.
+        let opener = BigOpener {
+            target: BigTarget {
+                inner: VecTarget::new(8 * MIB, 512).expect("fixture target fits"),
+                size: image_len + LARGE_DRIVE_SLACK + 1,
+            },
+        };
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("warned write runs");
+        let found: Vec<&str> = warnings(&reporter);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("left untouched"), "{}", found[0]);
+        let bytes = opener.target.inner.bytes().expect("bytes read back");
+        assert_eq!(&bytes[..size as usize], &pattern_bytes(size as usize)[..]);
+    }
+
+    #[test]
+    fn write_mode_copy_is_refused_by_name() {
+        let opener = TestOpener::new(4096);
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan(vec![Step::Write {
+                mode: WriteMode::Copy,
+            }]),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("copy is not implemented yet");
+        let text = error.to_string();
+        assert!(text.contains("copy"), "{text}");
+        assert!(text.contains("not implemented"), "{text}");
+    }
+
+    #[test]
+    fn cancellation_before_the_first_chunk_writes_nothing() {
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let calls = Cell::new(0u32);
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| {
+                let seen = calls.get();
+                calls.set(seen + 1);
+                seen >= 1
+            },
+        )
+        .expect_err("the first chunk cancels");
+        assert!(error.to_string().contains("cancelled"), "{error:?}");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert!(bytes.iter().all(|&byte| byte == 0), "nothing written");
     }
 
     #[test]
@@ -895,15 +1342,15 @@ mod tests {
         let opener = TestOpener::new(4096);
         let mut reporter = VecReporter::new();
         run(
-            &test_plan(vec![Step::Write {
-                mode: WriteMode::Dd,
+            &test_plan(vec![Step::Bootloader {
+                mode: BootloaderMode::Auto,
             }]),
             &opener,
             &run_options(),
             &mut reporter,
             &|| false,
         )
-        .expect_err("write is not implemented yet");
+        .expect_err("bootloader is not implemented yet");
         assert_eq!(opener.device_calls(), 0);
         // ...nor does a run cancelled before the first step...
         let opener = TestOpener::new(4096);
@@ -1139,17 +1586,17 @@ mod tests {
         let opener = TestOpener::new(4096);
         let mut reporter = VecReporter::new();
         let error = run(
-            &test_plan(vec![Step::Write {
-                mode: WriteMode::Dd,
+            &test_plan(vec![Step::Bootloader {
+                mode: BootloaderMode::Auto,
             }]),
             &opener,
             &run_options(),
             &mut reporter,
             &|| false,
         )
-        .expect_err("write is not implemented yet");
+        .expect_err("bootloader is not implemented yet");
         let text = error.to_string();
-        assert!(text.contains("write"), "{text}");
+        assert!(text.contains("bootloader"), "{text}");
         assert!(text.contains("not implemented"), "{text}");
     }
 
@@ -1270,8 +1717,8 @@ mod tests {
         run(
             &test_plan(vec![
                 Step::Finalize,
-                Step::Write {
-                    mode: WriteMode::Dd,
+                Step::Bootloader {
+                    mode: BootloaderMode::Auto,
                 },
             ]),
             &opener,
@@ -1279,7 +1726,7 @@ mod tests {
             &mut reporter,
             &|| false,
         )
-        .expect_err("write is not implemented yet");
+        .expect_err("bootloader is not implemented yet");
         let finished: Vec<&str> = reporter
             .events()
             .iter()
