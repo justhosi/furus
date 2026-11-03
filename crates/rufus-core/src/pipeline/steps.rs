@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use rufus_proto::Scheme;
 
+use super::RunOptions;
 use crate::error::CoreError;
 use crate::error::Result;
 use crate::log::Level;
@@ -52,6 +53,9 @@ pub(crate) struct RunContext<'a> {
     /// Cancellation probe, checked at step boundaries by [`run`](super::run)
     /// and inside the steps through [`check_cancelled`].
     pub(crate) cancelled: &'a dyn Fn() -> bool,
+    /// Run-wide options (verify, retry policy): carried here so step
+    /// signatures stay stable as slices add knobs.
+    pub(crate) options: RunOptions,
 }
 
 impl<'a> RunContext<'a> {

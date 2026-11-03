@@ -215,6 +215,10 @@ fn help_lists_commands_and_documented_flags() {
     let out = run(&["write", "--help"]);
     assert_eq!(out.code, 0);
     assert!(out.stdout.contains("--plan"), "write --help lacks --plan");
+    assert!(
+        out.stdout.contains("--reset-usb"),
+        "write --help lacks --reset-usb"
+    );
 
     let out = run(&["log", "--help"]);
     assert_eq!(out.code, 0);
@@ -777,6 +781,32 @@ fn write_runs_end_to_end_over_the_device_file_seam() {
     assert!(out.stderr.contains("bytes"), "{}", out.stderr);
     assert!(!out.stderr.contains("Some("), "{}", out.stderr);
     assert!(!out.stderr.contains("None"), "{}", out.stderr);
+}
+
+/// `write --reset-usb` is parsed and plumbed: the same seam run with
+/// the flag on exits 0 and lands the same bytes (on the file seam the
+/// reset is a no-op default, so the payload is the proof the flag
+/// travelled from argv to the pipeline without disturbing the write).
+#[test]
+fn write_reset_usb_runs_end_to_end_over_the_device_file_seam() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let image = raw_image(&dir.path().join("image.iso"), 32 * 1024 + 17);
+    let seam_path = seam(&dir.path().join("stick.img"), 64 * 1024 * 1024, 0xAA);
+    let plan_out = plan_run(&dir.path().join("image.iso"), "/dev/null", true);
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let plan_file = runnable_plan(dir.path(), &plan_out.stdout, "plan.json");
+
+    let out = run(&[
+        "write",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+        "--reset-usb",
+    ]);
+    assert_eq!(out.code, 0, "{:?}", out);
+    let got = std::fs::read(&seam_path).expect("read seam");
+    assert_eq!(&got[..image.len()], &image[..]);
 }
 
 /// A gzip-compressed image built with the host `gzip` binary (present

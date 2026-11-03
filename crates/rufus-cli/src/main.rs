@@ -605,6 +605,12 @@ enum Command {
         /// Plan JSON file produced by `rufus plan`.
         #[arg(long, value_name = "FILE")]
         plan: PathBuf,
+        /// Reset the USB device once the write retry budget is spent,
+        /// then retry the failed chunk once more. Best effort: non-USB
+        /// devices and unopenable reset nodes report "no reset was
+        /// possible" and the original write error stands.
+        #[arg(long)]
+        reset_usb: bool,
     },
 
     /// Print the log file location and the last N log lines.
@@ -1142,7 +1148,12 @@ fn cmd_plan(
     Ok(Exit::Ok)
 }
 
-fn cmd_write(json: bool, plan_path: &Path, paths: &HostPaths) -> Result<Exit, Fail> {
+fn cmd_write(
+    json: bool,
+    plan_path: &Path,
+    paths: &HostPaths,
+    reset_usb: bool,
+) -> Result<Exit, Fail> {
     let text = std::fs::read_to_string(plan_path)
         .map_err(|source| Fail::from_core(CoreError::io(plan_path, source)))?;
     let parsed: Plan = serde_json::from_str(&text).map_err(|err| Fail {
@@ -1193,7 +1204,7 @@ fn cmd_write(json: bool, plan_path: &Path, paths: &HostPaths) -> Result<Exit, Fa
         // mode, so a graded device cannot be written by accident — only
         // the seam file is touched.
         let opener = rufus_linux::FileOpener::open(file, table).map_err(Fail::from_core)?;
-        run_plan(&parsed, &opener, &cancel, json)
+        run_plan(&parsed, &opener, &cancel, json, reset_usb)
     } else {
         let sysfs = paths.sysfs();
         let devices = rufus_linux::enumerate(&sysfs).map_err(|core| Fail {
@@ -1203,7 +1214,7 @@ fn cmd_write(json: bool, plan_path: &Path, paths: &HostPaths) -> Result<Exit, Fa
         })?;
         let device = find_device(&devices, Path::new(&parsed.device.path))?;
         let opener = rufus_linux::DeviceOpener::new(&device, table, sysfs);
-        run_plan(&parsed, &opener, &cancel, json)
+        run_plan(&parsed, &opener, &cancel, json, reset_usb)
     }
 }
 
@@ -1259,11 +1270,9 @@ fn run_plan(
     opener: &dyn rufus_core::pipeline::Opener,
     cancel: &rufus_linux::Cancel,
     json: bool,
+    reset_usb: bool,
 ) -> Result<Exit, Fail> {
-    let options = rufus_core::pipeline::RunOptions {
-        verify: plan.options.verify,
-        badblocks: plan.options.bad_blocks,
-    };
+    let options = write_options(plan.options.verify, plan.options.bad_blocks, reset_usb);
     let probe = cancel.as_fn();
     if json {
         let mut reporter = JsonReporter;
@@ -1282,6 +1291,26 @@ fn run_plan(
         }
     }
     Ok(Exit::Ok)
+}
+
+/// The [`RunOptions`](rufus_core::pipeline::RunOptions) a `write` run
+/// executes with: verify and surface-scan intent from the plan, the
+/// `--reset-usb` flag verbatim, and the reference retry policy
+/// (`0x140010a40`): three retries, five seconds apart. A pure
+/// constructor so the flag plumbing is unit-testable without running a
+/// plan.
+fn write_options(
+    verify: bool,
+    bad_blocks: bool,
+    reset_usb: bool,
+) -> rufus_core::pipeline::RunOptions {
+    rufus_core::pipeline::RunOptions {
+        verify,
+        badblocks: bad_blocks,
+        retries: 3,
+        retry_delay: std::time::Duration::from_secs(5),
+        reset_usb,
+    }
 }
 
 /// Streams every pipeline [`Event`] as one JSON line on stdout, flushed
@@ -1654,7 +1683,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
                 },
             )
         }
-        Command::Write { plan } => cmd_write(json, plan, paths),
+        Command::Write { plan, reset_usb } => cmd_write(json, plan, paths, *reset_usb),
         Command::Log { lines } => cmd_log(json, *lines),
     }
 }
@@ -1803,5 +1832,35 @@ mod tests {
         assert_eq!(fail.exit, Exit::Usage);
         assert_eq!(fail.exit.code(), 1);
         assert_eq!(fail.kind, "invalid_input");
+    }
+
+    /// `--reset-usb` parses on `write` (absent by default) and reaches
+    /// [`RunOptions`](rufus_core::pipeline::RunOptions) verbatim, with
+    /// the reference retry policy alongside: the parse half and the
+    /// plumbing half of the flag, without running a plan.
+    #[test]
+    fn write_reset_usb_parses_and_plumbs_to_run_options() {
+        let cli = Cli::try_parse_from(["rufus", "write", "--plan", "plan.json"])
+            .expect("write parses without the flag");
+        let Command::Write { plan, reset_usb } = &cli.command else {
+            panic!("expected the write subcommand");
+        };
+        assert_eq!(plan, &PathBuf::from("plan.json"));
+        assert!(!*reset_usb);
+        assert!(!write_options(false, false, *reset_usb).reset_usb);
+
+        let cli = Cli::try_parse_from(["rufus", "write", "--plan", "plan.json", "--reset-usb"])
+            .expect("write parses with the flag");
+        let Command::Write { reset_usb, .. } = &cli.command else {
+            panic!("expected the write subcommand");
+        };
+        assert!(*reset_usb);
+        let options = write_options(true, true, *reset_usb);
+        assert!(options.reset_usb);
+        assert!(options.verify);
+        assert!(options.badblocks);
+        // The reference policy (`0x140010a40`) rides along unchanged.
+        assert_eq!(options.retries, 3);
+        assert_eq!(options.retry_delay, std::time::Duration::from_secs(5));
     }
 }

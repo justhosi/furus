@@ -1,19 +1,22 @@
-//! The single unsafe island of the tree: four kernel block ioctls with
-//! no safe wrapper in rustix (S07).
+//! The single unsafe island of the tree: kernel ioctls with no safe
+//! wrapper in rustix (S07, extended S17 slice 8).
 //!
 //! # Why this module exists
 //!
 //! The write pipeline needs the kernel's zero/discard/flush/rescan
-//! primitives on an *opened* block device, and rustix deliberately ships
-//! none of them (`BLKZEROOUT`, `BLKDISCARD`, `BLKRRPART`, `BLKFLSBUF`).
-//! Rather than fork rustix or shell out to `blockdev`, this module makes
-//! the four one-line `ioctl(2)` calls and nothing else.
+//! primitives on an *opened* block device, plus (slice 8) the USB
+//! device reset for the post-retry recovery path — and rustix
+//! deliberately ships none of them (`BLKZEROOUT`, `BLKDISCARD`,
+//! `BLKRRPART`, `BLKFLSBUF`, `USBDEVFS_RESET`). Rather than fork
+//! rustix or shell out to `blockdev`, this module makes the five
+//! one-line `ioctl(2)` calls and nothing else.
 //!
 //! # What is allowed here
 //!
-//! Exactly the four requests below, each with the argument shape the
-//! Linux UAPI header pins (numbers from `include/uapi/linux/fs.h`,
-//! literal-checked in the test module):
+//! Exactly the five requests below, each with the argument shape the
+//! Linux UAPI header pins (numbers from `include/uapi/linux/fs.h` and
+//! `include/uapi/linux/usbdevice_fs.h`, literal-checked in the test
+//! module):
 //!
 //! | shim | request | macro form | argument |
 //! |------|---------|------------|----------|
@@ -21,6 +24,7 @@
 //! | [`discard`] | `BLKDISCARD` | `_IO(0x12, 119)` | `[u64; 2]` = offset, len |
 //! | [`reread_partitions`] | `BLKRRPART` | `_IO(0x12, 95)` | none |
 //! | [`flush_buffers`] | `BLKFLSBUF` | `_IO(0x12, 97)` | none |
+//! | [`usb_reset`] | `USBDEVFS_RESET` | `_IO('U', 20)` | none |
 //!
 //! Nothing else may be added without review: no other syscall, no
 //! pointer arithmetic, no larger kernel struct shared across the call,
@@ -49,6 +53,9 @@ const BLKDISCARD: libc::c_ulong = 0x1277;
 const BLKRRPART: libc::c_ulong = 0x125F;
 /// `BLKFLSBUF` — `_IO(0x12, 97)`: flush the device's in-kernel buffers.
 const BLKFLSBUF: libc::c_ulong = 0x1261;
+/// `USBDEVFS_RESET` — `_IO('U', 20)`: ask the kernel to reset the USB
+/// device behind the fd (re-enumeration; the node stays valid).
+const USBDEVFS_RESET: libc::c_ulong = 0x5514;
 
 /// The raw `ioctl(2)` shim and one of the two unsafe blocks in the
 /// workspace (the other is the SIGINT install in `crate::signal`).
@@ -57,12 +64,12 @@ const BLKFLSBUF: libc::c_ulong = 0x1261;
 /// *here* — on this one function — and nowhere else besides
 /// `crate::signal`: the workspace lint is `deny`, every other module
 /// inherits it, and the module charter above describes exactly what
-/// this body may do (one `ioctl` call, four requests, caller-owned
+/// this body may do (one `ioctl` call, five requests, caller-owned
 /// stack arguments).
 #[allow(unsafe_code)]
 fn ioctl_raw(fd: RawFd, request: libc::c_ulong, arg: *mut libc::c_void) -> io::Result<()> {
     // SAFETY: one variadic `ioctl(2)` call; the file descriptor is
-    // owned by the caller, `request` is one of the four constants of
+    // owned by the caller, `request` is one of the five constants of
     // this module, and `arg` is either `null` (the no-argument
     // requests) or points at a two-element `u64` stack array the
     // caller keeps alive for the duration of the call (the kernel
@@ -131,17 +138,33 @@ pub fn flush_buffers(file: &impl AsRawFd) -> io::Result<()> {
     ioctl_raw(file.as_raw_fd(), BLKFLSBUF, ptr::null_mut())
 }
 
+/// Reset the USB device behind `file` (`USBDEVFS_RESET`).
+///
+/// `file` must be the `/dev/bus/usb/BBB/DDD` node, opened read-write;
+/// the node stays valid across the reset. Same failure discipline as
+/// the block shims: the raw outcome surfaces and the caller
+/// (`DeviceOpener::reset_device`) decides what an unopenable node or
+/// a failed reset means.
+pub fn usb_reset(file: &impl AsRawFd) -> io::Result<()> {
+    // SAFETY: `USBDEVFS_RESET` takes no argument; the variadic slot is
+    // empty, so there is never a pointer to validate.
+    ioctl_raw(file.as_raw_fd(), USBDEVFS_RESET, ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn request_numbers_are_pinned_to_the_uapi_header() {
         // `include/uapi/linux/fs.h`: BLKZEROOUT/BLKDISCARD/BLKRRPART/
-        // BLKFLSBUF are `_IO(0x12, ...)` of the numbers below. Pin the
-        // literals so a kernel header reshuffle cannot pass silently.
+        // BLKFLSBUF are `_IO(0x12, ...)` of the numbers below, and
+        // `include/uapi/linux/usbdevice_fs.h`: USBDEVFS_RESET is
+        // `_IO('U', 20)`. Pin the literals so a kernel header
+        // reshuffle cannot pass silently.
         assert_eq!(super::BLKZEROOUT, 0x127F, "_IO(0x12, 127)");
         assert_eq!(super::BLKDISCARD, 0x1277, "_IO(0x12, 119)");
         assert_eq!(super::BLKRRPART, 0x125F, "_IO(0x12, 95)");
         assert_eq!(super::BLKFLSBUF, 0x1261, "_IO(0x12, 97)");
+        assert_eq!(super::USBDEVFS_RESET, 0x5514, "_IO('U', 20)");
     }
 
     #[test]
@@ -152,5 +175,14 @@ mod tests {
         let scratch = tempfile::NamedTempFile::new().expect("scratch file");
         assert!(super::zero_out(&scratch, 0, 512).is_err(), "zero_out");
         assert!(super::discard(&scratch, 0, 512).is_err(), "discard");
+    }
+
+    #[test]
+    fn usb_reset_is_rejected_by_plain_files_without_panicking() {
+        // A regular file is not a USB device node: the reset must
+        // answer with an OS error (typically ENOTTY) and never a
+        // panic. No USB hardware is needed or touched in this test.
+        let scratch = tempfile::NamedTempFile::new().expect("scratch file");
+        assert!(super::usb_reset(&scratch).is_err(), "usb_reset");
     }
 }

@@ -35,7 +35,8 @@
 //!   requests require plus the [`MemorySink`](block::MemorySink) and
 //!   [`SparseFile`](block::SparseFile) test doubles.
 //! * [`ioctl`] — the kernel ioctl shim (`BLKZEROOUT`, `BLKDISCARD`,
-//!   `BLKRRPART`, `BLKFLSBUF`): the only module of the workspace that
+//!   `BLKRRPART`, `BLKFLSBUF`, plus `USBDEVFS_RESET` for the slice-8
+//!   post-retry USB reset): the only module of the workspace that
 //!   may compile unsafe code, and exactly what it may call.
 //! * [`wipe`] — the S08 wipe sequence on the PLAN §6 rule-6 seam:
 //!   [`wipe_device`](wipe::wipe_device) clears the first/last 1 MiB

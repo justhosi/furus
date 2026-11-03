@@ -29,6 +29,15 @@ pub trait Opener {
     /// because the partition may not be openable yet.
     fn partition_path(&self) -> Result<std::path::PathBuf>;
 
+    /// Reset the underlying USB device once the write retry budget is
+    /// spent: `Ok(true)` means a reset was issued and the failed chunk
+    /// deserves one more attempt; `Ok(false)` means not supported by
+    /// this opener (a file seam has no bus to reset, a non-USB disk has
+    /// no reset node). Test openers keep the default no-op.
+    fn reset_device(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Data ranges of the image file at `path`: `(offset, len)` windows
     /// in ascending order, non-overlapping, exactly covering the file's
     /// data, so the write step can stream data and zero holes instead

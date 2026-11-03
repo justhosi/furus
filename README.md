@@ -104,6 +104,11 @@ write side is the most complete part:
   cancellation (exit 6), and typed refusals (exit 7 only for the steps
   no slice implements yet: bootloader installation and file-tree copy).
   `--device-file` runs the same plan against a regular file for tests.
+  A chunk write that fails with `EIO`/`ENOSPC` is retried three times,
+  five seconds apart (the failing chunk only, with the device size
+  re-read before each attempt); `write --reset-usb` additionally resets
+  the USB device once the retries are spent and retries the chunk one
+  last time — best effort, off by default.
 * The GUI is still a stub: it prints version/help and otherwise reports
   "GUI arrives in S24".
 

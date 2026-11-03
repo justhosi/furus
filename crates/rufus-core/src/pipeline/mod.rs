@@ -30,6 +30,7 @@ pub use event::Reporter;
 pub use opener::Opener;
 pub use target::Target;
 
+use std::time::Duration;
 use std::time::Instant;
 
 use rufus_proto::Plan;
@@ -41,9 +42,11 @@ use crate::log::Level;
 use crate::log::Logger;
 
 /// Run options. `verify` reads the written bytes back and compares
-/// them to the plan digest; `badblocks` (surface scan, slice 9) is
-/// carried now and honoured then — passing it today keeps the CLI
-/// signature stable. Accepted without acting.
+/// them to the plan digest; `retries`, `retry_delay` and `reset_usb`
+/// tune the write chunk retry policy (see `write_chunk` in
+/// [`write`](crate::pipeline::write)); `badblocks` (surface scan,
+/// slice 9) is carried now and honoured then — passing it today keeps
+/// the CLI signature stable. Accepted without acting.
 /// The format label does not live here: it comes from the plan step,
 /// and image-derived label defaults stay future work (the formatter
 /// default applies).
@@ -56,6 +59,18 @@ pub struct RunOptions {
     pub verify: bool,
     /// Scan the surface for bad blocks (honoured from slice 9).
     pub badblocks: bool,
+    /// Chunk write retries after the initial attempt: 3 is the
+    /// reference policy (`0x140010a40` gives up with `if (3 < uVar4)`),
+    /// and the seam that keeps tests instant (they pass small counts
+    /// with a zero delay).
+    pub retries: u32,
+    /// Delay between retries: 5 s is the reference policy (`Sleep(5000)`
+    /// after each `Retrying in %d seconds...`).
+    pub retry_delay: Duration,
+    /// Reset the USB device once the retry budget is spent, then retry
+    /// the chunk once more. Off by default: a reset re-enumerates the
+    /// bus and is only worth it on a flaky stick.
+    pub reset_usb: bool,
 }
 
 /// Wall time of one finished step.
@@ -106,12 +121,7 @@ pub fn step_name(step: &Step) -> &'static str {
 /// bootloader arm refuses until S19. The match is exhaustive, so a new
 /// [`Step`] variant fails to compile here (and in [`step_name`]) until
 /// it is handled.
-fn run_step(
-    plan: &Plan,
-    step: &Step,
-    ctx: &mut steps::RunContext<'_>,
-    options: &RunOptions,
-) -> Result<()> {
+fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result<()> {
     match step {
         Step::Wipe => wipe::run(ctx),
         Step::Mklabel { scheme } => mklabel::run(ctx, scheme),
@@ -122,7 +132,7 @@ fn run_step(
             cluster_bytes,
             quick,
         } => mkfs::run(ctx, filesystem, label, cluster_bytes, *quick),
-        Step::Write { mode } => write::run(ctx, mode, &plan.image, options.verify),
+        Step::Write { mode } => write::run(ctx, mode, &plan.image),
         Step::Bootloader { .. } => Err(CoreError::NotImplemented {
             what: "bootloader installation (S19)",
         }),
@@ -173,6 +183,7 @@ pub fn run(
         logger: Logger::new(Level::Info),
         reporter,
         cancelled,
+        options: *options,
     };
     let mut steps = Vec::new();
     for (index, step) in plan.steps.iter().enumerate() {
@@ -194,7 +205,7 @@ pub fn run(
         // whose `what` already names the step (wrapping it would
         // stutter): the JSONL consumer can otherwise only infer the
         // step from the last `step_started`.
-        run_step(plan, step, &mut ctx, options).map_err(|error| match error {
+        run_step(plan, step, &mut ctx).map_err(|error| match error {
             CoreError::NotImplemented { .. } => error,
             other => CoreError::Step {
                 step: step_name(step),
@@ -441,6 +452,9 @@ mod tests {
         RunOptions {
             verify: false,
             badblocks: false,
+            retries: 3,
+            retry_delay: std::time::Duration::ZERO,
+            reset_usb: false,
         }
     }
 
@@ -449,6 +463,9 @@ mod tests {
         RunOptions {
             verify: true,
             badblocks: false,
+            retries: 3,
+            retry_delay: std::time::Duration::ZERO,
+            reset_usb: false,
         }
     }
 
@@ -2131,6 +2148,484 @@ mod tests {
         ] {
             assert_eq!(step_name(&step), name);
         }
+    }
+
+    /// What a flaky write fails with: a retryable media error or a
+    /// validation refusal that must fail fast.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FlakyKind {
+        Eio,
+        Invalid,
+    }
+
+    /// Shared flakiness behind [`FlakyTarget`]: how many more
+    /// `write_all_at_cancellable` calls fail, and how many calls
+    /// happened. `Rc`-shared so every cloned handle (the opener clones
+    /// per `device()` call, the run caches one) reports to the same
+    /// counters.
+    #[derive(Debug)]
+    struct FlakyState {
+        remaining: Cell<u32>,
+        attempts: Cell<u32>,
+    }
+
+    /// A [`Target`] failing its next `remaining` cancellable writes
+    /// with an [`FlakyKind`] error, then succeeding; `attempts` counts
+    /// every cancellable call. Everything else delegates to an inner
+    /// [`VecTarget`].
+    #[derive(Debug, Clone)]
+    struct FlakyTarget {
+        inner: VecTarget,
+        shared: Rc<FlakyState>,
+        kind: FlakyKind,
+    }
+
+    impl FlakyTarget {
+        fn new(len: u64, failures: u32, kind: FlakyKind) -> Self {
+            Self {
+                inner: VecTarget::new(len, 512).expect("fixture target fits"),
+                shared: Rc::new(FlakyState {
+                    remaining: Cell::new(failures),
+                    attempts: Cell::new(0),
+                }),
+                kind,
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.inner.bytes().expect("bytes read back")
+        }
+    }
+
+    impl Target for FlakyTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.shared.attempts.set(self.shared.attempts.get() + 1);
+            if self.shared.remaining.get() > 0 {
+                self.shared.remaining.set(self.shared.remaining.get() - 1);
+                return match self.kind {
+                    FlakyKind::Eio => Err(CoreError::io(
+                        "test-device",
+                        std::io::Error::from_raw_os_error(5),
+                    )),
+                    FlakyKind::Invalid => Err(CoreError::invalid("injected validation failure")),
+                };
+            }
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`FlakyTarget`].
+    #[derive(Debug, Clone)]
+    struct FlakyOpener {
+        target: FlakyTarget,
+    }
+
+    impl Opener for FlakyOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    /// An [`Opener`] serving one [`FlakyTarget`] whose
+    /// [`reset_device`](Opener::reset_device) answers `Ok(true)` and
+    /// counts its calls.
+    #[derive(Debug, Clone)]
+    struct ResetOpener {
+        target: FlakyTarget,
+        resets: Rc<Cell<u32>>,
+    }
+
+    impl Opener for ResetOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+
+        fn reset_device(&self) -> Result<bool> {
+            self.resets.set(self.resets.get() + 1);
+            Ok(true)
+        }
+    }
+
+    /// [`RunOptions`] with an instant retry policy for the retry tests:
+    /// `retries` attempts past the first, no delay, USB reset per
+    /// `reset_usb`.
+    fn retry_options(retries: u32, reset_usb: bool) -> RunOptions {
+        RunOptions {
+            verify: false,
+            badblocks: false,
+            retries,
+            retry_delay: std::time::Duration::ZERO,
+            reset_usb,
+        }
+    }
+
+    #[test]
+    fn retry_succeeds_on_the_second_attempt() {
+        // One `EIO` failure, then success: the run is `Ok`, the payload
+        // complete, three cancellable calls (failed chunk, retried
+        // chunk, second chunk), and exactly one warning naming the
+        // first attempt.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(512 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = FlakyOpener {
+            target: FlakyTarget::new(8 * MIB, 1, FlakyKind::Eio),
+        };
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &retry_options(3, false),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("one retry heals the write");
+        assert_eq!(&opener.target.bytes()[..size as usize], &content[..]);
+        assert_eq!(opener.target.shared.attempts.get(), 3);
+        let found = warnings(&reporter);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("attempt 1 of 4"), "{}", found[0]);
+        assert!(found[0].contains("offset 0"), "{}", found[0]);
+    }
+
+    #[test]
+    fn retry_gives_up_after_three_attempts() {
+        // Always failing: four write attempts (initial + 3), a flush
+        // before each retry, and a step-wrapped I/O error — never a
+        // silent success, never a second wrapper.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(512 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = FlakyOpener {
+            target: FlakyTarget::new(8 * MIB, u32::MAX, FlakyKind::Eio),
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &retry_options(3, false),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an always-failing chunk gives up");
+        assert_eq!(opener.target.shared.attempts.get(), 4);
+        assert_eq!(opener.target.inner.flushes(), 3);
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "the refusal is step-wrapped once: {error:?}"
+        );
+        assert!(error.to_string().contains("I/O error"), "{error:?}");
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { .. })),
+            "no step finished: {:?}",
+            reporter.events()
+        );
+    }
+
+    /// A [`Target`] shrinking below the failing offset on its first
+    /// failed write: the size the retry re-reads no longer holds the
+    /// chunk. `Rc`-shared like [`FlakyTarget`].
+    #[derive(Debug, Clone)]
+    struct ShrinkTarget {
+        inner: VecTarget,
+        size: Rc<Cell<u64>>,
+        attempts: Rc<Cell<u32>>,
+        shrunk: Rc<Cell<bool>>,
+    }
+
+    impl Target for ShrinkTarget {
+        fn size(&self) -> u64 {
+            self.size.get()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.attempts.set(self.attempts.get() + 1);
+            if !self.shrunk.get() {
+                self.shrunk.set(true);
+                self.size.set(1024);
+                return Err(CoreError::io(
+                    "test-device",
+                    std::io::Error::from_raw_os_error(5),
+                ));
+            }
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`ShrinkTarget`].
+    #[derive(Debug, Clone)]
+    struct ShrinkOpener {
+        target: ShrinkTarget,
+    }
+
+    impl Opener for ShrinkOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    #[test]
+    fn retry_rechecks_the_device_size() {
+        // The first chunk fails, then the device reports 1024 bytes:
+        // the retry refuses at once naming the new size, with exactly
+        // the one attempt that observed the shrink.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(512 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = ShrinkOpener {
+            target: ShrinkTarget {
+                inner: VecTarget::new(8 * MIB, 512).expect("fixture target fits"),
+                size: Rc::new(Cell::new(8 * MIB)),
+                attempts: Rc::new(Cell::new(0)),
+                shrunk: Rc::new(Cell::new(false)),
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &retry_options(3, false),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a vanished device refuses");
+        assert_eq!(opener.target.attempts.get(), 1);
+        let text = error.to_string();
+        assert!(text.contains("1024"), "{text}");
+        assert!(text.contains("offset 0"), "{text}");
+    }
+
+    #[test]
+    fn non_retryable_errors_are_not_retried() {
+        // A validation failure is not `EIO`/`ENOSPC`: one attempt, no
+        // warning, no flush, straight to the step wrapper.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(512 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = FlakyOpener {
+            target: FlakyTarget::new(8 * MIB, u32::MAX, FlakyKind::Invalid),
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &retry_options(3, false),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a validation failure fails fast");
+        assert_eq!(opener.target.shared.attempts.get(), 1);
+        assert!(
+            warnings(&reporter).is_empty(),
+            "no retry, no warning: {:?}",
+            reporter.events()
+        );
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("injected"), "{error:?}");
+    }
+
+    #[test]
+    fn retry_stops_when_cancelled() {
+        // Always failing, with the probe flipping true on its third
+        // consultation (the step boundary, the chunk check, then the
+        // pre-sleep check): one attempt, `Cancelled`, no retry.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(512 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = FlakyOpener {
+            target: FlakyTarget::new(8 * MIB, u32::MAX, FlakyKind::Eio),
+        };
+        let mut reporter = VecReporter::new();
+        let calls = Cell::new(0u32);
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &retry_options(3, false),
+            &mut reporter,
+            &|| {
+                let seen = calls.get();
+                calls.set(seen + 1);
+                seen >= 2
+            },
+        )
+        .expect_err("a cancelled retry stops");
+        assert_eq!(opener.target.shared.attempts.get(), 1);
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "cancellation surfaces wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("cancelled"), "{error:?}");
+    }
+
+    #[test]
+    fn usb_reset_is_attempted_after_the_retries() {
+        // Two failures then success, one retry of budget, reset on: the
+        // reset fires exactly once between the attempts, its message
+        // names it, and the run succeeds with a complete payload.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(512 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = ResetOpener {
+            target: FlakyTarget::new(8 * MIB, 2, FlakyKind::Eio),
+            resets: Rc::new(Cell::new(0)),
+        };
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &retry_options(1, true),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a reset heals the chunk");
+        assert_eq!(opener.resets.get(), 1);
+        // Three cancellable calls for the healed chunk (fail, fail,
+        // post-reset success) plus one for the clean second chunk.
+        assert_eq!(opener.target.shared.attempts.get(), 4);
+        assert_eq!(&opener.target.bytes()[..size as usize], &content[..]);
+        let found: Vec<&str> = reporter
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            found.iter().any(|text| text.contains("reset")),
+            "a message names the reset: {found:?}"
+        );
+    }
+
+    #[test]
+    fn usb_reset_is_skipped_without_the_flag() {
+        // Same two failures, reset off: no reset call, and the second
+        // failure is the terminal one — the run reports the I/O error.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(512 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = ResetOpener {
+            target: FlakyTarget::new(8 * MIB, u32::MAX, FlakyKind::Eio),
+            resets: Rc::new(Cell::new(0)),
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &retry_options(1, false),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an unhealed chunk fails");
+        assert_eq!(opener.resets.get(), 0);
+        assert_eq!(opener.target.shared.attempts.get(), 2);
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("I/O error"), "{error:?}");
     }
 
     /// A [`Target`] counting its cancellable writes, zero calls and

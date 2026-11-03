@@ -228,6 +228,119 @@ fn check_image(
     Ok(len)
 }
 
+/// Linux `EIO` (5): the device reported a media error. A named
+/// constant rather than `libc` (which `rufus-core` does not depend on,
+/// and must not — see the crate's dependency discipline); Linux-only
+/// by design, from the Linux UAPI, like the rest of this pipeline.
+const EIO: i32 = 5;
+/// Linux `ENOSPC` (28): no space left. Retryable: thin-provisioned and
+/// quirky USB bridges report it transiently.
+const ENOSPC: i32 = 28;
+
+/// True only for I/O failures worth retrying: `EIO` or `ENOSPC` by raw
+/// code. An `Io` error without a raw code (a portable failure with no
+/// errno behind it) is not retryable — without a code there is nothing
+/// to classify by. Cancellation, validation, impossible counts and
+/// tool failures all fail fast.
+fn retryable(error: &CoreError) -> bool {
+    match error {
+        CoreError::Io { source, .. } => {
+            matches!(source.raw_os_error(), Some(EIO) | Some(ENOSPC))
+        }
+        _ => false,
+    }
+}
+
+/// The per-attempt retry notice: 1-based attempt ordinal, total
+/// attempts, offset, error, and the coming delay. Emitted for every
+/// failure a retry follows; the terminal failure returns its error
+/// silently (the reset messages or the run report cover it). The shape
+/// mirrors the reference (`0x140010a40` logs `Retrying in %d
+/// seconds...` with 5 after each `Write error at sector %lld: %s`);
+/// the offset here is a byte offset, not a sector number, because the
+/// pipeline addresses the device in bytes.
+fn retry_message(
+    op: &str,
+    offset: u64,
+    attempt: u32,
+    total: u32,
+    error: &CoreError,
+    delay: Duration,
+) -> String {
+    format!(
+        "{op} error at offset {offset} (attempt {attempt} of {total}): {error}; retrying in {} seconds",
+        delay.as_secs()
+    )
+}
+
+/// Flush best effort before a retry: a flush failure is a warning, not
+/// fatal — the flush is hygiene before the re-attempt, not the write
+/// itself. The reference (`0x140010a40`) instead restores the stream
+/// position before retrying (`SetFilePointerEx`, refused as `Write
+/// error: Could not reset position - %s` after the `WARNING: Unable to
+/// rewind image position - wrong data might be copied!` open-time
+/// guard): this pipeline needs no repositioning because every attempt
+/// addresses the same explicit offset, so the flush is the whole
+/// between-attempt recovery.
+fn flush_best_effort(ctx: &mut RunContext<'_>, offset: u64) {
+    if let Err(error) = ctx.device().and_then(|target| target.flush()) {
+        ctx.reporter.event(Event::Message {
+            level: "warn",
+            text: format!("write retry flush failed at offset {offset}: {error}; continuing"),
+        });
+    }
+}
+
+/// Re-read the device size after a failed attempt: if the device no
+/// longer holds the chunk, retrying is pointless — refuse naming the
+/// new size and the offset. The analogue of the reference's drive
+/// layout refresh (`0x140010a40` ends the run with `Could not refresh
+/// drive layout: %s` when the rescan fails): a device that vanished or
+/// shrank under the write is observed here, before the next attempt,
+/// rather than after the run.
+fn recheck_size(ctx: &mut RunContext<'_>, offset: u64, len: u64) -> Result<u64> {
+    let size = ctx.device()?.size();
+    if offset.checked_add(len).is_some_and(|end| end > size) {
+        return Err(CoreError::invalid(format!(
+            "device shrank to {size} bytes during write retries: refusing chunk at offset {offset} ({len} bytes); the device no longer holds it"
+        )));
+    }
+    Ok(size)
+}
+
+/// Run the once-per-chunk USB reset after the retry budget is spent:
+/// `true` means the device was reset and the chunk deserves one more
+/// attempt; `false` means give up with the original error. Exactly one
+/// `Message` names the outcome either way; a reset failure never
+/// replaces the write error the run reports.
+fn attempt_usb_reset(ctx: &mut RunContext<'_>) -> bool {
+    match ctx.opener.reset_device() {
+        Ok(true) => {
+            ctx.reporter.event(Event::Message {
+                level: "warn",
+                text: "USB device was reset after write errors; retrying the failed chunk"
+                    .to_string(),
+            });
+            true
+        }
+        Ok(false) => {
+            ctx.reporter.event(Event::Message {
+                level: "warn",
+                text: "no USB reset was possible for this device; reporting the write error"
+                    .to_string(),
+            });
+            false
+        }
+        Err(error) => {
+            ctx.reporter.event(Event::Message {
+                level: "warn",
+                text: format!("USB reset failed: {error}; reporting the original write error"),
+            });
+            false
+        }
+    }
+}
+
 /// Write one `chunk` at `done` through the cancellable primitive,
 /// folding the sample into `ema`: a short count reads as cancellation
 /// (a target that reports full while swallowing bytes cannot be
@@ -258,6 +371,130 @@ fn write_piece(
     }
     ema.observe(read, chunk_started.elapsed());
     Ok(written)
+}
+
+/// Zero one window with the reference retry policy, mirroring
+/// [`write_chunk`]: one `zero_range` call per attempt (cancellable
+/// between sub-chunks inside), the same warn/flush/size/sleep/reset
+/// flow on a retryable failure. Shared policy, separate loop — the
+/// success shapes differ (`()` vs bytes written) and the attempt
+/// itself is one call either way.
+fn zero_chunk(
+    ctx: &mut RunContext<'_>,
+    offset: u64,
+    len: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
+    let options = ctx.options;
+    let total = options.retries.saturating_add(1);
+    let mut performed: u32 = 0;
+    let mut did_reset = false;
+    loop {
+        match ctx.device()?.zero_range(offset, len, cancelled) {
+            Ok(()) => return Ok(()),
+            Err(error) if !retryable(&error) => return Err(error),
+            Err(error) => {
+                let attempt = performed.saturating_add(1);
+                if performed < options.retries {
+                    ctx.reporter.event(Event::Message {
+                        level: "warn",
+                        text: retry_message(
+                            "zero",
+                            offset,
+                            attempt,
+                            total,
+                            &error,
+                            options.retry_delay,
+                        ),
+                    });
+                    flush_best_effort(ctx, offset);
+                    recheck_size(ctx, offset, len)?;
+                    if cancelled() {
+                        return Err(CoreError::Cancelled);
+                    }
+                    std::thread::sleep(options.retry_delay);
+                    performed += 1;
+                    continue;
+                }
+                if options.reset_usb && !did_reset {
+                    did_reset = true;
+                    if attempt_usb_reset(ctx) {
+                        if cancelled() {
+                            return Err(CoreError::Cancelled);
+                        }
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Write one chunk with the reference retry policy (`0x140010a40`):
+/// the initial attempt plus [`RunOptions::retries`] retries — the
+/// reference gives up with `if (3 < uVar4)`, three retries, four tries
+/// total. On a retryable failure the loop warns (attempt, offset,
+/// error), flushes best effort, re-reads the device size (a vanished
+/// device refuses at once), honours cancellation, sleeps
+/// [`RunOptions::retry_delay`], and retries the same offset. The loop
+/// retries only the failing chunk — never a chunk that already
+/// succeeded — and there is no partial-chunk bookkeeping because
+/// `write_all_at` is all-or-error. After the budget is spent (and only
+/// then, and only with [`RunOptions::reset_usb` set) one USB reset
+/// buys exactly one more attempt. The last error returns unwrapped:
+/// [`run`](super::run) adds the single `Step` wrapper.
+fn write_chunk(
+    ctx: &mut RunContext<'_>,
+    offset: u64,
+    chunk: &[u8],
+    cancelled: &dyn Fn() -> bool,
+    ema: &mut RateEma,
+) -> Result<u64> {
+    let options = ctx.options;
+    let total = options.retries.saturating_add(1);
+    let mut performed: u32 = 0;
+    let mut did_reset = false;
+    loop {
+        match write_piece(ctx, chunk, offset, cancelled, ema) {
+            Ok(written) => return Ok(written),
+            Err(error) if !retryable(&error) => return Err(error),
+            Err(error) => {
+                let attempt = performed.saturating_add(1);
+                if performed < options.retries {
+                    ctx.reporter.event(Event::Message {
+                        level: "warn",
+                        text: retry_message(
+                            "write",
+                            offset,
+                            attempt,
+                            total,
+                            &error,
+                            options.retry_delay,
+                        ),
+                    });
+                    flush_best_effort(ctx, offset);
+                    recheck_size(ctx, offset, chunk.len() as u64)?;
+                    if cancelled() {
+                        return Err(CoreError::Cancelled);
+                    }
+                    std::thread::sleep(options.retry_delay);
+                    performed += 1;
+                    continue;
+                }
+                if options.reset_usb && !did_reset {
+                    did_reset = true;
+                    if attempt_usb_reset(ctx) {
+                        if cancelled() {
+                            return Err(CoreError::Cancelled);
+                        }
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
 }
 
 /// Emit one [`Progress`](Event::Progress) for `step` unless
@@ -357,7 +594,7 @@ fn pump(
         let chunk = chunk
             .get(..read)
             .ok_or_else(|| CoreError::invalid("write chunk window runs past its buffer"))?;
-        let written = write_piece(ctx, chunk, done, cancelled, &mut ema)?;
+        let written = write_chunk(ctx, done, chunk, cancelled, &mut ema)?;
         done = done.saturating_add(written);
         emit_progress(
             ctx,
@@ -438,14 +675,19 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64, path: &str) -> Result
 /// [`compressed`] when [`tool_for`] names a host decompressor, then —
 /// for raw images only — reads the bytes back when `verify` is set;
 /// anything else refuses (see [`run`]).
-pub(crate) fn run(
-    ctx: &mut RunContext<'_>,
-    mode: &WriteMode,
-    image: &ImageRef,
-    verify: bool,
-) -> Result<()> {
+pub(crate) fn run(ctx: &mut RunContext<'_>, mode: &WriteMode, image: &ImageRef) -> Result<()> {
     match mode {
         WriteMode::Dd => {
+            let verify = ctx.options.verify;
+            // A plan with an empty digest refuses before any I/O: there
+            // is nothing to compare against (`rufus plan` always fills
+            // it, so this is a hand-written plan), and a hand-edited
+            // plan wastes no write finding that out.
+            if verify && image.sha256.is_empty() {
+                return Err(CoreError::invalid(
+                    "plan carries no digest to verify against: refusing to compare",
+                ));
+            }
             let size = ctx.device()?.size();
             let tool = tool_for(&image.kind);
             let len = check_image(ctx, image, size, tool.is_some())?;
@@ -484,9 +726,8 @@ pub(crate) fn run(
 /// [`CHUNK`]-sized pieces, hash them (SHA-256, lowercase hex, like the
 /// plan digest), and compare case-insensitively. Sparse writes verify
 /// the same way: the target holds the image's logical bytes (holes
-/// zeroed), so the digest matches the file's own bytes. A plan with an
-/// empty digest refuses up front — there is nothing to compare against
-/// (`rufus plan` always fills it, so this is a hand-written plan).
+/// zeroed), so the digest matches the file's own bytes. (An empty
+/// digest refuses earlier, in [`run`], before any I/O.)
 /// The mismatch locator never opens a path that is not a regular file
 /// (see [`locate_mismatch`]). Progress runs
 /// under the event-level `"verify"` pseudo-step — not a plan step (see
@@ -496,11 +737,6 @@ pub(crate) fn run(
 fn verify_target(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
     use sha2::Digest as _;
 
-    if image.sha256.is_empty() {
-        return Err(CoreError::invalid(
-            "plan carries no digest to verify against: refusing to compare",
-        ));
-    }
     let len = image.size_bytes;
     ctx.reporter.event(Event::Message {
         level: "info",
@@ -571,10 +807,12 @@ fn verify_target(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
 /// First offset where the target bytes differ from the image file, or
 /// `None` when either side cannot be read (the caller then reports the
 /// digests). Compares in [`CHUNK`] pieces without retaining them: on a
-/// mismatch it re-reads the whole image and the whole target — two
-/// extra passes, but only on failure, so the cost is predictable.
-/// Never opens a path that is not a regular file (a FIFO would block
-/// in `open` with no writer, the defect the hole query already avoids).
+/// mismatch it re-reads up to the whole image and the whole target in
+/// the worst case — two extra passes, but only on failure, so the cost
+/// is predictable (an early difference costs one extra chunk,
+/// measured). Never opens a path that is not a regular file (a FIFO
+/// would block in `open` with no writer, the defect the hole query
+/// already avoids).
 fn locate_mismatch(ctx: &mut RunContext<'_>, image: &ImageRef, len: u64) -> Option<u64> {
     let meta = std::fs::metadata(&image.path).ok()?;
     if !meta.is_file() {
@@ -747,7 +985,7 @@ mod raw {
                     .get_mut(..want)
                     .ok_or_else(|| CoreError::invalid("write chunk window runs past its buffer"))?;
                 super::read_exact_at(file, chunk, at, &image.path)?;
-                let written = super::write_piece(ctx, chunk, at, cancelled, &mut ema)?;
+                let written = super::write_chunk(ctx, at, chunk, cancelled, &mut ema)?;
                 at += written;
                 rest -= written;
                 done += written;
@@ -775,7 +1013,8 @@ mod raw {
     /// window (cancellable between sub-chunks inside), counted into
     /// `done` like every byte the target ends up holding. The running
     /// rate rides along unchanged — gaps add no sample. Empty windows
-    /// are free.
+    /// are free. A retryable zero failure retries under the same
+    /// policy as chunk writes (see [`write_chunk`](super::write_chunk)).
     fn zero_gap(
         ctx: &mut RunContext<'_>,
         from: u64,
@@ -792,7 +1031,7 @@ mod raw {
         if cancelled() {
             return Err(CoreError::Cancelled);
         }
-        ctx.device()?.zero_range(from, to - from, cancelled)?;
+        super::zero_chunk(ctx, from, to - from, cancelled)?;
         let done = done + (to - from);
         super::emit_progress(ctx, "write", done, Some(len), ema, last_emit, done == len);
         Ok(done)
@@ -959,6 +1198,13 @@ mod tests {
             logger: Logger::new(Level::Info),
             reporter: &mut reporter,
             cancelled: &never,
+            options: crate::pipeline::RunOptions {
+                verify: false,
+                badblocks: false,
+                retries: 3,
+                retry_delay: std::time::Duration::ZERO,
+                reset_usb: false,
+            },
         };
         let image = ImageRef {
             path: fifo.to_str().expect("scratch path is UTF-8").to_string(),
@@ -973,7 +1219,9 @@ mod tests {
     fn locate_mismatch_names_a_real_difference() {
         // A regular file vs a target holding other bytes: the first
         // differing offset comes back, proving the guard above did not
-        // swallow the normal path.
+        // swallow the normal path — at offset 0 and, with a bigger
+        // file, in a later chunk (300000 sits in the second 256 KiB
+        // piece, so the locator must advance past the first).
         let scratch = tempfile::tempdir().expect("scratch fits");
         let path = scratch.path().join("image.bin");
         std::fs::write(&path, [0x11u8; 2048]).expect("fixture image writes");
@@ -994,6 +1242,13 @@ mod tests {
             logger: Logger::new(Level::Info),
             reporter: &mut reporter,
             cancelled: &never,
+            options: crate::pipeline::RunOptions {
+                verify: false,
+                badblocks: false,
+                retries: 3,
+                retry_delay: std::time::Duration::ZERO,
+                reset_usb: false,
+            },
         };
         let image = ImageRef {
             path: path.to_str().expect("scratch path is UTF-8").to_string(),
@@ -1002,5 +1257,39 @@ mod tests {
             kind: ImageKind::Raw,
         };
         assert_eq!(locate_mismatch(&mut ctx, &image, 2048), Some(0));
+
+        let big = scratch.path().join("big.bin");
+        let body = vec![0x11u8; 300_001];
+        std::fs::write(&big, &body).expect("fixture image writes");
+        let big_target = VecTarget::new(512 * 1024, 512).expect("fixture target fits");
+        big_target.write_all_at(0, &body).expect("target fills");
+        big_target
+            .write_all_at(300_000, &[0x22u8; 1])
+            .expect("one byte differs");
+        let big_opener = LocatorOpener { target: big_target };
+        let mut reporter = VecReporter::new();
+        let mut ctx = RunContext {
+            opener: &big_opener,
+            target: None,
+            table: None,
+            partitioned: false,
+            logger: Logger::new(Level::Info),
+            reporter: &mut reporter,
+            cancelled: &never,
+            options: crate::pipeline::RunOptions {
+                verify: false,
+                badblocks: false,
+                retries: 3,
+                retry_delay: std::time::Duration::ZERO,
+                reset_usb: false,
+            },
+        };
+        let image = ImageRef {
+            path: big.to_str().expect("scratch path is UTF-8").to_string(),
+            size_bytes: 300_001,
+            sha256: "0".repeat(64),
+            kind: ImageKind::Raw,
+        };
+        assert_eq!(locate_mismatch(&mut ctx, &image, 300_001), Some(300_000));
     }
 }

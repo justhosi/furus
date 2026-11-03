@@ -238,7 +238,9 @@ pub type FileTarget = SinkTarget<BlockDevice>;
 enum Backend {
     /// A real device node: open exclusively with discovery geometry,
     /// wait for `part_name` under `disk_name` in `sysfs` before handing
-    /// the node path to an external formatter.
+    /// the node path to an external formatter. `usb` records whether
+    /// the discovered transport is USB (reset nodes only exist for
+    /// those).
     Device {
         path: PathBuf,
         disk_name: String,
@@ -247,6 +249,7 @@ enum Backend {
         logical: u32,
         physical: u32,
         sysfs: SysfsRoot,
+        usb: bool,
     },
     /// The `--device-file` seam: a regular file, no kernel table, no
     /// node to wait for.
@@ -360,6 +363,7 @@ impl DeviceOpener {
             logical: device.sector_size,
             physical: device.physical_sector_size,
             sysfs,
+            usb: device.usb,
         };
         Self(Arc::new(Shared {
             table,
@@ -406,6 +410,43 @@ impl Opener for DeviceOpener {
 
     fn release(&self) -> Result<()> {
         self.0.release()
+    }
+
+    fn reset_device(&self) -> Result<bool> {
+        let Backend::Device {
+            disk_name,
+            sysfs,
+            usb,
+            ..
+        } = &self.0.backend
+        else {
+            return Err(CoreError::invalid(
+                "device opener lost its device backend".to_string(),
+            ));
+        };
+        if !usb {
+            // No bus to reset: best effort, not an error.
+            return Ok(false);
+        }
+        let Some(node) = usb_reset_node(sysfs, disk_name) else {
+            // The bus/device address is unknowable here: best effort,
+            // not an error.
+            return Ok(false);
+        };
+        // A reset is a write-class operation, so the node opens
+        // read-write; an unopenable node is best effort too
+        // (permissions, a device that just vanished) — never the write
+        // error.
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
+        {
+            Ok(file) => file,
+            Err(_) => return Ok(false),
+        };
+        crate::ioctl::usb_reset(&file).map_err(|error| CoreError::io(&node, error))?;
+        Ok(true)
     }
 }
 
@@ -527,6 +568,43 @@ impl Opener for FileOpener {
 /// file as data, always correct) rather than looping forever.
 const MAX_RANGES: usize = 64 * 1024;
 
+/// The USB reset node for a disk: `/dev/bus/usb/BBB/DDD` from the
+/// bus/device address, not from any stored field — the [`Device`]
+/// model carries no bus or device numbers (only the `usb` flag, the
+/// `vid:pid` and the port path), so the address is resolved live by
+/// walking up from `<sysfs>/class/block/<disk>/device` to the ancestor
+/// carrying the `busnum` and `devnum` attributes (the USB device node
+/// itself). At most eight levels up: a real chain is four or fewer,
+/// and anything deeper is not a USB stick. `None` when the chain, the
+/// attributes, or their numbers are missing — best effort, never an
+/// error here.
+fn usb_reset_node(sysfs: &SysfsRoot, disk: &str) -> Option<PathBuf> {
+    let mut dir = std::fs::canonicalize(
+        sysfs
+            .root
+            .join("class")
+            .join("block")
+            .join(disk)
+            .join("device"),
+    )
+    .ok()?;
+    for _ in 0..8 {
+        let address = std::fs::read_to_string(dir.join("busnum"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .zip(
+                std::fs::read_to_string(dir.join("devnum"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok()),
+            );
+        if let Some((bus, dev)) = address {
+            return Some(PathBuf::from(format!("/dev/bus/usb/{bus:03}/{dev:03}")));
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    // No ancestor carries an address: not a USB stick under here.
+    None
+}
 /// Hole map of the regular file at `path` through `SEEK_DATA`/
 /// `SEEK_HOLE` (`rustix`, no new `unsafe`): ascending,
 /// non-overlapping, merged data runs clamped to the file length —
@@ -889,6 +967,42 @@ mod tests {
             return;
         };
         assert!(ranges.is_empty(), "{ranges:?}");
+    }
+
+    #[test]
+    fn reset_device_is_unsupported_off_usb() {
+        use crate::model::Transport;
+
+        // A non-USB disk: reset reports `Ok(false)` without touching
+        // hardware (no bus node exists for it) — the reset ioctl
+        // itself is pinned in `ioctl.rs` without any device at all.
+        // The file seam keeps the same default by construction.
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let device = Device {
+            sysfs: dir.path().join("sys/class/block/sda").display().to_string(),
+            name: "sda".to_string(),
+            dev_path: "/dev/sda".to_string(),
+            size_bytes: 1024 * 1024 * 1024,
+            sector_size: 512,
+            physical_sector_size: 512,
+            removable: false,
+            read_only: false,
+            usb: false,
+            vendor: None,
+            model: None,
+            serial: None,
+            transport: Transport::Sata,
+            partition_table: None,
+            vid_pid: None,
+            port_path: None,
+            partitions: Vec::new(),
+        };
+        let opener = DeviceOpener::new(
+            &device,
+            TableKind::Mbr,
+            SysfsRoot::new(dir.path().join("sys")),
+        );
+        assert!(!opener.reset_device().expect("no error"));
     }
 
     #[test]
