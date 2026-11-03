@@ -779,6 +779,62 @@ fn write_runs_end_to_end_over_the_device_file_seam() {
     assert!(!out.stderr.contains("None"), "{}", out.stderr);
 }
 
+/// A gzip-compressed image built with the host `gzip` binary (present
+/// on every build host, so nothing is skipped): `len` patterned bytes
+/// compressed with `gzip -c` into `path`. Returns the payload the seam
+/// must equal after the write.
+fn gzip_image(path: &std::path::Path, len: usize) -> Vec<u8> {
+    let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let raw = path.with_extension("raw");
+    std::fs::write(&raw, &payload).expect("write payload");
+    let output = std::process::Command::new("gzip")
+        .arg("-c")
+        .arg(&raw)
+        .output()
+        .expect("the host gzip runs");
+    assert!(output.status.success(), "gzip compresses");
+    std::fs::write(path, &output.stdout).expect("write image");
+    payload
+}
+
+#[test]
+fn write_compressed_gzip_end_to_end_over_the_device_file_seam() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    // 32 KiB + 17 bytes of payload, as in the raw end-to-end test, so
+    // the same tail-zeroing argument applies to the decoded stream.
+    let payload = gzip_image(&dir.path().join("image.gz"), 32 * 1024 + 17);
+    let seam_path = seam(&dir.path().join("stick.img"), 64 * 1024 * 1024, 0xAA);
+    let plan_out = plan_run(&dir.path().join("image.gz"), "/dev/null", true);
+    assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    // The planner selects `Dd` for the sniffed gzip stream (not the
+    // `Copy` refusal): the decompressor path is reachable.
+    let planned: serde_json::Value = serde_json::from_str(&plan_out.stdout).expect("plan json");
+    let write = planned["steps"]
+        .as_array()
+        .expect("steps array")
+        .iter()
+        .find(|step| step["op"] == "write")
+        .expect("a write step");
+    assert_eq!(write["mode"], "dd");
+    let plan_file = runnable_plan(dir.path(), &plan_out.stdout, "plan.json");
+
+    let out = run(&[
+        "write",
+        "--plan",
+        plan_file.to_str().expect("path"),
+        "--device-file",
+        seam_path.to_str().expect("path"),
+    ]);
+    assert_eq!(out.code, 0, "{:?}", out);
+    let got = std::fs::read(&seam_path).expect("read seam");
+    // The decoded bytes land at the target start.
+    assert_eq!(&got[..payload.len()], &payload[..]);
+    // The sector tail past the decoded image zeroes (the prefill
+    // proves it).
+    let aligned = payload.len().div_ceil(512) * 512;
+    assert!(got[payload.len()..aligned].iter().all(|&byte| byte == 0));
+}
+
 #[test]
 fn write_json_streams_one_object_per_line() {
     let dir = tempfile::tempdir().expect("scratch dir");

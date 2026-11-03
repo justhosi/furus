@@ -13,6 +13,7 @@
 //! [`step_name`] is the one shared snake_case vocabulary for step
 //! identifiers, so the CLI and the machine cannot drift apart.
 
+pub(crate) mod decompress;
 pub mod event;
 pub mod mkfs;
 pub mod mklabel;
@@ -739,6 +740,272 @@ mod tests {
         Step::Write {
             mode: WriteMode::Dd,
         }
+    }
+
+    /// Compress `bytes` with the host `program -c` (stdout capture)
+    /// into `name` under `scratch`; returns the archive path and its
+    /// length. Deterministic input, no network, no fixtures: every
+    /// format test below shares this helper so the four tools cannot
+    /// drift apart in how they are fed.
+    fn compressed_image(
+        scratch: &tempfile::TempDir,
+        name: &str,
+        program: &str,
+        bytes: &[u8],
+    ) -> (std::path::PathBuf, u64) {
+        let raw = scratch.path().join(format!("{name}.raw"));
+        std::fs::write(&raw, bytes).expect("raw fixture writes");
+        let output = std::process::Command::new(program)
+            .arg("-c")
+            .arg(&raw)
+            .output()
+            .expect("the host tool runs");
+        assert!(output.status.success(), "{program} compresses");
+        let path = scratch.path().join(name);
+        std::fs::write(&path, &output.stdout).expect("archive writes");
+        (path, output.stdout.len() as u64)
+    }
+
+    /// A plan carrying `steps` over the archive at `path` (`size`
+    /// compressed bytes) of container `kind`.
+    fn test_plan_compressed(
+        steps: Vec<Step>,
+        path: &std::path::Path,
+        size: u64,
+        kind: ImageKind,
+    ) -> Plan {
+        let mut plan = test_plan_image(steps, path, size);
+        plan.image.kind = kind;
+        plan
+    }
+
+    /// Every `Progress` event as `(done, total)`, in emission order.
+    fn full_progress(reporter: &VecReporter) -> Vec<(u64, Option<u64>, u64, Option<u64>)> {
+        reporter
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Progress {
+                    done,
+                    total,
+                    bytes_per_second,
+                    eta_seconds,
+                    ..
+                } => Some((*done, *total, *bytes_per_second, *eta_seconds)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gzip_stream_is_written_verbatim() {
+        // Two chunks of patterned payload (256 KiB each plus a byte, so
+        // the loop runs more than once) through `[Write, Finalize]`.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let payload = pattern_bytes(2 * 256 * 1024 + 1);
+        let (path, size) = compressed_image(&scratch, "image.gz", "gzip", &payload);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let report = run(
+            &test_plan_compressed(
+                vec![write_dd(), Step::Finalize],
+                &path,
+                size,
+                ImageKind::Gzip,
+            ),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a gzip image streams");
+        assert_eq!(report.steps.len(), 2);
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert_eq!(&bytes[..payload.len()], &payload[..]);
+        let progress = full_progress(&reporter);
+        assert!(!progress.is_empty(), "a stream still reports");
+        let (last_done, last_total, last_rate, _) =
+            progress.last().copied().expect("a final progress event");
+        // Exactly one final event with the total known: at EOF the
+        // decoded size is honest, while every intermediate carries no
+        // total (and no ETA — nothing remains to estimate mid-stream).
+        assert_eq!(
+            (last_done, last_total),
+            (payload.len() as u64, Some(payload.len() as u64))
+        );
+        assert!(
+            progress[..progress.len() - 1]
+                .iter()
+                .all(|(_, total, _, eta)| total.is_none() && eta.is_none()),
+            "no intermediate event claims a total: {progress:?}"
+        );
+        assert!(last_rate > 0, "the rate is measured: {progress:?}");
+    }
+
+    #[test]
+    fn xz_bzip2_and_zstd_stream_too() {
+        // The other three formats through the same helper and the same
+        // assertions, so no tool gets a private code path.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        for (program, kind, suffix) in [
+            ("xz", ImageKind::Xz, "image.xz"),
+            ("bzip2", ImageKind::Bzip2, "image.bz2"),
+            ("zstd", ImageKind::Zstd, "image.zst"),
+        ] {
+            let payload = pattern_bytes(50_000);
+            let (path, size) = compressed_image(&scratch, suffix, program, &payload);
+            let opener = TestOpener::new(8 * MIB);
+            let mut reporter = VecReporter::new();
+            run(
+                &test_plan_compressed(vec![write_dd(), Step::Finalize], &path, size, kind),
+                &opener,
+                &run_options(),
+                &mut reporter,
+                &|| false,
+            )
+            .expect("{program} streams");
+            let bytes = opener.target.bytes().expect("bytes read back");
+            assert_eq!(
+                &bytes[..payload.len()],
+                &payload[..],
+                "{program} is verbatim"
+            );
+            let progress = progresses(&reporter);
+            assert_eq!(
+                progress.last().copied(),
+                Some((payload.len() as u64, Some(payload.len() as u64))),
+                "{program} ends with a known total"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_stream_fails_and_is_not_reported_as_success() {
+        // A valid gzip header followed by garbage: the tool emits a
+        // prefix (maybe nothing at all), then exits non-zero — the run
+        // must fail, never `Ok`, and never `step_finished` for `write`.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let payload = pattern_bytes(10_000);
+        let (path, _) = compressed_image(&scratch, "image.gz", "gzip", &payload);
+        let mut archive = std::fs::read(&path).expect("archive reads");
+        archive.truncate(20);
+        archive.extend_from_slice(b"garbage-garbage-garbage");
+        let (path, size) = image_file(&scratch, "broken.gz", &archive);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_compressed(vec![write_dd()], &path, size, ImageKind::Gzip),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a corrupt archive refuses");
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("gzip"), "{text}");
+        assert!(text.contains("failed"), "{text}");
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { step: "write", .. })),
+            "no success is reported: {:?}",
+            reporter.events()
+        );
+    }
+
+    #[test]
+    fn oversized_stream_is_refused_before_the_target_overflows() {
+        // A 2 MiB payload decoded onto a 1 MiB target: four full chunks
+        // stream, then the fifth would cross the end — refuse naming
+        // both counts instead of writing past it.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let payload = pattern_bytes(2 * MIB as usize);
+        let (path, size) = compressed_image(&scratch, "image.gz", "gzip", &payload);
+        let opener = TestOpener::new(MIB);
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_compressed(vec![write_dd()], &path, size, ImageKind::Gzip),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an overflowing archive refuses");
+        let text = error.to_string();
+        assert!(text.contains("1310720"), "{text}");
+        assert!(text.contains("1048576"), "{text}");
+        assert!(text.contains("write"), "{text}");
+        // The prefix streamed before the refusal is real decoded bytes;
+        // nothing past the device end was ever written.
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert_eq!(bytes.len() as u64, MIB);
+        assert_eq!(&bytes[..MIB as usize], &payload[..MIB as usize]);
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { step: "write", .. })),
+            "no success is reported: {:?}",
+            reporter.events()
+        );
+    }
+
+    #[test]
+    fn cancelled_stream_kills_the_decompressor() {
+        // Twelve chunks of payload with the flag flipping after three
+        // checks: the run refuses as cancelled (step-wrapped, no
+        // `step_finished`), the child is reaped by the cancel — and a
+        // control run right after still spawns cleanly, which is the
+        // observable proof no zombie wedged the helper.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let payload = pattern_bytes(3 * MIB as usize);
+        let (path, size) = compressed_image(&scratch, "image.gz", "gzip", &payload);
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let calls = Cell::new(0u32);
+        let error = run(
+            &test_plan_compressed(vec![write_dd()], &path, size, ImageKind::Gzip),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| {
+                let seen = calls.get();
+                calls.set(seen + 1);
+                seen >= 3
+            },
+        )
+        .expect_err("a cancelled stream refuses");
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "cancellation surfaces wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("cancelled"), "{error:?}");
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { step: "write", .. })),
+            "no success is reported: {:?}",
+            reporter.events()
+        );
+        // Control run on a fresh target: spawning still works.
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_compressed(vec![write_dd()], &path, size, ImageKind::Gzip),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a control run spawns cleanly after the cancel");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert_eq!(&bytes[..payload.len()], &payload[..]);
     }
 
     #[test]

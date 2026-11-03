@@ -1,19 +1,23 @@
 //! The write step: stream the image to the device.
 //!
-//! Layout choice: one file with an inline `mod raw`, so slices 5
-//! (sparse) and 6 (compressed) add sibling inline mods without renaming
-//! files or churning paths. Only [`Dd`](rufus_proto::WriteMode::Dd)
-//! exists this slice; `Copy` refuses by name (see [`run`]).
+//! Layout choice: one file with an inline `mod raw` for the
+//! straight-through path and an inline `mod compressed` for the host
+//! decompressor path, so slice 6 (sparse) adds one more sibling
+//! without renaming files or churning paths. Only
+//! [`Dd`](rufus_proto::WriteMode::Dd) exists this slice; `Copy`
+//! refuses by name (see [`run`]).
 //!
 //! Evidence ported here (`0x140010a40` is the write thread: open the
 //! image, allocate a write buffer — 256 KiB, `0x40000`, on the
 //! compressed path — read a chunk, write it, advance the image
-//! position): the straight-through path below reads and writes in
-//! [`CHUNK`]-sized pieces with the Rufus error shapes (`Write error at
+//! position): both paths read and write in [`CHUNK`]-sized pieces with
+//! the Rufus error shapes (`Write error at
 //! sector`, `Wrote %d bytes, expected %d bytes`, `Read error`, stale
-//! layout) mapped onto [`CoreError`] refusals that name their numbers.
+//! layout, plus `Writing compressed image:` / `Could not write
+//! compressed image: %lld` for the tool path) mapped onto [`CoreError`]
+//! refusals that name their numbers.
 //! `0x140010830` bounds a fill buffer at 64 KiB sectors and 1 GiB total;
-//! sparse and compressed writing are slices 5 and 6, not this one.
+//! sparse writing is slice 6, not this one.
 //!
 //! Trust boundary: the image path comes from the plan, and it names
 //! whatever the planner was pointed at — a regular file, a FIFO, or a
@@ -32,13 +36,13 @@ use rufus_proto::WriteMode;
 
 use crate::error::CoreError;
 use crate::error::Result;
+use crate::pipeline::decompress::ToolStream;
+use crate::pipeline::decompress::tool_for;
 use crate::pipeline::event::Event;
 use crate::pipeline::steps::RunContext;
-use crate::pipeline::steps::check_cancelled;
 
 /// Chunk size in bytes (256 KiB, the compressed path's `0x40000`
-/// buffer): the straight-through loop shares it now, slice 5's sparse
-/// and slice 6's compressed loops share it next.
+/// buffer): both loops below share it.
 pub(crate) const CHUNK: usize = 256 * 1024;
 
 /// Device slack past the image that triggers the large-drive warning
@@ -50,8 +54,308 @@ pub(crate) const LARGE_DRIVE_SLACK: u64 = 4 * 1024 * 1024 * 1024;
 /// most this often, plus always the final one at 100 %.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Exponential moving average of write throughput in bytes per
+/// second: `rate = alpha * sample + (1 - alpha) * rate` with
+/// [`EMA_ALPHA`], the first sample setting the rate outright. The
+/// average deliberately covers the read and the write of each chunk
+/// (per-chunk wall time): on a real device the write dominates, and
+/// smoothing both keeps one number for the event stream. Elapsed
+/// time arrives as an explicit [`Duration`] so the arithmetic is
+/// testable without sleeping.
+struct RateEma {
+    rate: f64,
+}
+
+/// Smoothing factor: each chunk moves the average a quarter of the
+/// way to its sample — responsive within a few chunks, stable
+/// across one slow outlier.
+const EMA_ALPHA: f64 = 0.25;
+
+impl RateEma {
+    fn new() -> Self {
+        Self { rate: 0.0 }
+    }
+
+    /// Fold one chunk's bytes and wall time into the average. A zero
+    /// elapsed time carries no information (it would divide by
+    /// zero), so the sample is dropped and the rate stands.
+    fn observe(&mut self, bytes: u64, elapsed: Duration) {
+        if elapsed.is_zero() {
+            return;
+        }
+        let sample = bytes as f64 / elapsed.as_secs_f64();
+        if self.rate == 0.0 {
+            self.rate = sample;
+        } else {
+            self.rate = EMA_ALPHA * sample + (1.0 - EMA_ALPHA) * self.rate;
+        }
+    }
+
+    /// Current rate, rounded down to whole bytes per second.
+    fn bytes_per_second(&self) -> u64 {
+        self.rate as u64
+    }
+
+    /// Seconds to drain `remaining` at the current rate, rounded up;
+    /// `None` while the rate is still zero.
+    fn eta_seconds(&self, remaining: u64) -> Option<u64> {
+        if self.rate <= 0.0 {
+            return None;
+        }
+        Some((remaining as f64 / self.rate).ceil() as u64)
+    }
+}
+
+/// Warn when the device dwarfs the image: returns the warning text
+/// when `device_size` exceeds `image_size` by more than
+/// [`LARGE_DRIVE_SLACK`], so the exact boundary is unit-testable
+/// without a 4 GiB fixture.
+fn large_drive_warning(device_size: u64, image_size: u64) -> Option<String> {
+    if device_size.saturating_sub(image_size) > LARGE_DRIVE_SLACK {
+        Some(format!(
+            "write: large device of {device_size} bytes for a {image_size} byte image, {} bytes left untouched",
+            device_size.saturating_sub(image_size)
+        ))
+    } else {
+        None
+    }
+}
+
+/// The write loop's byte source: the raw image file or a host
+/// decompressor's stdout pipe (see the `decompress` module).
+enum Source {
+    /// Straight-through reads with `read_exact` semantics.
+    File { file: File, path: String },
+    /// A pulled pipe; EOF arrives as a short read.
+    Pipe(ToolStream),
+}
+
+impl Source {
+    /// Fill `buf`: the file arm reads exactly (a short read before EOF
+    /// is the Rufus `Read error` shape, naming the offset); the pipe
+    /// arm pulls until full or EOF, returning what arrived (`0` only
+    /// at EOF).
+    fn fill(&mut self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        match self {
+            Source::File { file, path } => {
+                file.read_exact(buf).map_err(|error| {
+                    CoreError::io(
+                        &*path,
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("read error at image offset {offset}: {error}"),
+                        ),
+                    )
+                })?;
+                Ok(buf.len())
+            }
+            Source::Pipe(stream) => {
+                let mut filled = 0;
+                while filled < buf.len() {
+                    let read = stream.read(&mut buf[filled..])?;
+                    if read == 0 {
+                        break;
+                    }
+                    filled += read;
+                }
+                Ok(filled)
+            }
+        }
+    }
+
+    /// Reap the source: the pipe arm waits on the child and refuses on
+    /// a non-zero exit (even after a clean EOF — EOF only closed the
+    /// pipe, not the verdict); the file arm has nothing to reap.
+    fn finish(&mut self) -> Result<()> {
+        match self {
+            Source::File { .. } => Ok(()),
+            Source::Pipe(stream) => stream.finish(),
+        }
+    }
+
+    /// Abandon the source: the pipe arm kills and reaps the child; the
+    /// file arm has nothing running.
+    fn cancel(&mut self) {
+        match self {
+            Source::File { .. } => {}
+            Source::Pipe(stream) => stream.cancel(),
+        }
+    }
+}
+
+/// The shared open-time guards for both sources: the real file length
+/// must match the plan's `size_bytes`, and a file already larger than
+/// the target refuses before any step writes. For a piped image the
+/// length is the archive (compressed) size, and the refusal says so:
+/// an archive larger than the target can never decode onto it, while a
+/// fitting archive may still overflow mid-stream — the streaming guard
+/// in [`pump`] is authoritative, this check is the fast path. The
+/// large-device warning fires on the file length too — for a piped
+/// image the decoded size is unknowable upfront, so the compressed
+/// size is the honest basis. Returns the file length the loops run
+/// against.
+fn check_image(
+    ctx: &mut RunContext<'_>,
+    image: &ImageRef,
+    size: u64,
+    compressed: bool,
+) -> Result<u64> {
+    let len = std::fs::metadata(&image.path)
+        .map_err(|source| CoreError::io(&image.path, source))?
+        .len();
+    if len != image.size_bytes {
+        return Err(CoreError::invalid(format!(
+            "image file '{}' is {len} bytes but the plan describes {} bytes: refusing to write a different file",
+            image.path, image.size_bytes
+        )));
+    }
+    if len > size {
+        if compressed {
+            return Err(CoreError::invalid(format!(
+                "archive of {len} bytes (compressed) does not fit the {size} byte device: refusing to start the write"
+            )));
+        }
+        return Err(CoreError::invalid(format!(
+            "image of {len} bytes does not fit the {size} byte device: refusing to start the write"
+        )));
+    }
+    if let Some(warning) = large_drive_warning(size, len) {
+        ctx.reporter.event(Event::Message {
+            level: "warn",
+            text: warning,
+        });
+    }
+    Ok(len)
+}
+
+/// Stream `source` to the device in [`CHUNK`]-sized pieces, returning
+/// the bytes written with the loop's rate average. `total` is the raw
+/// file length (every event carries it, the last at `done == total`)
+/// or `None` for a piped stream (every intermediate carries `None` —
+/// the decoded size is unknowable without decoding twice — and the
+/// caller emits the one final `Some(done)` once EOF makes it known).
+/// Cancellation kills the source first (reaping a piped child) and
+/// refuses bare [`Cancelled`](CoreError::Cancelled); a chunk that
+/// would cross the device end kills the source and refuses naming both
+/// counts instead of writing past it.
+fn pump(
+    ctx: &mut RunContext<'_>,
+    source: &mut Source,
+    total: Option<u64>,
+    size: u64,
+) -> Result<(u64, RateEma)> {
+    let mut buf = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    let mut ema = RateEma::new();
+    let mut last_emit = Instant::now();
+    loop {
+        if total.is_some_and(|len| done >= len) {
+            break;
+        }
+        // Copy the probe out first: the device borrow below rules out
+        // holding another `ctx` borrow across the call. A set flag
+        // kills a piped child before refusing, so no decompressor
+        // outlives its run; checking once per chunk is the whole
+        // cancellation cadence.
+        let cancelled = ctx.cancelled;
+        if cancelled() {
+            source.cancel();
+            return Err(CoreError::Cancelled);
+        }
+        let want = total
+            .map(|len| (len - done).min(CHUNK as u64) as usize)
+            .unwrap_or(CHUNK);
+        let chunk = buf
+            .get_mut(..want)
+            .ok_or_else(|| CoreError::invalid("write chunk window runs past its buffer"))?;
+        let read = source.fill(chunk, done)?;
+        if read == 0 {
+            // EOF: only the unknown-total stream can end here (the
+            // file arm reads exactly or errors), so the loop is over.
+            break;
+        }
+        let end = done.checked_add(read as u64).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "write offset {done} plus a {read} byte chunk overflows"
+            ))
+        })?;
+        if end > size {
+            // The archive decodes past the target: kill the child and
+            // refuse naming what the stream produced and what fits.
+            // Nothing past `size` is ever written, so the tail logic
+            // below cannot corrupt beyond the device.
+            source.cancel();
+            return Err(CoreError::invalid(format!(
+                "decompressed image of at least {end} bytes does not fit the {size} byte device: refusing before the target overflows"
+            )));
+        }
+        let chunk = chunk
+            .get(..read)
+            .ok_or_else(|| CoreError::invalid("write chunk window runs past its buffer"))?;
+        let chunk_started = Instant::now();
+        let written = ctx
+            .device()?
+            .write_all_at_cancellable(done, chunk, CHUNK, cancelled)?;
+        if written < read as u64 {
+            // The contract reads a short count as cancellation: a
+            // target that reports full while swallowing bytes cannot
+            // be detected here, which is why the verify pass
+            // (slice 7) exists. This is the honest form of Rufus's
+            // `Wrote %d bytes, expected %d bytes` check.
+            return Err(CoreError::Cancelled);
+        }
+        if written > read as u64 {
+            // Impossible by contract (no more than the chunk went
+            // in): a target that claims otherwise is faulty, not
+            // cancelled, so it refuses by name with both numbers.
+            return Err(CoreError::invalid(format!(
+                "target reported {written} bytes written for a {read} byte chunk at offset {done}: refusing an impossible count"
+            )));
+        }
+        done = done.saturating_add(written);
+        ema.observe(read as u64, chunk_started.elapsed());
+        let finished = total.is_some_and(|len| done >= len);
+        if last_emit.elapsed() >= PROGRESS_INTERVAL || finished {
+            last_emit = Instant::now();
+            ctx.reporter.event(Event::Progress {
+                step: "write",
+                done,
+                total,
+                bytes_per_second: ema.bytes_per_second(),
+                eta_seconds: match total {
+                    Some(len) => ema.eta_seconds(len.saturating_sub(done)),
+                    None => None,
+                },
+            });
+        }
+    }
+    Ok((done, ema))
+}
+
+/// Zero the tail from `done` up to the next sector boundary — never
+/// the whole remaining device, whose tail is the plan's business:
+/// zeroing tens of gigabytes because of a small image would be data
+/// loss twice over. Clamped to the device (an exactly device-sized but
+/// unaligned image has no room past itself) and skipped for a zero
+/// sector size — then flush and rescan: the run's epilogue for both
+/// sources.
+fn finish_write(ctx: &mut RunContext<'_>, done: u64, size: u64) -> Result<()> {
+    let sector = u64::from(ctx.device()?.sector_size());
+    if sector != 0 && !done.is_multiple_of(sector) {
+        let end = (done / sector + 1).saturating_mul(sector).min(size);
+        if end > done {
+            ctx.device()?.zero_range(done, end - done)?;
+        }
+    }
+    ctx.device()?.flush()?;
+    ctx.device()?.reread_partitions()?;
+    Ok(())
+}
+
 /// Run the write step for `mode` over `image`: `Dd` streams through
-/// [`raw`], anything else refuses (see [`run`]).
+/// [`raw`] (every other [`ImageKind`] stays raw) or through
+/// [`compressed`] when [`tool_for`] names a host decompressor;
+/// anything else refuses (see [`run`]).
 pub(crate) fn run(
     ctx: &mut RunContext<'_>,
     mode: &WriteMode,
@@ -59,7 +363,25 @@ pub(crate) fn run(
     verify: bool,
 ) -> Result<()> {
     match mode {
-        WriteMode::Dd => raw::run(ctx, image, verify),
+        WriteMode::Dd => {
+            if verify {
+                // Slice 7 replaces this with the real read-back check; until
+                // then the flag warns instead of vanishing silently. One
+                // warning per run, whichever source the kind selects.
+                ctx.reporter.event(Event::Message {
+                    level: "warn",
+                    text: "verify requested but verification is not implemented yet (slice 7): continuing without it"
+                        .to_string(),
+                });
+            }
+            let size = ctx.device()?.size();
+            let tool = tool_for(&image.kind);
+            let len = check_image(ctx, image, size, tool.is_some())?;
+            match tool {
+                Some(tool) => compressed::run(ctx, image, tool, size),
+                None => raw::run(ctx, image, len, size),
+            }
+        }
         WriteMode::Copy => Err(CoreError::NotImplemented {
             what: "write mode 'copy' (file-tree copying arrives in slice 18)",
         }),
@@ -67,113 +389,23 @@ pub(crate) fn run(
 }
 
 /// Straight-through raw writing: no sparse skipping, no decompression
-/// (slices 5 and 6).
+/// (slice 6).
 mod raw {
     use super::*;
 
-    /// Exponential moving average of write throughput in bytes per
-    /// second: `rate = alpha * sample + (1 - alpha) * rate` with
-    /// [`EMA_ALPHA`], the first sample setting the rate outright. The
-    /// average deliberately covers the read and the write of each chunk
-    /// (per-chunk wall time): on a real device the write dominates, and
-    /// smoothing both keeps one number for the event stream. Elapsed
-    /// time arrives as an explicit [`Duration`] so the arithmetic is
-    /// testable without sleeping.
-    struct RateEma {
-        rate: f64,
-    }
-
-    /// Smoothing factor: each chunk moves the average a quarter of the
-    /// way to its sample — responsive within a few chunks, stable
-    /// across one slow outlier.
-    const EMA_ALPHA: f64 = 0.25;
-
-    impl RateEma {
-        fn new() -> Self {
-            Self { rate: 0.0 }
-        }
-
-        /// Fold one chunk's bytes and wall time into the average. A zero
-        /// elapsed time carries no information (it would divide by
-        /// zero), so the sample is dropped and the rate stands.
-        fn observe(&mut self, bytes: u64, elapsed: Duration) {
-            if elapsed.is_zero() {
-                return;
-            }
-            let sample = bytes as f64 / elapsed.as_secs_f64();
-            if self.rate == 0.0 {
-                self.rate = sample;
-            } else {
-                self.rate = EMA_ALPHA * sample + (1.0 - EMA_ALPHA) * self.rate;
-            }
-        }
-
-        /// Current rate, rounded down to whole bytes per second.
-        fn bytes_per_second(&self) -> u64 {
-            self.rate as u64
-        }
-
-        /// Seconds to drain `remaining` at the current rate, rounded up;
-        /// `None` while the rate is still zero.
-        fn eta_seconds(&self, remaining: u64) -> Option<u64> {
-            if self.rate <= 0.0 {
-                return None;
-            }
-            Some((remaining as f64 / self.rate).ceil() as u64)
-        }
-    }
-
-    /// Warn when the device dwarfs the image: returns the warning text
-    /// when `device_size` exceeds `image_size` by more than
-    /// [`LARGE_DRIVE_SLACK`], so the exact boundary is unit-testable
-    /// without a 4 GiB fixture.
-    fn large_drive_warning(device_size: u64, image_size: u64) -> Option<String> {
-        if device_size.saturating_sub(image_size) > super::LARGE_DRIVE_SLACK {
-            Some(format!(
-                "write: large device of {device_size} bytes for a {image_size} byte image, {} bytes left untouched",
-                device_size.saturating_sub(image_size)
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Stream the image to the device in [`CHUNK`](super::CHUNK)-sized
-    /// pieces.
-    pub(crate) fn run(ctx: &mut RunContext<'_>, image: &ImageRef, verify: bool) -> Result<()> {
-        if verify {
-            // Slice 7 replaces this with the real read-back check; until
-            // then the flag warns instead of vanishing silently.
-            ctx.reporter.event(Event::Message {
-                level: "warn",
-                text: "verify requested but verification is not implemented yet (slice 7): continuing without it"
-                    .to_string(),
-            });
-        }
-        let mut file =
-            File::open(&image.path).map_err(|source| CoreError::io(&image.path, source))?;
-        let len = file
-            .metadata()
-            .map_err(|source| CoreError::io(&image.path, source))?
-            .len();
-        if len != image.size_bytes {
-            return Err(CoreError::invalid(format!(
-                "image file '{}' is {len} bytes but the plan describes {} bytes: refusing to write a different file",
-                image.path, image.size_bytes
-            )));
-        }
-        let size = ctx.device()?.size();
-        if len > size {
-            return Err(CoreError::invalid(format!(
-                "image of {len} bytes does not fit the {size} byte device: refusing to start the write"
-            )));
-        }
-        if let Some(warning) = large_drive_warning(size, len) {
-            ctx.reporter.event(Event::Message {
-                level: "warn",
-                text: warning,
-            });
-        }
+    /// Stream the image file to the device in [`CHUNK`](super::CHUNK)-sized
+    /// pieces; `len` is the guarded file length from [`check_image`](super::check_image).
+    pub(crate) fn run(
+        ctx: &mut RunContext<'_>,
+        image: &ImageRef,
+        len: u64,
+        size: u64,
+    ) -> Result<()> {
+        let file = File::open(&image.path).map_err(|source| CoreError::io(&image.path, source))?;
+        let mut source = super::Source::File {
+            file,
+            path: image.path.clone(),
+        };
         if len == 0 {
             // An empty image still reports itself: without this the run
             // emits no Progress at all and a consumer cannot tell "done
@@ -186,92 +418,23 @@ mod raw {
                 eta_seconds: None,
             });
         }
-        let mut buf = vec![0u8; super::CHUNK];
-        let mut done = 0u64;
-        let mut ema = RateEma::new();
-        let mut last_emit = Instant::now();
-        while done < len {
-            check_cancelled(ctx)?;
-            let want = (len - done).min(super::CHUNK as u64) as usize;
-            let chunk = buf
-                .get_mut(..want)
-                .ok_or_else(|| CoreError::invalid("write chunk window runs past its buffer"))?;
-            read_chunk(&mut file, &image.path, chunk, done)?;
-            let chunk_started = Instant::now();
-            // Copy the probe out first: the device borrow below rules
-            // out holding another `ctx` borrow across the call.
-            let cancelled = ctx.cancelled;
-            let written =
-                ctx.device()?
-                    .write_all_at_cancellable(done, chunk, super::CHUNK, cancelled)?;
-            if written < want as u64 {
-                // The contract reads a short count as cancellation: a
-                // target that reports full while swallowing bytes cannot
-                // be detected here, which is why the verify pass
-                // (slice 7) exists. This is the honest form of Rufus's
-                // `Wrote %d bytes, expected %d bytes` check.
-                return Err(CoreError::Cancelled);
+        let (done, _) = match super::pump(ctx, &mut source, Some(len), size) {
+            Ok(done) => done,
+            Err(error) => {
+                let _ = source.finish();
+                return Err(error);
             }
-            if written > want as u64 {
-                // Impossible by contract (no more than the chunk went
-                // in): a target that claims otherwise is faulty, not
-                // cancelled, so it refuses by name with both numbers.
-                return Err(CoreError::invalid(format!(
-                    "target reported {written} bytes written for a {want} byte chunk at offset {done}: refusing an impossible count"
-                )));
-            }
-            done = done.saturating_add(written);
-            ema.observe(want as u64, chunk_started.elapsed());
-            let remaining = len.saturating_sub(done);
-            if last_emit.elapsed() >= super::PROGRESS_INTERVAL || done == len {
-                last_emit = Instant::now();
-                ctx.reporter.event(Event::Progress {
-                    step: "write",
-                    done,
-                    total: Some(len),
-                    bytes_per_second: ema.bytes_per_second(),
-                    eta_seconds: ema.eta_seconds(remaining),
-                });
-            }
-        }
-        // Zero the tail from the image end up to the next sector
-        // boundary — never the whole remaining device, whose tail is
-        // the plan's business: zeroing tens of gigabytes because of a
-        // small image would be data loss twice over. Clamped to the
-        // device (an exactly device-sized but unaligned image has no
-        // room past itself) and skipped for a zero sector size.
-        let sector = u64::from(ctx.device()?.sector_size());
-        if sector != 0 && len % sector != 0 {
-            let end = (len / sector + 1).saturating_mul(sector).min(size);
-            if end > len {
-                ctx.device()?.zero_range(len, end - len)?;
-            }
-        }
-        ctx.device()?.flush()?;
-        ctx.device()?.reread_partitions()?;
+        };
+        source.finish()?;
+        super::finish_write(ctx, done, size)?;
         Ok(())
-    }
-
-    /// Fill `chunk` from the image file: `read_exact` semantics, so a
-    /// short read before EOF is an I/O error naming the offset (the
-    /// Rufus `Read error` shape, with its class kept).
-    fn read_chunk(file: &mut File, path: &String, chunk: &mut [u8], offset: u64) -> Result<()> {
-        file.read_exact(chunk).map_err(|error| {
-            CoreError::io(
-                path,
-                std::io::Error::new(
-                    error.kind(),
-                    format!("read error at image offset {offset}: {error}"),
-                ),
-            )
-        })
     }
 
     #[cfg(test)]
     mod tests {
         use std::time::Duration;
 
-        use super::*;
+        use super::super::*; // hoisted RateEma, large_drive_warning
 
         #[test]
         fn rate_ema_and_eta_are_deterministic() {
@@ -303,5 +466,60 @@ mod raw {
             assert!(warning.contains(&(slack + 1).to_string()), "{warning}");
             assert!(warning.contains("left untouched"), "{warning}");
         }
+    }
+}
+
+/// Decompressed writing: the image file stays the compressed archive
+/// on disk while a host tool streams the decoded bytes through the
+/// same chunk loop the raw path uses.
+mod compressed {
+    use std::path::Path;
+
+    use super::super::decompress::Tool;
+    use super::super::decompress::kind_name;
+    use super::*;
+
+    /// Stream the decoded image to the device: spawn the tool over the
+    /// archive, pump an unknown total (`Progress` carries `total: None`
+    /// and no ETA while streaming), then reap the child. EOF only
+    /// closed the pipe, so `finish` runs even after a clean drain: a
+    /// tool that dies mid-archive must fail the run, never read as
+    /// success.
+    pub(crate) fn run(
+        ctx: &mut RunContext<'_>,
+        image: &ImageRef,
+        tool: Tool,
+        size: u64,
+    ) -> Result<()> {
+        let mut source = super::Source::Pipe(ToolStream::spawn(
+            Path::new(&image.path),
+            tool,
+            kind_name(&image.kind),
+        )?);
+        let (done, ema) = match super::pump(ctx, &mut source, None, size) {
+            Ok(done) => done,
+            Err(error) => {
+                // Reap on the error path too (a no-op after a
+                // cancellation already reaped); the caller's error is
+                // what propagates.
+                let _ = source.finish();
+                return Err(error);
+            }
+        };
+        source.finish()?;
+        // The decoded size is honest only now that the whole stream
+        // arrived: one final event with the total known (every
+        // intermediate carried `None`), so "done" stays
+        // distinguishable from silence even for an empty payload. No
+        // ETA: nothing remains to estimate.
+        ctx.reporter.event(Event::Progress {
+            step: "write",
+            done,
+            total: Some(done),
+            bytes_per_second: ema.bytes_per_second(),
+            eta_seconds: None,
+        });
+        super::finish_write(ctx, done, size)?;
+        Ok(())
     }
 }

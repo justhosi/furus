@@ -133,20 +133,28 @@ pub fn device_ref(path: &Path, dry_run: bool, sysfs: &SysfsRoot) -> Result<Devic
     Ok(device)
 }
 
-/// How the image transfers: raw streams by dd, structured containers by
-/// copy. Detection is authoritative: a sniffed ISO or raw stream is
-/// dd-ed whatever the name, and a sniffed container (WIM, gzip, ...) is
-/// *copied* even when named `.iso` — a Windows `.iso` whose bytes sniff
-/// as WIM must not go to the raw writer. The extension is only a
-/// tiebreaker when the content could not be identified at all
-/// ([`ImageKind::Unknown`]): `iso`/`img`/`raw` names conventionally mean
-/// sector images worth dd-ing, anything else is a job for a later-slice
-/// reader (WIM: wimlib in S21, compressed raws: S15). Provisional for
+/// How the image transfers: sniffed ISO, raw and compressed streams go
+/// by dd (the pipeline streams the compressed kinds through their host
+/// tool), structured containers by copy. Detection is authoritative: a
+/// sniffed ISO or raw stream is dd-ed whatever the name, and a sniffed
+/// container (WIM, ...) is *copied* even when named `.iso` — a Windows
+/// `.iso` whose bytes sniff as WIM must not go to the raw writer. The
+/// extension is only a tiebreaker when the content could not be
+/// identified at all ([`ImageKind::Unknown`]): `iso`/`img`/`raw` names
+/// conventionally mean sector images worth dd-ing, anything else is a
+/// job for a later-slice reader (WIM: wimlib in S21). Provisional for
 /// this schema generation: the executor decides finally.
 fn write_mode(image: &Path, kind: &ImageKind) -> WriteMode {
     match kind {
-        // Content is authoritative for the streamable kinds.
-        ImageKind::Iso | ImageKind::Raw => WriteMode::Dd,
+        // Content is authoritative for the streamable kinds: sector
+        // images raw, archives through the pipeline's host-tool
+        // streaming (S17 slice 5).
+        ImageKind::Iso
+        | ImageKind::Raw
+        | ImageKind::Gzip
+        | ImageKind::Xz
+        | ImageKind::Bzip2
+        | ImageKind::Zstd => WriteMode::Dd,
         // Unidentified content: fall back to the extension as the
         // user-declared hint about the byte layout.
         ImageKind::Unknown => {
@@ -166,18 +174,13 @@ fn write_mode(image: &Path, kind: &ImageKind) -> WriteMode {
         }
         // Every other sniffed container needs its reader/copier (WIM
         // through wimlib in S21, VHD/VHDX/FFU through their parsers, qcow2
-        // through its reader in S15, a gzip/xz/bzip2 stream decompressed
-        // first in S15, PE files as
+        // through its reader in S15, PE files as
         // payload parts).
         ImageKind::Wim
         | ImageKind::Vhd
         | ImageKind::Vhdx
         | ImageKind::Ffu
         | ImageKind::Qcow2
-        | ImageKind::Gzip
-        | ImageKind::Xz
-        | ImageKind::Bzip2
-        | ImageKind::Zstd
         | ImageKind::Pe => WriteMode::Copy,
     }
 }
@@ -269,8 +272,8 @@ mod tests {
             // …even when a .iso name would have said dd.
             ("image.iso", ImageKind::Wim, WriteMode::Copy),
             ("image.iso", ImageKind::Pe, WriteMode::Copy),
-            ("image.iso", ImageKind::Xz, WriteMode::Copy),
-            ("archive.gz", ImageKind::Gzip, WriteMode::Copy),
+            ("image.iso", ImageKind::Xz, WriteMode::Dd),
+            ("archive.gz", ImageKind::Gzip, WriteMode::Dd),
             ("disk.vhd", ImageKind::Vhd, WriteMode::Copy),
             ("disk.qcow2", ImageKind::Qcow2, WriteMode::Copy),
             // Unknown content: the extension is the only hint.
