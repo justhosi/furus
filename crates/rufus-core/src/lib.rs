@@ -43,6 +43,11 @@
 //! * [`paths`] — XDG directories without the `dirs` crate, asset-dir
 //!   resolution (`$RUFUS_ASSETS`, AppImage `$APPDIR`, FHS install), and
 //!   portable-mode (`./rufus.toml`) discovery.
+//! * [`pipeline`] — the S17 write pipeline (slice 1 of 10): the
+//!   [`Target`](pipeline::Target) write surface, the
+//!   [`Opener`](pipeline::Opener) store supplier, the
+//!   [`Event`](pipeline::Event) progress contract and the
+//!   [`run`](pipeline::run) step machine (Finalize only so far).
 //! * [`i18n`] — [`Catalog`](i18n::Catalog): the Rufus `.loc`
 //!   (pollock-format) catalog, parsed eagerly from disk, with locale
 //!   normalisation, an English fallback chain and a [`Translator`](i18n::Translator).
@@ -118,6 +123,7 @@ pub mod log;
 pub mod part;
 pub mod partition;
 pub mod paths;
+pub mod pipeline;
 pub mod report;
 pub mod safety;
 pub mod text;
