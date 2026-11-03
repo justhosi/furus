@@ -15,7 +15,6 @@
 //! purpose: this is the store, that is the boot goal; the paths keep
 //! them apart.)
 
-#[cfg(test)]
 use crate::error::CoreError;
 use crate::error::Result;
 #[cfg(test)]
@@ -52,8 +51,48 @@ pub trait Target {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<u64>;
 
-    /// Zero out `[offset, offset + len)`. A zero `len` is invalid.
-    fn zero_range(&self, offset: u64, len: u64) -> Result<()>;
+    /// Zero out `[offset, offset + len)`, consulting `cancelled`
+    /// between 4 MiB pieces. A zero `len` is invalid.
+    ///
+    /// The default body is the fallback for targets with no
+    /// `BLKZEROOUT`-style primitive: it writes zeroes through
+    /// [`write_all_at_cancellable`](Target::write_all_at_cancellable)
+    /// in 4 MiB pieces, refusing a short count as
+    /// [`Cancelled`](CoreError::Cancelled) like every early stop, and
+    /// a count past the piece as invalid like every impossible one.
+    /// Targets with a kernel primitive override this with a single
+    /// fast call (dropping the probe — run-level cancellation then
+    /// happens between windows at the call sites).
+    fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+        if len == 0 {
+            return Err(CoreError::invalid("cannot zero a zero-length window"));
+        }
+        const PIECE: u64 = 4 * 1024 * 1024;
+        let zeros = vec![0u8; PIECE as usize];
+        let mut pos = offset;
+        let mut remaining = len;
+        while remaining > 0 {
+            if cancelled() {
+                return Err(CoreError::Cancelled);
+            }
+            let piece = remaining.min(PIECE);
+            let window = zeros
+                .get(..piece as usize)
+                .ok_or_else(|| CoreError::invalid("zero chunk window runs past its buffer"))?;
+            let written = self.write_all_at_cancellable(pos, window, PIECE as usize, cancelled)?;
+            if written < piece {
+                return Err(CoreError::Cancelled);
+            }
+            if written > piece {
+                return Err(CoreError::invalid(format!(
+                    "target reported {written} bytes zeroed for a {piece} byte chunk at offset {pos}: refusing an impossible count"
+                )));
+            }
+            pos += written;
+            remaining -= written;
+        }
+        Ok(())
+    }
 
     /// Suggest that `[offset, offset + len)` be deallocated. Best effort
     /// by contract: no support means the data stays and the call still
@@ -229,13 +268,14 @@ impl Target for VecTarget {
         Ok(done as u64)
     }
 
-    fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
+    fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
         check_window(self.inner.size, offset, len, "zero")?;
         if len == 0 {
             return Err(CoreError::invalid("cannot zero a zero-length window"));
         }
         // Plain zero writes in bounded pieces (a test double has no
-        // kernel primitive to prefer).
+        // kernel primitive to prefer), consulting the probe like the
+        // default body does.
         const PIECE: u64 = 64 * 1024;
         let zeros = vec![0u8; PIECE as usize];
         let mut volume = self
@@ -246,6 +286,9 @@ impl Target for VecTarget {
         let mut pos = offset;
         let mut remaining = len;
         while remaining > 0 {
+            if cancelled() {
+                return Err(CoreError::Cancelled);
+            }
             let piece = remaining.min(PIECE);
             volume.write_all_at(pos, &zeros[..piece as usize])?;
             pos += piece;
@@ -299,7 +342,7 @@ mod tests {
         assert!(text.contains("1028"), "{text}");
         assert!(text.contains("1024"), "{text}");
         let error = target
-            .zero_range(0, 0)
+            .zero_range(0, 0, &|| false)
             .expect_err("a zero-length zero refuses");
         assert!(error.to_string().contains("zero-length"), "{error:?}");
         let error = target
@@ -336,7 +379,7 @@ mod tests {
     fn zero_range_and_defaults_behave() {
         let target = VecTarget::new(1024, 512).expect("fixture target fits");
         target.write_all_at(0, &[9u8; 100]).expect("seed writes");
-        target.zero_range(10, 20).expect("zeroing works");
+        target.zero_range(10, 20, &|| false).expect("zeroing works");
         let bytes = target.bytes().expect("bytes read back");
         assert!(bytes[..10].iter().all(|&byte| byte == 9));
         assert!(bytes[10..30].iter().all(|&byte| byte == 0));
@@ -345,5 +388,132 @@ mod tests {
         assert_eq!(target.sector_size(), 512);
         assert_eq!(target.flushes(), 0);
         assert_eq!(target.rereads(), 0);
+    }
+
+    /// A [`Target`] without a `zero_range` override, so the default
+    /// body is what runs: a plain byte store counting its cancellable
+    /// writes. Its cancellable form writes the whole buffer at once
+    /// and ignores the probe on purpose — the tests below count
+    /// exactly the default body's own per-piece consultations.
+    #[derive(Debug)]
+    struct PlainTarget {
+        store: RefCell<Vec<u8>>,
+        writes: Cell<usize>,
+    }
+
+    impl PlainTarget {
+        fn new(len: usize, fill: u8) -> Self {
+            Self {
+                store: RefCell::new(vec![fill; len]),
+                writes: Cell::new(0),
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.store.borrow().clone()
+        }
+    }
+
+    impl Target for PlainTarget {
+        fn size(&self) -> u64 {
+            self.store.borrow().len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let store = self.store.borrow();
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| CoreError::invalid("test read overflows"))?;
+            if end > store.len() as u64 {
+                return Err(CoreError::invalid(format!(
+                    "test read of {} bytes at offset {offset} runs past the {} byte store",
+                    buf.len(),
+                    store.len()
+                )));
+            }
+            buf.copy_from_slice(&store[offset as usize..end as usize]);
+            Ok(())
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.write_all_at_cancellable(offset, buf, usize::MAX, &|| false)?;
+            Ok(())
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            _cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            if chunk == 0 {
+                return Err(CoreError::invalid("write chunk size must be non-zero"));
+            }
+            let mut store = self.store.borrow_mut();
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| CoreError::invalid("test write overflows"))?;
+            if end > store.len() as u64 {
+                return Err(CoreError::invalid(format!(
+                    "test write of {} bytes at offset {offset} runs past the {} byte store",
+                    buf.len(),
+                    store.len()
+                )));
+            }
+            store[offset as usize..end as usize].copy_from_slice(buf);
+            self.writes.set(self.writes.get() + 1);
+            Ok(buf.len() as u64)
+        }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One mebibyte, shared with the chunk math below.
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn zero_range_default_zeroes_in_four_mib_chunks() {
+        // 9 MiB through the default body: three pieces (4 + 4 + 1 MiB),
+        // every byte zero, the probe consulted once per piece.
+        let target = PlainTarget::new(9 * MIB as usize, 0xAA);
+        let calls = Cell::new(0u32);
+        target
+            .zero_range(0, 9 * MIB, &|| {
+                calls.set(calls.get() + 1);
+                false
+            })
+            .expect("default zeroing runs");
+        assert!(target.bytes().iter().all(|&byte| byte == 0));
+        assert_eq!(calls.get(), 3, "one consultation per 4 MiB piece");
+        assert_eq!(target.writes.get(), 3, "one write per 4 MiB piece");
+    }
+
+    #[test]
+    fn zero_range_default_refuses_cancellation_mid_window() {
+        // Cancel on the second consultation: the first 4 MiB chunk is
+        // zeroed, the run refuses as bare `Cancelled`, nothing after.
+        let target = PlainTarget::new(9 * MIB as usize, 0xAA);
+        let calls = Cell::new(0u32);
+        let error = target
+            .zero_range(0, 9 * MIB, &|| {
+                calls.set(calls.get() + 1);
+                calls.get() >= 2
+            })
+            .expect_err("a mid-window cancel refuses");
+        assert!(
+            matches!(error, CoreError::Cancelled),
+            "cancellation surfaces bare: {error:?}"
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(target.writes.get(), 1, "only the first chunk landed");
+        let bytes = target.bytes();
+        assert!(bytes[..4 * MIB as usize].iter().all(|&byte| byte == 0));
+        assert!(
+            bytes[4 * MIB as usize..].iter().all(|&byte| byte == 0xAA),
+            "past the first chunk the prefill survives"
+        );
     }
 }

@@ -41,7 +41,8 @@ pub(crate) fn run(ctx: &mut RunContext<'_>) -> Result<()> {
             text: format!("wipe: discard hint for bytes 0..{size}"),
         });
         check_cancelled(ctx)?;
-        ctx.device()?.zero_range(0, size)?;
+        let cancelled = ctx.cancelled;
+        ctx.device()?.zero_range(0, size, cancelled)?;
         ctx.reporter.event(Event::Message {
             level: "info",
             text: format!("wipe: zeroing bytes 0..{size}"),
@@ -60,7 +61,8 @@ pub(crate) fn run(ctx: &mut RunContext<'_>) -> Result<()> {
         }
         for offset in [0, rear] {
             check_cancelled(ctx)?;
-            ctx.device()?.zero_range(offset, WINDOW)?;
+            let cancelled = ctx.cancelled;
+            ctx.device()?.zero_range(offset, WINDOW, cancelled)?;
             let end = offset.saturating_add(WINDOW);
             ctx.reporter.event(Event::Message {
                 level: "info",

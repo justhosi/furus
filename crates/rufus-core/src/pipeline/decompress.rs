@@ -22,6 +22,12 @@
 //! stdout pulls — the between-chunks cancellation check stays
 //! reachable. Past the cap the thread keeps reading and discards the
 //! excess, and the refusal notes the cut.
+//!
+//! Cancellation is honoured between chunks only, so a decompressor
+//! that stalls its stdout delays Ctrl-C until it produces more or
+//! exits: measured, a tool that spent 30 s on stderr before producing
+//! delayed the exit by 38 s, and a tool that sleeps without producing
+//! cannot be cancelled at all (SIGKILL only, the child orphaned).
 
 use std::io::Read;
 use std::path::Path;

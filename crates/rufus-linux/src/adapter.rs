@@ -104,7 +104,11 @@ impl<S: Sink> Target for SinkTarget<S> {
             .write_all_at_cancellable(offset, buf, chunk, cancelled)
     }
 
-    fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
+    fn zero_range(&self, offset: u64, len: u64, _cancelled: &dyn Fn() -> bool) -> Result<()> {
+        // Dropped deliberately: zeroing is one fast `BLKZEROOUT`
+        // ioctl (or the sink's own fallback), so there is no chunk
+        // loop to consult the probe in — run-level cancellation
+        // happens between windows at the call sites instead.
         self.sink.zero_range(offset, len)
     }
 
@@ -506,9 +510,98 @@ impl Opener for FileOpener {
         ))
     }
 
+    fn data_ranges(&self, path: &Path) -> Result<Option<Vec<(u64, u64)>>> {
+        data_ranges_of_file(path)
+    }
+
     fn release(&self) -> Result<()> {
         self.0.release()
     }
+}
+
+/// At most this many `SEEK_DATA`/`SEEK_HOLE` round trips per query: a
+/// sane filesystem yields one data range per trip, so a file needing
+/// more is pathologically fragmented (or the kernel stopped making
+/// progress) — the query then falls back to `None` (whole file as
+/// data, always correct) rather than looping forever.
+const MAX_RANGES: usize = 1024 * 1024;
+
+/// Hole map of the regular file at `path` through `SEEK_DATA`/
+/// `SEEK_HOLE` (`rustix`, no new `unsafe`): ascending,
+/// non-overlapping, merged data runs clamped to the file length —
+/// exactly what
+/// [`Opener::data_ranges`](rufus_core::pipeline::Opener::data_ranges)
+/// promises. `None` when the filesystem cannot answer (`EINVAL`,
+/// `ENOTSUP`/`EOPNOTSUPP`); `Some(vec![])` when the query succeeds on
+/// a file with no data at all (including the zero-length file). Any
+/// other failure is a genuine I/O error naming the path.
+fn data_ranges_of_file(path: &Path) -> Result<Option<Vec<(u64, u64)>>> {
+    /// A `SEEK_DATA`/`SEEK_HOLE` refusal the caller cannot answer
+    /// with: fall back to the whole file as data. (`rustix` reports
+    /// raw codes here, so the comparison is against `libc` like the
+    /// block layer's own errno mapping.)
+    fn unsupported(raw: i32) -> bool {
+        raw == libc::EINVAL || raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP
+    }
+
+    // Read-only, no exclusive claim: this runs alongside the open
+    // read-write handle without disturbing it.
+    let file = std::fs::File::open(path).map_err(|error| CoreError::io(path, error))?;
+    let len = file
+        .metadata()
+        .map_err(|error| CoreError::io(path, error))?
+        .len();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut off = 0u64;
+    while off < len {
+        if ranges.len() >= MAX_RANGES {
+            // Pathological fragmentation (or a stuck kernel): correct
+            // beats sparse — the whole file as data.
+            return Ok(None);
+        }
+        let data = match rustix::fs::seek(&file, rustix::fs::SeekFrom::Data(off)) {
+            Ok(data) => data.min(len),
+            // No data at or past `off`: a trailing hole to EOF.
+            Err(error) if error.raw_os_error() == libc::ENXIO => break,
+            Err(error) if unsupported(error.raw_os_error()) => return Ok(None),
+            Err(error) => return Err(CoreError::io(path, std::io::Error::from(error))),
+        };
+        if data >= len {
+            // Defensive: no data below EOF means a trailing hole.
+            break;
+        }
+        if data < off {
+            // The kernel went backwards: untrustworthy answer, fall
+            // back rather than loop.
+            return Ok(None);
+        }
+        let hole = match rustix::fs::seek(&file, rustix::fs::SeekFrom::Hole(data)) {
+            Ok(hole) => hole.min(len),
+            // No hole past `data` should be impossible (the kernel
+            // implies one at EOF): read it as EOF.
+            Err(error) if error.raw_os_error() == libc::ENXIO => len,
+            Err(error) if unsupported(error.raw_os_error()) => return Ok(None),
+            Err(error) => return Err(CoreError::io(path, std::io::Error::from(error))),
+        };
+        if hole <= data {
+            // A zero-length or backwards run contradicts the walk:
+            // fall back rather than record or loop on it.
+            return Ok(None);
+        }
+        // Adjacent runs merge (a zero-length hole between them would
+        // contradict the walk, so equality is the only case).
+        if let Some(last) = ranges.last_mut() {
+            if last.0 + last.1 == data {
+                last.1 += hole - data;
+            } else {
+                ranges.push((data, hole - data));
+            }
+        } else {
+            ranges.push((data, hole - data));
+        }
+        off = hole;
+    }
+    Ok(Some(ranges))
 }
 
 #[cfg(test)]
@@ -536,7 +629,7 @@ mod tests {
             .write_all_at_cancellable(200, &[9u8; 32], 8, &|| false)
             .expect("cancellable write lands");
         assert_eq!(done, 32);
-        target.zero_range(200, 8).expect("zero lands");
+        target.zero_range(200, 8, &|| false).expect("zero lands");
         target.read_at(200, &mut buf).expect("read lands");
         assert_eq!(&buf[..8], &[0u8; 8]);
         assert_eq!(&buf[8..], &[9u8; 8]);
@@ -711,6 +804,75 @@ mod tests {
         // No partition node behind a file.
         let error = opener.partition_path().expect_err("the seam has no node");
         assert!(error.to_string().contains("no partition node"), "{error:?}");
+    }
+
+    #[test]
+    fn data_ranges_of_a_sparse_file_are_exact() {
+        use std::io::Seek as _;
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("sparse.img");
+        // Two 4 KiB data runs with holes around and between: 4 KiB at
+        // 0, a hole to 6 MiB, 4 KiB there, a hole to EOF at 8 MiB.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("sparse file creates");
+        file.write_all(&[0x5Au8; 4096]).expect("head writes");
+        file.seek(std::io::SeekFrom::Start(6 * 1024 * 1024))
+            .expect("hole seeks");
+        file.write_all(&[0xA5u8; 4096]).expect("tail writes");
+        file.set_len(8 * 1024 * 1024).expect("sparse file sizes");
+        drop(file);
+        let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
+        let ranges = opener
+            .data_ranges(&path)
+            .expect("the query runs")
+            .expect("tmpfs answers hole queries");
+        assert_eq!(ranges, [(0, 4096), (6 * 1024 * 1024, 4096)]);
+        // The holes read back as zeros, and nothing is reported past
+        // the length.
+        let bytes = std::fs::read(&path).expect("sparse file reads");
+        assert_eq!(bytes.len(), 8 * 1024 * 1024);
+        assert!(bytes[4096..6 * 1024 * 1024].iter().all(|&byte| byte == 0));
+        assert!(
+            bytes[6 * 1024 * 1024 + 4096..]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        let (last_off, last_len) = ranges.last().copied().expect("a data run");
+        assert_eq!(last_off + last_len, 6 * 1024 * 1024 + 4096);
+    }
+
+    #[test]
+    fn data_ranges_of_a_dense_file_is_one_range() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("dense.img");
+        std::fs::write(&path, vec![0x5Au8; 1024 * 1024]).expect("dense file writes");
+        let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
+        let ranges = opener
+            .data_ranges(&path)
+            .expect("the query runs")
+            .expect("tmpfs answers hole queries");
+        assert_eq!(ranges, [(0, 1024 * 1024)]);
+    }
+
+    #[test]
+    fn data_ranges_of_an_empty_file_is_empty() {
+        // The query succeeds on an empty file — there is just no data:
+        // `Some([])`, never `None` (which means "cannot answer").
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("empty.img");
+        std::fs::write(&path, []).expect("empty file writes");
+        let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
+        let ranges = opener
+            .data_ranges(&path)
+            .expect("the query runs")
+            .expect("tmpfs answers hole queries");
+        assert!(ranges.is_empty(), "{ranges:?}");
     }
 
     #[test]

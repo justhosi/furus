@@ -215,6 +215,8 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::path::Path;
+    use std::rc::Rc;
 
     use rufus_proto::BootloaderMode;
     use rufus_proto::DeviceRef;
@@ -528,8 +530,8 @@ mod tests {
             Ok(done.saturating_sub(1))
         }
 
-        fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
-            self.inner.zero_range(offset, len)
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
         }
 
         fn flush(&self) -> Result<()> {
@@ -585,8 +587,8 @@ mod tests {
             Ok(done.saturating_add(1))
         }
 
-        fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
-            self.inner.zero_range(offset, len)
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
         }
 
         fn flush(&self) -> Result<()> {
@@ -674,8 +676,8 @@ mod tests {
                 .write_all_at_cancellable(offset, buf, chunk, cancelled)
         }
 
-        fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
-            self.inner.zero_range(offset, len)
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
         }
 
         fn flush(&self) -> Result<()> {
@@ -1856,7 +1858,7 @@ mod tests {
                 .write_all_at_cancellable(offset, buf, chunk, cancelled)
         }
 
-        fn zero_range(&self, _offset: u64, _len: u64) -> Result<()> {
+        fn zero_range(&self, _offset: u64, _len: u64, _cancelled: &dyn Fn() -> bool) -> Result<()> {
             Err(CoreError::io(
                 "test-device",
                 std::io::Error::other("injected media error"),
@@ -2105,6 +2107,299 @@ mod tests {
         ] {
             assert_eq!(step_name(&step), name);
         }
+    }
+
+    /// A [`Target`] counting its cancellable writes, zero calls and
+    /// target reads over a shared [`VecTarget`]: the sparse tests pin
+    /// call counts through these. Counters ride in an `Rc` so every
+    /// cloned handle shares them (the opener clones per `device()`
+    /// call); single-threaded only, like [`VecTarget`].
+    #[derive(Debug, Clone)]
+    struct CountTarget {
+        inner: VecTarget,
+        write_calls: Rc<Cell<usize>>,
+        write_bytes: Rc<Cell<u64>>,
+        zero_calls: Rc<Cell<usize>>,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl CountTarget {
+        fn new(len: u64) -> Self {
+            Self {
+                inner: VecTarget::new(len, 512).expect("fixture target fits"),
+                write_calls: Rc::new(Cell::new(0)),
+                write_bytes: Rc::new(Cell::new(0)),
+                zero_calls: Rc::new(Cell::new(0)),
+                reads: Rc::new(Cell::new(0)),
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.inner.bytes().expect("bytes read back")
+        }
+    }
+
+    impl Target for CountTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            let done = self
+                .inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)?;
+            self.write_calls.set(self.write_calls.get() + 1);
+            self.write_bytes.set(self.write_bytes.get() + done);
+            Ok(done)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.zero_calls.set(self.zero_calls.get() + 1);
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// A fixture [`Opener`] reporting caller-chosen `ranges` (or `None`
+    /// for the default straight-copy answer) over one [`CountTarget`].
+    #[derive(Debug, Clone)]
+    struct SparseOpener {
+        target: CountTarget,
+        ranges: Option<Vec<(u64, u64)>>,
+    }
+
+    impl Opener for SparseOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+
+        fn data_ranges(&self, _path: &Path) -> Result<Option<Vec<(u64, u64)>>> {
+            Ok(self.ranges.clone())
+        }
+    }
+
+    #[test]
+    fn sparse_write_zeroes_holes_and_streams_only_data() {
+        // 6 MiB image with data at [1 MiB, 2 MiB) and [4 MiB, 4.5 MiB):
+        // the data lands verbatim, the three hole windows zero (wiping
+        // the prefill), writes cover data only, and progress ends at
+        // the image size.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(6 * MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        assert_eq!(size, 6 * MIB);
+        let opener = SparseOpener {
+            target: CountTarget::new(6 * MIB),
+            ranges: Some(vec![(MIB, MIB), (4 * MIB, MIB / 2)]),
+        };
+        opener
+            .target
+            .inner
+            .write_all_at(0, &vec![0xAAu8; 6 * MIB as usize])
+            .expect("prefill writes");
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a sparse write runs");
+        let bytes = opener.target.bytes();
+        assert_eq!(
+            &bytes[MIB as usize..2 * MIB as usize],
+            &content[MIB as usize..2 * MIB as usize]
+        );
+        assert_eq!(
+            &bytes[4 * MIB as usize..9 * MIB as usize / 2],
+            &content[4 * MIB as usize..9 * MIB as usize / 2]
+        );
+        // The three hole windows read zero: the prefill is gone there.
+        for window in [
+            0..MIB as usize,
+            2 * MIB as usize..4 * MIB as usize,
+            9 * MIB as usize / 2..6 * MIB as usize,
+        ] {
+            assert!(
+                bytes[window.clone()].iter().all(|&byte| byte == 0),
+                "hole {window:?} is zeroed"
+            );
+        }
+        // Four 256 KiB data chunks plus two: holes cost zero calls,
+        // never writes.
+        assert_eq!(opener.target.write_calls.get(), 6);
+        assert_eq!(opener.target.write_bytes.get(), 3 * MIB / 2);
+        assert_eq!(opener.target.zero_calls.get(), 3);
+        let progress = progresses(&reporter);
+        assert!(
+            progress.iter().all(|(_, total)| *total == Some(6 * MIB)),
+            "one stream at the image size: {progress:?}"
+        );
+        assert_eq!(
+            progress.last().copied(),
+            Some((6 * MIB, Some(6 * MIB))),
+            "holes included, the final event is done == total"
+        );
+    }
+
+    #[test]
+    fn sparse_write_refuses_ranges_that_contradict_the_plan_size() {
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(6 * MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        // A range running past the image size: 5 MiB + 2 MiB ends at
+        // 7340032 against a 6291456 byte image.
+        let opener = SparseOpener {
+            target: CountTarget::new(6 * MIB),
+            ranges: Some(vec![(5 * MIB, 2 * MIB)]),
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a past-the-end range refuses");
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("7340032"), "{text}");
+        assert!(text.contains("6291456"), "{text}");
+        assert!(
+            opener.target.bytes().iter().all(|&byte| byte == 0),
+            "nothing written"
+        );
+        // An overlapping pair: the second range starts at 1.5 MiB,
+        // inside the first range's 1..2 MiB.
+        let opener = SparseOpener {
+            target: CountTarget::new(6 * MIB),
+            ranges: Some(vec![(MIB, MIB), (3 * MIB / 2, MIB)]),
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an overlapping pair refuses");
+        let text = error.to_string();
+        assert!(text.contains("1572864"), "{text}");
+        assert!(text.contains("2097152"), "{text}");
+        assert!(
+            opener.target.bytes().iter().all(|&byte| byte == 0),
+            "nothing written"
+        );
+    }
+
+    #[test]
+    fn no_data_ranges_means_a_straight_copy() {
+        // The default (`None`) answer keeps today's straight-through
+        // behaviour: the whole 1 MiB image streams in four 256 KiB
+        // writes, no zero calls, progress to the image size.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = SparseOpener {
+            target: CountTarget::new(8 * MIB),
+            ranges: None,
+        };
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("the default answer copies straight through");
+        let bytes = opener.target.bytes();
+        assert_eq!(&bytes[..size as usize], &content[..]);
+        assert_eq!(opener.target.write_calls.get(), 4);
+        assert_eq!(opener.target.write_bytes.get(), MIB);
+        assert_eq!(opener.target.zero_calls.get(), 0);
+        assert_eq!(
+            progresses(&reporter).last().copied(),
+            Some((MIB, Some(MIB)))
+        );
+    }
+
+    #[test]
+    fn all_holes_means_the_whole_image_is_zeroed() {
+        // No data at all over a 2 MiB image: one hole window zeroes the
+        // whole target, progress still reaches the total, and no read
+        // — of the target or the file — ever happens.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(2 * MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = SparseOpener {
+            target: CountTarget::new(2 * MIB),
+            ranges: Some(Vec::new()),
+        };
+        opener
+            .target
+            .inner
+            .write_all_at(0, &vec![0xAAu8; 2 * MIB as usize])
+            .expect("prefill writes");
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("an all-hole image zeroes");
+        assert!(opener.target.bytes().iter().all(|&byte| byte == 0));
+        assert_eq!(opener.target.write_calls.get(), 0);
+        assert_eq!(opener.target.zero_calls.get(), 1);
+        assert_eq!(opener.target.reads.get(), 0);
+        assert_eq!(
+            progresses(&reporter).last().copied(),
+            Some((2 * MIB, Some(2 * MIB)))
+        );
     }
 
     #[test]

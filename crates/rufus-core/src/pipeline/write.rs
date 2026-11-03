@@ -228,6 +228,65 @@ fn check_image(
     Ok(len)
 }
 
+/// Write one `chunk` at `done` through the cancellable primitive,
+/// folding the sample into `ema`: a short count reads as cancellation
+/// (a target that reports full while swallowing bytes cannot be
+/// detected here, which is why the verify pass in slice 7 exists —
+/// the honest form of Rufus's `Wrote %d bytes, expected %d bytes`
+/// check), a count past the chunk as a faulty target refusing by name
+/// with both numbers. Shared by the straight and sparse loops so the
+/// rules cannot drift.
+fn write_piece(
+    ctx: &mut RunContext<'_>,
+    chunk: &[u8],
+    done: u64,
+    cancelled: &dyn Fn() -> bool,
+    ema: &mut RateEma,
+) -> Result<u64> {
+    let chunk_started = Instant::now();
+    let written = ctx
+        .device()?
+        .write_all_at_cancellable(done, chunk, CHUNK, cancelled)?;
+    let read = chunk.len() as u64;
+    if written < read {
+        return Err(CoreError::Cancelled);
+    }
+    if written > read {
+        return Err(CoreError::invalid(format!(
+            "target reported {written} bytes written for a {read} byte chunk at offset {done}: refusing an impossible count"
+        )));
+    }
+    ema.observe(read, chunk_started.elapsed());
+    Ok(written)
+}
+
+/// Emit one [`Progress`](Event::Progress) unless throttled: at most
+/// every [`PROGRESS_INTERVAL`], plus always when `force` (the final
+/// sample of a loop). `total` rides along unchanged — `Some` length
+/// for sized streams, `None` while a decoded size is still unknown.
+fn emit_progress(
+    ctx: &mut RunContext<'_>,
+    done: u64,
+    total: Option<u64>,
+    ema: &RateEma,
+    last_emit: &mut Instant,
+    force: bool,
+) {
+    if !force && last_emit.elapsed() < PROGRESS_INTERVAL {
+        return;
+    }
+    *last_emit = Instant::now();
+    ctx.reporter.event(Event::Progress {
+        step: "write",
+        done,
+        total,
+        bytes_per_second: ema.bytes_per_second(),
+        eta_seconds: match total {
+            Some(len) => ema.eta_seconds(len.saturating_sub(done)),
+            None => None,
+        },
+    });
+}
 /// Stream `source` to the device in [`CHUNK`]-sized pieces, returning
 /// the bytes written with the loop's rate average. `total` is the raw
 /// file length (every event carries it, the last at `done == total`)
@@ -256,7 +315,9 @@ fn pump(
         // holding another `ctx` borrow across the call. A set flag
         // kills a piped child before refusing, so no decompressor
         // outlives its run; checking once per chunk is the whole
-        // cancellation cadence.
+        // cancellation cadence — a source stalled inside `fill` (a
+        // decompressor producing nothing) stalls cancellation with it
+        // until it produces more or exits.
         let cancelled = ctx.cancelled;
         if cancelled() {
             source.cancel();
@@ -292,42 +353,16 @@ fn pump(
         let chunk = chunk
             .get(..read)
             .ok_or_else(|| CoreError::invalid("write chunk window runs past its buffer"))?;
-        let chunk_started = Instant::now();
-        let written = ctx
-            .device()?
-            .write_all_at_cancellable(done, chunk, CHUNK, cancelled)?;
-        if written < read as u64 {
-            // The contract reads a short count as cancellation: a
-            // target that reports full while swallowing bytes cannot
-            // be detected here, which is why the verify pass
-            // (slice 7) exists. This is the honest form of Rufus's
-            // `Wrote %d bytes, expected %d bytes` check.
-            return Err(CoreError::Cancelled);
-        }
-        if written > read as u64 {
-            // Impossible by contract (no more than the chunk went
-            // in): a target that claims otherwise is faulty, not
-            // cancelled, so it refuses by name with both numbers.
-            return Err(CoreError::invalid(format!(
-                "target reported {written} bytes written for a {read} byte chunk at offset {done}: refusing an impossible count"
-            )));
-        }
+        let written = write_piece(ctx, chunk, done, cancelled, &mut ema)?;
         done = done.saturating_add(written);
-        ema.observe(read as u64, chunk_started.elapsed());
-        let finished = total.is_some_and(|len| done >= len);
-        if last_emit.elapsed() >= PROGRESS_INTERVAL || finished {
-            last_emit = Instant::now();
-            ctx.reporter.event(Event::Progress {
-                step: "write",
-                done,
-                total,
-                bytes_per_second: ema.bytes_per_second(),
-                eta_seconds: match total {
-                    Some(len) => ema.eta_seconds(len.saturating_sub(done)),
-                    None => None,
-                },
-            });
-        }
+        emit_progress(
+            ctx,
+            done,
+            total,
+            &ema,
+            &mut last_emit,
+            total.is_some_and(|len| done >= len),
+        );
     }
     Ok((done, ema))
 }
@@ -339,12 +374,17 @@ fn pump(
 /// unaligned image has no room past itself) and skipped for a zero
 /// sector size — then flush and rescan: the run's epilogue for both
 /// sources.
-fn finish_write(ctx: &mut RunContext<'_>, done: u64, size: u64) -> Result<()> {
+fn finish_write(
+    ctx: &mut RunContext<'_>,
+    done: u64,
+    size: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
     let sector = u64::from(ctx.device()?.sector_size());
     if sector != 0 && !done.is_multiple_of(sector) {
         let end = (done / sector + 1).saturating_mul(sector).min(size);
         if end > done {
-            ctx.device()?.zero_range(done, end - done)?;
+            ctx.device()?.zero_range(done, end - done, cancelled)?;
         }
     }
     ctx.device()?.flush()?;
@@ -388,9 +428,14 @@ pub(crate) fn run(
     }
 }
 
-/// Straight-through raw writing: no sparse skipping, no decompression
-/// (slice 6).
+/// Straight-through raw writing, sparse-aware: the opener's
+/// [`data_ranges`](super::super::opener::Opener::data_ranges) answer
+/// decides. `None` keeps the straight copy byte for byte; `Some`
+/// streams only the data runs and zeroes the holes (see
+/// [`pump_sparse`]).
 mod raw {
+    use std::path::Path;
+
     use super::*;
 
     /// Stream the image file to the device in [`CHUNK`](super::CHUNK)-sized
@@ -402,14 +447,136 @@ mod raw {
         size: u64,
     ) -> Result<()> {
         let file = File::open(&image.path).map_err(|source| CoreError::io(&image.path, source))?;
-        let mut source = super::Source::File {
-            file,
-            path: image.path.clone(),
-        };
+        // Compressed streams have no holes; only the raw arm asks.
+        let ranges = ctx.opener.data_ranges(Path::new(&image.path))?;
+        match ranges {
+            None => {
+                let mut source = super::Source::File {
+                    file,
+                    path: image.path.clone(),
+                };
+                if len == 0 {
+                    // An empty image still reports itself: without this the run
+                    // emits no Progress at all and a consumer cannot tell "done
+                    // instantly" from "never reported".
+                    ctx.reporter.event(Event::Progress {
+                        step: "write",
+                        done: 0,
+                        total: Some(0),
+                        bytes_per_second: 0,
+                        eta_seconds: None,
+                    });
+                }
+                let (done, _) = match super::pump(ctx, &mut source, Some(len), size) {
+                    Ok(done) => done,
+                    Err(error) => {
+                        let _ = source.finish();
+                        return Err(error);
+                    }
+                };
+                source.finish()?;
+                let cancelled = ctx.cancelled;
+                super::finish_write(ctx, done, size, cancelled)?;
+                Ok(())
+            }
+            Some(ranges) => run_sparse(ctx, image, &file, &ranges, len, size),
+        }
+    }
+
+    /// Validate a `data_ranges` answer against the plan image size:
+    /// ascending, non-overlapping, no empty entries, nothing past the
+    /// image — a map contradicting `plan.image.size_bytes` is refused
+    /// naming both, before any byte moves.
+    fn check_ranges(ranges: &[(u64, u64)], len: u64) -> Result<()> {
+        let mut prev_end = 0u64;
+        for (offset, rlen) in ranges {
+            if *rlen == 0 {
+                return Err(CoreError::invalid(format!(
+                    "sparse range at offset {offset} is empty: refusing a map with zero-length entries"
+                )));
+            }
+            if *offset < prev_end {
+                return Err(CoreError::invalid(format!(
+                    "sparse ranges overlap: range at offset {offset} starts before the previous range ends at {prev_end}"
+                )));
+            }
+            let end = offset.checked_add(*rlen).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "sparse range at offset {offset} with length {rlen} overflows"
+                ))
+            })?;
+            if end > len {
+                return Err(CoreError::invalid(format!(
+                    "sparse range [{offset}, {end}) runs past the {len} byte image: refusing a map that contradicts the plan size"
+                )));
+            }
+            prev_end = end;
+        }
+        Ok(())
+    }
+
+    /// Fill `buf` from `file` at `offset`: a short read before EOF is
+    /// the Rufus `Read error` shape, naming path and offset.
+    fn read_exact_at(file: &File, buf: &mut [u8], offset: u64, path: &str) -> Result<()> {
+        use std::os::unix::fs::FileExt as _;
+
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            let window = buf
+                .get_mut(filled..)
+                .ok_or_else(|| CoreError::invalid("sparse read window runs past its buffer"))?;
+            match file.read_at(window, offset + filled as u64) {
+                Ok(0) => {
+                    return Err(CoreError::io(
+                        path,
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("read error at image offset {offset}: unexpected end of file"),
+                        ),
+                    ));
+                }
+                Ok(read) => filled += read,
+                Err(error) => {
+                    return Err(CoreError::io(
+                        path,
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("read error at image offset {offset}: {error}"),
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream only the data runs and zero the holes: gaps before the
+    /// first, between, and after the last range go through
+    /// [`zero_range`](super::super::Target::zero_range) (one call per
+    /// window, cancellable between sub-chunks inside), data runs stream
+    /// in [`CHUNK`](super::CHUNK) pieces under the same per-chunk
+    /// cancellation and short/over-count rules as the straight loop.
+    /// One `Progress` stream whose `total` is the image size and whose
+    /// `done` counts every byte the target ends up holding, holes
+    /// included, so the final event is `done == total == image size`.
+    ///
+    /// Holes are zeroed rather than skipped: the target holds whatever
+    /// the previous image or a failed run left, so skipping a hole
+    /// would leak stale bytes into the new filesystem's free space.
+    /// Holes cost a `zero_range`, never a source read — and a target
+    /// without a zero-out primitive pays the 4 MiB fallback writes.
+    fn run_sparse(
+        ctx: &mut RunContext<'_>,
+        image: &ImageRef,
+        file: &File,
+        ranges: &[(u64, u64)],
+        len: u64,
+        size: u64,
+    ) -> Result<()> {
+        check_ranges(ranges, len)?;
         if len == 0 {
-            // An empty image still reports itself: without this the run
-            // emits no Progress at all and a consumer cannot tell "done
-            // instantly" from "never reported".
+            // As in the straight arm: one zero event, so "done
+            // instantly" reads apart from "never reported".
             ctx.reporter.event(Event::Progress {
                 step: "write",
                 done: 0,
@@ -418,16 +585,68 @@ mod raw {
                 eta_seconds: None,
             });
         }
-        let (done, _) = match super::pump(ctx, &mut source, Some(len), size) {
-            Ok(done) => done,
-            Err(error) => {
-                let _ = source.finish();
-                return Err(error);
+        let mut buf = vec![0u8; super::CHUNK];
+        let mut ema = super::RateEma::new();
+        let mut last_emit = Instant::now();
+        let mut done = 0u64;
+        let mut pos = 0u64;
+        for (offset, rlen) in ranges {
+            // The hole window before this data run.
+            done = zero_gap(ctx, pos, *offset, len, &ema, &mut last_emit, done)?;
+            // The data run itself, in chunk pieces.
+            let mut rest = *rlen;
+            let mut at = *offset;
+            while rest > 0 {
+                let cancelled = ctx.cancelled;
+                if cancelled() {
+                    return Err(CoreError::Cancelled);
+                }
+                let want = rest.min(super::CHUNK as u64) as usize;
+                let chunk = buf
+                    .get_mut(..want)
+                    .ok_or_else(|| CoreError::invalid("write chunk window runs past its buffer"))?;
+                read_exact_at(file, chunk, at, &image.path)?;
+                let written = super::write_piece(ctx, chunk, at, cancelled, &mut ema)?;
+                at += written;
+                rest -= written;
+                done += written;
+                super::emit_progress(ctx, done, Some(len), &ema, &mut last_emit, done == len);
             }
-        };
-        source.finish()?;
-        super::finish_write(ctx, done, size)?;
+            pos = *offset + *rlen;
+        }
+        // The trailing hole window, if any.
+        done = zero_gap(ctx, pos, len, len, &ema, &mut last_emit, done)?;
+        let cancelled = ctx.cancelled;
+        super::finish_write(ctx, done, size, cancelled)?;
         Ok(())
+    }
+
+    /// Zero the hole window `[from, to)`: one
+    /// [`zero_range`](super::super::Target::zero_range) call per
+    /// window (cancellable between sub-chunks inside), counted into
+    /// `done` like every byte the target ends up holding. The running
+    /// rate rides along unchanged — gaps add no sample. Empty windows
+    /// are free.
+    fn zero_gap(
+        ctx: &mut RunContext<'_>,
+        from: u64,
+        to: u64,
+        len: u64,
+        ema: &super::RateEma,
+        last_emit: &mut Instant,
+        done: u64,
+    ) -> Result<u64> {
+        if to <= from {
+            return Ok(done);
+        }
+        let cancelled = ctx.cancelled;
+        if cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+        ctx.device()?.zero_range(from, to - from, cancelled)?;
+        let done = done + (to - from);
+        super::emit_progress(ctx, done, Some(len), ema, last_emit, done == len);
+        Ok(done)
     }
 
     #[cfg(test)]
@@ -519,7 +738,8 @@ mod compressed {
             bytes_per_second: ema.bytes_per_second(),
             eta_seconds: None,
         });
-        super::finish_write(ctx, done, size)?;
+        let cancelled = ctx.cancelled;
+        super::finish_write(ctx, done, size, cancelled)?;
         Ok(())
     }
 }

@@ -29,6 +29,18 @@ pub trait Opener {
     /// because the partition may not be openable yet.
     fn partition_path(&self) -> Result<std::path::PathBuf>;
 
+    /// Data ranges of the image file at `path`: `(offset, len)` windows
+    /// in ascending order, non-overlapping, exactly covering the file's
+    /// data, so the write step can stream data and zero holes instead
+    /// of copying every byte. `Ok(None)` means the platform or the
+    /// filesystem cannot answer — never an error for a file that
+    /// simply has no holes — and the caller then treats the whole file
+    /// as data. Errors are reserved for a genuine I/O failure (an
+    /// unreadable file, a failed query).
+    fn data_ranges(&self, _path: &std::path::Path) -> Result<Option<Vec<(u64, u64)>>> {
+        Ok(None)
+    }
+
     /// Give up the whole-disk handle opened so far, if any: flush it,
     /// close it, and forget it so the next [`device`](Opener::device)
     /// reopens from scratch. The tool-based `Mkfs` arms call this
