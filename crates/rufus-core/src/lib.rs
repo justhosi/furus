@@ -111,6 +111,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod copy;
 pub mod distro;
 pub mod error;
 pub mod fs;
