@@ -42,9 +42,9 @@ pub enum Event {
     /// loop; zero/`None` only while no sample exists.
     Progress {
         /// Snake-case step identifier (see `step_name`): a plan step,
-        /// or `"verify"` for the read-back pass, which is an
-        /// event-level pseudo-step rather than a plan step. A
-        /// `step: "verify"` sample reaching `done == total` means
+        /// or `"verify"` for the read-back pass or `"badblocks"` for
+        /// the surface scan, both event-level pseudo-steps rather than
+        /// plan steps. A `step: "verify"` sample reaching `done == total` means
         /// "bytes read", not "bytes matched": the run's `finished`
         /// event — absent on failure — is the only honest success
         /// signal for a consumer.

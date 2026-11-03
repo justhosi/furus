@@ -221,7 +221,8 @@ pub struct Options {
     pub cluster_bytes: Option<u32>,
     /// Quick format (Rufus default); `false` means a full surface format.
     pub quick_format: bool,
-    /// Scan for bad blocks while formatting.
+    /// Scan for bad blocks in the wipe step, before the table and
+    /// format.
     pub bad_blocks: bool,
     /// Read-back verification of the written image.
     pub verify: bool,

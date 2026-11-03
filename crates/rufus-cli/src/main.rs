@@ -573,7 +573,8 @@ enum Command {
         /// Quick format (metadata only) instead of a full surface format.
         #[arg(long)]
         quick: bool,
-        /// Scan for bad blocks while formatting.
+        /// Scan for bad blocks in the wipe step, before the table and
+        /// format.
         #[arg(long)]
         badblocks: bool,
         /// Read the written image back for verification.

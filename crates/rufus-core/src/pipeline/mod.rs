@@ -237,6 +237,10 @@ mod tests {
     use std::cell::RefCell;
     use std::path::Path;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use rufus_proto::BootloaderMode;
     use rufus_proto::DeviceRef;
@@ -2680,6 +2684,150 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(300),
             "a cancel during the delay returns promptly, not after 600 ms: {elapsed:?}"
+        );
+    }
+
+    /// A [`Target`] sleeping `delay` on every cancellable write call
+    /// before delegating: the cancellation-response test pins
+    /// wall-time behaviour through this. Everything else delegates to
+    /// an inner [`VecTarget`].
+    #[derive(Debug, Clone)]
+    struct DelayTarget {
+        inner: VecTarget,
+        delay: std::time::Duration,
+    }
+
+    impl Target for DelayTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            std::thread::sleep(self.delay);
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`DelayTarget`].
+    #[derive(Debug, Clone)]
+    struct DelayOpener {
+        target: DelayTarget,
+    }
+
+    impl Opener for DelayOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    #[test]
+    fn write_stops_within_200_ms_of_cancellation() {
+        // A 2 MiB image (eight 256 KiB chunks) over a target sleeping
+        // 50 ms per chunk write, with a flipper thread setting the
+        // flag 120 ms in: the run must report `Cancelled` within
+        // 200 ms of the flip — at most the in-flight chunk (50 ms)
+        // plus loop overhead can follow it, so the bound carries 4x
+        // headroom. The payload stays incomplete and no
+        // `step_finished` for `write` follows either.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(2 * MIB as usize);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = DelayOpener {
+            target: DelayTarget {
+                inner: VecTarget::new(8 * MIB, 512).expect("fixture target fits"),
+                delay: std::time::Duration::from_millis(50),
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        let flipped_at = Arc::new(Mutex::new(None));
+        let flipper = {
+            let flag = Arc::clone(&flag);
+            let flipped_at = Arc::clone(&flipped_at);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                flag.store(true, Ordering::SeqCst);
+                *flipped_at.lock().expect("flip instant records") = Some(std::time::Instant::now());
+            })
+        };
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| flag.load(Ordering::SeqCst),
+        )
+        .expect_err("a mid-write cancel stops");
+        let returned_at = std::time::Instant::now();
+        flipper.join().expect("the flipper finishes");
+        let flipped = flipped_at
+            .lock()
+            .expect("flip instant reads")
+            .expect("the flipper ran");
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "cancellation surfaces wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("cancelled"), "{error:?}");
+        assert!(
+            returned_at.duration_since(flipped) < std::time::Duration::from_millis(200),
+            "the run stops within 200 ms of the flip: {:?}",
+            returned_at.duration_since(flipped)
+        );
+        let bytes = opener.target.inner.bytes().expect("bytes read back");
+        assert_ne!(
+            &bytes[..size as usize],
+            &content[..],
+            "the payload stays incomplete"
+        );
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { step: "write", .. })),
+            "no success is reported: {:?}",
+            reporter.events()
         );
     }
 
