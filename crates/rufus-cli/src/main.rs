@@ -606,9 +606,10 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         plan: PathBuf,
         /// Reset the USB device once the write retry budget is spent,
-        /// then retry the failed chunk once more. Best effort: non-USB
-        /// devices and unopenable reset nodes report "no reset was
-        /// possible" and the original write error stands.
+        /// then retry the failed chunk once more. Best effort: when no
+        /// reset happens the run reports "no USB reset was possible for
+        /// this device; reporting the write error" and the original
+        /// write error stands.
         #[arg(long)]
         reset_usb: bool,
     },

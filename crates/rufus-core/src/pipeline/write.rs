@@ -51,8 +51,9 @@ pub(crate) const CHUNK: usize = 256 * 1024;
 pub(crate) const LARGE_DRIVE_SLACK: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Slowest progress cadence: a [`Progress`](Event::Progress) goes out at
-/// most this often, plus always the final one at 100 %.
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// most this often, plus always the final one at 100 %. Shared with
+/// the bad-blocks scan, which keeps the same cadence.
+pub(crate) const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Exponential moving average of write throughput in bytes per
 /// second: `rate = alpha * sample + (1 - alpha) * rate` with
@@ -61,8 +62,9 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// (per-chunk wall time): on a real device the write dominates, and
 /// smoothing both keeps one number for the event stream. Elapsed
 /// time arrives as an explicit [`Duration`] so the arithmetic is
-/// testable without sleeping.
-struct RateEma {
+/// testable without sleeping. Shared with the bad-blocks scan, which
+/// folds each scanned piece the same way.
+pub(crate) struct RateEma {
     rate: f64,
 }
 
@@ -72,14 +74,14 @@ struct RateEma {
 const EMA_ALPHA: f64 = 0.25;
 
 impl RateEma {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { rate: 0.0 }
     }
 
     /// Fold one chunk's bytes and wall time into the average. A zero
     /// elapsed time carries no information (it would divide by
     /// zero), so the sample is dropped and the rate stands.
-    fn observe(&mut self, bytes: u64, elapsed: Duration) {
+    pub(crate) fn observe(&mut self, bytes: u64, elapsed: Duration) {
         if elapsed.is_zero() {
             return;
         }
@@ -92,13 +94,13 @@ impl RateEma {
     }
 
     /// Current rate, rounded down to whole bytes per second.
-    fn bytes_per_second(&self) -> u64 {
+    pub(crate) fn bytes_per_second(&self) -> u64 {
         self.rate as u64
     }
 
     /// Seconds to drain `remaining` at the current rate, rounded up;
     /// `None` while the rate is still zero.
-    fn eta_seconds(&self, remaining: u64) -> Option<u64> {
+    pub(crate) fn eta_seconds(&self, remaining: u64) -> Option<u64> {
         if self.rate <= 0.0 {
             return None;
         }
@@ -251,10 +253,14 @@ fn retryable(error: &CoreError) -> bool {
     }
 }
 
-/// The per-attempt retry notice: 1-based attempt ordinal, total
-/// attempts, offset, error, and the coming delay. Emitted for every
+/// The per-attempt retry notice: 1-based attempt ordinal, attempt
+/// budget, offset, error, and the coming delay. Emitted for every
 /// failure a retry follows; the terminal failure returns its error
-/// silently (the reset messages or the run report cover it). The shape
+/// silently (the reset messages or the run report cover it). The
+/// budget counts the initial attempt plus [`RunOptions::retries`]
+/// retries — a USB reset may still buy one more attempt after it
+/// (see [`write_chunk`](super::write_chunk)), so the total is worded
+/// as what it is: the attempts before any USB reset. The shape
 /// mirrors the reference (`0x140010a40` logs `Retrying in %d
 /// seconds...` with 5 after each `Write error at sector %lld: %s`);
 /// the offset here is a byte offset, not a sector number, because the
@@ -268,9 +274,34 @@ fn retry_message(
     delay: Duration,
 ) -> String {
     format!(
-        "{op} error at offset {offset} (attempt {attempt} of {total}): {error}; retrying in {} seconds",
+        "{op} error at offset {offset} (attempt {attempt} of {total} before any USB reset): {error}; retrying in {} seconds",
         delay.as_secs()
     )
+}
+
+/// Delay slices for [`sleep_cancellable`]: the cancel probe is
+/// consulted this often while a retry delay elapses.
+const SLEEP_SLICE: Duration = Duration::from_millis(100);
+
+/// Sleep `delay` in [`SLEEP_SLICE`] slices, consulting `cancelled`
+/// between slices: a Ctrl-C during a long retry delay returns
+/// [`Cancelled`](CoreError::Cancelled) promptly instead of waiting
+/// the full delay out. A set probe refuses even for a zero delay,
+/// like the check-then-sleep this replaces.
+fn sleep_cancellable(delay: Duration, cancelled: &dyn Fn() -> bool) -> Result<()> {
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        let slice = remaining.min(SLEEP_SLICE);
+        std::thread::sleep(slice);
+        if cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+        remaining = remaining.saturating_sub(slice);
+    }
+    Ok(())
 }
 
 /// Flush best effort before a retry: a flush failure is a warning, not
@@ -297,7 +328,10 @@ fn flush_best_effort(ctx: &mut RunContext<'_>, offset: u64) {
 /// layout refresh (`0x140010a40` ends the run with `Could not refresh
 /// drive layout: %s` when the rescan fails): a device that vanished or
 /// shrank under the write is observed here, before the next attempt,
-/// rather than after the run.
+/// rather than after the run. The re-read is genuinely live on
+/// file-backed stores (the store re-stats on every `size` call); on
+/// block devices the enumerated extent is stable, so the check is a
+/// no-op safeguard there.
 fn recheck_size(ctx: &mut RunContext<'_>, offset: u64, len: u64) -> Result<u64> {
     let size = ctx.device()?.size();
     if offset.checked_add(len).is_some_and(|end| end > size) {
@@ -409,10 +443,7 @@ fn zero_chunk(
                     });
                     flush_best_effort(ctx, offset);
                     recheck_size(ctx, offset, len)?;
-                    if cancelled() {
-                        return Err(CoreError::Cancelled);
-                    }
-                    std::thread::sleep(options.retry_delay);
+                    sleep_cancellable(options.retry_delay, cancelled)?;
                     performed += 1;
                     continue;
                 }
@@ -434,7 +465,8 @@ fn zero_chunk(
 /// Write one chunk with the reference retry policy (`0x140010a40`):
 /// the initial attempt plus [`RunOptions::retries`] retries — the
 /// reference gives up with `if (3 < uVar4)`, three retries, four tries
-/// total. On a retryable failure the loop warns (attempt, offset,
+/// total (five when the post-reset attempt fires, which is why the
+/// per-attempt notice counts its total "before any USB reset"). On a retryable failure the loop warns (attempt, offset,
 /// error), flushes best effort, re-reads the device size (a vanished
 /// device refuses at once), honours cancellation, sleeps
 /// [`RunOptions::retry_delay`], and retries the same offset. The loop
@@ -475,10 +507,7 @@ fn write_chunk(
                     });
                     flush_best_effort(ctx, offset);
                     recheck_size(ctx, offset, chunk.len() as u64)?;
-                    if cancelled() {
-                        return Err(CoreError::Cancelled);
-                    }
-                    std::thread::sleep(options.retry_delay);
+                    sleep_cancellable(options.retry_delay, cancelled)?;
                     performed += 1;
                     continue;
                 }
@@ -502,9 +531,10 @@ fn write_chunk(
 /// `force` (the final sample of a loop). `total` rides along unchanged
 /// — `Some` length for sized streams, `None` while a decoded size is
 /// still unknown. `step` is usually `"write"`; the read-back verify
-/// reports `"verify"`, an event-level pseudo-step that is not a plan
-/// step (see [`step_name`](super::step_name), which stays unchanged).
-fn emit_progress(
+/// reports `"verify"` and the surface scan `"badblocks"`, event-level
+/// pseudo-steps that are not plan steps (see
+/// [`step_name`](super::step_name), which stays unchanged).
+pub(crate) fn emit_progress(
     ctx: &mut RunContext<'_>,
     step: &'static str,
     done: u64,

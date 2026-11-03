@@ -13,6 +13,7 @@
 //! [`step_name`] is the one shared snake_case vocabulary for step
 //! identifiers, so the CLI and the machine cannot drift apart.
 
+pub mod badblocks;
 pub(crate) mod decompress;
 pub mod event;
 pub mod mkfs;
@@ -44,9 +45,8 @@ use crate::log::Logger;
 /// Run options. `verify` reads the written bytes back and compares
 /// them to the plan digest; `retries`, `retry_delay` and `reset_usb`
 /// tune the write chunk retry policy (see `write_chunk` in
-/// [`write`](crate::pipeline::write)); `badblocks` (surface scan,
-/// slice 9) is carried now and honoured then — passing it today keeps
-/// the CLI signature stable. Accepted without acting.
+/// [`write`](crate::pipeline::write)); `badblocks` runs the surface
+/// scan at the end of [`Wipe`](crate::pipeline::wipe::run) when set.
 /// The format label does not live here: it comes from the plan step,
 /// and image-derived label defaults stay future work (the formatter
 /// default applies).
@@ -57,7 +57,10 @@ pub struct RunOptions {
     /// nothing and warn about nothing: there are no written bytes to
     /// compare.
     pub verify: bool,
-    /// Scan the surface for bad blocks (honoured from slice 9).
+    /// Scan the surface for bad blocks: runs at the end of
+    /// [`Wipe`](crate::pipeline::wipe::run) after the zeroing when
+    /// set (see [`badblocks`](crate::pipeline::badblocks) for the
+    /// placement and the destructive-scan contract).
     pub badblocks: bool,
     /// Chunk write retries after the initial attempt: 3 is the
     /// reference policy (`0x140010a40` gives up with `if (3 < uVar4)`),
@@ -231,6 +234,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::cell::RefCell;
     use std::path::Path;
     use std::rc::Rc;
 
@@ -2626,6 +2630,733 @@ mod tests {
             "the refusal is step-wrapped: {error:?}"
         );
         assert!(error.to_string().contains("I/O error"), "{error:?}");
+    }
+
+    #[test]
+    fn retry_returns_promptly_when_cancelled_during_the_delay() {
+        // Always failing with a 600 ms retry delay, cancelled on the
+        // fourth probe consultation (the step boundary, the chunk
+        // check, the pre-sleep check, then the first 100 ms slice end):
+        // the sliced sleep notices after one slice, so the run reports
+        // `Cancelled` with one attempt in ~100 ms — not after 600 ms.
+        // A blocking sleep would sleep the delay out and retry instead
+        // (four attempts, an I/O error), so every assertion below
+        // fails on the old shape.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let content = pattern_bytes(512 * 1024);
+        let (path, size) = image_file(&scratch, "image.bin", &content);
+        let opener = FlakyOpener {
+            target: FlakyTarget::new(8 * MIB, u32::MAX, FlakyKind::Eio),
+        };
+        let mut reporter = VecReporter::new();
+        let options = RunOptions {
+            verify: false,
+            badblocks: false,
+            retries: 3,
+            retry_delay: std::time::Duration::from_millis(600),
+            reset_usb: false,
+        };
+        let calls = Cell::new(0u32);
+        let started = std::time::Instant::now();
+        let error = run(
+            &test_plan_image(vec![write_dd()], &path, size),
+            &opener,
+            &options,
+            &mut reporter,
+            &|| {
+                let seen = calls.get();
+                calls.set(seen + 1);
+                seen >= 3
+            },
+        )
+        .expect_err("a cancelled delay stops");
+        let elapsed = started.elapsed();
+        assert_eq!(opener.target.shared.attempts.get(), 1);
+        assert!(
+            matches!(error, CoreError::Step { step: "write", .. }),
+            "cancellation surfaces wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("cancelled"), "{error:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "a cancel during the delay returns promptly, not after 600 ms: {elapsed:?}"
+        );
+    }
+
+    /// [`RunOptions`] with the surface scan on and an instant retry
+    /// policy: the bad-blocks tests never fail a write, so the delay
+    /// stays zero.
+    fn badblocks_options() -> RunOptions {
+        RunOptions {
+            verify: false,
+            badblocks: true,
+            retries: 3,
+            retry_delay: std::time::Duration::ZERO,
+            reset_usb: false,
+        }
+    }
+
+    /// Every `badblocks` progress sample as `(done, total)`, in
+    /// emission order.
+    fn badblocks_progress(reporter: &VecReporter) -> Vec<(u64, Option<u64>)> {
+        stepped_progress(reporter)
+            .into_iter()
+            .filter_map(|(step, done, total)| (step == "badblocks").then_some((done, total)))
+            .collect()
+    }
+
+    /// A [`Target`] recording every `write_all_at` call as
+    /// `(offset, len, first byte)` over a shared [`VecTarget`]: the
+    /// coverage test pins per-pattern bytes through these. The wipe's
+    /// zeroing runs through `zero_range`, never through this call, so
+    /// the record isolates scan writes. Calls ride in an `Rc` so every
+    /// cloned handle shares them.
+    #[derive(Debug, Clone)]
+    struct CountingTarget {
+        inner: VecTarget,
+        calls: Rc<RefCell<Vec<(u64, u64, u8)>>>,
+    }
+
+    impl CountingTarget {
+        fn new(len: u64) -> Self {
+            Self {
+                inner: VecTarget::new(len, 512).expect("fixture target fits"),
+                calls: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Target for CountingTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            if let Some(first) = buf.first() {
+                self.calls
+                    .borrow_mut()
+                    .push((offset, buf.len() as u64, *first));
+            }
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`CountingTarget`].
+    #[derive(Debug, Clone)]
+    struct CountingOpener {
+        target: CountingTarget,
+    }
+
+    impl Opener for CountingOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    /// A [`Target`] corrupting one window on read-back: writes land
+    /// intact, but every read flips the bytes in
+    /// `[torn_offset, torn_offset + torn_len)`, so the scan's compare
+    /// sees exactly one torn range however many passes run.
+    #[derive(Debug, Clone)]
+    struct TornTarget {
+        inner: VecTarget,
+        torn_offset: u64,
+        torn_len: u64,
+    }
+
+    impl Target for TornTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)?;
+            let start = offset.max(self.torn_offset);
+            let end = (offset + buf.len() as u64).min(self.torn_offset + self.torn_len);
+            if start < end {
+                let from = (start - offset) as usize;
+                let to = (end - offset) as usize;
+                for byte in &mut buf[from..to] {
+                    *byte ^= 0xFF;
+                }
+            }
+            Ok(())
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`TornTarget`].
+    #[derive(Debug, Clone)]
+    struct TornOpener {
+        target: TornTarget,
+    }
+
+    impl Opener for TornOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    /// A [`Target`] rotting the first 64 bytes of every 512-byte block
+    /// on read-back (12.5% bad, far over the 1% abort threshold), so
+    /// the scan aborts on its first block.
+    #[derive(Debug, Clone)]
+    struct RottenTarget {
+        inner: VecTarget,
+    }
+
+    impl Target for RottenTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)?;
+            for (index, byte) in buf.iter_mut().enumerate() {
+                if (offset + index as u64) % 512 < 64 {
+                    *byte ^= 0xFF;
+                }
+            }
+            Ok(())
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`RottenTarget`].
+    #[derive(Debug, Clone)]
+    struct RottenOpener {
+        target: RottenTarget,
+    }
+
+    impl Opener for RottenOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    /// A [`Target`] corrupting different windows per most-recently-written
+    /// pattern: each `write_all_at` of a uniform buffer arms that byte
+    /// as the current pattern (the scan always writes uniform pattern
+    /// buffers; the wipe never calls this), and reads flip the windows
+    /// ruled for it. The cross-pass merge test pins multi-pass
+    /// bookkeeping through this: regions torn in different passes must
+    /// all survive with exact counts.
+    #[derive(Debug, Clone)]
+    struct PatternTarget {
+        inner: VecTarget,
+        rules: Vec<(u8, u64, u64)>,
+        current: Rc<Cell<u8>>,
+    }
+
+    impl Target for PatternTarget {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)?;
+            for rule in &self.rules {
+                if rule.0 != self.current.get() {
+                    continue;
+                }
+                let start = offset.max(rule.1);
+                let end = (offset + buf.len() as u64).min(rule.1 + rule.2);
+                if start < end {
+                    let from = (start - offset) as usize;
+                    let to = (end - offset) as usize;
+                    for byte in &mut buf[from..to] {
+                        *byte ^= 0xFF;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            if let Some(first) = buf.first() {
+                self.current.set(*first);
+            }
+            self.inner.write_all_at(offset, buf)
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.inner
+                .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        }
+
+        fn zero_range(&self, offset: u64, len: u64, cancelled: &dyn Fn() -> bool) -> Result<()> {
+            self.inner.zero_range(offset, len, cancelled)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.inner.flush()
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            self.inner.reread_partitions()
+        }
+    }
+
+    /// An [`Opener`] serving one [`PatternTarget`].
+    #[derive(Debug, Clone)]
+    struct PatternOpener {
+        target: PatternTarget,
+    }
+
+    impl Opener for PatternOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Ok(Box::new(
+                VecVolume::new(4096, 512).expect("fixture partition fits"),
+            ))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    #[test]
+    fn badblocks_find_nothing_on_a_clean_target() {
+        // A clean 64 KiB target: wipe plus scan succeed, four pass
+        // starts go out, the summary reports no bad blocks, and the
+        // final progress lands exactly on the device size.
+        let opener = TestOpener::new(64 * 1024);
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan(vec![Step::Wipe]),
+            &opener,
+            &badblocks_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a clean device scans");
+        let texts = messages(&reporter);
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.contains("badblocks pass"))
+                .count(),
+            4,
+            "one start per pattern pass: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("no bad bytes found")),
+            "the summary reports clean: {texts:?}"
+        );
+        let progress = badblocks_progress(&reporter);
+        assert_eq!(
+            progress.last().copied(),
+            Some((64 * 1024, Some(64 * 1024))),
+            "the final sample lands on the device size: {progress:?}"
+        );
+    }
+
+    #[test]
+    fn badblocks_name_a_torn_block() {
+        // One torn 512-byte block at the end of a 64 KiB device: the
+        // scan completes (one block in 128 stays far under the 1%
+        // abort), then refuses — summary and error both name the
+        // offset, and the bad count is exactly the torn block.
+        const LEN: u64 = 64 * 1024;
+        const TORN: u64 = 64 * 1024 - 512;
+        let opener = TornOpener {
+            target: TornTarget {
+                inner: VecTarget::new(LEN, 512).expect("fixture target fits"),
+                torn_offset: TORN,
+                torn_len: 512,
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan(vec![Step::Wipe]),
+            &opener,
+            &badblocks_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a torn block refuses");
+        assert!(
+            matches!(error, CoreError::Step { step: "wipe", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("512"), "{text}");
+        assert!(text.contains("65024"), "{text}");
+        let texts = messages(&reporter);
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.contains("512 bad bytes (first at offset 65024)")),
+            "the summary names the count and the offset too: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn badblocks_abort_above_the_threshold() {
+        // Every block rotten in its first 64 bytes: the first piece
+        // already holds 8192 bad bytes of a 64 KiB device (12.5%),
+        // far over the 1% abort threshold, so the scan stops at once
+        // naming the count, the device size, the first offset and the
+        // threshold.
+        let opener = RottenOpener {
+            target: RottenTarget {
+                inner: VecTarget::new(64 * 1024, 512).expect("fixture target fits"),
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan(vec![Step::Wipe]),
+            &opener,
+            &badblocks_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a rotten device aborts");
+        assert!(
+            matches!(error, CoreError::Step { step: "wipe", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("8192"), "{text}");
+        assert!(text.contains("65536"), "{text}");
+        assert!(text.contains("offset 0"), "{text}");
+        assert!(text.contains("1%"), "{text}");
+        let texts = messages(&reporter);
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.contains("8192 bad bytes (first at offset 0)")),
+            "the summary names the count and the offset too: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn badblocks_merge_ranges_across_passes() {
+        // Two regions torn in different passes only (96 KiB during the
+        // 0x00 pass, 0 during the 0xFF pass) on a 128 KiB device: the
+        // report keeps both — 1024 bad bytes in 2 ranges from offset
+        // 0 — instead of folding the earlier region into the later
+        // pass's ascending order. The ascending-only merge reported
+        // 512 bytes in 1 range here.
+        const LEN: u64 = 128 * 1024;
+        let opener = PatternOpener {
+            target: PatternTarget {
+                inner: VecTarget::new(LEN, 512).expect("fixture target fits"),
+                rules: vec![(0x00, 96 * 1024, 512), (0xFF, 0, 512)],
+                current: Rc::new(Cell::new(0x00)),
+            },
+        };
+        let mut reporter = VecReporter::new();
+        let error = run(
+            &test_plan(vec![Step::Wipe]),
+            &opener,
+            &badblocks_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("torn regions refuse");
+        assert!(
+            matches!(error, CoreError::Step { step: "wipe", .. }),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("1024"), "{text}");
+        assert!(text.contains("2 ranges"), "{text}");
+        assert!(text.contains("offset 0"), "{text}");
+        let texts = messages(&reporter);
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.contains("1024 bad bytes (first at offset 0)")),
+            "the summary names the count and the offset too: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn badblocks_abort_threshold_pins_at_one_percent_of_the_device() {
+        // 102400-byte device, so 1% is exactly 1024 bytes: a 1024-byte
+        // bad prefix completes the scan (strictly-exceed never fires)
+        // while a 1025-byte prefix aborts on the first piece — the
+        // threshold is a density over the device, not over the bytes
+        // scanned so far.
+        const LEN: u64 = 102400;
+        for (prefix, aborts) in [(1024u64, false), (1025u64, true)] {
+            let opener = TornOpener {
+                target: TornTarget {
+                    inner: VecTarget::new(LEN, 512).expect("fixture target fits"),
+                    torn_offset: 0,
+                    torn_len: prefix,
+                },
+            };
+            let mut reporter = VecReporter::new();
+            let error = run(
+                &test_plan(vec![Step::Wipe]),
+                &opener,
+                &badblocks_options(),
+                &mut reporter,
+                &|| false,
+            )
+            .expect_err("a bad prefix refuses");
+            assert!(
+                matches!(error, CoreError::Step { step: "wipe", .. }),
+                "the refusal is step-wrapped: {error:?}"
+            );
+            let text = error.to_string();
+            if aborts {
+                assert!(text.contains("1025"), "{text}");
+                assert!(text.contains("abort"), "{text}");
+                assert!(text.contains("1%"), "{text}");
+            } else {
+                assert!(
+                    !text.contains("abort"),
+                    "exactly 1% bad still scans: {text}"
+                );
+                assert!(text.contains("found 1024 bad bytes"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn badblocks_are_skipped_without_the_flag() {
+        // Flag off: the wipe zeroes its windows and nothing else — the
+        // prefill survives between them, and no badblocks progress
+        // event exists.
+        let opener = TestOpener::new(8 * MIB);
+        opener
+            .target
+            .write_all_at(0, &vec![0xAAu8; 8 * MIB as usize])
+            .expect("prefill writes");
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan(vec![Step::Wipe]),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("wipe runs");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert!(
+            bytes[MIB as usize..7 * MIB as usize]
+                .iter()
+                .all(|&byte| byte == 0xAA),
+            "no scan writes outside the wipe windows"
+        );
+        assert!(
+            badblocks_progress(&reporter).is_empty(),
+            "no badblocks progress without the flag: {:?}",
+            reporter.events()
+        );
+    }
+
+    #[test]
+    fn badblocks_cover_the_whole_device() {
+        // A 4 KiB device (eight 512-byte blocks): every pattern pass
+        // writes exactly the device extent — four times the size in
+        // total — with each pass tiling [0, size) once, in order.
+        const LEN: u64 = 4096;
+        let opener = CountingOpener {
+            target: CountingTarget::new(LEN),
+        };
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan(vec![Step::Wipe]),
+            &opener,
+            &badblocks_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a clean device scans");
+        let calls = opener.target.calls.borrow();
+        let total: u64 = calls.iter().map(|call| call.1).sum();
+        assert_eq!(total, 4 * LEN, "one full extent per pattern");
+        for pattern in [0x00u8, 0xFF, 0xAA, 0x55] {
+            let mut expected = 0u64;
+            for call in calls.iter().filter(|call| call.2 == pattern) {
+                assert_eq!(
+                    call.0, expected,
+                    "pass 0x{pattern:02X} tiles in order: {calls:?}"
+                );
+                expected += call.1;
+            }
+            assert_eq!(expected, LEN, "pass 0x{pattern:02X} covers the device");
+        }
+    }
+
+    #[test]
+    fn badblocks_stop_when_cancelled() {
+        // Cancel after a few blocks (past the wipe's own checks): bare
+        // `Cancelled` wrapped once as step 'wipe', no summary message,
+        // no finished step.
+        let opener = TestOpener::new(8 * MIB);
+        let mut reporter = VecReporter::new();
+        let calls = Cell::new(0u32);
+        let error = run(
+            &test_plan(vec![Step::Wipe]),
+            &opener,
+            &badblocks_options(),
+            &mut reporter,
+            &|| {
+                let seen = calls.get();
+                calls.set(seen + 1);
+                seen >= 12
+            },
+        )
+        .expect_err("a cancelled scan stops");
+        assert!(
+            matches!(error, CoreError::Step { step: "wipe", .. }),
+            "cancellation surfaces wrapped: {error:?}"
+        );
+        assert!(error.to_string().contains("cancelled"), "{error:?}");
+        let texts = messages(&reporter);
+        assert!(
+            !texts.iter().any(|text| text.contains("bad bytes found")
+                || text.contains("bad bytes (first at offset")),
+            "no summary after cancel: {texts:?}"
+        );
+        assert!(
+            !reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::StepFinished { step: "wipe", .. })),
+            "no success is reported: {:?}",
+            reporter.events()
+        );
     }
 
     /// A [`Target`] counting its cancellable writes, zero calls and

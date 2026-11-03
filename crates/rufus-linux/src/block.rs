@@ -571,19 +571,41 @@ struct FileStore {
     file: File,
     /// Where it was opened, for every error message.
     path: PathBuf,
-    /// Extent in bytes, as the caller supplied it.
+    /// Extent in bytes at open: the standing answer for device nodes
+    /// (see [`FileStore::size`]), the initial report for regular
+    /// files.
     size: u64,
     /// Whether the fd really runs with `O_DIRECT`: decided once at
     /// open time (yes for device nodes the kernel accepted the flag
     /// for, never for plain files), so the flag and the descriptor
     /// always agree.
     direct: bool,
+    /// Whether the node is a regular file: only those re-stat live
+    /// (see [`FileStore::size`]).
+    regular: bool,
 }
 
 impl FileStore {
-    /// Total extent in bytes.
+    /// Total extent in bytes: re-read from the fd on every call for
+    /// regular files (one `fstat`, so a file truncated or grown under
+    /// an open run is visible — this is what makes the write retry's
+    /// size re-check genuinely live). There is deliberately no floor
+    /// at the open extent: masking a shrink would blind the re-check
+    /// the live read exists for, so a shrink surfaces as window
+    /// refusals instead. The open extent stands for anything else,
+    /// whose `fstat` length is always 0 (device nodes) and whose
+    /// kernel extent cannot change under an exclusive open. An
+    /// `fstat` failure keeps the open extent — the `fstat` of an open
+    /// fd cannot fail in practice, so there is no honest error to
+    /// report from here.
     fn size(&self) -> u64 {
-        self.size
+        if !self.regular {
+            return self.size;
+        }
+        match self.file.metadata() {
+            Ok(meta) => meta.len(),
+            Err(_) => self.size,
+        }
     }
 
     /// One validated piece write: reject misaligned direct geometry
@@ -598,7 +620,7 @@ impl FileStore {
     /// Exact positional read (see [`FileStore::write_piece`] for the
     /// alignment policy).
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        check_window(offset, buf.len() as u64, self.size, "read")?;
+        check_window(offset, buf.len() as u64, self.size(), "read")?;
         if self.direct {
             check_direct(offset, buf.as_ptr(), buf.len(), "read")?;
         }
@@ -609,7 +631,7 @@ impl FileStore {
 
     /// Exact positional write over the whole buffer.
     fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        check_window(offset, buf.len() as u64, self.size, "write")?;
+        check_window(offset, buf.len() as u64, self.size(), "write")?;
         if self.direct {
             check_direct(offset, buf.as_ptr(), buf.len(), "write")?;
         }
@@ -629,7 +651,7 @@ impl FileStore {
         chunk: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<u64> {
-        check_window(offset, buf.len() as u64, self.size, "write")?;
+        check_window(offset, buf.len() as u64, self.size(), "write")?;
         if self.direct {
             check_direct(offset, buf.as_ptr(), buf.len(), "write")?;
         }
@@ -641,7 +663,7 @@ impl FileStore {
     /// `BLKZEROOUT` when the kernel offers it, aligned zero writes
     /// otherwise — the zero path every file-backed sink shares.
     fn zero_range(&self, offset: u64, len: u64) -> Result<()> {
-        check_window(offset, len, self.size, "zero")?;
+        check_window(offset, len, self.size(), "zero")?;
         if len == 0 {
             return Err(CoreError::invalid("cannot zero a zero-length window"));
         }
@@ -657,7 +679,7 @@ impl FileStore {
     /// `BLKDISCARD` where the kernel supports it; the documented
     /// best-effort rule turns every unsupported answer into `Ok`.
     fn discard(&self, offset: u64, len: u64) -> Result<()> {
-        check_window(offset, len, self.size, "discard")?;
+        check_window(offset, len, self.size(), "discard")?;
         match ioctl::discard(&self.file, offset, len) {
             Ok(()) => Ok(()),
             // Best effort (Sink docs): without the primitive the kernel
@@ -707,7 +729,10 @@ impl BlockDevice {
     /// Open `path` for positional write access with the sysfs geometry
     /// the enumeration step (`crate::sysfs`, `crate::inspect`) already
     /// holds: `size` in bytes plus logical/physical sector sizes (both
-    /// must be non-zero).
+    /// must be non-zero). For regular files `size` is the initial
+    /// extent only — the store re-reads the live length on every
+    /// `size` call; for device nodes it stands, because
+    /// their `fstat` length is always 0.
     ///
     /// The open is `O_RDWR|O_EXCL|O_CLOEXEC|O_NOFOLLOW`: exclusive on
     /// purpose (nothing else should hold the device while it is about
@@ -771,6 +796,7 @@ impl BlockDevice {
                 path: path.to_path_buf(),
                 size,
                 direct,
+                regular: is_file,
             },
             logical,
             physical,
@@ -892,6 +918,7 @@ impl SparseFile {
                 path: path.to_path_buf(),
                 size: len,
                 direct: false,
+                regular: true,
             },
         })
     }
@@ -1104,14 +1131,21 @@ mod tests {
     /// alignment-rule tests, built by hand (the fields live in this
     /// module, so the construction needs no unsafe and no block
     /// device: the O_DIRECT rule is pure CPU-side validation ahead of
-    /// the syscalls).
+    /// the syscalls). The scratch file is sized to the declared
+    /// extent, so declared and live lengths agree and the test pins
+    /// the alignment rule rather than the window checks (the store
+    /// re-stats regular files live).
     fn direct_block_device(scratch: &tempfile::NamedTempFile) -> BlockDevice {
+        scratch.as_file().set_len(8192).expect("size scratch file");
         BlockDevice {
             store: FileStore {
                 file: scratch.reopen().expect("reopen scratch file"),
                 path: scratch.path().to_path_buf(),
                 size: 8192,
                 direct: true,
+                // A scratch regular file: live re-stat, like `open`
+                // would record for it.
+                regular: true,
             },
             logical: 512,
             physical: 4096,

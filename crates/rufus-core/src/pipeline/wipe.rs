@@ -15,6 +15,16 @@
 //! extent instead: the front and rear windows would overlap otherwise,
 //! and the rear offset would wrap. A zero-size device is a no-op, the
 //! same correct sequence `wipe_device` runs.
+//!
+//! When [`RunOptions::badblocks`](super::RunOptions::badblocks) is
+//! set, the wipe ends with the [`badblocks`](super::badblocks)
+//! surface scan: Rufus offers the check as part of preparing the
+//! device and the plan carries no step for it, so it lives here —
+//! after the zeroing and the rescan, before any table, format or
+//! write step. The scan is destructive (pattern passes overwrite the
+//! whole device), which is safe exactly because every later step
+//! overwrites the surface anyway. An empty device skips the scan
+//! with the early return above: there are no blocks to check.
 
 use crate::error::Result;
 use crate::pipeline::event::Event;
@@ -25,7 +35,9 @@ use crate::pipeline::steps::check_cancelled;
 const WINDOW: u64 = 1024 * 1024;
 
 /// Clear the device's edge megabytes: discard hints best effort, then
-/// zeroing, then a partition re-read.
+/// zeroing, then a partition re-read — then the bad-blocks surface
+/// scan when [`RunOptions::badblocks`](super::RunOptions::badblocks)
+/// is set (see the module docs for why the scan lives here).
 pub(crate) fn run(ctx: &mut RunContext<'_>) -> Result<()> {
     let size = ctx.device()?.size();
     if size == 0 {
@@ -71,5 +83,8 @@ pub(crate) fn run(ctx: &mut RunContext<'_>) -> Result<()> {
         }
     }
     ctx.device()?.reread_partitions()?;
+    if ctx.options.badblocks {
+        super::badblocks::run(ctx)?;
+    }
     Ok(())
 }

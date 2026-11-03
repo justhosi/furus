@@ -34,6 +34,7 @@
 //! planner call, so the formatted window is the stamped partition by
 //! construction.
 
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -434,12 +435,14 @@ impl Opener for DeviceOpener {
             return Ok(false);
         };
         // A reset is a write-class operation, so the node opens
-        // read-write; an unopenable node is best effort too
-        // (permissions, a device that just vanished) — never the write
-        // error.
+        // read-write with `O_NOFOLLOW` like the block layer (a swapped
+        // symlink must never redirect a privileged reset); an
+        // unopenable node is best effort too (permissions, a device
+        // that just vanished) — never the write error.
         let file = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&node)
         {
             Ok(file) => file,
