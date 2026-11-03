@@ -2768,8 +2768,9 @@ mod tests {
         // flag 120 ms in: the run must report `Cancelled` within
         // 200 ms of the flip — at most the in-flight chunk (50 ms)
         // plus loop overhead can follow it, so the bound carries 4x
-        // headroom. The payload stays incomplete and no
-        // `step_finished` for `write` follows either.
+        // headroom. The first chunk lands before the flip, the last
+        // never runs, and no `step_finished` for `write` follows
+        // either.
         let scratch = tempfile::tempdir().expect("scratch fits");
         let content = pattern_bytes(2 * MIB as usize);
         let (path, size) = image_file(&scratch, "image.bin", &content);
@@ -2816,10 +2817,16 @@ mod tests {
             returned_at.duration_since(flipped)
         );
         let bytes = opener.target.inner.bytes().expect("bytes read back");
-        assert_ne!(
-            &bytes[..size as usize],
-            &content[..],
-            "the payload stays incomplete"
+        assert_eq!(
+            &bytes[..256 * 1024],
+            &content[..256 * 1024],
+            "the first chunk lands before the flip"
+        );
+        assert!(
+            bytes[size as usize - 256 * 1024..]
+                .iter()
+                .all(|&byte| byte == 0),
+            "the last chunk never runs"
         );
         assert!(
             !reporter

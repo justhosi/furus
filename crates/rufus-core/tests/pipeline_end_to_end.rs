@@ -53,8 +53,8 @@
 //! cargo test --offline -p rufus-core --test pipeline_end_to_end -- --ignored --nocapture
 //! ```
 //!
-//! and the throughput comparison in release mode (debug timings are
-//! meaningless against the optimised `dd` binary):
+//! and the throughput comparison in release mode (debug numbers are
+//! unreliable — see its docs):
 //!
 //! ```sh
 //! export PATH="$HOME/.cargo/bin:$PATH"
@@ -63,6 +63,7 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::os::unix::fs::FileExt;
@@ -70,6 +71,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::rc::Rc;
 use std::time::Instant;
 
 use common::Mounted;
@@ -844,6 +846,84 @@ fn verify_failure_names_the_byte_on_a_loop_device() {
 // Throughput: pipeline engine against dd, like-for-like buffered files
 // ---------------------------------------------------------------------------
 
+/// A [`Target`] counting payload bytes through
+/// [`write_all_at_cancellable`](Target::write_all_at_cancellable)
+/// over a shared [`FileTarget`]: the throughput test pins the moved
+/// total through this, so a discarding engine cannot pass the
+/// overhead bound below. The counter rides in an `Rc` so every handle
+/// the opener hands out shares it.
+#[derive(Debug)]
+struct CountingTarget {
+    inner: FileTarget,
+    bytes: Rc<Cell<u64>>,
+}
+
+impl Target for CountingTarget {
+    fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.inner.write_all_at(offset, buf)
+    }
+
+    fn write_all_at_cancellable(
+        &self,
+        offset: u64,
+        buf: &[u8],
+        chunk: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<u64> {
+        let done = self
+            .inner
+            .write_all_at_cancellable(offset, buf, chunk, cancelled)?;
+        self.bytes.set(self.bytes.get() + done);
+        Ok(done)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// An [`Opener`] serving [`CountingTarget`]s over a null sink (no
+/// `fsync`: there is nothing to push through `/dev/null`).
+#[derive(Debug, Clone)]
+struct CountingOpener {
+    path: PathBuf,
+    len: u64,
+    bytes: Rc<Cell<u64>>,
+}
+
+impl Opener for CountingOpener {
+    fn device(&self) -> Result<Box<dyn Target>> {
+        Ok(Box::new(CountingTarget {
+            inner: FileTarget::open_sync(&self.path, self.len, false)?,
+            bytes: Rc::clone(&self.bytes),
+        }))
+    }
+
+    fn partition(&self) -> Result<Box<dyn Volume>> {
+        Err(CoreError::invalid(
+            "the throughput suite writes the whole disk only",
+        ))
+    }
+
+    fn partition_path(&self) -> Result<PathBuf> {
+        Err(CoreError::invalid(
+            "the throughput suite writes the whole disk only",
+        ))
+    }
+}
+
 /// Pipeline engine throughput against `dd` at the same 256 KiB
 /// chunking, with both numbers printed.
 ///
@@ -871,8 +951,9 @@ fn verify_failure_names_the_byte_on_a_loop_device() {
 ///
 /// Release mode only: `cargo test --offline --release -p rufus-core
 /// --test pipeline_end_to_end pipeline_matches_dd_throughput --
-/// --ignored --nocapture`. Debug timings against the optimised `dd`
-/// binary are meaningless (and fail the bound below).
+/// --ignored --nocapture`. Debug numbers are unreliable (an
+/// unoptimised engine against the optimised `dd` binary), so record
+/// runs use release.
 #[ignore]
 #[test]
 fn pipeline_matches_dd_throughput() {
@@ -886,13 +967,14 @@ fn pipeline_matches_dd_throughput() {
     let image_path = dir.path().join("image.bin");
     sparse_image(&image_path, SIZE);
     // Pipeline side: Write-only plan (the `dd` equivalent — no wipe,
-    // format or verify noise) onto a declared-size null target.
-    let null = PathBuf::from("/dev/null");
-    let opener = LoopOpener {
-        path: null.clone(),
+    // format or verify noise) onto a declared-size null target, with
+    // a counter proving the engine moved exactly the image: without
+    // it a discarding engine would pass the overhead bound below.
+    let written = Rc::new(Cell::new(0u64));
+    let opener = CountingOpener {
+        path: PathBuf::from("/dev/null"),
         len: SIZE,
-        ranges: None,
-        sync: false,
+        bytes: Rc::clone(&written),
     };
     let plan = plan_for(
         "/dev/null",
@@ -920,6 +1002,11 @@ fn pipeline_matches_dd_throughput() {
     )
     .expect("the throughput write runs");
     let pipeline_secs = started.elapsed().as_secs_f64();
+    assert_eq!(
+        written.get(),
+        SIZE,
+        "the engine moved exactly the image size"
+    );
     // `dd` side: identical chunking, identical null sink, quiet.
     let dd_path = image_path.display().to_string();
     let started = Instant::now();

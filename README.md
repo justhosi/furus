@@ -100,18 +100,20 @@ write side is the most complete part:
 * The end-to-end write path runs: the CLI's `write` command validates
   its plan file (schema version + confirm hash) and executes it through
   the pipeline — wipe, table, partition, format, raw write, verify,
-  finalize — with per-event JSON (`--json`) or a throttled progress line, Ctrl-C
-  cancellation (exit 6), and typed refusals (exit 7 only for the steps
-  no slice implements yet: bootloader installation (S19) and file-tree
-  copy (S18)). `--device-file` runs the same plan against a regular file for tests.
-  `write --verify` reads the whole image back and compares it against
-  the plan digest, doubling the I/O; `write --badblocks` scans the
-  surface for bad blocks in the wipe step. A chunk write that fails with `EIO`/`ENOSPC` is retried three times,
-  five seconds apart (the failing chunk only, with the device size
-  re-read before each attempt); `write --reset-usb` additionally resets
-  the USB device once the retries are spent and retries the chunk one
-  last time — best effort, off by default. The plan records `bad_blocks`
-  (and `verify`); the retry/reset knobs are runtime recoveries, not plan
+  finalize — with per-event JSON (`--json`) or a throttled progress
+  line, Ctrl-C cancellation (exit 6), and typed refusals (exit 7 only
+  for the steps no slice implements yet: bootloader installation
+  (S19) and file-tree copy (S18)). `--device-file` runs the same plan
+  against a regular file for tests. `rufus plan --verify` records a
+  read-back of the whole image against the plan digest, doubling the
+  I/O; `rufus plan --badblocks` records a surface scan that runs in
+  the wipe step. A chunk write that fails with `EIO`/`ENOSPC` is
+  retried three times, five seconds apart (the failing chunk only,
+  with the device size re-read before each attempt);
+  `write --reset-usb` additionally resets the USB device once the
+  retries are spent and retries the chunk one last time — best
+  effort, off by default. The plan records `bad_blocks` (and
+  `verify`); the retry/reset knobs are runtime recoveries, not plan
   content. The `--json` stream (one `Event` object per stdout line) is
   documented in `crates/rufus-cli/src/main.rs` and on
   `rufus_core::pipeline::Event`.
