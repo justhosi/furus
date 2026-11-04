@@ -94,6 +94,48 @@ const EXT_LENGTHS_AT: usize = 208;
 /// Offset of the extended-attribute area in an extended file entry.
 const EXT_EA_AT: usize = 216;
 
+/// Offset of the permissions word (both entry shapes: `fileEntry`
+/// and `extendedFileEntry` carry uid, gid then permissions at 36, 40,
+/// 44 — see the Linux `fileEntry`/`extendedFileEntry` structs for
+/// ECMA-167 4/14.9 and 4/14.17).
+const FE_PERM_AT: usize = 44;
+/// Offsets of the three recording dates in a plain file entry
+/// (access, modification, attribute — each a 12-byte timestamp).
+const FE_ACCESS_AT: usize = 72;
+/// Offset of the modification date in a plain file entry.
+const FE_MOD_AT: usize = 84;
+/// Offset of the attribute date in a plain file entry.
+const FE_ATTR_AT: usize = 96;
+/// Offsets of the recording dates in an extended file entry (access,
+/// modification, attribute — the creation date at 104 is skipped, it
+/// has no copy destination).
+const EXT_ACCESS_AT: usize = 80;
+/// Offset of the modification date in an extended file entry.
+const EXT_MOD_AT: usize = 92;
+/// Offset of the attribute date in an extended file entry.
+const EXT_ATTR_TIME_AT: usize = 116;
+/// Hard ceiling on symlink target bytes collected before decoding:
+/// a target longer than one block is hostile (the kernel refuses
+/// past one block too), so this refuses naming both numbers.
+pub(crate) const MAX_SYMLINK_BYTES: u64 = 4096;
+
+/// Path component type 0: reserved, never valid in a target.
+const PC_RESERVED: u8 = 0;
+/// Path component type 1: filesystem root in the OpenBSD header
+/// (the Linux driver treats a type 1 with data as an agreed-place
+/// marker to skip, and a bare type 1 as root — see
+/// [`decode_symlink_target`]).
+const PC_ROOT: u8 = 1;
+/// Path component type 2: root in the Linux driver (volume root in
+/// the OpenBSD header) — treated as root here too.
+const PC_MOUNTROOT: u8 = 2;
+/// Path component type 3: the parent directory (`..`).
+const PC_PARENT: u8 = 3;
+/// Path component type 4: the current directory (`.`).
+const PC_CURRENT: u8 = 4;
+/// Path component type 5: a named component (OSTA CS0 bytes).
+const PC_NAME: u8 = 5;
+
 /// Length of a short allocation descriptor (length, position).
 const SHORT_AD_LEN: usize = 8;
 /// Length of a long allocation descriptor (length, block, reference).
@@ -132,14 +174,419 @@ pub const TYPE_EXTENDED_ATTR: u8 = 8;
 pub const TYPE_FIFO: u8 = 9;
 pub const TYPE_SOCKET: u8 = 10;
 pub const TYPE_TERMINAL: u8 = 11;
-/// Symbolic links: refused everywhere (their targets are path-component
-/// records, never decoded here).
+/// Symbolic links: listed with their decoded target (see
+/// [`decode_symlink_target`]), never followed.
 pub const TYPE_SYMLINK: u8 = 12;
 pub const TYPE_STREAM_DIR: u8 = 13;
 pub const TYPE_VAT: u8 = 248;
 pub const TYPE_REALTIME: u8 = 249;
 pub const TYPE_META_MAIN: u8 = 250;
 pub const TYPE_META_MIRROR: u8 = 251;
+
+/// One ECMA-167 timestamp (1/7.3): the type and timezone word plus
+/// the civil fields and the three sub-second fields. The timezone
+/// word carries the type in the top 4 bits (1 means local time with
+/// an offset) and a signed 12-bit offset in the low 12 bits, in
+/// quarter-hours (so the converter multiplies by 900 — the same
+/// civil arithmetic as `copy::rock_time_to_system_time`, restated
+/// here so `udf` never calls into `copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timestamp {
+    /// Raw type-and-timezone word (type in the top 4 bits, signed
+    /// 12-bit quarter-hour offset below).
+    pub type_and_timezone: u16,
+    /// Full year.
+    pub year: u16,
+    /// Month 1..12.
+    pub month: u8,
+    /// Day 1..31.
+    pub day: u8,
+    /// Hour 0..23.
+    pub hour: u8,
+    /// Minute 0..59.
+    pub minute: u8,
+    /// Second 0..59 (a leap 60 reads as absent in the converter).
+    pub second: u8,
+    /// Centiseconds 0..99.
+    pub centiseconds: u8,
+    /// Hundreds of microseconds 0..99.
+    pub hundreds: u8,
+    /// Microseconds 0..99.
+    pub microseconds: u8,
+}
+
+/// Parse one 12-byte timestamp at `at` of `block`.
+pub fn parse_timestamp(block: &[u8], at: usize, what: &str) -> Result<Timestamp> {
+    let type_and_timezone = le_u16(block, at, what)?;
+    let year = le_u16(block, at + 2, what)?;
+    let month = block.get(at + 4).copied().ok_or_else(|| {
+        CoreError::invalid(format!("{what} ends before its month byte at {}", at + 4))
+    })?;
+    let day = block.get(at + 5).copied().ok_or_else(|| {
+        CoreError::invalid(format!("{what} ends before its day byte at {}", at + 5))
+    })?;
+    let hour = block.get(at + 6).copied().ok_or_else(|| {
+        CoreError::invalid(format!("{what} ends before its hour byte at {}", at + 6))
+    })?;
+    let minute = block.get(at + 7).copied().ok_or_else(|| {
+        CoreError::invalid(format!("{what} ends before its minute byte at {}", at + 7))
+    })?;
+    let second = block.get(at + 8).copied().ok_or_else(|| {
+        CoreError::invalid(format!("{what} ends before its second byte at {}", at + 8))
+    })?;
+    let centiseconds = block.get(at + 9).copied().ok_or_else(|| {
+        CoreError::invalid(format!(
+            "{what} ends before its centiseconds byte at {}",
+            at + 9
+        ))
+    })?;
+    let hundreds = block.get(at + 10).copied().ok_or_else(|| {
+        CoreError::invalid(format!(
+            "{what} ends before its hundreds byte at {}",
+            at + 10
+        ))
+    })?;
+    let microseconds = block.get(at + 11).copied().ok_or_else(|| {
+        CoreError::invalid(format!(
+            "{what} ends before its microseconds byte at {}",
+            at + 11
+        ))
+    })?;
+    Ok(Timestamp {
+        type_and_timezone,
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        centiseconds,
+        hundreds,
+        microseconds,
+    })
+}
+
+/// Convert a [`Timestamp`] to [`SystemTime`]: civil-days arithmetic
+/// (the same Howard Hinnant days-from-civil restatement as
+/// `copy::rock_time_to_system_time`), total — out means `None`,
+/// never a guess.
+///
+/// Type 1 means local time with the signed 12-bit quarter-hour
+/// offset applied (multiplied by 900); any other type reads as UTC.
+/// The unspecified offset (-2047, all low bits set but one) reads as
+/// UTC too, like the kernel. Refused rather than placed: months
+/// outside 1..12, days outside the month's length (leap years
+/// counted), hours past 23, minutes/seconds past 59, any sub-second
+/// past 99. `i64` carries millennia either way, so no checked
+/// arithmetic is needed at these magnitudes.
+#[must_use]
+pub fn timestamp_to_system_time(stamp: &Timestamp) -> Option<std::time::SystemTime> {
+    use std::time::Duration;
+    use std::time::UNIX_EPOCH;
+
+    let raw_offset = (stamp.type_and_timezone & 0x0FFF) as i16;
+    let sign_extended = ((i32::from(raw_offset) << 20) >> 20) as i16;
+    let kind = stamp.type_and_timezone >> 12;
+    let quarters: i64 = if kind == 1 && sign_extended != -2047 {
+        i64::from(sign_extended)
+    } else {
+        0
+    };
+    if stamp.centiseconds > 99 || stamp.hundreds > 99 || stamp.microseconds > 99 {
+        return None;
+    }
+    let leap = stamp.year.is_multiple_of(4)
+        && (!stamp.year.is_multiple_of(100) || stamp.year.is_multiple_of(400));
+    let max_day: u16 = match stamp.month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if stamp.day == 0 || u16::from(stamp.day) > max_day {
+        return None;
+    }
+    if stamp.hour > 23 || stamp.minute > 59 || stamp.second > 59 {
+        return None;
+    }
+    let year = i64::from(stamp.year);
+    let month = i64::from(stamp.month);
+    let day = i64::from(stamp.day);
+    let adjusted = if month <= 2 { year - 1 } else { year };
+    let era = adjusted.div_euclid(400);
+    let yoe = adjusted - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86_400
+        + i64::from(stamp.hour) * 3_600
+        + i64::from(stamp.minute) * 60
+        + i64::from(stamp.second)
+        - quarters * 900;
+    let nanos = u32::from(stamp.centiseconds) * 10_000_000
+        + u32::from(stamp.hundreds) * 100_000
+        + u32::from(stamp.microseconds) * 1_000;
+    if secs >= 0 {
+        Some(UNIX_EPOCH + Duration::new(secs as u64, nanos))
+    } else {
+        Some(UNIX_EPOCH - Duration::new(secs.unsigned_abs(), 0) + Duration::new(0, nanos))
+    }
+}
+
+/// Map a UDF permissions word plus ICB flags to a POSIX mode masked
+/// to `0o7777`: the low permission bits map like the kernel
+/// (`udf_convert_permissions` — other, group, owner triads shifted
+/// from the UDF words, setuid/setgid/sticky from the ICB flags).
+/// Ownership (`uid`/`gid`) never maps: the copy applies no owner.
+#[must_use]
+pub fn permissions_to_mode(permissions: u32, icb_flags: u16) -> u32 {
+    let mut mode = (permissions & 7) | ((permissions >> 2) & 0o70) | ((permissions >> 4) & 0o700);
+    if icb_flags & 0x0040 != 0 {
+        mode |= 0o4000;
+    }
+    if icb_flags & 0x0080 != 0 {
+        mode |= 0o2000;
+    }
+    if icb_flags & 0x0100 != 0 {
+        mode |= 0o1000;
+    }
+    mode & 0o7777
+}
+
+/// Decode symlink file data as an ECMA-167 path component list
+/// (4/14.16) to its `/`-joined target string, with the identifier
+/// decoded as OSTA CS0 like directory names.
+///
+/// Two shapes decode, discriminated by the leading 2-byte length: a
+/// prefixed shape (`u16` little-endian total covering exactly the
+/// rest, then repeated `{u8 component type, u8 identifier length,
+/// identifier bytes, padding to a 4-byte boundary}` with no version
+/// word) and the bare shape real images carry (no prefix, each
+/// component `{u8 component type, u8 identifier length, u16 version,
+/// identifier bytes}`, the version parsed and ignored). Types map as
+/// the Linux and OpenBSD drivers agree for the cases that matter: 3
+/// is `..`, 4 is `.`, 5 is a name, 1 and 2 are roots (`/`); type 0
+/// and anything past 5 refuses.
+///
+/// Malformed lists refuse naming the byte offset and the reason —
+/// empty data, a length prefix covering more than the data holds,
+/// truncated headers, identifiers running past the data, bad types,
+/// empty names, non-UTF8 targets — never panic. An empty input
+/// refuses as carrying no components.
+pub fn decode_symlink_target(data: &[u8], what: &str) -> Result<String> {
+    if data.is_empty() {
+        return Err(CoreError::invalid(format!(
+            "{what} symlink data is empty: no path components to decode"
+        )));
+    }
+    // The prefixed shape claims its total up front: exactly the rest
+    // of the data, or the prefix is not a prefix (the bare shape's
+    // first component header reads as some other number).
+    let mut head = [0u8; 2];
+    let prefixed = match data.get(..2) {
+        Some(pair) => {
+            head.copy_from_slice(pair);
+            usize::from(u16::from_le_bytes(head)) == data.len().saturating_sub(2)
+        }
+        None => false,
+    };
+    let bytes = if prefixed {
+        data.get(2..).ok_or_else(|| {
+            CoreError::invalid(format!("{what} symlink length prefix runs past its data"))
+        })?
+    } else {
+        data
+    };
+    if bytes.is_empty() {
+        return Err(CoreError::invalid(format!(
+            "{what} symlink data holds only a length prefix: no path components to decode"
+        )));
+    }
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    let mut at: usize = 0;
+    while at < bytes.len() {
+        let comp_type = bytes.get(at).copied().ok_or_else(|| {
+            CoreError::invalid(format!(
+                "{what} symlink component at offset {at} is truncated: no type byte"
+            ))
+        })?;
+        let id_len_byte = bytes.get(at.saturating_add(1)).copied().ok_or_else(|| {
+            CoreError::invalid(format!(
+                "{what} symlink component at offset {at} is truncated: no length byte"
+            ))
+        })?;
+        let id_len = usize::from(id_len_byte);
+        // The prefixed shape carries no version word (the identifier
+        // follows the header directly); the bare shape carries two
+        // version bytes first, and tolerates their absence when the
+        // identifier would otherwise not fit, so both padded and
+        // unpadded real images decode.
+        let after_header = at.saturating_add(2);
+        let ident_at = if prefixed {
+            after_header
+        } else {
+            let remaining = bytes.len().saturating_sub(after_header);
+            if remaining >= 2usize.saturating_add(id_len) {
+                after_header.saturating_add(2)
+            } else {
+                after_header
+            }
+        };
+        if id_len > bytes.len().saturating_sub(ident_at) {
+            return Err(CoreError::invalid(format!(
+                "{what} symlink component at offset {at} with identifier length {id_len} \
+                 runs past the {} byte data",
+                bytes.len()
+            )));
+        }
+        let ident_end = ident_at.saturating_add(id_len);
+        let ident = bytes.get(ident_at..ident_end).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "{what} symlink component at offset {at} identifier runs past its data"
+            ))
+        })?;
+        let next = skip_component_pad(bytes, at, ident_end, what)?;
+        push_symlink_component(&mut parts, comp_type, id_len, ident, at, what)?;
+        // The agreed-place skip inside `push_symlink_component`
+        // advances past the component itself; every other arm lands on
+        // `next`, which is past the identifier, so the loop always
+        // makes progress.
+        if next > at {
+            at = next;
+        } else {
+            return Err(CoreError::invalid(format!(
+                "{what} symlink component at offset {at} makes no progress: refusing a stall"
+            )));
+        }
+    }
+    if parts.is_empty() {
+        return Err(CoreError::invalid(format!(
+            "{what} symlink data carries no path components"
+        )));
+    }
+    // A single root (empty part) is `/`; otherwise join with `/`,
+    // keeping a leading empty part as the leading slash.
+    let mut target: Vec<u8> = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            target.push(b'/');
+        }
+        target.extend_from_slice(part);
+    }
+    String::from_utf8(target)
+        .map_err(|_| CoreError::invalid(format!("{what} symlink target is not valid UTF-8")))
+}
+
+/// Skip the padding after one symlink component's identifier: zero
+/// bytes up to the next 4-byte boundary from the component start.
+/// Non-zero bytes open the next component instead (see
+/// [`decode_symlink_target`]), so the end rewinds to the identifier
+/// end in that case.
+fn skip_component_pad(bytes: &[u8], at: usize, ident_end: usize, what: &str) -> Result<usize> {
+    let mut next = ident_end;
+    while next < bytes.len()
+        && !next.saturating_sub(at).is_multiple_of(4)
+        && bytes.get(next) == Some(&0)
+    {
+        next = next.saturating_add(1);
+    }
+    if next < bytes.len() && !next.saturating_sub(at).is_multiple_of(4) {
+        let gap = bytes.get(ident_end..next).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "{what} symlink component at offset {at} padding runs past its data"
+            ))
+        })?;
+        if gap.iter().any(|byte| *byte != 0) {
+            next = ident_end;
+        }
+    }
+    Ok(next)
+}
+
+/// Map one symlink component onto the target parts: roots push an
+/// empty part (the leading slash), `..`/`.` push literally, names
+/// decode as OSTA CS0. A type-1 root carrying identifier bytes is an
+/// agreed-place marker the Linux driver skips, so it advances past
+/// the component with no part pushed (handled by returning `None`);
+/// every other arm pushes exactly one part (returning `Some`).
+fn push_symlink_component(
+    parts: &mut Vec<Vec<u8>>,
+    comp_type: u8,
+    id_len: usize,
+    ident: &[u8],
+    at: usize,
+    what: &str,
+) -> Result<()> {
+    use crate::udf::unicode::decode_osta;
+
+    match comp_type {
+        PC_RESERVED => Err(CoreError::invalid(format!(
+            "{what} symlink component at offset {at} has reserved type 0"
+        ))),
+        PC_ROOT | PC_MOUNTROOT => {
+            if id_len > 0 {
+                // Linux skips an agreed-place component carrying
+                // data; a bare one is the root.
+                if comp_type == PC_ROOT {
+                    return Ok(());
+                }
+                return Err(CoreError::invalid(format!(
+                    "{what} symlink component at offset {at} is a root with \
+                     {id_len} identifier bytes: roots carry none"
+                )));
+            }
+            parts.push(Vec::new());
+            Ok(())
+        }
+        PC_PARENT => {
+            if id_len != 0 {
+                return Err(CoreError::invalid(format!(
+                    "{what} symlink component at offset {at} is a parent with \
+                     {id_len} identifier bytes: parents carry none"
+                )));
+            }
+            parts.push(b"..".to_vec());
+            Ok(())
+        }
+        PC_CURRENT => {
+            if id_len != 0 {
+                return Err(CoreError::invalid(format!(
+                    "{what} symlink component at offset {at} is a current with \
+                     {id_len} identifier bytes: currents carry none"
+                )));
+            }
+            parts.push(b".".to_vec());
+            Ok(())
+        }
+        PC_NAME => {
+            if ident.is_empty() {
+                return Err(CoreError::invalid(format!(
+                    "{what} symlink component at offset {at} is an empty name"
+                )));
+            }
+            let decoded = decode_osta(ident, &format!("{what} symlink component at offset {at}"))?;
+            if decoded.is_empty() {
+                return Err(CoreError::invalid(format!(
+                    "{what} symlink component at offset {at} decodes to an empty name"
+                )));
+            }
+            if decoded.contains('/') || decoded.contains('\0') {
+                return Err(CoreError::invalid(format!(
+                    "{what} symlink component at offset {at} decodes to a name holding \
+                     a separator"
+                )));
+            }
+            parts.push(decoded.into_bytes());
+            Ok(())
+        }
+        other => Err(CoreError::invalid(format!(
+            "{what} symlink component at offset {at} has unknown type {other}: \
+             only 1 (root), 2 (root), 3 (parent), 4 (current) and 5 (name) decode"
+        ))),
+    }
+}
 
 /// Display name of an ICB file-type byte for refusal messages: ASCII,
 /// suitable for error strings. Unknown values read as `unknown file type
@@ -179,9 +626,10 @@ pub struct FileSetDescriptor {
 }
 
 /// One parsed file entry: the allocation type with either the embedded
-/// bytes or the raw allocation descriptors. Extended attributes are
-/// skipped (their length only moves the data start); interpreting them
-/// belongs to a later slice.
+/// bytes or the raw allocation descriptors, plus the permissions word,
+/// the ICB flags and the three recording dates the copy needs.
+/// Extended attributes are skipped (their length only moves the data
+/// start); interpreting them belongs to a later slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     /// True for an extended file entry (tag 266), false for tag 261.
@@ -195,6 +643,48 @@ pub struct FileEntry {
     pub embedded: Vec<u8>,
     /// Raw allocation descriptors (types 0 and 1 only).
     pub ads: Vec<AllocDesc>,
+    /// Permissions word (mapped to a mode with [`permissions_to_mode`]).
+    pub permissions: u32,
+    /// ICB flags (setuid/setgid/sticky live here, not in permissions).
+    pub icb_flags: u16,
+    /// Access recording date.
+    pub access: Timestamp,
+    /// Modification recording date.
+    pub modification: Timestamp,
+    /// Attribute recording date.
+    pub attribute: Timestamp,
+}
+
+impl FileEntry {
+    /// POSIX mode masked to `0o7777` (no file type bits, no owner).
+    #[must_use]
+    pub fn mode(&self) -> u32 {
+        permissions_to_mode(self.permissions, self.icb_flags)
+    }
+
+    /// Modification time, or `None` when the stamp cannot be placed.
+    #[must_use]
+    pub fn modified_time(&self) -> Option<std::time::SystemTime> {
+        timestamp_to_system_time(&self.modification)
+    }
+
+    /// Access time, or `None` when the stamp cannot be placed.
+    #[must_use]
+    pub fn accessed_time(&self) -> Option<std::time::SystemTime> {
+        timestamp_to_system_time(&self.access)
+    }
+
+    /// True for symbolic links (file type 12).
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        self.file_type == TYPE_SYMLINK
+    }
+
+    /// True for regular files (file type 5).
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.file_type == TYPE_FILE
+    }
 }
 
 /// One raw allocation descriptor: the extent length with its address. The
@@ -318,6 +808,15 @@ pub fn read_file_entry(
     let flags = le_u16(&block, FE_FLAGS_AT, &what)?;
     let ad_type = flags & FE_AD_MASK;
     let info_len = le_u64(&block, FE_INFO_AT, &what)?;
+    let permissions = le_u32(&block, FE_PERM_AT, &what)?;
+    let (access_at, mod_at, attr_at) = if extended {
+        (EXT_ACCESS_AT, EXT_MOD_AT, EXT_ATTR_TIME_AT)
+    } else {
+        (FE_ACCESS_AT, FE_MOD_AT, FE_ATTR_AT)
+    };
+    let access = parse_timestamp(&block, access_at, &what)?;
+    let modification = parse_timestamp(&block, mod_at, &what)?;
+    let attribute = parse_timestamp(&block, attr_at, &what)?;
     let (lengths_at, ea_at) = if extended {
         (EXT_LENGTHS_AT, EXT_EA_AT)
     } else {
@@ -360,6 +859,11 @@ pub fn read_file_entry(
                 info_len,
                 embedded: embedded.to_vec(),
                 ads: Vec::new(),
+                permissions,
+                icb_flags: flags,
+                access,
+                modification,
+                attribute,
             })
         }
         AD_SHORT | AD_LONG => {
@@ -452,6 +956,11 @@ pub fn read_file_entry(
                 info_len,
                 embedded: Vec::new(),
                 ads,
+                permissions,
+                icb_flags: flags,
+                access,
+                modification,
+                attribute,
             })
         }
         AD_EXTENDED => Err(CoreError::invalid(format!(
@@ -1309,5 +1818,215 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains('3'), "{text}");
         assert!(text.contains('1'), "{text}");
+    }
+
+    /// OSTA CS0 bytes for `name` (compression id 8, like every
+    /// directory name the fixtures encode).
+    fn cs0(name: &[u8]) -> Vec<u8> {
+        let mut out = vec![8];
+        out.extend_from_slice(name);
+        out
+    }
+
+    /// One prefixed-shape component: type, length, identifier, zero
+    /// padding to a 4-byte boundary.
+    fn brief_comp(comp_type: u8, ident: &[u8]) -> Vec<u8> {
+        let mut out = vec![comp_type, ident.len() as u8];
+        out.extend_from_slice(ident);
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+        out
+    }
+
+    /// Prefixed-shape data: the 2-byte length over `comps`.
+    fn brief_data(comps: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for comp in comps {
+            body.extend_from_slice(comp);
+        }
+        let mut out = (body.len() as u16).to_le_bytes().to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn symlink_prefixed_shape_decodes_to_a_relative_target() {
+        // `../FILE.TXT` in the brief's shape (length prefix, no
+        // version words, padded): the parent plus a 9-byte CS0 name.
+        let data = brief_data(&[brief_comp(3, &[]), brief_comp(5, &cs0(b"FILE.TXT"))]);
+        assert_eq!(
+            decode_symlink_target(&data, "link `L`").expect("the brief list decodes"),
+            "../FILE.TXT"
+        );
+        // `./../AB`: a current, a parent and a 3-byte CS0 name (the
+        // padding-heavy length the version heuristic would misread —
+        // the prefix marks the shape, so it decodes exactly).
+        let data = brief_data(&[
+            brief_comp(4, &[]),
+            brief_comp(3, &[]),
+            brief_comp(5, &cs0(b"AB")),
+        ]);
+        assert_eq!(
+            decode_symlink_target(&data, "link `M`").expect("the short name decodes"),
+            "./../AB"
+        );
+    }
+
+    #[test]
+    fn symlink_bare_shape_decodes_past_the_version() {
+        // The shape real images carry (see the reader's symlink
+        // fixture): no prefix, a 2-byte version before the CS0 name.
+        let data = vec![5, 5, 1, 0, 8, b'l', b'i', b'n', b'k'];
+        assert_eq!(
+            decode_symlink_target(&data, "link `L`").expect("the bare list decodes"),
+            "link"
+        );
+    }
+
+    #[test]
+    fn symlink_malformed_lists_refuse_without_panic() {
+        // Each input refuses with its own reason named; none may
+        // panic (a panic would fail the test outright).
+        for (data, fragment) in [
+            (vec![], "no path components"),
+            (vec![3], "no length byte"),
+            (vec![7, 0], "unknown type 7"),
+            (vec![0, 0], "only a length prefix"),
+            (vec![2, 0, 0, 0], "reserved type 0"),
+            (vec![4, 0, 5, 9, 8, b'F'], "runs past"),
+            (vec![5, 0, 8], "empty name"),
+            (vec![5, 2, 0, 0, 3, b'x'], "3"),
+        ] {
+            let error =
+                decode_symlink_target(&data, "link `L`").expect_err("a malformed list refuses");
+            assert!(error.to_string().contains(fragment), "{:?}", error);
+        }
+    }
+
+    /// One [`Timestamp`] from parts: the conversion tests build stamps
+    /// directly (byte parsing is covered end to end through the reader
+    /// fixture).
+    fn stamp(
+        type_and_timezone: u16,
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> Timestamp {
+        Timestamp {
+            type_and_timezone,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            centiseconds: 0,
+            hundreds: 0,
+            microseconds: 0,
+        }
+    }
+
+    #[test]
+    fn timestamp_conversion_places_known_instants() {
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+
+        // Type 1 with zero offset is UTC: 2024-02-29T12:34:56Z is
+        // 1709210096 and 2023-11-14T22:13:20Z is 1700000000 (both per
+        // `date -u`, not per the converter).
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1000, 2024, 2, 29, 12, 34, 56)),
+            Some(UNIX_EPOCH + Duration::new(1_709_210_096, 0))
+        );
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1000, 2023, 11, 14, 22, 13, 20)),
+            Some(UNIX_EPOCH + Duration::new(1_700_000_000, 0))
+        );
+        // Type 1 with +8 quarter-hours is two hours east: 2024-06-01
+        // 12:00 local reads as 10:00Z, 1717236000 per `date -u`.
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1008, 2024, 6, 1, 12, 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(1_717_236_000, 0))
+        );
+        // The unspecified offset (-2047) reads as UTC, like the
+        // kernel: 2024-02-29T12:34:56 with no zone places like UTC.
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1801, 2024, 2, 29, 12, 34, 56)),
+            Some(UNIX_EPOCH + Duration::new(1_709_210_096, 0))
+        );
+        // Any other type reads as UTC too: the offset bits below a
+        // type-0 stamp are ignored.
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x0008, 2024, 6, 1, 12, 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(1_717_243_200, 0))
+        );
+        // A leap century places (2000-02-29T00:00:00Z is 951782400
+        // per `date -u`).
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1000, 2000, 2, 29, 0, 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(951_782_400, 0))
+        );
+    }
+
+    #[test]
+    fn timestamp_conversion_refuses_impossible_dates() {
+        for bad in [
+            stamp(0x1000, 2024, 0, 15, 0, 0, 0),
+            stamp(0x1000, 2024, 13, 15, 0, 0, 0),
+            stamp(0x1000, 2024, 2, 0, 0, 0, 0),
+            stamp(0x1000, 2023, 2, 29, 0, 0, 0),
+            stamp(0x1000, 2024, 4, 31, 0, 0, 0),
+            stamp(0x1000, 2024, 1, 1, 24, 0, 0),
+            stamp(0x1000, 2024, 1, 1, 0, 60, 0),
+            stamp(0x1000, 2024, 1, 1, 0, 0, 60),
+        ] {
+            assert_eq!(timestamp_to_system_time(&bad), None, "{bad:?}");
+        }
+        let mut centi = stamp(0x1000, 2024, 1, 1, 0, 0, 0);
+        centi.centiseconds = 100;
+        assert_eq!(timestamp_to_system_time(&centi), None, "{centi:?}");
+        let mut micro = stamp(0x1000, 2024, 1, 1, 0, 0, 0);
+        micro.microseconds = 100;
+        assert_eq!(timestamp_to_system_time(&micro), None, "{micro:?}");
+    }
+
+    #[test]
+    fn timestamp_parses_from_entry_bytes() {
+        // The 12-byte layout the file entry parser reads: timezone,
+        // year, month, day, hour, minute, second, centiseconds,
+        // hundreds, microseconds. 2024-02-29T12:34:56Z places at
+        // 1709210096 (per `date -u`).
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+
+        let bytes = [0x00, 0x10, 0xE8, 0x07, 2, 29, 12, 34, 56, 0, 0, 0];
+        let parsed = parse_timestamp(&bytes, 0, "test stamp").expect("the stamp parses");
+        assert_eq!(parsed.type_and_timezone, 0x1000);
+        assert_eq!(parsed.year, 2024);
+        assert_eq!(
+            timestamp_to_system_time(&parsed),
+            Some(UNIX_EPOCH + Duration::new(1_709_210_096, 0))
+        );
+        let error =
+            parse_timestamp(&bytes[..11], 0, "test stamp").expect_err("a short stamp refuses");
+        assert!(error.to_string().contains("microseconds"), "{error:?}");
+    }
+
+    #[test]
+    fn permissions_word_maps_to_mode_masked() {
+        // Owner triad at bits 10-12, group at 5-7, other at 0-2:
+        // 0x1CA5 (bits 12,11,10,7,5,2,0) maps to 0o755.
+        assert_eq!(permissions_to_mode(0x1CA5, 3), 0o755);
+        assert_eq!(permissions_to_mode(0, 0), 0);
+        // Setuid, setgid and sticky ride from the ICB flags, and the
+        // result never escapes 0o7777.
+        assert_eq!(permissions_to_mode(0x1CA5, 0x0040), 0o4755);
+        assert_eq!(permissions_to_mode(0x1CA5, 0x0080), 0o2755);
+        assert_eq!(permissions_to_mode(0x1CA5, 0x0100), 0o1755);
+        assert_eq!(permissions_to_mode(u32::MAX, 0xFFFF), 0o7777);
     }
 }

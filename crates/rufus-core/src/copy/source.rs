@@ -10,13 +10,10 @@
 //! them (see [`IsoSource`] for that fidelity boundary).
 //!
 //! Metadata rides the listings too: POSIX modes and UTC stamps where
-//! the reader has them (ISO `PX`/`TF`; UDF entries carry `None` — the
-//! UDF reader parses neither extended attributes nor timestamps, and
-//! UDF on a stick is a data volume, so carrying the gap is the honest
-//! choice for now — the UDF reader itself is untouched). Link targets
-//! stay out (slice 4); an entry the adapters cannot size as data
-//! still refuses here, before any byte moves, instead of copying
-//! something wrong.
+//! the reader has them (ISO `PX`/`TF`; UDF permissions and recording
+//! dates), plus symlink targets (`SL` on ISO, path components on UDF).
+//! An entry the adapters cannot size as data still refuses here,
+//! before any byte moves, instead of copying something wrong.
 
 use std::time::Duration;
 use std::time::SystemTime;
@@ -28,29 +25,46 @@ use crate::iso::IsoReader;
 use crate::iso::rock::RockTime;
 use crate::udf::UdfReader;
 
-/// One listed entry: name, kind, size and metadata. Link targets stay
-/// absent (slice 4); ownership never rides along (needs privileges —
-/// see [`DestDir::apply_metadata`](super::DestDir::apply_metadata)).
+/// One listed entry: name, kind, size, metadata and link target.
+/// Ownership never rides along (needs privileges — see
+/// [`DestDir::apply_metadata`](super::DestDir::apply_metadata)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// File name as stored: raw identifier bytes on ISO
     /// ([`file_name`](crate::iso::reader::Entry::file_name)), UTF-8 on
     /// UDF.
     pub name: Vec<u8>,
-    /// True for directories.
+    /// True for directories. Symlinks never read `true` here for
+    /// copying purposes: even a symlink in a directory slot is treated
+    /// as a link, never descended into (see [`walk`](super::walk)).
     pub is_dir: bool,
-    /// File size in bytes; 0 for directories.
+    /// File size in bytes; 0 for directories and for symlinks (a link
+    /// costs no bytes — a dereferenced link's size is resolved during
+    /// the walk, not here).
     pub size: u64,
     /// POSIX mode from `PX` (file type bits included — the destination
-    /// masks); `None` where the record carries no `PX`, and always on
-    /// UDF.
+    /// masks) or from the UDF permissions word (masked to `0o7777`);
+    /// `None` where the record carries no `PX` (ISO).
     pub mode: Option<u32>,
-    /// Modification time from `TF`, converted to UTC; `None` where the
-    /// record carries none, where conversion refuses, and always on
-    /// UDF.
+    /// Modification time from `TF` (ISO) or the UDF modification date,
+    /// converted to UTC; `None` where the record carries none or where
+    /// conversion refuses.
     pub modified: Option<SystemTime>,
-    /// Last-access time from `TF`, converted like [`modified`](Entry::modified).
+    /// Last-access time, converted like [`modified`](Entry::modified).
     pub accessed: Option<SystemTime>,
+    /// Raw symlink target for link entries (`None` for files and
+    /// directories): the `SL` target on ISO, the decoded path-component
+    /// target on UDF.
+    pub link: Option<Vec<u8>>,
+}
+
+impl Entry {
+    /// True for symbolic links (a target is present), regardless of
+    /// the directory flag: links are never descended into.
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        self.link.is_some()
+    }
 }
 
 /// A readable filesystem tree: listings plus chunked file reads. The
@@ -134,8 +148,8 @@ fn rock_time_to_system_time(stamp: &RockTime) -> Option<SystemTime> {
 /// (names that are not valid UTF-8 cannot round-trip through its
 /// `&str` lookup — the same lossy boundary its `walk` documents),
 /// and Rock Ridge alternate names resolve like the reader resolves
-/// them (preferred on a SUSP volume). Symlinks refuse at listing
-/// time: they are never followed, and a silent skip would lose data.
+/// them (preferred on a SUSP volume). Symlinks list with their
+/// target but are never followed (see [`walk`](super::walk)).
 #[derive(Debug)]
 pub struct IsoSource {
     reader: IsoReader,
@@ -161,23 +175,21 @@ impl IsoSource {
         path
     }
 
-    /// Translate one reader listing, refusing symlink entries: they
-    /// are never followed, and skipping them would lose data. Modes
-    /// ride whole (the destination masks); stamps convert to UTC, and
-    /// a stamp the converter cannot place reads as absent.
+    /// Translate one reader listing, carrying symlink entries as links
+    /// (never followed) alongside files and directories. Modes ride
+    /// whole (the destination masks); stamps convert to UTC, and a
+    /// stamp the converter cannot place reads as absent. Symlinks size
+    /// 0: a recreated link costs no bytes, and a dereferenced link's
+    /// size is resolved during the walk, not here.
     fn translate(&self, entries: Vec<crate::iso::reader::Entry>) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
         for entry in &entries {
-            if entry.symlink_target.is_some() {
-                return Err(CoreError::invalid(format!(
-                    "copy refuses '{}': it is a symbolic link, and this slice copies data only",
-                    String::from_utf8_lossy(&entry.file_name())
-                )));
-            }
+            let link = entry.symlink_target.clone().map(String::into_bytes);
+            let is_symlink = link.is_some();
             out.push(Entry {
                 name: entry.file_name(),
-                is_dir: entry.is_dir,
-                size: if entry.is_dir {
+                is_dir: entry.is_dir && !is_symlink,
+                size: if is_symlink || entry.is_dir {
                     0
                 } else {
                     u64::from(entry.data_len)
@@ -193,6 +205,7 @@ impl IsoSource {
                     .as_ref()
                     .and_then(|times| times.access.as_ref())
                     .and_then(rock_time_to_system_time),
+                link,
             });
         }
         Ok(out)
@@ -225,10 +238,10 @@ impl Source for IsoSource {
 /// information length, and reads stream through `open_file` plus
 /// `read_open_at` without ever buffering a whole file.
 ///
-/// Entries the reader cannot open as data (symlinks, FIFOs and the
-/// rest — each refuses with its kind named) fail the listing that
-/// contains them: failing fast before any byte moves, exactly like
-/// the ISO side's symlink refusal.
+/// Entries the reader cannot open as data (FIFOs and the rest —
+/// each refuses with its kind named) fail the listing that contains
+/// them: failing fast before any byte moves. Symlinks list with their
+/// target instead (see [`walk`](super::walk)).
 #[derive(Debug)]
 pub struct UdfSource {
     reader: UdfReader,
@@ -260,26 +273,30 @@ impl UdfSource {
         Ok(current)
     }
 
-    /// Translate one reader listing, sizing files through `open_file`
-    /// (which is also what refuses symlinks and special files with
-    /// their kind named). Modes and stamps stay `None`: the UDF
-    /// reader parses neither extended attributes nor timestamps (see
-    /// the module docs).
+    /// Translate one reader listing, carrying symlink entries as links
+    /// alongside files and directories. Regular files size through
+    /// `open_file` (which is also what refuses FIFOs and special files
+    /// with their kind named); symlinks and directories size 0 (a link
+    /// costs no bytes — a dereferenced link's size resolves during the
+    /// walk). Modes and stamps ride from the listing itself.
     fn translate(&self, entries: Vec<crate::udf::reader::Entry>) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
         for entry in &entries {
-            let size = if entry.is_directory {
+            let link = entry.symlink_target.clone().map(String::into_bytes);
+            let is_symlink = link.is_some();
+            let size = if is_symlink || entry.is_directory {
                 0
             } else {
                 self.reader.open_file(entry)?.len()
             };
             out.push(Entry {
                 name: entry.name.clone().into_bytes(),
-                is_dir: entry.is_directory,
+                is_dir: entry.is_directory && !is_symlink,
                 size,
-                mode: None,
-                modified: None,
-                accessed: None,
+                mode: entry.mode,
+                modified: entry.modified,
+                accessed: entry.accessed,
+                link,
             });
         }
         Ok(out)
@@ -926,6 +943,150 @@ mod tests {
         assert!(error.to_string().contains('7'), "{error:?}");
     }
 
+    /// One SUSP entry with the computed length byte and version 1.
+    /// Copied from the `iso/reader.rs` test builders, not refactored:
+    /// those helpers are private to their module on purpose.
+    fn susp_entry(sig: &[u8; 2], payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![sig[0], sig[1], (4 + payload.len()) as u8, 1];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// An `SL` entry over `(component flags, text)` pairs (flag 0 is
+    /// a plain component, `0x04` climbs to the parent). Copied from
+    /// the `iso/reader.rs` test builders (see [`susp_entry`]).
+    fn sl_entry(comps: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut payload = vec![0];
+        for (flags, text) in comps {
+            payload.push(*flags);
+            payload.push(text.len() as u8);
+            payload.extend_from_slice(text);
+        }
+        susp_entry(b"SL", &payload)
+    }
+
+    /// Symlink fixture image: root at 20 holding `FILE.TXT;1` (9
+    /// bytes), `LINK;1` (an `SL` link to `FILE.TXT`) and `SUB/` at 25
+    /// holding `UP;1` (an `SL` link to `../FILE.TXT`). The root dot
+    /// record carries `SP` so the reader parses Rock Ridge.
+    /// Synthetic layout only, claims nothing about real mastering
+    /// tools.
+    fn symlink_fixture_bytes() -> Vec<u8> {
+        const SUB_SECTOR: u32 = 25;
+        const FILE_SECTOR: u32 = 26;
+        let mut image = vec![0u8; IMAGE_SECTORS as usize * SECTOR_BYTES];
+        let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut image,
+            16,
+            &primary_sector("LABEL", ROOT_SECTOR, SECTOR_BYTES as u32),
+        );
+        put(&mut image, 17, &boot_sector());
+        put(&mut image, 18, &terminator_sector());
+        let dot = encode_record_su(
+            ROOT_SECTOR,
+            SECTOR_BYTES as u32,
+            FLAG_DIRECTORY,
+            b"\x00",
+            &sp_marker(),
+        );
+        let parent = encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01");
+        put(
+            &mut image,
+            ROOT_SECTOR,
+            &dir_sector(&[
+                dot,
+                parent,
+                encode_record(FILE_SECTOR, 9, 0, b"FILE.TXT;1"),
+                encode_record_su(0, 0, 0, b"LINK;1", &sl_entry(&[(0, b"FILE.TXT")])),
+                encode_record(SUB_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"SUB"),
+            ]),
+        );
+        put(
+            &mut image,
+            SUB_SECTOR,
+            &dir_sector(&[
+                encode_record(SUB_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(SUB_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(
+                    0,
+                    0,
+                    0,
+                    b"UP;1",
+                    &sl_entry(&[(0x04, b""), (0, b"FILE.TXT")]),
+                ),
+            ]),
+        );
+        put(&mut image, FILE_SECTOR, b"iso-bytes");
+        image
+    }
+
+    #[test]
+    fn copies_rock_ridge_symlinks_end_to_end() {
+        // LINK recreates as a link to FILE.TXT and SUB/UP as a link
+        // to ../FILE.TXT; the file lands with its bytes and only its
+        // bytes count (one directory, three files, nine bytes), with
+        // no warnings.
+        let bytes = symlink_fixture_bytes();
+        let total = bytes.len() as u64;
+        let mut volume = VecVolume::new(total, 512).expect("the fixture fits in RAM");
+        volume.write_all_at(0, &bytes).expect("the fixture writes");
+        let source = IsoSource::new(IsoReader::open(Box::new(volume)).expect("the fixture opens"));
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = WarnLog { warns: Vec::new() };
+        let summary = super::super::walk(
+            &source,
+            scratch.path(),
+            &super::super::CopyOptions { free_bytes: None },
+            &mut progress,
+        )
+        .expect("the symlink tree copies");
+        assert_eq!(
+            summary,
+            super::super::Summary {
+                directories: 1,
+                files: 3,
+                bytes: 9,
+                renamed: 0,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "inside links warn nothing: {:?}",
+            progress.warns
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("FILE.TXT")).expect("the file reads back"),
+            b"iso-bytes"
+        );
+        let link = scratch.path().join("LINK");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link stats")
+                .file_type()
+                .is_symlink(),
+            "LINK lands as a link"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("the LINK target reads"),
+            std::path::Path::new("FILE.TXT")
+        );
+        let up = scratch.path().join("SUB").join("UP");
+        assert!(
+            std::fs::symlink_metadata(&up)
+                .expect("the nested link stats")
+                .file_type()
+                .is_symlink(),
+            "SUB/UP lands as a link"
+        );
+        assert_eq!(
+            std::fs::read_link(&up).expect("the UP target reads"),
+            std::path::Path::new("../FILE.TXT")
+        );
+    }
     /// One [`RockTime`] from parts: the conversion tests below build
     /// stamps directly (the TF decoder is the reader's tested
     /// business, not this slice's).
@@ -1012,6 +1173,309 @@ mod tests {
         assert_eq!(
             rock_time_to_system_time(&stamp(2024, [2, 29, 0, 0, 0], 0, 0)),
             Some(std::time::UNIX_EPOCH + std::time::Duration::new(1_709_164_800, 0))
+        );
+    }
+
+    /// Block size the synthetic UDF volume below uses.
+    const UF_SIZE: u32 = 512;
+    /// Absolute block of the anchor (sector 256 in 512-byte units).
+    const UF_ANCHOR_AT: u32 = 256;
+    /// Partition start the synthetic volume uses.
+    const UF_PART_AT: u32 = 257;
+
+    /// Recognition region: BEA01, NSR03, TEA01. Copied from the
+    /// `udf/reader.rs` test builders, not refactored: those helpers
+    /// are private to their module on purpose.
+    fn uf_recognition() -> Vec<u8> {
+        let mut region = vec![0u8; 6144];
+        for (index, id) in [*b"BEA01", *b"NSR03", *b"TEA01"].iter().enumerate() {
+            let base = index * 2048;
+            region[base] = 0x00;
+            region[base + 1..base + 6].copy_from_slice(id);
+            region[base + 6] = 0x01;
+        }
+        region
+    }
+
+    /// Anchor block with a main extent (8 blocks from 96) and no
+    /// reserve, CRC fixed. Copied (see [`uf_recognition`]).
+    fn uf_anchor() -> Vec<u8> {
+        let mut block = vec![0u8; UF_SIZE as usize];
+        block[16..20].copy_from_slice(&(8 * UF_SIZE).to_le_bytes());
+        block[20..24].copy_from_slice(&96u32.to_le_bytes());
+        crate::udf::stamp_tag(&mut block, 2, (UF_SIZE - 16) as u16, UF_ANCHOR_AT);
+        block
+    }
+
+    /// Zeroed block with only a tag: primary (1), unallocated (7),
+    /// implementation use (4) and terminator (8) carry nothing the
+    /// adapter test reads. Copied (see [`uf_recognition`]).
+    fn uf_skipped(lbn: u32, id: u16) -> Vec<u8> {
+        let mut block = vec![0u8; UF_SIZE as usize];
+        crate::udf::stamp_tag(&mut block, id, (UF_SIZE - 16) as u16, lbn);
+        block
+    }
+
+    /// Partition body for number 0 at `UF_PART_AT`, contents `+NSR03`.
+    /// Copied (see [`uf_recognition`]).
+    fn uf_partition(lbn: u32) -> Vec<u8> {
+        let mut block = vec![0u8; UF_SIZE as usize];
+        block[22..24].copy_from_slice(&0u16.to_le_bytes());
+        block[25..31].copy_from_slice(b"+NSR03");
+        block[188..192].copy_from_slice(&UF_PART_AT.to_le_bytes());
+        block[192..196].copy_from_slice(&900u32.to_le_bytes());
+        crate::udf::stamp_tag(&mut block, 5, (UF_SIZE - 16) as u16, lbn);
+        block
+    }
+
+    /// Logical volume body: label `LABEL`, revision 2.01, one type-1
+    /// map to partition 0, file set at partition-relative block 8.
+    /// Copied (see [`uf_recognition`]).
+    fn uf_logical(lbn: u32) -> Vec<u8> {
+        let mut block = vec![0u8; UF_SIZE as usize];
+        block[84] = 8;
+        block[85..90].copy_from_slice(b"LABEL");
+        block[84 + 127] = 6;
+        block[212..216].copy_from_slice(&UF_SIZE.to_le_bytes());
+        block[217..236].copy_from_slice(b"*OSTA UDF Compliant");
+        block[240..242].copy_from_slice(&0x0201u16.to_le_bytes());
+        block[248..252].copy_from_slice(&UF_SIZE.to_le_bytes());
+        block[252..256].copy_from_slice(&8u32.to_le_bytes());
+        block[264..268].copy_from_slice(&6u32.to_le_bytes());
+        block[268..272].copy_from_slice(&1u32.to_le_bytes());
+        block[440..446].copy_from_slice(&[1, 6, 1, 0, 0, 0]);
+        crate::udf::stamp_tag(&mut block, 6, (446 - 16) as u16, lbn);
+        block
+    }
+
+    /// File set block with the root ICB (one block, relative 10,
+    /// reference 0). Copied (see [`uf_recognition`]).
+    fn uf_fsd() -> Vec<u8> {
+        let mut block = vec![0u8; UF_SIZE as usize];
+        block[400..404].copy_from_slice(&UF_SIZE.to_le_bytes());
+        block[404..408].copy_from_slice(&10u32.to_le_bytes());
+        crate::udf::stamp_tag(&mut block, 256, (UF_SIZE - 16) as u16, 8);
+        block
+    }
+
+    /// Extended file entry with `data` embedded (information length =
+    /// data length) and file type `ftype`, claiming
+    /// partition-relative `rel`. Copied (see [`uf_recognition`]).
+    fn uf_ext(rel: u32, data: &[u8], ftype: u8) -> Vec<u8> {
+        let mut block = vec![0u8; UF_SIZE as usize];
+        block[27] = ftype;
+        block[16 + 18..16 + 20].copy_from_slice(&3u16.to_le_bytes());
+        block[56..64].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        block[208..212].copy_from_slice(&0u32.to_le_bytes());
+        block[212..216].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        block[216..216 + data.len()].copy_from_slice(data);
+        crate::udf::stamp_tag(&mut block, 266, (UF_SIZE - 16) as u16, rel);
+        block
+    }
+
+    /// One FID record: characteristics `char`, ICB (one block, `lbn`),
+    /// `name` bytes, location `loc`, CRC fixed, padded to 4. Copied
+    /// (see [`uf_recognition`]).
+    fn uf_fid(characteristics: u8, lbn: u32, name: &[u8], loc: u32) -> Vec<u8> {
+        let body = 38 + name.len();
+        let total = body + (4 - body % 4) % 4;
+        let mut record = vec![0u8; total];
+        record[16..18].copy_from_slice(&1u16.to_le_bytes());
+        record[18] = characteristics;
+        record[19] = name.len() as u8;
+        record[20..24].copy_from_slice(&UF_SIZE.to_le_bytes());
+        record[24..28].copy_from_slice(&lbn.to_le_bytes());
+        record[38..38 + name.len()].copy_from_slice(name);
+        crate::udf::stamp_tag(&mut record, 257, (total - 16) as u16, loc);
+        record
+    }
+
+    /// One 12-byte ECMA timestamp: type 1 with `quarters`
+    /// quarter-hour offset, then year and the civil fields (month,
+    /// day, hour, minute, second, centiseconds, hundreds;
+    /// microseconds stays zero). Copied from the `udf/reader.rs`
+    /// symlink test builders (see [`uf_recognition`]).
+    fn uf_stamp(quarters: u16, year: u16, fields: [u8; 7]) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[0..2].copy_from_slice(&(0x1000 | (quarters & 0x0FFF)).to_le_bytes());
+        out[2..4].copy_from_slice(&year.to_le_bytes());
+        out[4..11].copy_from_slice(&fields);
+        out
+    }
+
+    /// One prefixed-shape symlink component: type, length,
+    /// identifier, zero padding to a 4-byte boundary. Copied (see
+    /// [`uf_recognition`]).
+    fn uf_comp(comp_type: u8, ident: &[u8]) -> Vec<u8> {
+        let mut out = vec![comp_type, ident.len() as u8];
+        out.extend_from_slice(ident);
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+        out
+    }
+
+    /// Full synthetic volume: recognition, anchor, six-descriptor
+    /// main sequence, file set at relative 8 and root entry at
+    /// relative 10 embedding `root`. Extra `(absolute block, bytes)`
+    /// pairs land after the fixed layout.
+    fn uf_volume(root: &[u8], extra: &[(u32, Vec<u8>)]) -> VecVolume {
+        let mut total_blocks = UF_PART_AT + 16;
+        for (abs, _) in extra {
+            total_blocks = total_blocks.max(abs.saturating_add(1));
+        }
+        let mut volume = VecVolume::new(u64::from(total_blocks) * u64::from(UF_SIZE), 512)
+            .expect("the fixture fits in RAM");
+        volume
+            .write_all_at(32768, &uf_recognition())
+            .expect("the recognition fits");
+        let mut put = |abs: u32, bytes: &[u8]| {
+            volume
+                .write_all_at(u64::from(abs) * u64::from(UF_SIZE), bytes)
+                .expect("the block fits");
+        };
+        put(UF_ANCHOR_AT, &uf_anchor());
+        put(96, &uf_skipped(96, 1));
+        put(97, &uf_logical(97));
+        put(98, &uf_partition(98));
+        put(99, &uf_skipped(99, 7));
+        put(100, &uf_skipped(100, 4));
+        put(101, &uf_skipped(101, 8));
+        put(UF_PART_AT + 8, &uf_fsd());
+        put(UF_PART_AT + 10, &uf_ext(10, root, 4));
+        for (abs, bytes) in extra {
+            put(*abs, bytes);
+        }
+        volume
+    }
+
+    #[test]
+    fn udf_source_carries_links_modes_and_stamps() {
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+
+        // Root holds FILE.TXT (9 bytes), SUB/ (with UP pointing at
+        // `../FILE.TXT` in the prefixed shape, permission word
+        // 0x1CA5 and known stamps) and LINK (pointing at FILE.TXT in
+        // the bare shape with a zero permission word). Listings carry
+        // every adapter field, and the tree copies end to end with
+        // both links recreated.
+        let mut up_body = uf_comp(3, &[]);
+        up_body.extend_from_slice(&uf_comp(
+            5,
+            &[8, b'F', b'I', b'L', b'E', b'.', b'T', b'X', b'T'],
+        ));
+        let mut up_data = (up_body.len() as u16).to_le_bytes().to_vec();
+        up_data.extend_from_slice(&up_body);
+        let mut up_block = uf_ext(14, &up_data, 12);
+        up_block[44..48].copy_from_slice(&0x1CA5u32.to_le_bytes());
+        up_block[80..92].copy_from_slice(&uf_stamp(0, 2023, [11, 14, 22, 13, 20, 0, 0]));
+        up_block[92..104].copy_from_slice(&uf_stamp(0, 2024, [2, 29, 12, 34, 56, 0, 0]));
+        crate::udf::stamp_tag(&mut up_block, 266, (UF_SIZE - 16) as u16, 14);
+        let bare = vec![
+            5, 9, 1, 0, 8, b'F', b'I', b'L', b'E', b'.', b'T', b'X', b'T',
+        ];
+        let mut sub = uf_fid(0x0A, 12, &[], 12);
+        sub.extend_from_slice(&uf_fid(0x00, 14, &[8, b'U', b'P'], 12));
+        let mut root = uf_fid(0x0A, 10, &[], 10);
+        root.extend_from_slice(&uf_fid(
+            0x00,
+            11,
+            &[8, b'F', b'I', b'L', b'E', b'.', b'T', b'X', b'T'],
+            10,
+        ));
+        root.extend_from_slice(&uf_fid(0x02, 12, &[8, b'S', b'U', b'B'], 10));
+        root.extend_from_slice(&uf_fid(0x00, 13, &[8, b'L', b'I', b'N', b'K'], 10));
+        // Fixture file and directory entries need usable permission
+        // words: the copy applies them, and a zero word would chmod
+        // the file unreadable and the directory untraversable for a
+        // non-root tester. LINK keeps its zero word (symlinks carry no
+        // metadata — setting times through a link would touch its
+        // target).
+        let mut file_block = uf_ext(11, b"udf-bytes", 5);
+        file_block[44..48].copy_from_slice(&0x1884u32.to_le_bytes());
+        crate::udf::stamp_tag(&mut file_block, 266, (UF_SIZE - 16) as u16, 11);
+        let mut sub_block = uf_ext(12, &sub, 4);
+        sub_block[44..48].copy_from_slice(&0x1CA5u32.to_le_bytes());
+        crate::udf::stamp_tag(&mut sub_block, 266, (UF_SIZE - 16) as u16, 12);
+        let volume = uf_volume(
+            &root,
+            &[
+                (UF_PART_AT + 11, file_block),
+                (UF_PART_AT + 12, sub_block),
+                (UF_PART_AT + 13, uf_ext(13, &bare, 12)),
+                (UF_PART_AT + 14, up_block),
+            ],
+        );
+        let reader = UdfReader::open(Box::new(volume)).expect("the fixture opens");
+        let source = UdfSource::new(reader);
+        // Listings keep store order and carry every field: LINK has
+        // the decoded target with a zero-word mode and no stamps (a
+        // zeroed stamp cannot place).
+        let listed = source.root_entries().expect("the root lists");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>(),
+            [b"FILE.TXT".to_vec(), b"SUB".to_vec(), b"LINK".to_vec()]
+        );
+        assert_eq!(listed[0].size, 9);
+        assert_eq!(listed[0].link, None);
+        assert_eq!(listed[2].link, Some(b"FILE.TXT".to_vec()));
+        assert!(!listed[2].is_dir && listed[2].size == 0);
+        assert_eq!(listed[2].mode, Some(0));
+        assert_eq!(listed[2].modified, None);
+        // UP carries the target, the mapped mode and both stamps
+        // (epochs per `date -u`, not per the converter).
+        let children = source.child_entries(&[b"SUB".to_vec()]).expect("SUB lists");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].link, Some(b"../FILE.TXT".to_vec()));
+        assert_eq!(children[0].mode, Some(0o755));
+        assert_eq!(
+            children[0].modified,
+            Some(UNIX_EPOCH + Duration::new(1_709_210_096, 0))
+        );
+        assert_eq!(
+            children[0].accessed,
+            Some(UNIX_EPOCH + Duration::new(1_700_000_000, 0))
+        );
+        // End to end: both links recreate, the file lands with its
+        // bytes, and only its bytes count.
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = WarnLog { warns: Vec::new() };
+        let summary = super::super::walk(
+            &source,
+            scratch.path(),
+            &super::super::CopyOptions { free_bytes: None },
+            &mut progress,
+        )
+        .expect("the UDF link tree copies");
+        assert_eq!(
+            summary,
+            super::super::Summary {
+                directories: 1,
+                files: 3,
+                bytes: 9,
+                renamed: 0,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "inside links warn nothing: {:?}",
+            progress.warns
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("FILE.TXT")).expect("the file reads back"),
+            b"udf-bytes"
+        );
+        assert_eq!(
+            std::fs::read_link(scratch.path().join("LINK")).expect("LINK reads"),
+            std::path::Path::new("FILE.TXT")
+        );
+        assert_eq!(
+            std::fs::read_link(scratch.path().join("SUB").join("UP")).expect("UP reads"),
+            std::path::Path::new("../FILE.TXT")
         );
     }
 }

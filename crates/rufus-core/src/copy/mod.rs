@@ -1,14 +1,15 @@
-//! File-tree copy foundation (S18, slice 1 of 7): move an ISO/UDF
+//! File-tree copy foundation (S18, slices 1-4 of 7): move an ISO/UDF
 //! filesystem onto a real directory, exactly as Rufus does — one
-//! directory at a time, deterministic order, progress by bytes.
+//! directory at a time, deterministic order, progress by bytes,
+//! symlinks recreated or dereferenced.
 //!
 //! PLAN §S18 asks for the image's tree on the target the way Rufus
 //! lays it down. This slice builds only the foundation, on purpose:
 //!
 //! * [`Source`] (see [`source`]) abstracts the two readers behind the
 //!   minimum a copy needs — listings, names, kinds, sizes, chunked
-//!   reads — with thin [`IsoSource`] and [`UdfSource`] adapters. The
-//!   readers themselves are untouched.
+//!   reads, link targets — with thin [`IsoSource`] and [`UdfSource`]
+//!   adapters. The readers themselves are untouched.
 //! * [`DestDir`] writes into one existing directory on
 //!   a real filesystem (Rufus copies into a mounted filesystem, never
 //!   into a raw image).
@@ -23,8 +24,16 @@
 //!   mode lacks it (a `0555` directory from an earlier run still
 //!   opens), restoring the prior mode afterwards unless the source
 //!   carries its own — then applying it is the restore.
+//! * Links (this slice): a relative target resolving lexically inside
+//!   the copied tree is recreated with the sanitised target; a target
+//!   that escapes, is absolute, or names no copied entry is
+//!   dereferenced (the resolved file's bytes land under the link's
+//!   own name, as Rufus does); a link with no file behind it warns
+//!   once naming the link and leaves nothing behind. Links never
+//!   descend, even in a directory slot, and no created link ever
+//!   points outside the destination.
 //!
-//! Not here yet: link targets (slice 4), ownership (never applied —
+//! Not here yet: ownership (never applied —
 //! it needs privileges), boot/extended attributes, and any CLI
 //! wiring.
 //!
@@ -108,7 +117,8 @@ pub trait Progress {
     fn report(&mut self, done_bytes: u64, total_bytes: u64);
 
     /// Report a warning line (an over-long name the walk shortens,
-    /// today): the default body drops it, so the one-method trait
+    /// a link it skips, a metadata write it cannot apply): the
+    /// default body drops it, so the one-method trait
     /// stays source-compatible for implementors that only meter
     /// bytes. Warning texts are ASCII by construction (see the name
     /// rules).
@@ -120,19 +130,32 @@ pub trait Progress {
 /// through one fixed buffer. Returns the [`Summary`] counts.
 ///
 /// The copy merges, it does not mirror: entries already in the
-/// destination from an earlier, different tree persist as orphans,
-/// and an assigned name occupied by a directory or symlink refuses
-/// (a regular file is removed and rewritten — see the replacement
-/// policy above).
+/// destination from an earlier, different tree persist as orphans.
+/// The replacement policy is remove-and-rewrite per kind — a regular
+/// file in the way of a file (or of a dereferenced link, which lands
+/// as a regular file) is removed and rewritten, a file or link in the
+/// way of a recreated link is removed and relinked, an existing
+/// directory is reused — while anything else in either slot refuses:
+/// a symlink or directory in a file slot, a file or symlink in a
+/// directory slot, a directory in a link slot (a symlink is never
+/// traversed, in either direction).
 ///
 /// Destination names are sanitised per component (version suffixes,
 /// separators, trailing dots and spaces, length) and de-collided per
 /// directory (case-insensitive `~N` suffixes); [`Summary::renamed`]
 /// counts every entry stored under a different name, and truncations
-/// warn through [`Progress::warn`]. The replacement policy is
-/// remove-and-rewrite — a matching-name regular file in the
-/// destination is removed and rewritten, while a symlink or any other
-/// kind in either slot refuses.
+/// warn through [`Progress::warn`].
+///
+/// Links resolve against the source tree, never the destination: a
+/// relative target that stays inside and names a copied entry is
+/// recreated as a link (counted as a file with no bytes, carrying no
+/// metadata — stamping through a link would touch its target); any
+/// other target whose file resolves is dereferenced instead (its
+/// bytes land under the link's own name with the link's own
+/// metadata); a link with no file behind it warns once naming the
+/// link and leaves nothing behind. The sizing pass agrees exactly: a
+/// recreated link costs nothing, a dereferenced one costs its file's
+/// bytes, a skipped one costs nothing.
 ///
 /// Order of checks: the destination must exist as a directory, then
 /// the tree's declared total is summed (a second traversal — sources
@@ -443,6 +466,223 @@ fn check_name(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Cap on symlink target components examined during resolution: a
+/// longer target is hostile (real targets are a handful of
+/// components), refused as dangling rather than allocated.
+const MAX_LINK_COMPONENTS: usize = 128;
+
+/// Cap on symlink chain steps followed during dereference: a longer
+/// chain loops (POSIX allows 40), refused as dangling rather than
+/// followed forever.
+const MAX_SYMLINK_DEPTH: usize = 40;
+
+/// Split a symlink target on `/`, dropping empty segments (so `//`
+/// collapses and a trailing `/` reads as its directory). The caller
+/// checks absoluteness separately — emptiness here only means the
+/// target was empty or all slashes.
+fn split_target(target: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for part in target.split(|byte| *byte == b'/') {
+        if part.is_empty() {
+            continue;
+        }
+        out.push(part.to_vec());
+    }
+    out
+}
+
+/// Lexically resolve `target` against `base` (the link's parent
+/// directory, as source name bytes), strictly: relative targets that
+/// never climb above the root resolve to the path inside, anything
+/// absolute, empty or escaping reads as `None`. Dots skip, dot-dots
+/// pop, names push; a dot-dot on an empty stack escapes.
+fn strict_resolve(base: &[Vec<u8>], target: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if target.is_empty() {
+        return None;
+    }
+    if target.first() == Some(&b'/') {
+        return None;
+    }
+    let comps = split_target(target);
+    if comps.len() > MAX_LINK_COMPONENTS {
+        return None;
+    }
+    let mut stack = base.to_vec();
+    for comp in &comps {
+        if comp.as_slice() == b"." {
+            continue;
+        }
+        if comp.as_slice() == b".." {
+            stack.pop()?;
+            continue;
+        }
+        stack.push(comp.clone());
+    }
+    Some(stack)
+}
+
+/// Lexically resolve `target` against `base` leniently, for
+/// dereference: absolute targets resolve from the root, dot-dots
+/// above the root clamp (POSIX `/../a` reads as `/a`), dots skip.
+/// Returns `None` only for empty targets and hostile lengths — the
+/// caller checks existence separately.
+fn lenient_resolve(base: &[Vec<u8>], target: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if target.is_empty() {
+        return None;
+    }
+    let comps = split_target(target);
+    if comps.is_empty() || comps.len() > MAX_LINK_COMPONENTS {
+        return None;
+    }
+    let mut stack = if target.first() == Some(&b'/') {
+        Vec::new()
+    } else {
+        base.to_vec()
+    };
+    for comp in &comps {
+        if comp.as_slice() == b"." {
+            continue;
+        }
+        if comp.as_slice() == b".." {
+            stack.pop();
+            continue;
+        }
+        stack.push(comp.clone());
+    }
+    Some(stack)
+}
+
+/// Look up `path` (source name bytes from the root) through `source`:
+/// `Ok(None)` when any component is missing, when descent would pass
+/// through a file or a symlink (directory slots holding links are
+/// never followed), or when a listing itself fails (target lookup is
+/// best-effort — the tree walk still fails fast on its own listings).
+/// The empty path (the root) reads as `None` too: the root always
+/// exists, but it carries no `Entry` to return.
+fn lookup_source(source: &dyn Source, path: &[Vec<u8>]) -> Result<Option<Entry>> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let mut dir: Vec<Vec<u8>> = Vec::new();
+    for (index, comp) in path.iter().enumerate() {
+        let children = if dir.is_empty() {
+            match source.root_entries() {
+                Ok(children) => children,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            match source.child_entries(&dir) {
+                Ok(children) => children,
+                Err(_) => return Ok(None),
+            }
+        };
+        let found = children
+            .iter()
+            .find(|child| child.name.as_slice() == comp.as_slice());
+        let entry = match found {
+            Some(entry) => entry.clone(),
+            None => return Ok(None),
+        };
+        let last = index + 1 == path.len();
+        if last {
+            return Ok(Some(entry));
+        }
+        if entry.is_symlink() || !entry.is_dir {
+            return Ok(None);
+        }
+        dir.push(comp.clone());
+    }
+    Ok(None)
+}
+
+/// True when `target` (relative to `base`) strictly resolves inside
+/// and names an existing entry (or the root): the shape recreated as
+/// a symlink. Anything else — absolute, escaping, dangling, or
+/// passing through a link — reads as `false` and falls to
+/// dereference.
+fn strict_link_inside(source: &dyn Source, base: &[Vec<u8>], target: &[u8]) -> bool {
+    let resolved = match strict_resolve(base, target) {
+        Some(path) => path,
+        None => return false,
+    };
+    if resolved.is_empty() {
+        return true;
+    }
+    match lookup_source(source, &resolved) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => false,
+    }
+}
+
+/// Resolve `target` (relative to `base`) to a regular file for
+/// dereference: lenient resolution, then follow symlink chains (each
+/// step lenient against its own parent) up to [`MAX_SYMLINK_DEPTH`].
+/// Returns the file's source path and size, or `None` when the target
+/// is missing, names a directory, loops, or runs too deep.
+fn dereference_file(
+    source: &dyn Source,
+    base: &[Vec<u8>],
+    target: &[u8],
+) -> Option<(Vec<Vec<u8>>, u64)> {
+    let mut path = lenient_resolve(base, target)?;
+    let mut seen: Vec<Vec<Vec<u8>>> = Vec::new();
+    for _ in 0..MAX_SYMLINK_DEPTH {
+        if seen.contains(&path) {
+            return None;
+        }
+        seen.push(path.clone());
+        let entry = match lookup_source(source, &path) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return None,
+            Err(_) => return None,
+        };
+        if let Some(next_target) = entry.link {
+            let end = path.len().saturating_sub(1);
+            let parent: &[Vec<u8>] = match path.get(..end) {
+                Some(parent) => parent,
+                None => &[],
+            };
+            let parent_vec = parent.to_vec();
+            path = lenient_resolve(&parent_vec, &next_target)?;
+            continue;
+        }
+        if entry.is_dir {
+            return None;
+        }
+        return Some((path, entry.size));
+    }
+    None
+}
+
+/// Sanitise a symlink target for recreation: split on `/`, keep `.`
+/// and `..` as navigation, sanitise every other component with
+/// [`sanitise`] (no warnings — target shortening stays silent, and a
+/// colliding rename may leave the link dangling, see the walk docs),
+/// rejoin with `/`. Absolute targets never reach here (they
+/// dereference), so no leading slash is preserved.
+fn sanitised_target(target: &[u8]) -> Vec<u8> {
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    for part in target.split(|byte| *byte == b'/') {
+        if part.is_empty() {
+            continue;
+        }
+        if part == b"." || part == b".." {
+            parts.push(part.to_vec());
+            continue;
+        }
+        parts.push(sanitise(part).name);
+    }
+    let mut out = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
+    out
+}
+
 /// The walk state: everything [`copy_dir`](Copier::copy_dir) threads
 /// through the recursion in one struct instead of nine arguments.
 struct Copier<'a> {
@@ -527,6 +767,50 @@ impl Copier<'_> {
         )))
     }
 
+    /// Stream `size` bytes of the source file at `src` (name bytes
+    /// from the root) into the already-open `file` at destination
+    /// `abs`: the shared body behind regular files and dereferenced
+    /// links, so both count progress identically. A short read
+    /// refuses naming the destination and both counts, exactly like
+    /// the capacity check measured them.
+    fn stream_from(
+        &mut self,
+        abs: &Path,
+        src: &[Vec<u8>],
+        size: u64,
+        file: &mut std::fs::File,
+    ) -> Result<()> {
+        let mut offset = 0u64;
+        while offset < size {
+            let placed = self.source.read_bytes(src, offset, &mut self.buf)?;
+            if placed == 0 {
+                return Err(CoreError::invalid(format!(
+                    "copy of '{}' ends at {offset} of {size} bytes: refusing a short read",
+                    abs.display(),
+                )));
+            }
+            let window = self.buf.get(..placed).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "copy window of {placed} bytes runs past the {} byte buffer",
+                    self.buf.len()
+                ))
+            })?;
+            file.write_all(window)
+                .map_err(|error| CoreError::io(abs, error))?;
+            offset = offset.checked_add(placed as u64).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "copy offset of '{}' overflows past {size} bytes",
+                    abs.display(),
+                ))
+            })?;
+            self.done = self.done.checked_add(placed as u64).ok_or_else(|| {
+                CoreError::invalid("copy byte count overflows the counter".to_string())
+            })?;
+            self.progress.report(self.done, self.total);
+        }
+        Ok(())
+    }
+
     /// Copy the directory at `rel` (name bytes from the source root)
     /// into `abs`: create each child directory and recurse, stream
     /// each file through the fixed buffer. `depth` counts descents
@@ -563,7 +847,53 @@ impl Copier<'_> {
                     CoreError::invalid("copy rename count overflows the counter".to_string())
                 })?;
             }
-            if child.is_dir {
+            if let Some(target) = child.link.as_ref() {
+                // Links never descend, even in a directory slot: the
+                // target resolves against the parent directory (the
+                // link's own name is not part of the base).
+                let base: &[Vec<u8>] = match rel.split_last() {
+                    Some((_, parent)) => parent,
+                    None => &[],
+                };
+                if strict_link_inside(self.source, base, target) {
+                    // Inside: recreate as a link with the sanitised
+                    // target. Counts as a file with no bytes; no
+                    // metadata is applied (setting times or modes
+                    // through the link would touch the target).
+                    let sanitised = sanitised_target(target);
+                    let link_to = Path::new(OsStr::from_bytes(&sanitised));
+                    self.dest.replace_symlink(abs, link_to)?;
+                    self.summary.files = self.summary.files.checked_add(1).ok_or_else(|| {
+                        CoreError::invalid("copy file count overflows the counter".to_string())
+                    })?;
+                } else if let Some((resolved, size)) = dereference_file(self.source, base, target) {
+                    // Outside or dangling-but-resolvable: copy the
+                    // target's bytes as a regular file under the
+                    // link's own name, with the link's own metadata.
+                    let mut file = self.dest.replace_file(abs)?;
+                    self.stream_from(abs, &resolved, size, &mut file)?;
+                    self.summary.files = self.summary.files.checked_add(1).ok_or_else(|| {
+                        CoreError::invalid("copy file count overflows the counter".to_string())
+                    })?;
+                    self.summary.bytes = self.summary.bytes.checked_add(size).ok_or_else(|| {
+                        CoreError::invalid("copy byte count overflows the counter".to_string())
+                    })?;
+                    if let Err(error) = self.dest.apply_metadata(abs, &child) {
+                        self.progress.warn(&format!(
+                            "copy cannot apply metadata to '{}': {error}; continuing",
+                            abs.display(),
+                        ));
+                    }
+                } else {
+                    // No file to copy: warn once naming the link and
+                    // leave nothing behind.
+                    self.progress.warn(&format!(
+                        "copy skips link '{}': its target does not resolve to a file inside \
+                         the image; continuing",
+                        display_name(&child.name),
+                    ));
+                }
+            } else if child.is_dir {
                 self.dest.create_dir(abs)?;
                 self.summary.directories =
                     self.summary.directories.checked_add(1).ok_or_else(|| {
@@ -619,36 +949,7 @@ impl Copier<'_> {
                 }
             } else {
                 let mut file = self.dest.replace_file(abs)?;
-                let mut offset = 0u64;
-                while offset < child.size {
-                    let placed = self.source.read_bytes(rel, offset, &mut self.buf)?;
-                    if placed == 0 {
-                        return Err(CoreError::invalid(format!(
-                            "copy of '{}' ends at {offset} of {} bytes: refusing a short read",
-                            abs.display(),
-                            child.size
-                        )));
-                    }
-                    let window = self.buf.get(..placed).ok_or_else(|| {
-                        CoreError::invalid(format!(
-                            "copy window of {placed} bytes runs past the {} byte buffer",
-                            self.buf.len()
-                        ))
-                    })?;
-                    file.write_all(window)
-                        .map_err(|error| CoreError::io(abs.as_path(), error))?;
-                    offset = offset.checked_add(placed as u64).ok_or_else(|| {
-                        CoreError::invalid(format!(
-                            "copy offset of '{}' overflows past {} bytes",
-                            abs.display(),
-                            child.size
-                        ))
-                    })?;
-                    self.done = self.done.checked_add(placed as u64).ok_or_else(|| {
-                        CoreError::invalid("copy byte count overflows the counter".to_string())
-                    })?;
-                    self.progress.report(self.done, self.total);
-                }
+                self.stream_from(abs, rel, child.size, &mut file)?;
                 self.summary.files = self.summary.files.checked_add(1).ok_or_else(|| {
                     CoreError::invalid("copy file count overflows the counter".to_string())
                 })?;
@@ -693,6 +994,21 @@ fn total_bytes(source: &dyn Source) -> Result<u64> {
             // so only the traversal-blocking rules apply, not the
             // sanitiser.
             check_reserved(&child.name)?;
+            if let Some(target) = child.link.as_ref() {
+                // Links never descend (even in a directory slot): a
+                // strictly-inside target costs nothing (recreated as a
+                // link), a dereferenced one costs its file's size, and
+                // a dangling one costs nothing (warned and skipped).
+                if strict_link_inside(source, dir, target) {
+                    continue;
+                }
+                if let Some((_, size)) = dereference_file(source, dir, target) {
+                    total = total.checked_add(size).ok_or_else(|| {
+                        CoreError::invalid("copy total overflows the byte arithmetic".to_string())
+                    })?;
+                }
+                continue;
+            }
             if child.is_dir {
                 dir.push(child.name.clone());
                 let sub = sum(source, dir, depth.saturating_add(1))?;
@@ -729,13 +1045,25 @@ mod tests {
         bytes: Vec<u8>,
     }
 
-    /// One in-memory directory: child files and child directory names.
-    /// Children keep insertion order on purpose (unsorted, to prove
-    /// the walk sorts).
+    /// One in-memory symlink: its own name with the raw target.
+    /// `is_dir` carries the directory flag for the directory-slot
+    /// test only — proving the walk never descends through a link
+    /// even when the listing marks one as a directory.
+    #[derive(Debug, Clone)]
+    struct MemLink {
+        name: Vec<u8>,
+        target: Vec<u8>,
+        is_dir: bool,
+    }
+
+    /// One in-memory directory: child files, child directory names and
+    /// child links. Children keep insertion order on purpose (unsorted,
+    /// to prove the walk sorts).
     #[derive(Debug, Clone, Default)]
     struct MemDir {
         files: Vec<MemFile>,
         dirs: Vec<Vec<u8>>,
+        links: Vec<MemLink>,
     }
 
     /// An in-memory [`Source`] over a `BTreeMap` of directories keyed
@@ -799,6 +1127,7 @@ mod tests {
                     mode: Some(Self::mode_for(&self.modes, &full).unwrap_or(0o644)),
                     modified: None,
                     accessed: None,
+                    link: None,
                 });
             }
             for name in &found.dirs {
@@ -810,6 +1139,21 @@ mod tests {
                     mode: Some(Self::mode_for(&self.modes, &full).unwrap_or(0o755)),
                     modified: None,
                     accessed: None,
+                    link: None,
+                });
+            }
+            for link in &found.links {
+                // Links list with their target and no size: a recreated
+                // link costs no bytes, and a dereferenced link's size
+                // resolves during the walk, not here.
+                out.push(Entry {
+                    name: link.name.clone(),
+                    is_dir: link.is_dir,
+                    size: 0,
+                    mode: None,
+                    modified: None,
+                    accessed: None,
+                    link: Some(link.target.clone()),
                 });
             }
             Ok(out)
@@ -1451,6 +1795,7 @@ mod tests {
                 mode: None,
                 modified: None,
                 accessed: None,
+                link: None,
             }])
         }
 
@@ -1462,6 +1807,7 @@ mod tests {
                 mode: None,
                 modified: None,
                 accessed: None,
+                link: None,
             }])
         }
 
@@ -1655,5 +2001,259 @@ mod tests {
             vec![0x5Au8; 300 * 1024]
         );
         assert_eq!(mode_of(&dir), 0o500, "B ends at its stored mode");
+    }
+
+    #[test]
+    fn inside_link_recreated_as_link() {
+        // LINK points at the sibling FILE.TXT: the walk recreates it
+        // as a link (symlink metadata, the same target text) while
+        // the file lands with its bytes. The link costs no bytes:
+        // two files, 10 bytes, no warnings.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"FILE.TXT".to_vec(),
+            bytes: b"file-bytes".to_vec(),
+        });
+        source.dir(&[]).links.push(MemLink {
+            name: b"LINK".to_vec(),
+            target: b"FILE.TXT".to_vec(),
+            is_dir: false,
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a link tree copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 2,
+                bytes: 10,
+                renamed: 0,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "an inside link warns nothing: {:?}",
+            progress.warns
+        );
+        let link = scratch.path().join("LINK");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link stats")
+                .file_type()
+                .is_symlink(),
+            "LINK lands as a link"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("the target reads"),
+            Path::new("FILE.TXT")
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("FILE.TXT")).expect("the file reads back"),
+            b"file-bytes"
+        );
+    }
+
+    #[test]
+    fn escaping_link_dereferenced_to_file() {
+        // SUB/LINK climbs past the root (`../../FILE.TXT`): lexically
+        // outside, so the walk copies the resolved file's bytes as a
+        // regular file under the link's own name, as Rufus does. Both
+        // passes agree on the total: the meter opens and ends on 18.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"FILE.TXT".to_vec(),
+            bytes: b"top-bytes".to_vec(),
+        });
+        source.dir(&[]).dirs.push(b"SUB".to_vec());
+        source.dir(&[b"SUB".to_vec()]);
+        source.dir(&[b"SUB".to_vec()]).links.push(MemLink {
+            name: b"LINK".to_vec(),
+            target: b"../../FILE.TXT".to_vec(),
+            is_dir: false,
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
+            .expect("an escaping link copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 1,
+                files: 2,
+                bytes: 18,
+                renamed: 0,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "a resolved link warns nothing: {:?}",
+            progress.warns
+        );
+        assert_eq!(progress.reports.first().copied(), Some((0, 18)));
+        assert_eq!(progress.reports.last().copied(), Some((18, 18)));
+        let link = scratch.path().join("SUB").join("LINK");
+        let meta = std::fs::symlink_metadata(&link).expect("the dereferenced link stats");
+        assert!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "an escaping link lands as a regular file"
+        );
+        assert_eq!(
+            std::fs::read(&link).expect("the dereferenced bytes read back"),
+            b"top-bytes"
+        );
+    }
+
+    #[test]
+    fn absolute_and_dangling_links_warn_and_skip() {
+        // An absolute target and a dangling one resolve to no file:
+        // each warns once naming the link and leaves nothing behind.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"FILE.TXT".to_vec(),
+            bytes: b"top-bytes".to_vec(),
+        });
+        source.dir(&[]).links.push(MemLink {
+            name: b"ABS".to_vec(),
+            target: b"/NOPE.TXT".to_vec(),
+            is_dir: false,
+        });
+        source.dir(&[]).links.push(MemLink {
+            name: b"DANGLING".to_vec(),
+            target: b"NOPE.TXT".to_vec(),
+            is_dir: false,
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
+            .expect("unresolvable links skip");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 1,
+                bytes: 9,
+                renamed: 0,
+            }
+        );
+        assert_eq!(
+            progress.warns.len(),
+            2,
+            "one warning per link: {:?}",
+            progress.warns
+        );
+        assert!(
+            progress.warns.iter().any(|warn| warn.contains("ABS")),
+            "the absolute link is named: {:?}",
+            progress.warns
+        );
+        assert!(
+            progress.warns.iter().any(|warn| warn.contains("DANGLING")),
+            "the dangling link is named: {:?}",
+            progress.warns
+        );
+        for name in ["ABS", "DANGLING"] {
+            let missing = std::fs::symlink_metadata(scratch.path().join(name));
+            assert!(
+                missing.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "{name} leaves nothing behind"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(scratch.path())
+                .expect("the destination lists")
+                .count(),
+            1,
+            "only the file lands"
+        );
+    }
+
+    #[test]
+    fn dereferenced_size_counted_by_free_space_check() {
+        // FILE.TXT (9 bytes) plus SUB/LINK dereferencing it past the
+        // root (9 more): the sizing pass counts both, so 17 free
+        // bytes refuse naming both counts before any write.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"FILE.TXT".to_vec(),
+            bytes: b"top-bytes".to_vec(),
+        });
+        source.dir(&[]).dirs.push(b"SUB".to_vec());
+        source.dir(&[b"SUB".to_vec()]);
+        source.dir(&[b"SUB".to_vec()]).links.push(MemLink {
+            name: b"LINK".to_vec(),
+            target: b"../../FILE.TXT".to_vec(),
+            is_dir: false,
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let error = walk(
+            &source,
+            scratch.path(),
+            &CopyOptions {
+                free_bytes: Some(17),
+            },
+            &mut progress,
+        )
+        .expect_err("17 bytes refuse an 18 byte tree");
+        let text = error.to_string();
+        assert!(text.contains("18"), "{text}");
+        assert!(text.contains("17"), "{text}");
+        assert_eq!(
+            std::fs::read_dir(scratch.path())
+                .expect("the destination lists")
+                .count(),
+            0,
+            "nothing is written"
+        );
+    }
+
+    #[test]
+    fn symlink_in_directory_slot_never_descended() {
+        // LINK carries the directory flag but a link target: the walk
+        // recreates it as a link and never descends — the reads prove
+        // it, with only DIR/FILE.TXT read, once.
+        let mut source = MemSource::default();
+        source.dir(&[]).dirs.push(b"DIR".to_vec());
+        source.dir(&[b"DIR".to_vec()]).files.push(MemFile {
+            name: b"FILE.TXT".to_vec(),
+            bytes: b"dir-bytes".to_vec(),
+        });
+        source.dir(&[]).links.push(MemLink {
+            name: b"LINK".to_vec(),
+            target: b"DIR".to_vec(),
+            is_dir: true,
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
+            .expect("a directory-slot link copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 1,
+                files: 2,
+                bytes: 9,
+                renamed: 0,
+            }
+        );
+        assert_eq!(
+            source.reads.borrow().clone(),
+            [vec![b"DIR".to_vec(), b"FILE.TXT".to_vec()]],
+            "nothing reads through the link"
+        );
+        let link = scratch.path().join("LINK");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link stats")
+                .file_type()
+                .is_symlink(),
+            "a directory-slot link still lands as a link"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("the target reads"),
+            Path::new("DIR")
+        );
     }
 }

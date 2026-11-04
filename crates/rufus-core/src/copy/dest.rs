@@ -1,9 +1,9 @@
 //! The copy destination: one existing directory on a real filesystem.
 //!
 //! [`DestDir`] is deliberately thin — open, create a directory,
-//! create a file — because Rufus copies into a mounted filesystem
-//! and every placement decision (which names, which order, what to
-//! skip) lives in [`walk`](super::walk), not here. Every I/O error
+//! create a file, create a symlink — because Rufus copies into a
+//! mounted filesystem and every placement decision (which names, which
+//! order, what to skip) lives in [`walk`](super::walk), not here. Every I/O error
 //! surfaces as [`CoreError::io`](crate::error::CoreError::io) naming
 //! the path it hit, never anything vaguer.
 
@@ -139,6 +139,29 @@ impl DestDir {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.create_file(path),
             Err(error) => Err(CoreError::io(path, error)),
         }
+    }
+
+    /// Create the symlink at `path` pointing at `target`: remove a
+    /// regular file or symlink already there and recreate it (the
+    /// resumed-copy policy, like [`replace_file`](DestDir::replace_file)
+    /// for files); a directory or anything else in the way refuses.
+    /// The caller guarantees `target` stays inside the copied tree —
+    /// this never creates a link pointing outside the destination.
+    pub fn replace_symlink(&self, path: &Path, target: &Path) -> Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
+                std::fs::remove_file(path).map_err(|error| CoreError::io(path, error))?;
+            }
+            Ok(_) => {
+                return Err(CoreError::invalid(format!(
+                    "copy destination '{}' exists and is not a file: refusing to replace it",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(CoreError::io(path, error)),
+        }
+        std::os::unix::fs::symlink(target, path).map_err(|error| CoreError::io(path, error))
     }
 
     /// Apply an entry's metadata to the already-written `path`:

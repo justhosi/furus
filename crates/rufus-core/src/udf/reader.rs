@@ -16,10 +16,12 @@
 //! (an 88-byte subdirectory, a 19-byte file, a 14-byte file holding a
 //! NUL byte and non-ASCII content, a 3-byte file, each returned
 //! byte-exact); a 10000-byte file reads back byte-identical through one
-//! long extent. Multi-extent directories, symlinks (type 12) and FIFOs
-//! (type 9) are synthetic-fixture facts: the unit tests join two directory
-//! extents and refuse symlinks and FIFOs in both directions with their
-//! kind named.
+//! long extent. Multi-extent directories and FIFOs (type 9) are
+//! synthetic-fixture facts: the unit tests join two directory extents
+//! and refuse FIFOs in both directions with their kind named.
+//! Symlinks (type 12) list with their decoded path-component target
+//! (see [`file`](super::file)) and refuse to open or descend — listed,
+//! never followed.
 //!
 //! *Inferred* — that accepting both `NSR02` and `NSR03` is right (the
 //! writer side pins `NSR03` and refuses `NSR02`; a *reader* that refused
@@ -52,8 +54,9 @@ const RECOGNITION_AT: u64 = 32768;
 /// Length of the recognition region in bytes.
 const RECOGNITION_LEN: u64 = 3 * 2048;
 
-/// One directory entry: the decoded name, the directory flag and the ICB
-/// slice 2 needs to read the entry's content.
+/// One directory entry: the decoded name, the directory flag, the ICB
+/// slice 2 needs to read the entry's content, plus the decoded symlink
+/// target and the file-entry metadata the copy needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// Decoded file name (OSTA compressed Unicode). Empty for the root,
@@ -66,6 +69,46 @@ pub struct Entry {
     pub icb: LongAd,
     /// File version number from the file identifier (1 on real images).
     pub file_version: u16,
+    /// Decoded symlink target for type-12 entries (`None` otherwise):
+    /// symlinks list like any entry but are never followed.
+    pub symlink_target: Option<String>,
+    /// POSIX mode from the permissions word and ICB flags, masked to
+    /// `0o7777` (`None` for the synthesised root, which carries no file
+    /// entry read).
+    pub mode: Option<u32>,
+    /// Modification time (`None` when the stamp cannot be placed, or
+    /// for the synthesised root).
+    pub modified: Option<std::time::SystemTime>,
+    /// Last-access time, like [`modified`](Entry::modified).
+    pub accessed: Option<std::time::SystemTime>,
+}
+
+impl Entry {
+    /// True for symbolic links (a decoded target is present).
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        self.symlink_target.is_some()
+    }
+
+    /// True for regular files: not a directory and not a symlink.
+    /// Special files (FIFOs and the rest) still read `true` here —
+    /// they list like files and refuse on open with their kind named,
+    /// exactly like the ISO side's `is_file`.
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        !self.is_directory && self.symlink_target.is_none()
+    }
+}
+
+/// Metadata read for one listed child: the symlink target with the
+/// mode and stamps. A small struct so the helper stays under the
+/// type-complexity lint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildMeta {
+    symlink_target: Option<String>,
+    mode: Option<u32>,
+    modified: Option<std::time::SystemTime>,
+    accessed: Option<std::time::SystemTime>,
 }
 
 /// An opened regular file: the resolved extent windows (or the embedded
@@ -285,7 +328,9 @@ impl UdfReader {
     }
 
     /// The root directory entry (empty name, always a directory),
-    /// synthesised from the file set's root ICB.
+    /// synthesised from the file set's root ICB. Metadata stays absent:
+    /// the root is never copied as an entry (only its children are),
+    /// so no file entry is read for it here.
     #[must_use]
     pub fn root(&self) -> Entry {
         Entry {
@@ -293,6 +338,10 @@ impl UdfReader {
             is_directory: true,
             icb: self.fsd.root_icb,
             file_version: 1,
+            symlink_target: None,
+            mode: None,
+            modified: None,
+            accessed: None,
         }
     }
 
@@ -347,24 +396,145 @@ impl UdfReader {
                 &format!("{what} entry at directory offset {}", id.name_off),
             )
             .map_err(|error| CoreError::invalid(format!("cannot list `{display}`: {error}")))?;
+            // Child metadata is best-effort at listing time: a child
+            // whose file entry is missing or corrupt still lists (with
+            // no target, mode or stamps) so listings stay cheap and
+            // existing callers keep their shape; opening or reading it
+            // refuses with the kind named. A present symlink with a
+            // malformed target still refuses here — that target is the
+            // listing's own business, not a later open.
+            let meta = match self.entry_metadata(&id.icb, &name) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    let text = error.to_string();
+                    if text.contains("symlink") {
+                        return Err(CoreError::invalid(format!(
+                            "cannot list `{display}`: {error}"
+                        )));
+                    }
+                    ChildMeta {
+                        symlink_target: None,
+                        mode: None,
+                        modified: None,
+                        accessed: None,
+                    }
+                }
+            };
             out.push(Entry {
                 name,
                 is_directory: id.is_directory,
                 icb: id.icb,
                 file_version: id.version,
+                symlink_target: meta.symlink_target,
+                mode: meta.mode,
+                modified: meta.modified,
+                accessed: meta.accessed,
             });
         }
         Ok(out)
     }
 
+    /// Metadata for one listed child: its symlink target (for type-12
+    /// entries), mode and stamps. Reads the child's file entry through
+    /// its ICB; a malformed entry or target refuses naming the child.
+    fn entry_metadata(&self, icb: &LongAd, name: &str) -> Result<ChildMeta> {
+        let display = short_name(name);
+        let (home, abs, rel) = self.resolve(icb, &display)?;
+        check_icb_window(self.block_size, self.total, icb, abs, &display)?;
+        let file_entry = file::read_file_entry(&*self.volume, self.block_size, abs, rel)?;
+        let mode = Some(file_entry.mode());
+        let modified = file_entry.modified_time();
+        let accessed = file_entry.accessed_time();
+        let symlink_target = if file_entry.file_type == file::TYPE_SYMLINK {
+            Some(self.symlink_target(&file_entry, &home, &display)?)
+        } else {
+            None
+        };
+        Ok(ChildMeta {
+            symlink_target,
+            mode,
+            modified,
+            accessed,
+        })
+    }
+
+    /// Decode the target of a type-12 file entry: collect its data
+    /// (embedded or extent-backed, capped at
+    /// [`MAX_SYMLINK_BYTES`](file::MAX_SYMLINK_BYTES)) and decode it
+    /// as a path component list. Refuses empty data, over-long data
+    /// and malformed lists, naming the entry throughout.
+    fn symlink_target(
+        &self,
+        entry: &file::FileEntry,
+        home: &PartitionDesc,
+        display: &str,
+    ) -> Result<String> {
+        let what = format!("symlink `{display}`");
+        if entry.info_len > file::MAX_SYMLINK_BYTES {
+            return Err(CoreError::invalid(format!(
+                "{what} information length {} runs past the {} byte symlink cap",
+                entry.info_len,
+                file::MAX_SYMLINK_BYTES
+            )));
+        }
+        if !entry.ads.is_empty() || entry.info_len > entry.embedded.len() as u64 {
+            let windows = file::resolve_extents(
+                self.block_size,
+                &self.maps,
+                &self.partitions,
+                home,
+                &entry.ads,
+                &what,
+                crate::udf::MAX_FILE_EXTENTS,
+            )?;
+            file::check_file_bounds(entry.info_len, &windows, &what)?;
+            let data = file::read_windows(&*self.volume, &windows, entry.info_len, &what)?;
+            return file::decode_symlink_target(&data, &what);
+        }
+        let len = usize::try_from(entry.info_len).map_err(|_| {
+            CoreError::invalid(format!(
+                "{what} information length {} is not addressable",
+                entry.info_len
+            ))
+        })?;
+        let data = entry.embedded.get(..len).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "{what} information length {} runs past the {} embedded bytes",
+                entry.info_len,
+                entry.embedded.len()
+            ))
+        })?;
+        file::decode_symlink_target(data, &what)
+    }
+
+    /// Read the decoded symlink target of `entry`: the entry must be a
+    /// symlink (its file entry must carry type 12); anything else
+    /// refuses naming the kind. Listing already decodes targets, so
+    /// this is the explicit read for callers holding a stale entry.
+    pub fn read_symlink(&self, entry: &Entry) -> Result<String> {
+        let display = short_name(&entry.name);
+        let (home, abs, rel) = self.resolve(&entry.icb, &display)?;
+        check_icb_window(self.block_size, self.total, &entry.icb, abs, &display)?;
+        let file_entry = file::read_file_entry(&*self.volume, self.block_size, abs, rel)
+            .map_err(|error| CoreError::invalid(format!("cannot read `{display}`: {error}")))?;
+        if file_entry.file_type != file::TYPE_SYMLINK {
+            return Err(CoreError::invalid(format!(
+                "cannot read `{display}`: it is a {}, not a symbolic link",
+                file::file_type_name(file_entry.file_type)
+            )));
+        }
+        self.symlink_target(&file_entry, &home, &display)
+            .map_err(|error| CoreError::invalid(format!("cannot read `{display}`: {error}")))
+    }
+
     /// Open the regular file `entry` for reading with
     /// [`UdfReader::read_open`]: resolve its ICB, gate its file type and
     /// resolve its extents against their partitions. Only regular files
-    /// (type 5) open: directories, symlinks (whose targets are
-    /// path-component records this reader does not decode), FIFOs,
-    /// sockets, devices and anything else refuse with the kind named.
-    /// Embedded files (allocation type 3) carry their bytes in the
-    /// handle; extent-backed files resolve to absolute byte windows.
+    /// (type 5) open: directories, symlinks (listed with their decoded
+    /// target — see [`UdfReader::read_symlink`] — but never followed),
+    /// FIFOs, sockets, devices and anything else refuse with the kind
+    /// named. Embedded files (allocation type 3) carry their bytes in
+    /// the handle; extent-backed files resolve to absolute byte windows.
     pub fn open_file(&self, entry: &Entry) -> Result<OpenFile> {
         let display = short_name(&entry.name);
         let (home, abs, rel) = self.resolve(&entry.icb, &display)?;
@@ -381,8 +551,7 @@ impl UdfReader {
             file::TYPE_SYMLINK => {
                 return Err(CoreError::invalid(format!(
                     "cannot open `{display}`: it is a symbolic link, not a regular file: \
-                     symlink targets are path-component records this reader does not decode, \
-                     so symlinks are listed but never followed"
+                     symlinks are listed with their target but never followed"
                 )));
             }
             other => {
@@ -585,7 +754,10 @@ impl UdfReader {
                 format!("{path}/{}", child.name)
             };
             out.push((child_path.clone(), child.clone()));
-            if child.is_directory {
+            // Symlinks never descend, even when their file identifier
+            // carries the directory bit: listing one as a directory
+            // would only refuse it as a symlink.
+            if child.is_directory && !child.is_symlink() {
                 self.walk_dir(child, &child_path, depth.saturating_add(1), out)?;
             }
         }
@@ -1230,7 +1402,10 @@ mod tests {
         let reader = open_with(
             &root,
             &[
-                (PART_AT + 14, ext_typed_entry(14, b"\x05\x03link", 12)),
+                (
+                    PART_AT + 14,
+                    ext_typed_entry(14, b"\x05\x05\x01\x00\x08link", 12),
+                ),
                 (PART_AT + 15, ext_typed_entry(15, b"", 9)),
             ],
         );
@@ -1252,6 +1427,132 @@ mod tests {
             .open_file(&entries[1])
             .expect_err("a FIFO never opens");
         assert!(fifo.to_string().contains("FIFO"), "{:?}", fifo);
+    }
+
+    /// OSTA CS0 bytes for `name` (compression id 8, like every FID
+    /// name the fixtures encode).
+    fn cs0_name(name: &[u8]) -> Vec<u8> {
+        let mut out = vec![8];
+        out.extend_from_slice(name);
+        out
+    }
+
+    /// One prefixed-shape symlink component: type, length,
+    /// identifier, zero padding to a 4-byte boundary.
+    fn link_comp(comp_type: u8, ident: &[u8]) -> Vec<u8> {
+        let mut out = vec![comp_type, ident.len() as u8];
+        out.extend_from_slice(ident);
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+        out
+    }
+
+    /// One 12-byte ECMA timestamp: type 1 with `quarters`
+    /// quarter-hour offset, then year and the civil fields (month,
+    /// day, hour, minute, second, centiseconds, hundreds;
+    /// microseconds stays zero).
+    fn stamp_bytes(quarters: u16, year: u16, fields: [u8; 7]) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[0..2].copy_from_slice(&(0x1000 | (quarters & 0x0FFF)).to_le_bytes());
+        out[2..4].copy_from_slice(&year.to_le_bytes());
+        out[4..11].copy_from_slice(&fields);
+        out
+    }
+
+    /// Type-12 entry block for the symlink test: `target` embedded as
+    /// the file data, permission word `perm`, access and modification
+    /// stamps, CRC re-stamped after the pokes.
+    fn symlink_block(
+        target: &[u8],
+        perm: u32,
+        access: &[u8; 12],
+        modification: &[u8; 12],
+    ) -> Vec<u8> {
+        let mut block = ext_typed_entry(13, target, 12);
+        block[44..48].copy_from_slice(&perm.to_le_bytes());
+        block[80..92].copy_from_slice(access);
+        block[92..104].copy_from_slice(modification);
+        stamp_tag(&mut block, 266, (SIZE - 16) as u16, 13);
+        block
+    }
+
+    #[test]
+    fn symlink_lists_with_target_mode_and_stamps() {
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+
+        // SUB/LINK points at `../FILE.TXT` (the prefixed component
+        // shape: parent plus a 9-byte CS0 name), carries permission
+        // word 0x1CA5 (mode 0o755) and known recording dates: the
+        // modification instant is 2024-02-29T12:34:56Z (1709210096)
+        // and the access instant is 2023-11-14T22:13:20Z
+        // (1700000000), both per `date -u`, not per the converter.
+        let mut body = link_comp(3, &[]);
+        body.extend_from_slice(&link_comp(5, &cs0_name(b"FILE.TXT")));
+        let mut prefixed = (body.len() as u16).to_le_bytes().to_vec();
+        prefixed.extend_from_slice(&body);
+        let modification = stamp_bytes(0, 2024, [2, 29, 12, 34, 56, 0, 0]);
+        let access = stamp_bytes(0, 2023, [11, 14, 22, 13, 20, 0, 0]);
+        let mut sub = fid_record(0x0A, 12, &[], 12);
+        sub.extend_from_slice(&fid_record(0x00, 13, &[8, b'L', b'I', b'N', b'K'], 12));
+        let mut root = fid_record(0x0A, 10, &[], 10);
+        root.extend_from_slice(&fid_record(
+            0x00,
+            11,
+            &[8, b'F', b'I', b'L', b'E', b'.', b'T', b'X', b'T'],
+            10,
+        ));
+        root.extend_from_slice(&fid_record(0x02, 12, &[8, b'S', b'U', b'B'], 10));
+        let reader = open_with(
+            &root,
+            &[
+                (PART_AT + 11, ext_typed_entry(11, b"file-bytes", 5)),
+                (PART_AT + 12, ext_typed_entry(12, &sub, 4)),
+                (
+                    PART_AT + 13,
+                    symlink_block(&prefixed, 0x1CA5, &access, &modification),
+                ),
+            ],
+        );
+        let entries = reader.read_dir(&reader.root()).expect("the root lists");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "FILE.TXT");
+        assert!(!entries[0].is_symlink());
+        assert_eq!(entries[0].symlink_target, None);
+        assert_eq!(entries[1].name, "SUB");
+        let sub_entries = reader.read_dir(&entries[1]).expect("SUB lists");
+        assert_eq!(sub_entries.len(), 1);
+        let link = &sub_entries[0];
+        assert_eq!(link.name, "LINK");
+        assert!(link.is_symlink());
+        assert_eq!(link.symlink_target.as_deref(), Some("../FILE.TXT"));
+        assert_eq!(link.mode, Some(0o755));
+        assert_eq!(
+            link.modified,
+            Some(UNIX_EPOCH + Duration::new(1_709_210_096, 0))
+        );
+        assert_eq!(
+            link.accessed,
+            Some(UNIX_EPOCH + Duration::new(1_700_000_000, 0))
+        );
+        assert_eq!(
+            reader.read_symlink(link).expect("the target reads"),
+            "../FILE.TXT"
+        );
+        // Listed but never followed: opens, reads and listings
+        // refuse with the kind named.
+        let error = reader.read_file(link).expect_err("a symlink never reads");
+        assert!(error.to_string().contains("symbolic link"), "{error:?}");
+        let error = reader.open_file(link).expect_err("a symlink never opens");
+        assert!(error.to_string().contains("symbolic link"), "{error:?}");
+        let error = reader.read_dir(link).expect_err("a symlink never lists");
+        assert!(error.to_string().contains("symbolic link"), "{error:?}");
+        // The walk carries the link without descending through it.
+        let walked = reader.walk().expect("the tree walks");
+        assert_eq!(walked.len(), 4);
+        assert_eq!(walked[3].0, "/SUB/LINK");
+        assert!(walked[3].1.is_symlink());
     }
 
     #[test]

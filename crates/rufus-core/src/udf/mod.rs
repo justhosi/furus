@@ -99,8 +99,7 @@
 //!   `open_file`/`read_file`/`read_file_at` file reads and `walk`.
 //!
 //! Deliberately left for later slices: logical volume integrity
-//! descriptors, extended attributes, symlink target decoding (symlinks
-//! refuse rather than follow), and any write path.
+//! descriptors, extended attributes, and any write path.
 //!
 //! On sharing the ISO sector cache: it is not shared, on purpose. That
 //! cache serves fixed 2048-byte sectors (`[u8; 2048]` sits in its type),
