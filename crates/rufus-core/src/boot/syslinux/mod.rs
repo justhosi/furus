@@ -17,16 +17,37 @@
 //! contiguous `/ldlinux.sys` — while everything else in this file
 //! never patches a sector and never creates a file. [`patch`] owns
 //! the byte patching: upstream `syslinux_patch` plus the default ADV.
+//! [`files`] owns the companion modules and the `syslinux.cfg`
+//! wrapper: triage, install and generation over an explicit source
+//! and volume. [`obsolete`] owns the stale-module substitution policy
+//! behind the `copy::Replacer` seam.
 //!
 //! [`install`]: self::install
 //! [`patch`]: self::patch
+//! [`files`]: self::files
+//! [`obsolete`]: self::obsolete
+//! [`files`]: self::files
+//! [`obsolete`]: self::obsolete
 
+mod files;
 mod install;
+mod obsolete;
 pub mod patch;
 
+pub use files::COMPANION_REQUIRED_604;
+pub use files::COMPANIONS;
+pub use files::CompanionInstall;
+pub use files::Inventory;
+pub use files::caution_for;
+pub use files::config_text;
+pub use files::install_companions;
+pub use files::inventory;
+pub use files::write_config;
 pub use install::Installed;
 pub use install::install_loader;
 pub use install::install_payloads;
+pub use obsolete::OBSOLETE_MODULES;
+pub use obsolete::Obsolete;
 pub use patch::Patched;
 pub use patch::default_adv;
 pub use patch::syslinux_patch;
