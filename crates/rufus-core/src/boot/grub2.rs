@@ -1096,4 +1096,43 @@ mod tests {
         assert_eq!(found.name(), "bootx64.efi");
         assert_eq!(found.bytes(), b"two!!", "the fall-through bytes return");
     }
+
+    #[test]
+    fn efi_payload_returns_a_payload_past_the_syslinux_cap() {
+        // A 2 MiB grubx64.efi: far past syslinux read's 1 MiB default,
+        // inside the 16 MiB EFI cap. The lookup must return it whole —
+        // exact length plus recognisable head and tail.
+        const SIZE: usize = 2 * 1024 * 1024;
+        let bytes: Vec<u8> = (0..SIZE)
+            .map(|index| ((index * 5 + 1) % 251) as u8)
+            .collect();
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"efi")])
+            .with_dir(&[b"efi"], vec![dir_entry(b"boot")])
+            .with_dir(
+                &[b"efi", b"boot"],
+                vec![file_entry(b"grubx64.efi", SIZE as u64)],
+            )
+            .with_file(&[b"efi", b"boot", b"grubx64.efi"], &bytes);
+        let found = efi_payload(&source)
+            .expect("the lookup reads")
+            .expect("the large payload exists");
+        assert_eq!(found.name(), "grubx64.efi");
+        assert_eq!(
+            found.bytes().len(),
+            SIZE,
+            "the payload keeps its 2097152 bytes"
+        );
+        assert_eq!(
+            &found.bytes()[..16],
+            &bytes[..16],
+            "the head survives the windows"
+        );
+        assert_eq!(
+            &found.bytes()[SIZE - 16..],
+            &bytes[SIZE - 16..],
+            "the tail survives the windows"
+        );
+        assert_eq!(found.bytes(), &bytes, "the payload is byte-identical");
+    }
 }

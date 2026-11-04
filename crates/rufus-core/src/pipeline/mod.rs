@@ -6,10 +6,11 @@
 //! [`Event`]s to a [`Reporter`] and timing every step. Five of the
 //! seven steps run: wipe, mklabel, mkpart, mkfs and finalize, plus the
 //! [`Dd`](rufus_proto::WriteMode::Dd) write path. Two refuse by name:
-//! [`Bootloader`](rufus_proto::Step::Bootloader) (no installer until
-//! S19) and [`Copy`](rufus_proto::WriteMode::Copy) (file-tree copying
-//! is implemented; its plan and write-path wiring arrives in a later
-//! slice).
+//! [`Bootloader`](rufus_proto::Step::Bootloader) (the installers exist
+//! in [`crate::boot`] but are not wired into the pipeline yet — a
+//! later slice) and [`Copy`](rufus_proto::WriteMode::Copy) (file-tree
+//! copying is implemented; its plan and write-path wiring arrives in
+//! a later slice).
 //!
 //! [`step_name`] is the one shared snake_case vocabulary for step
 //! identifiers, so the CLI and the machine cannot drift apart.
@@ -122,7 +123,8 @@ pub fn step_name(step: &Step) -> &'static str {
 
 /// Run one step through the run context: wipe, label, partition,
 /// filesystem and write stages live in their own modules; the
-/// bootloader arm refuses until S19. The match is exhaustive, so a new
+/// bootloader arm refuses because the installers are not wired in yet
+/// (see [`crate::boot`]). The match is exhaustive, so a new
 /// [`Step`] variant fails to compile here (and in [`step_name`]) until
 /// it is handled.
 fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result<()> {
@@ -138,7 +140,7 @@ fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result
         } => mkfs::run(ctx, filesystem, label, cluster_bytes, *quick),
         Step::Write { mode } => write::run(ctx, mode, &plan.image),
         Step::Bootloader { .. } => Err(CoreError::NotImplemented {
-            what: "bootloader installation (S19)",
+            what: "bootloader installation (not wired yet)",
         }),
         Step::Finalize => {
             let size = ctx.device()?.size();

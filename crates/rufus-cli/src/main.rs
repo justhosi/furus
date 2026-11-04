@@ -1790,7 +1790,7 @@ mod tests {
     #[test]
     fn from_core_maps_unimplemented_to_exit_7() {
         let fail = Fail::from_core(CoreError::NotImplemented {
-            what: "bootloader installation (S19)",
+            what: "bootloader installation (not wired yet)",
         });
         assert_eq!(fail.exit, Exit::NotImplemented);
         assert_eq!(fail.exit.code(), 7);

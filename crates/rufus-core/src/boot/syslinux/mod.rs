@@ -590,7 +590,8 @@ pub fn read_capped(
 
 /// Read one whole file from the located directory, capped at the 1
 /// MiB [`MAX_READ_BYTES`] default: [`read_capped`] with the historic
-/// cap, byte-identical behaviour down to the message words.
+/// cap, behaviour unchanged except that an over-cap refusal names the
+/// numeric cap.
 pub fn read(source: &dyn Source, dir: &[Vec<u8>], name: &str) -> Result<Option<Vec<u8>>> {
     read_capped(source, dir, name, MAX_READ_BYTES)
 }

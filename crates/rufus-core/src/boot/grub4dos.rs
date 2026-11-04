@@ -222,15 +222,20 @@ impl Installed {
 ///
 /// Loads resource 450 (`grldr.mbr`) and 451 (`grldr`) through
 /// [`load`] — which needs the runtime asset directory — and delegates
-/// to [`install_boot`] and [`install_loader`], which carry the
-/// ordering contracts. Tests use those two directly with bytes from
+/// to [`install_loader`] and [`install_boot`], which carry the
+/// ordering contracts. The loader lands first for exactly the torn
+/// rule [`install_boot`] states: a failure leaves at most an inert
+/// `/grldr`, never boot code without its payload. That is the reverse
+/// of Rufus's call order, the same way [`install_boot`]'s own
+/// sector-last order already reverses Rufus's MBR-first writes.
+/// Tests use those two directly with bytes from
 /// [`load_from`](crate::boot::load_from) instead (the same seam slice
 /// 3's installer tests use).
 pub fn install(disk: &mut dyn Volume, fat: &mut Fat32) -> Result<Installed> {
     let mbr = load(Resource::Grub4DosMbr)?;
     let grldr = load(Resource::Grub4DosCore)?;
-    let boot = install_boot(disk, mbr.bytes())?;
     let loader = install_loader(fat, grldr.bytes())?;
+    let boot = install_boot(disk, mbr.bytes())?;
     Ok(Installed { boot, loader })
 }
 

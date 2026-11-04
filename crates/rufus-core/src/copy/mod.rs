@@ -35,12 +35,14 @@
 //!   once naming the link and leaves nothing behind. Links never
 //!   descend, even in a directory slot, and no created link ever
 //!   points outside the destination.
-//! * Replacements (this slice, the S19 seam): [`Replacer`] swaps
+//! * Replacements (the obsolete-bootloader seam): [`Replacer`] swaps
 //!   obsolete bootloader payloads per regular file before its bytes
 //!   move — sizing counts the payload, the copy warns `Will replace
 //!   obsolete '<path>'` once and keeps the source mode when the
-//!   payload carries none. S19 owns the payloads; [`NoReplacements`]
-//!   is the declining default.
+//!   payload carries none. The payloads live in
+//!   [`crate::boot::syslinux::obsolete`]; [`NoReplacements`]
+//!   is the declining default. Wiring a table into `WriteMode::Copy`
+//!   remains a later slice.
 //! * Persistence (this slice pins it): `/persistence.conf` and
 //!   `/live-persistence.conf` are ordinary files to the copier and
 //!   land like any other entry at their root paths. The ext4
@@ -132,7 +134,8 @@ pub struct CopyOptions<'a> {
     /// refuses before any write when the tree's declared total exceeds
     /// it.
     pub free_bytes: Option<u64>,
-    /// Obsolete-bootloader replacer (the S19 seam): consulted once
+    /// Obsolete-bootloader replacer (see
+    /// [`crate::boot::syslinux::obsolete`]): consulted once
     /// per regular file, in the sizing pass, whose answers the copy
     /// reuses. `None` copies every file verbatim.
     pub replacer: Option<&'a dyn Replacer>,
@@ -165,8 +168,8 @@ impl<'a> std::fmt::Debug for CopyOptions<'a> {
 /// A replacement payload for one source file: the bytes to write
 /// under the destination name instead of the source data, with an
 /// optional mode (the source entry's mode wins when this is `None`).
-/// S19 owns the actual bootloader payloads; this struct is only the
-/// seam they arrive through (see [`Replacer`]).
+/// The obsolete-module payloads live in `crate::boot`; this struct is
+/// only the seam they arrive through (see [`Replacer`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Replacement {
     /// The bytes to write.
@@ -175,7 +178,7 @@ pub struct Replacement {
     pub mode: Option<u32>,
 }
 
-/// The S19 seam for obsolete-bootloader replacement (PLAN S18: `Will
+/// The seam for obsolete-bootloader replacement (PLAN S18: `Will
 /// replace obsolete '%s'`): given a regular file's parent directory
 /// (`source_path`, `/`-joined source name bytes relative to the
 /// source root — empty at the root) and its source file name,
@@ -877,7 +880,7 @@ type ReplacementMap = BTreeMap<Vec<Vec<u8>>, BTreeMap<Vec<u8>, Replacement>>;
 
 /// What the sizing pass hands the copy: the byte total plus the two
 /// whole-tree maps — stored names for link rewrites, replacement
-/// payloads for the S19 seam. One traversal builds all three, so the
+/// payloads for the obsolete-bootloader seam. One traversal builds all three, so the
 /// passes cannot disagree.
 struct Sizing {
     /// File payload bytes the copy will write.
@@ -1212,7 +1215,7 @@ impl Copier<'_> {
                 }
             } else {
                 // Regular files reuse the sizing pass's replacement
-                // (the S19 seam — never directories or symlinks): a
+                // (the replacer seam — never directories or symlinks): a
                 // payload lands under the destination name instead of
                 // the source data, with exactly one `Will replace
                 // obsolete` warning naming the source path.
@@ -1221,7 +1224,7 @@ impl Copier<'_> {
                     None => &[],
                 };
                 // The payload clones out of the map: peak memory is
-                // the map plus one payload (S19's bootloader payloads
+                // the map plus one payload (the obsolete payloads
                 // are small), and borrowing it would need splitting
                 // `self` around the streaming calls below.
                 let replacement = self
@@ -3076,7 +3079,7 @@ mod tests {
     }
 
     /// A [`Replacer`](super::Replacer) swapping one file's bytes (and
-    /// its mode): the S19 seam in miniature.
+    /// its mode): the replacer seam in miniature.
     struct SwapOne {
         bytes: Vec<u8>,
         mode: Option<u32>,

@@ -1,5 +1,5 @@
-//! The S19 bootloader payload foundation: verified loading of the six
-//! embedded bootloader resources every later S19 slice builds on.
+//! Bootloader installation: the six embedded payloads plus one
+//! installer per family, all in this module.
 //!
 //! The bytes live in `assets/resources/` and are pinned by
 //! `assets/manifest.json`: each [`Resource`] carries its manifest id,
@@ -7,24 +7,17 @@
 //! that does not match all of them. [`load`] is the production entry
 //! point (it resolves through [`asset_path`](crate::paths::asset_path));
 //! [`load_from`] is the testable core over an explicit directory. The
-//! Syslinux installer lives next to the family decision (see
-//! [`syslinux::install_loader`]); the GRUB2 BIOS installer and the
-//! UEFI GRUB placement live in [`grub2`]; the GRUB4DOS installer lives
-//! in [`grub4dos`].
+//! six resources are the Syslinux 4.07 VBR/core (ids 400/401), the
+//! Syslinux 6.04 VBR/core (402/403) and the Grub4DOS MBR/core
+//! (450/451).
 //!
-//! [`syslinux`] decides the embedded Syslinux family from a detected
-//! version or the `ldlinux.c32` presence and locates the payload
-//! directory over a tree source; it writes nothing and patches no
-//! sectors, which later S19 slices own.
-//!
-//! [`grub2`] installs a GRUB2 BIOS boot record from image-supplied
-//! `boot.img`/`core.img` payloads and places a `grubx64.efi` image at
-//! `efi/boot/bootx64.efi`; the bytes must come from the image or a
-//! caller-supplied directory — no embedded copy exists.
-//!
-//! [`grub4dos`] writes the 423-byte GRUB4DOS MBR window plus the SBR at
-//! offset 512 and the `grldr` loader at the volume root; upstream
-//! writes no `menu.lst`, so neither does this crate.
+//! [`syslinux`] installs either Syslinux family (family decision,
+//! contiguous `ldlinux.sys` plus sector-map/ADV patch, companions,
+//! config wrapper, obsolete-module substitution); [`grub2`] installs a
+//! GRUB2 BIOS boot record and places a `grubx64.efi` image;
+//! [`grub4dos`] writes the GRUB4DOS MBR window, SBR and root `grldr`.
+//! Wiring these installers into the copy and pipeline paths is a later
+//! slice, and no stick has been booted on hardware.
 
 pub mod grub2;
 pub mod grub4dos;
@@ -385,6 +378,299 @@ mod tests {
         assert!(
             text.contains(resource.sha256()),
             "the error names the expected digest: {text}"
+        );
+    }
+}
+
+/// Acceptance: every installer composed on one filesystem, plus a
+/// QEMU smoke test.
+///
+/// `one_stick_carries_every_installer` proves the installers compose
+/// on a single FAT32 volume without stepping on each other — the
+/// Syslinux stage, the GRUB4DOS loader and the UEFI image coexist,
+/// the boot sector stays the Syslinux graft, and the image is
+/// `fsck.fat` clean. It proves composition, not bootability: no menu
+/// is shown and no stick has booted on hardware.
+///
+/// `images_boot_in_qemu_when_available` proves SeaBIOS accepts the
+/// Syslinux-installed boot sector and hands off; it cannot see the
+/// Syslinux menu, and the PLAN's "boots to a menu" done-when stays
+/// unverified wherever QEMU is absent.
+#[cfg(test)]
+mod acceptance {
+    use super::Resource;
+    use super::load_from;
+    use crate::boot::grub2;
+    use crate::boot::grub4dos;
+    use crate::boot::syslinux;
+    use crate::error::Result;
+    use crate::fs::Volume;
+    use crate::fs::fat32::Fat32;
+    use crate::fs::fat32::format::FormatOptions;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// 128 MiB in bytes, one stick both tests share.
+    const STICK_BYTES: u64 = 128 * 1024 * 1024;
+
+    /// `assets/resources/` next to the workspace root, without going
+    /// through asset-dir resolution: every test below always executes.
+    fn resources_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/resources"
+        ))
+    }
+
+    /// The pinned payload bytes of `resource`, read straight from the
+    /// asset tree.
+    fn payload_bytes(resource: Resource) -> Vec<u8> {
+        load_from(&resources_dir(), resource)
+            .expect("the pinned payload loads")
+            .bytes()
+            .to_vec()
+    }
+
+    /// A [`Volume`] over shared bytes, so the tests can dump the image
+    /// while [`Fat32`] owns the store. Local to this module because
+    /// the same-shaped shim in `syslinux::install`'s tests is private
+    /// there; no production seam was added for either.
+    #[derive(Debug, Clone)]
+    struct SharedVolume {
+        bytes: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl SharedVolume {
+        fn blank(len: u64) -> Self {
+            let size = usize::try_from(len).expect("the ram size fits usize");
+            Self {
+                bytes: Rc::new(RefCell::new(vec![0u8; size])),
+            }
+        }
+
+        /// A copy of the first 512 bytes (the boot sector under test).
+        fn boot_sector(&self) -> [u8; 512] {
+            let borrowed = self.bytes.borrow();
+            let window = borrowed.get(..512).expect("the image holds a boot sector");
+            let mut sector = [0u8; 512];
+            sector.copy_from_slice(window);
+            sector
+        }
+    }
+
+    impl Volume for SharedVolume {
+        fn total_bytes(&self) -> u64 {
+            self.bytes.borrow().len() as u64
+        }
+
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let borrowed = self.bytes.borrow();
+            let start = usize::try_from(offset).expect("the test offset fits usize");
+            let end = start.checked_add(buf.len()).expect("the test window fits");
+            let window = borrowed.get(start..end).expect("the test read fits");
+            buf.copy_from_slice(window);
+            Ok(())
+        }
+
+        fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+            let mut borrowed = self.bytes.borrow_mut();
+            let start = usize::try_from(offset).expect("the test offset fits usize");
+            let end = start.checked_add(buf.len()).expect("the test window fits");
+            let window = borrowed.get_mut(start..end).expect("the test write fits");
+            window.copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    /// One formatted 128 MiB volume carrying the Syslinux 6.04 stage,
+    /// flushed and ready for the other installers.
+    ///
+    /// Interpretation, stated plainly: the brief asks for
+    /// `syslinux::install_loader`, but that wrapper differs from this
+    /// path only in its `load()` resolution step (the runtime asset
+    /// directory, which no test may depend on) — `load` delegates to
+    /// `load_from` once resolved, so these are byte-identical payloads
+    /// through the same `install_payloads` core.
+    fn syslinux_installed() -> (SharedVolume, Fat32, Vec<u8>, Vec<u8>) {
+        let backing = SharedVolume::blank(STICK_BYTES);
+        let mut fat = Fat32::format(
+            Box::new(backing.clone()),
+            &FormatOptions {
+                volume_id: 0x1234_5678,
+                ..Default::default()
+            },
+        )
+        .expect("the volume formats");
+        let vbr = payload_bytes(Resource::Syslinux604Vbr);
+        let core = payload_bytes(Resource::Syslinux604Core);
+        syslinux::install_payloads(&mut fat, syslinux::Family::V604, &vbr, &core)
+            .expect("the syslinux install runs");
+        fat.flush().expect("the stage flushes");
+        (backing, fat, vbr, core)
+    }
+
+    /// Synthetic UEFI image (~1.5 MiB) with a recognisable head and
+    /// tail.
+    fn uefi_image() -> Vec<u8> {
+        const SIZE: usize = 3 * 1024 * 1024 / 2;
+        (0..SIZE)
+            .map(|index| ((index * 5 + 1) % 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn one_stick_carries_every_installer() {
+        let (backing, mut fat, vbr, core) = syslinux_installed();
+        let grldr = payload_bytes(Resource::Grub4DosCore);
+        grub4dos::install_loader(&mut fat, &grldr).expect("the grldr lands");
+        let uefi = uefi_image();
+        grub2::install_uefi(&mut fat, &uefi).expect("the uefi image lands");
+        fat.flush().expect("every installer flushes");
+
+        // The boot sector is still the Syslinux graft: the GRUB4DOS
+        // loader install is a file write and must not touch it.
+        let sector = backing.boot_sector();
+        assert_eq!(
+            &sector[0..11],
+            &vbr[0..11],
+            "the payload jump and OEM name survive every installer"
+        );
+        assert_eq!(
+            2 + u16::from(sector[1]),
+            0x5A,
+            "the jump still lands on the code at 0x5A"
+        );
+
+        // The stage is the patched core plus the 1024-byte ADV tail.
+        let stage = fat.read_file("/ldlinux.sys").expect("the stage reads");
+        assert_eq!(
+            stage.len(),
+            core.len() + 1024,
+            "the stage is core plus adv in 69145 bytes"
+        );
+        assert_eq!(
+            &stage[core.len()..],
+            &syslinux::patch::default_adv(),
+            "the tail is exactly the default adv"
+        );
+
+        // Both companions read back whole.
+        let back = fat.read_file("/grldr").expect("the loader reads");
+        assert_eq!(back, grldr, "grldr is the asset byte for byte");
+        let back = fat
+            .read_file("/EFI/boot/bootx64.efi")
+            .expect("the efi image reads");
+        assert_eq!(back, uefi, "the efi image is byte-identical");
+
+        // The root holds all three installers' entries.
+        let listed = fat.list_dir("/").expect("the root lists");
+        let shorts: Vec<&str> = listed
+            .iter()
+            .map(|entry| entry.short_name.as_str())
+            .collect();
+        for want in ["LDLINUX.SYS", "GRLDR", "EFI"] {
+            assert!(shorts.contains(&want), "{want} is listed among {shorts:?}");
+        }
+
+        // Second passes are still refused, before any write each.
+        let second = syslinux::install_payloads(&mut fat, syslinux::Family::V604, &vbr, &core)
+            .expect_err("a second syslinux install refuses");
+        assert!(
+            second.to_string().contains("ldlinux.sys"),
+            "the syslinux refusal names the file"
+        );
+        let second =
+            grub4dos::install_loader(&mut fat, &grldr).expect_err("a second grldr install refuses");
+        assert!(
+            second.to_string().contains("grldr"),
+            "the grldr refusal names the file"
+        );
+        let second =
+            grub2::install_uefi(&mut fat, &uefi).expect_err("a second uefi install refuses");
+        assert!(
+            second.to_string().contains("/EFI/boot/bootx64.efi"),
+            "the uefi refusal names the path"
+        );
+
+        // The composed image is fsck clean.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let image = scratch.path().join("stick.img");
+        std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
+        let output = match std::process::Command::new("fsck.fat")
+            .arg("-n")
+            .arg(&image)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "fsck.fat -n exits 0 on the composed image ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    #[test]
+    fn images_boot_in_qemu_when_available() {
+        // Smoke shape (the loop-device suites use the same one): probe
+        // `qemu-system-x86_64 --version`, and skip on any spawn error.
+        // When QEMU runs, this proves SeaBIOS accepted the boot sector
+        // and handed off to the Syslinux stage; it cannot see the
+        // Syslinux menu, and the PLAN's "boots to a menu" done-when
+        // stays unverified wherever QEMU is absent.
+        let probe = std::process::Command::new("qemu-system-x86_64")
+            .arg("--version")
+            .output();
+        let probed = probe.map(|output| output.status.success()).unwrap_or(false);
+        if !probed {
+            eprintln!("skip: qemu-system-x86_64 is not on PATH");
+            return;
+        }
+        let (backing, _fat, _vbr, _core) = syslinux_installed();
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let picture = scratch.path().join("stick.img");
+        std::fs::write(&picture, backing.bytes.borrow().as_slice()).expect("the image dumps");
+        let log = scratch.path().join("debug.log");
+        let mut child = std::process::Command::new("qemu-system-x86_64")
+            .arg("-m")
+            .arg("128")
+            .arg("-drive")
+            .arg(format!("file={},format=raw,if=ide", picture.display()))
+            .arg("-display")
+            .arg("none")
+            .arg("-no-reboot")
+            .arg("-serial")
+            .arg("none")
+            .arg("-device")
+            .arg("isa-debugcon,iobase=0x402,chardev=dbg")
+            .arg("-chardev")
+            .arg(format!("file,id=dbg,path={}", log.display()))
+            .spawn()
+            .expect("qemu spawns");
+        // At most ~10 seconds of SeaBIOS time, then kill and reap.
+        for _ in 0..100 {
+            match child.try_wait().expect("qemu polls") {
+                Some(_) => break,
+                None => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let transcript = std::fs::read(&log).expect("the debug log reads");
+        let text = String::from_utf8_lossy(&transcript);
+        assert!(
+            text.contains("Booting from Hard Disk"),
+            "seabios hands off the hard disk"
+        );
+        assert!(
+            !text.contains("Boot failed"),
+            "seabios finds a bootable sector"
         );
     }
 }

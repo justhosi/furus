@@ -74,7 +74,7 @@ pub enum CoreError {
     /// other step error it is never wrapped in [`Step`](Self::Step)).
     #[error("not implemented yet: {what}")]
     NotImplemented {
-        /// What is missing, e.g. `"bootloader installation (S19)"`.
+        /// What is missing, e.g. `"bootloader installation (not wired yet)"`.
         what: &'static str,
     },
     /// Read-back verification failed: the bytes on the target do not
