@@ -12,18 +12,24 @@
 //! reads only: [`install`] owns the write half —
 //! [`install::install_loader`] loads the family's embedded payloads
 //! and [`install::install_payloads`] (the testable core over explicit
-//! bytes) grafts the VBR boot code onto a FAT32 volume's boot sector
-//! and lays the core down as a contiguous `/ldlinux.sys` — while
-//! everything else in this file never patches a sector and never
-//! creates a file.
+//! bytes) grafts the patched VBR boot code onto a FAT32 volume's boot
+//! sector and lays the patched core plus the ADV tail down as a
+//! contiguous `/ldlinux.sys` — while everything else in this file
+//! never patches a sector and never creates a file. [`patch`] owns
+//! the byte patching: upstream `syslinux_patch` plus the default ADV.
 //!
 //! [`install`]: self::install
+//! [`patch`]: self::patch
 
 mod install;
+pub mod patch;
 
 pub use install::Installed;
 pub use install::install_loader;
 pub use install::install_payloads;
+pub use patch::Patched;
+pub use patch::default_adv;
+pub use patch::syslinux_patch;
 
 use super::Resource;
 use crate::copy::Source;

@@ -5,13 +5,16 @@
 //! and delegates to [`install_payloads`], the testable core over
 //! explicit bytes: a present `/ldlinux.sys` refuses, one contiguous
 //! cluster run is reserved ([`Fat32::allocate_contiguous`]), the
-//! directory entry links at it ([`Fat32::link_file`]), the core bytes
-//! write at offset 0 ([`Fat32::write_at`]), the VBR's boot code grafts
-//! onto the volume's boot sector ([`Fat32::write_boot_code`]) and the
-//! pass flushes. No logger, no messages: the return value carries the
-//! facts and the caller logs, matching how the copy engine reports.
+//! directory entry links at it ([`Fat32::link_file`]), the patched
+//! core plus the ADV tail write at offset 0 ([`Fat32::write_at`]), the
+//! patched VBR's boot code grafts onto the volume's boot sector
+//! ([`Fat32::write_boot_code`]) and the pass flushes. [`super::patch`]
+//! owns the byte patching (`syslinux_patch` plus the default ADV).
+//! No logger, no messages: the return value carries the facts and the
+//! caller logs, matching how the copy engine reports.
 
 use super::Family;
+use super::patch;
 use crate::boot::load;
 use crate::error::CoreError;
 use crate::error::Result;
@@ -19,13 +22,15 @@ use crate::fs::fat32::Fat32;
 use crate::fs::fat32::bpb;
 
 /// What [`install_payloads`] laid down: the family installed, the head
-/// and length of its contiguous run, and the core's byte count.
+/// and length of its contiguous run, the core payload byte count, and
+/// the stage file byte count (core plus the ADV tail).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Installed {
     family: Family,
     first_cluster: u32,
     cluster_count: u32,
     core_bytes: u64,
+    stage_bytes: u64,
 }
 
 impl Installed {
@@ -47,10 +52,17 @@ impl Installed {
         self.cluster_count
     }
 
-    /// Byte count of the core (`/ldlinux.sys` size on the volume).
+    /// Byte count of the core payload (without the ADV tail).
     #[must_use]
     pub fn core_bytes(&self) -> u64 {
         self.core_bytes
+    }
+
+    /// Byte count of the stage file on the volume (core plus the
+    /// 1024-byte ADV tail).
+    #[must_use]
+    pub fn stage_bytes(&self) -> u64 {
+        self.stage_bytes
     }
 }
 
@@ -58,14 +70,31 @@ impl Installed {
 /// `vbr` and `core` bytes.
 ///
 /// The steps run in this order: a present `/ldlinux.sys` refuses, the
-/// payload lengths validate, one contiguous run is reserved for the
-/// core, the directory entry links at it, the core bytes write at
-/// offset 0, the VBR's boot code grafts onto the boot sector, and the
+/// volume sector size and payload lengths validate, one contiguous run
+/// is reserved for the stage (core plus the 1024-byte ADV tail), the
+/// directory entry links at it, the core and VBR patch for the file's
+/// sector list, the patched core plus the ADV tail write at offset 0,
+/// the patched VBR's boot code grafts onto the boot sector, and the
 /// pass flushes. The allocation runs before the link so the run is
 /// reserved before any directory entry points at it, and the graft
-/// runs last — matching upstream, and matching the later sector-map
-/// patch which needs the file in place — so a volume never carries
-/// Syslinux boot code without its stage file.
+/// runs last — matching upstream — so a volume never carries Syslinux
+/// boot code without its stage file.
+///
+/// The stage file is `core ++ 1024 bytes of ADV`: two identical
+/// 512-byte sectors per `setadv.c:syslinux_reset_adv`, with the core's
+/// sector map, sector pointers, ADV pointers, `"/"` directory string
+/// and checksum patched over them (see [`patch::syslinux_patch`]).
+/// FAT hidden/system/readonly attributes are intentionally not set:
+/// the writer has no attribute API, and the loader does not need them.
+///
+/// The sector list is linear — `first_lba + i` — because the allocator
+/// hands out a sequential cluster chain and [`Fat32::link_file`]
+/// re-verifies that exact linkage before the entry lands.
+///
+/// A non-512-byte sector size refuses before any write: the ADV unit,
+/// the `adv_sectors` count and the sector-pointer LBAs are all
+/// 512-byte sectors, so patching one onto a 4Kn volume would mispoint
+/// every address.
 ///
 /// The only torn state is a stage file with no boot code: a failure
 /// inside the stage write leaves an entry over a reserved run with
@@ -85,10 +114,6 @@ impl Installed {
 /// than a sector and a `core` of one sector or less (empty included)
 /// refuse naming the lengths, so a swapped or truncated pair never
 /// reaches the volume.
-///
-/// This installer writes the payload length exactly: the ADV /
-/// sector-map tail layout (upstream writes `ldlinux.sys` plus
-/// `2 * ADV_SIZE` before patching) is settled by the next slice.
 pub fn install_payloads(
     fat: &mut Fat32,
     family: Family,
@@ -105,6 +130,15 @@ pub fn install_payloads(
              refusing a second install that would leave an unreferenced cluster run",
         ));
     }
+    // The geometry's sector size is the volume's own: the formatter
+    // cross-checks the store's `sector_size()` against it at format
+    // time, so reading it here is the same refusal.
+    let sector_bytes = u64::from(fat.geometry().bytes_per_sector);
+    if sector_bytes != patch::SECTOR_BYTES {
+        return Err(CoreError::invalid(format!(
+            "syslinux install needs 512 byte sectors for its adv and sector map, the volume carries {sector_bytes}: refusing"
+        )));
+    }
     let vbr_len = vbr.len();
     if vbr_len < bpb::BOOT_SECTOR_BYTES {
         return Err(CoreError::invalid(format!(
@@ -116,21 +150,53 @@ pub fn install_payloads(
         .map_err(|_| CoreError::invalid("a syslinux core longer than u64"))?;
     if core.len() <= bpb::BOOT_SECTOR_BYTES {
         return Err(CoreError::invalid(format!(
-            "syslinux core image is {} bytes, refusing a core of one sector or less ({} bytes): refusing",
+            "syslinux core image is {} bytes, a stage file needs more than one sector ({} bytes): refusing",
             core.len(),
             bpb::BOOT_SECTOR_BYTES
         )));
     }
-    let (first_cluster, cluster_count) = fat.allocate_contiguous(core_len)?;
-    fat.link_file("/ldlinux.sys", first_cluster, core_len)?;
-    fat.write_at("/ldlinux.sys", 0, core)?;
-    fat.write_boot_code(vbr)?;
+    let stage_len = core_len
+        .checked_add(patch::ADV_BYTES as u64)
+        .ok_or_else(|| CoreError::invalid("a syslinux stage longer than u64: refusing"))?;
+    let (first_cluster, cluster_count) = fat.allocate_contiguous(stage_len)?;
+    fat.link_file("/ldlinux.sys", first_cluster, stage_len)?;
+    // Linear sector list over the reserved run: the allocator's chain
+    // is sequential and the link just re-verified it.
+    let run_base = fat.geometry().cluster_offset(first_cluster).ok_or_else(|| {
+        CoreError::invalid(format!(
+            "syslinux install: cluster {first_cluster} does not resolve on this volume: refusing"
+        ))
+    })?;
+    if run_base % patch::SECTOR_BYTES != 0 {
+        return Err(CoreError::invalid(format!(
+            "syslinux install: cluster {first_cluster} sits at byte {run_base}, not a 512 byte sector edge: refusing"
+        )));
+    }
+    let first_lba = run_base / patch::SECTOR_BYTES;
+    let total = core_len.div_ceil(patch::SECTOR_BYTES) + patch::ADV_SECTORS;
+    let sector_count = usize::try_from(total)
+        .map_err(|_| CoreError::invalid("a syslinux sector list longer than usize: refusing"))?;
+    let mut sectors = Vec::with_capacity(sector_count);
+    for index in 0..total {
+        let lba = first_lba
+            .checked_add(index)
+            .ok_or_else(|| CoreError::invalid("a syslinux sector lba overflows u64: refusing"))?;
+        sectors.push(lba);
+    }
+    let patched = patch::syslinux_patch(core, vbr, &sectors, b"/")?;
+    let adv = patch::default_adv();
+    let mut stage = Vec::with_capacity(sector_count * patch::SECTOR_BYTES as usize);
+    stage.extend_from_slice(&patched.core);
+    stage.extend_from_slice(&adv);
+    fat.write_at("/ldlinux.sys", 0, &stage)?;
+    fat.write_boot_code(&patched.vbr)?;
     fat.flush()?;
     Ok(Installed {
         family,
         first_cluster,
         cluster_count,
         core_bytes: core_len,
+        stage_bytes: stage_len,
     })
 }
 
@@ -184,13 +250,19 @@ mod tests {
     #[derive(Debug, Clone)]
     struct SharedVolume {
         bytes: Rc<RefCell<Vec<u8>>>,
+        sector_size: u32,
     }
 
     impl SharedVolume {
         fn blank(len: u64) -> Self {
+            Self::blank_with_sector_size(len, 512)
+        }
+
+        fn blank_with_sector_size(len: u64, sector_size: u32) -> Self {
             let size = usize::try_from(len).expect("the ram size fits usize");
             Self {
                 bytes: Rc::new(RefCell::new(vec![0u8; size])),
+                sector_size,
             }
         }
 
@@ -207,6 +279,10 @@ mod tests {
     impl Volume for SharedVolume {
         fn total_bytes(&self) -> u64 {
             self.bytes.borrow().len() as u64
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.sector_size
         }
 
         fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
@@ -243,10 +319,27 @@ mod tests {
         (backing, fat)
     }
 
+    fn le16(bytes: &[u8], at: usize) -> u16 {
+        let window = bytes.get(at..at + 2).expect("the test window fits");
+        u16::from_le_bytes([window[0], window[1]])
+    }
+
+    fn le32(bytes: &[u8], at: usize) -> u32 {
+        let window = bytes.get(at..at + 4).expect("the test window fits");
+        u32::from_le_bytes([window[0], window[1], window[2], window[3]])
+    }
+
+    fn le64(bytes: &[u8], at: usize) -> u64 {
+        let window = bytes.get(at..at + 8).expect("the test window fits");
+        u64::from_le_bytes([
+            window[0], window[1], window[2], window[3], window[4], window[5], window[6], window[7],
+        ])
+    }
+
     /// Pin contiguity from the raw image bytes, independently of the
     /// return value: walk the first FAT copy at `first_cluster` and
     /// require sequential links ending in an end-of-chain marker, then
-    /// require the core bytes verbatim at the linear data-area offset
+    /// require the stage bytes verbatim at the linear data-area offset
     /// (sequential cluster numbers are contiguous image bytes, so the
     /// verbatim span proves the linear placement too).
     fn assert_run_is_contiguous(
@@ -254,7 +347,7 @@ mod tests {
         fat: &Fat32,
         first: u32,
         count: u32,
-        core: &[u8],
+        stage: &[u8],
     ) {
         let geometry = fat.geometry();
         let fat_start = u64::from(geometry.reserved_sectors) * u64::from(geometry.bytes_per_sector);
@@ -285,17 +378,58 @@ mod tests {
         )
         .expect("the data offset fits usize");
         let window = image
-            .get(base..base + core.len())
-            .expect("the core span fits the image");
-        assert_eq!(window, core, "the core bytes sit verbatim at the run head");
+            .get(base..base + stage.len())
+            .expect("the stage span fits the image");
+        assert_eq!(
+            window, stage,
+            "the stage bytes sit verbatim at the run head"
+        );
+    }
+
+    /// Per-family patch pins: the sector totals, the EPA field offsets
+    /// from the spec, and the data extents as `(first-relative start,
+    /// length)` pairs.
+    struct FamilyPins {
+        total: u64,
+        data_sectors: u16,
+        dwords: u32,
+        epa_offset: usize,
+        advptr_offset: usize,
+        dir_offset: usize,
+        extents: Vec<(u64, u16)>,
+    }
+
+    fn pins_for(family: Family) -> FamilyPins {
+        match family {
+            Family::V407 => FamilyPins {
+                total: 74,
+                data_sectors: 72,
+                dwords: 9122,
+                epa_offset: 0x30a6,
+                advptr_offset: 0x3798,
+                dir_offset: 0x30bc,
+                extents: vec![(1, 71)],
+            },
+            Family::V604 => FamilyPins {
+                total: 136,
+                data_sectors: 134,
+                dwords: 17030,
+                epa_offset: 0x1446,
+                advptr_offset: 0x16d8,
+                dir_offset: 0x145c,
+                extents: vec![(1, 127), (128, 6)],
+            },
+        }
     }
 
     /// The shared install proof both families run: the boot sector
-    /// carries the payload entry, the volume geometry and the payload
-    /// code under the `0x55AA` signature, `/ldlinux.sys` lists with the
-    /// core's size and reads back byte-identical over a contiguous run,
-    /// and the geometry is untouched.
+    /// carries the patched payload entry, the volume geometry and the
+    /// payload code under the `0x55AA` signature with the file's first
+    /// LBA at the VBR pointers; `/ldlinux.sys` is the patched core
+    /// plus the exact ADV tail, reads back byte-identical over a
+    /// contiguous run, and the geometry is untouched.
     fn proves_install(backing: &SharedVolume, fat: &mut Fat32, family: Family) {
+        let pins = pins_for(family);
         let before_sector = backing.boot_sector();
         let before_geometry = *fat.geometry();
         let vbr = payload_bytes(family.vbr());
@@ -303,17 +437,26 @@ mod tests {
         let installed = install_payloads(fat, family, &vbr, &core).expect("the install runs");
         assert_eq!(installed.family(), family);
         assert_eq!(installed.core_bytes(), core.len() as u64);
+        let stage_len = core.len() + patch::ADV_BYTES;
+        assert_eq!(
+            installed.stage_bytes(),
+            stage_len as u64,
+            "the stage adds the adv tail to the payload"
+        );
 
+        let first_lba = before_geometry
+            .cluster_offset(installed.first_cluster())
+            .expect("the head resolves")
+            / patch::SECTOR_BYTES;
+
+        // Boot sector: the grafted patched VBR. The pointers name the
+        // file's first LBA and every other byte matches the graft of
+        // the payload VBR with those two words replaced.
         let after_sector = backing.boot_sector();
         assert_eq!(
             &after_sector[0..11],
             &vbr[0..11],
             "the payload jump and OEM name win"
-        );
-        assert_eq!(
-            &after_sector[0..3],
-            &vbr[0..3],
-            "the entry point is the payload's, never the formatter's"
         );
         assert_eq!(
             2 + u16::from(after_sector[1]),
@@ -326,9 +469,29 @@ mod tests {
             "the volume geometry survives the graft"
         );
         assert_eq!(
-            &after_sector[90..510],
-            &vbr[90..510],
-            "the boot code comes from the family VBR"
+            &after_sector[90..0x11a],
+            &vbr[90..0x11a],
+            "the boot code before the pointers is the payload's"
+        );
+        assert_eq!(
+            le32(&after_sector, 0x11a),
+            first_lba as u32,
+            "the low pointer names the first lba"
+        );
+        assert_eq!(
+            le32(&after_sector, 0x120),
+            0,
+            "the high pointer is zero on this volume"
+        );
+        assert_eq!(
+            &after_sector[0x11e..0x120],
+            &vbr[0x11e..0x120],
+            "the gap between the pointers is the payload's"
+        );
+        assert_eq!(
+            &after_sector[0x124..510],
+            &vbr[0x124..510],
+            "the boot code past the pointers is the payload's"
         );
         assert_eq!(
             &after_sector[510..],
@@ -341,7 +504,7 @@ mod tests {
             .iter()
             .find(|entry| entry.short_name == "LDLINUX.SYS")
             .expect("ldlinux.sys is listed");
-        assert_eq!(entry.size_bytes, core.len() as u64, "the listed size");
+        assert_eq!(entry.size_bytes, stage_len as u64, "the listed size");
         assert_eq!(
             entry.first_cluster,
             installed.first_cluster(),
@@ -350,20 +513,124 @@ mod tests {
         let cluster_bytes = fat.geometry().cluster_bytes();
         assert_eq!(
             u64::from(installed.cluster_count()),
-            (core.len() as u64).div_ceil(cluster_bytes),
-            "the run spans the rounded-up core"
+            (stage_len as u64).div_ceil(cluster_bytes),
+            "the run spans the rounded-up stage"
         );
+
+        // On-disk stage: the patched core plus the exact ADV tail.
+        let on_disk = fat.read_file("/ldlinux.sys").expect("the stage reads back");
+        assert_eq!(on_disk.len(), stage_len, "the file is core plus adv");
+        assert_eq!(
+            &on_disk[core.len()..],
+            &patch::default_adv(),
+            "the tail is exactly the default adv"
+        );
+        let patched = &on_disk[..core.len()];
+
+        // Patch-area counts and EPA offsets pin the family.
+        assert_eq!(
+            le32(patched, 0x18),
+            patch::LDLINUX_MAGIC,
+            "the magic survives the patch"
+        );
+        assert_eq!(
+            le16(patched, 0x18 + 0x08),
+            pins.data_sectors,
+            "data sectors"
+        );
+        assert_eq!(le16(patched, 0x18 + 0x0A), 2, "adv sectors");
+        assert_eq!(le32(patched, 0x18 + 0x0C), pins.dwords, "dwords");
+        assert_eq!(
+            le16(patched, 0x18 + 0x16),
+            pins.epa_offset as u16,
+            "the epa offset is untouched"
+        );
+        let epa = pins.epa_offset;
+        assert_eq!(
+            le16(patched, epa),
+            pins.advptr_offset as u16,
+            "advptroffset"
+        );
+        assert_eq!(le16(patched, epa + 2), pins.dir_offset as u16, "diroffset");
+        assert_eq!(le16(patched, epa + 4), 0x100, "dirlen");
+        assert_eq!(le16(patched, epa + 10), 0x1ee, "secptroffset");
+        assert_eq!(le16(patched, epa + 12), 192, "secptrcnt");
+
+        // Directory holds "/" plus NUL.
+        assert_eq!(
+            &patched[pins.dir_offset..pins.dir_offset + 2],
+            b"/\x00",
+            "the subdirectory"
+        );
+
+        // ADV pointers name the last two sectors of the list.
+        assert_eq!(
+            le64(patched, pins.advptr_offset),
+            first_lba + pins.total - 2,
+            "first adv lba"
+        );
+        assert_eq!(
+            le64(patched, pins.advptr_offset + 8),
+            first_lba + pins.total - 1,
+            "second adv lba"
+        );
+
+        // Sector map: the expected extents, reconstructed back into
+        // the sector list, with zeros past the written entries.
+        let mut expanded: Vec<u64> = Vec::new();
+        for (index, (start, len)) in pins.extents.iter().enumerate() {
+            let at = 0x1ee + index * 10;
+            assert_eq!(le64(patched, at), first_lba + start, "extent {index} lba");
+            assert_eq!(le16(patched, at + 8), *len, "extent {index} length");
+            for step in 0..*len {
+                expanded.push(first_lba + start + u64::from(step));
+            }
+        }
+        let expected: Vec<u64> = (1..pins.total - 2).map(|step| first_lba + step).collect();
+        assert_eq!(expanded, expected, "the map rebuilds the data sectors");
+        let written = pins.extents.len() * 10;
+        assert!(
+            patched[0x1ee + written..0x1ee + 1920]
+                .iter()
+                .all(|&byte| byte == 0),
+            "the map past the written entries stays zero"
+        );
+
+        // Checksum recomputed independently: zero the field, subtract
+        // every covered dword from the magic, wrapping.
+        let mut probe = patched.to_vec();
+        probe[0x18 + 0x10..0x18 + 0x14].copy_from_slice(&0u32.to_le_bytes());
+        let mut checksum = patch::LDLINUX_MAGIC;
+        for index in 0..pins.dwords as usize {
+            checksum = checksum.wrapping_sub(le32(&probe, index * 4));
+        }
+        assert_eq!(le32(patched, 0x18 + 0x10), checksum, "the checksum");
+
+        // Nothing else in the core moved: every byte outside the patch
+        // area, the map, the ADV pointers and the directory matches.
+        let mut touched = vec![false; core.len()];
+        for window in [
+            0x18..0x18 + 0x18,
+            0x1ee..0x1ee + 1920,
+            pins.advptr_offset..pins.advptr_offset + 16,
+            pins.dir_offset..pins.dir_offset + 0x100,
+        ] {
+            if let Some(area) = touched.get_mut(window) {
+                area.fill(true);
+            }
+        }
+        for (at, (&was, &is)) in core.iter().zip(patched.iter()).enumerate() {
+            if !touched[at] {
+                assert_eq!(is, was, "an unpatched byte moved at {at}");
+            }
+        }
+
         assert_run_is_contiguous(
             backing,
             fat,
             installed.first_cluster(),
             installed.cluster_count(),
-            &core,
-        );
-        let read_back = fat.read_file("/ldlinux.sys").expect("the core reads back");
-        assert_eq!(
-            read_back, core,
-            "the stage file is the payload byte for byte"
+            &on_disk,
         );
 
         assert_eq!(
@@ -429,7 +696,7 @@ mod tests {
         let error = install_payloads(&mut fat, Family::V604, &vbr, &empty)
             .expect_err("an empty core refuses");
         assert!(
-            error.to_string().contains('0'),
+            error.to_string().contains("0 bytes"),
             "the refusal names the empty length: {text}"
         );
         // A short VBR refuses before any byte moves: the root stays
@@ -451,6 +718,39 @@ mod tests {
             listed.is_empty(),
             "a refused vbr leaves no stage file behind"
         );
+    }
+
+    #[test]
+    fn non_512_byte_sectors_are_refused_before_any_write() {
+        // A 4Kn volume formats but never installs: the ADV unit, the
+        // adv_sectors count and the sector-pointer LBAs are all
+        // 512-byte sectors, so patching one would mispoint every
+        // address. The refusal lands before any write, so the root
+        // stays empty.
+        let backing = SharedVolume::blank_with_sector_size(300 * 1024 * 1024, 4096);
+        let mut fat = Fat32::format(
+            Box::new(backing.clone()),
+            &FormatOptions {
+                volume_id: 0x1234_5678,
+                ..Default::default()
+            },
+        )
+        .expect("the 4kn volume formats");
+        assert_eq!(
+            fat.geometry().bytes_per_sector,
+            4096,
+            "the volume really is 4kn"
+        );
+        let vbr = payload_bytes(Family::V604.vbr());
+        let core = payload_bytes(Family::V604.core());
+        let error = install_payloads(&mut fat, Family::V604, &vbr, &core)
+            .expect_err("a 4kn install refuses");
+        let text = error.to_string();
+        assert!(text.contains("512"), "names the needed size: {text}");
+        assert!(text.contains("4096"), "names the volume size: {text}");
+        assert!(text.is_ascii(), "the refusal stays ASCII: {text}");
+        let listed = fat.list_dir("/").expect("the root lists");
+        assert!(listed.is_empty(), "a refused install writes nothing");
     }
 
     #[test]
