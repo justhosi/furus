@@ -230,6 +230,70 @@ pub fn backup_boot_sector(boot: &[u8; 512]) -> [u8; 512] {
     *boot
 }
 
+/// Graft a Syslinux VBR's boot code onto a volume's own boot sector.
+///
+/// The returned 512 bytes take `vbr[0x00..0x0B]` — the jump
+/// instruction plus the OEM name — keep `current[0x0B..0x5A]` (the
+/// whole FAT32 BPB/EBPB geometry), take `vbr[0x5A..0x1FE]` (the boot
+/// code, [`BOOT_CODE_AREA`]), and keep `current[0x1FE..0x200]` (the
+/// `0x55AA` signature, which both sides carry).
+///
+/// The geometry survives but the entry point does not: a VBR's own
+/// BPB describes the build machine's volume, never this one, so
+/// copying it would repoint the FATs, the cluster size and the FSInfo
+/// pointer at a stranger's layout — while the formatter's own jump
+/// (`EB 3C 90`, landing at `0x3E`) would enter the retained header
+/// and never reach the Syslinux code at `0x5A`. The payload's jump
+/// (`EB 58 90`, landing at `0x5A`) must win, and its OEM name with it:
+/// upstream identifies an installed volume by `"SYSLINUX"` at offset
+/// 3. Only the primary boot sector is grafted — the FAT32 backup boot
+/// sector in the reserved area is deliberately not rewritten, so it
+/// keeps the formatter's image until a later slice owns the backup
+/// policy.
+///
+/// Refuses a `vbr` shorter than [`BOOT_SECTOR_BYTES`], naming both
+/// lengths, and likewise a `current` image shorter than a sector: a
+/// longer `vbr` (a padded or multi-sector image) is fine, its bytes
+/// past 512 are ignored.
+pub fn graft_boot_code(current: &[u8], vbr: &[u8]) -> Result<[u8; BOOT_SECTOR_BYTES]> {
+    let vbr_len = vbr.len();
+    if vbr_len < BOOT_SECTOR_BYTES {
+        return Err(CoreError::invalid(format!(
+            "syslinux vbr image is {vbr_len} bytes, a boot sector graft needs {BOOT_SECTOR_BYTES} bytes: refusing"
+        )));
+    }
+    let current_len = current.len();
+    if current_len < BOOT_SECTOR_BYTES {
+        return Err(CoreError::invalid(format!(
+            "volume boot sector image is {current_len} bytes, a boot sector graft needs {BOOT_SECTOR_BYTES} bytes: refusing"
+        )));
+    }
+    // Offsets as numbers: 11 is the BPB start (bytes-per-sector) and
+    // 90/510 are the [`BOOT_CODE_AREA`] ends — the code window shares
+    // the named range, the entry and geometry windows have no constant
+    // of their own.
+    let entry = vbr
+        .get(..11)
+        .ok_or_else(|| CoreError::invalid("syslinux vbr entry window vanished mid-copy"))?;
+    let bpb = current.get(11..BOOT_CODE_AREA.start).ok_or_else(|| {
+        CoreError::invalid("volume boot sector geometry window vanished mid-copy")
+    })?;
+    let code = vbr
+        .get(BOOT_CODE_AREA.clone())
+        .ok_or_else(|| CoreError::invalid("syslinux vbr code window vanished mid-copy"))?;
+    let signature = current
+        .get(BOOT_CODE_AREA.end..BOOT_SECTOR_BYTES)
+        .ok_or_else(|| {
+            CoreError::invalid("volume boot sector signature window vanished mid-copy")
+        })?;
+    let mut out = [0u8; BOOT_SECTOR_BYTES];
+    put_bytes(&mut out, 0, entry)?;
+    put_bytes(&mut out, 11, bpb)?;
+    put_bytes(&mut out, BOOT_CODE_AREA.start, code)?;
+    put_bytes(&mut out, BOOT_CODE_AREA.end, signature)?;
+    Ok(out)
+}
+
 /// Build the FSInfo structure image: the `0x41615252` (`RRaA`) lead
 /// signature at offset 0, the `0x61417272` (`rrAa`) structure
 /// signature at 484, free-cluster bookkeeping at 488/492 and the
@@ -784,5 +848,145 @@ mod tests {
         let boot = boot_sector(&sample_input()).expect("builds");
         let backup = backup_boot_sector(&boot);
         assert_eq!(boot, backup, "fsck compares both copies byte for byte");
+    }
+
+    #[test]
+    fn graft_takes_the_entry_and_code_but_keeps_the_geometry() {
+        let current = boot_sector(&sample_input()).expect("the volume sector builds");
+        // A VBR with a real-shaped entry (a jump landing at 0x5A plus
+        // an OEM name), a foreign BPB and a recognizable code window:
+        // every window differs from `current` where the graft must take
+        // the VBR, and matches where it must keep the volume.
+        let mut vbr = [0xCCu8; BOOT_SECTOR_BYTES];
+        vbr[0..11].copy_from_slice(b"\xEB\x58\x90SYSLINUX");
+        for (index, slot) in vbr[BOOT_CODE_AREA].iter_mut().enumerate() {
+            *slot = (index % 251) as u8;
+        }
+        let grafted = graft_boot_code(&current, &vbr).expect("the graft builds");
+        assert_eq!(grafted.len(), BOOT_SECTOR_BYTES);
+        assert_eq!(
+            &grafted[0..11],
+            &vbr[0..11],
+            "the jump and OEM name come from the VBR"
+        );
+        assert_eq!(
+            &grafted[0..3],
+            &vbr[0..3],
+            "the entry point is the payload's, never the formatter's"
+        );
+        assert_eq!(
+            2 + u16::from(grafted[1]),
+            0x5A,
+            "the jump lands on the code at 0x5A"
+        );
+        assert_eq!(
+            &grafted[11..BOOT_CODE_AREA.start],
+            &current[11..BOOT_CODE_AREA.start],
+            "the BPB/EBPB geometry survives"
+        );
+        assert_eq!(
+            &grafted[BOOT_CODE_AREA], &vbr[BOOT_CODE_AREA],
+            "the boot code comes from the VBR"
+        );
+        assert_eq!(
+            &grafted[BOOT_CODE_AREA.end..],
+            &current[BOOT_CODE_AREA.end..],
+            "the 0x55AA signature survives"
+        );
+        assert_eq!(
+            grafted[BOOT_CODE_AREA.end..],
+            [0x55, 0xAA],
+            "the tail is the signature itself"
+        );
+    }
+
+    #[test]
+    fn graft_lands_real_payload_jumps_on_the_code() {
+        // The pinned 6.04 and 4.07 VBRs straight from the asset tree:
+        // both open `eb 58 90` (`"SYSLINUX"` at offset 3) and the graft
+        // must carry those exact entry bytes onto the volume.
+        let dir = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/resources"
+        ));
+        for file in ["RCDATA_400.bin", "RCDATA_402.bin"] {
+            let vbr = std::fs::read(dir.join(file)).expect("the pinned vbr reads");
+            assert_eq!(vbr.len(), BOOT_SECTOR_BYTES, "{file} is one sector");
+            assert_eq!(
+                &vbr[0..4],
+                &[0xEB, 0x58, 0x90, b'S'],
+                "{file} opens with the syslinux jump and OEM"
+            );
+            let current = boot_sector(&sample_input()).expect("the volume sector builds");
+            let grafted = graft_boot_code(&current, &vbr).expect("the graft builds");
+            assert_eq!(
+                &grafted[0..3],
+                &vbr[0..3],
+                "{file}: the payload jump wins over the formatter's eb 3c 90"
+            );
+            assert_eq!(
+                2 + u16::from(grafted[1]),
+                0x5A,
+                "{file}: the jump lands on the code"
+            );
+            assert_eq!(
+                &grafted[3..11],
+                b"SYSLINUX",
+                "{file}: the OEM name marks an installed volume"
+            );
+            assert_eq!(
+                &grafted[11..BOOT_CODE_AREA.start],
+                &current[11..BOOT_CODE_AREA.start],
+                "{file}: the geometry survives"
+            );
+            assert_eq!(
+                &grafted[BOOT_CODE_AREA], &vbr[BOOT_CODE_AREA],
+                "{file}: the code comes from the VBR"
+            );
+            assert_eq!(
+                &grafted[BOOT_CODE_AREA.end..],
+                [0x55, 0xAA],
+                "{file}: the signature closes the sector"
+            );
+        }
+    }
+
+    #[test]
+    fn graft_refuses_a_short_vbr_naming_both_lengths() {
+        let current = boot_sector(&sample_input()).expect("the volume sector builds");
+        let short = [0xCCu8; BOOT_SECTOR_BYTES - 1];
+        let error = graft_boot_code(&current, &short).expect_err("511 bytes refuse");
+        let text = error.to_string();
+        assert!(
+            text.contains(&short.len().to_string()),
+            "the refusal names the vbr length: {text}"
+        );
+        assert!(
+            text.contains(&BOOT_SECTOR_BYTES.to_string()),
+            "the refusal names the needed length: {text}"
+        );
+    }
+
+    #[test]
+    fn graft_ignores_vbr_bytes_past_the_sector() {
+        // A 4096-byte VBR image (a padded or multi-sector read) grafts
+        // exactly like its first 512 bytes: the tail is never touched.
+        let current = boot_sector(&sample_input()).expect("the volume sector builds");
+        let mut vbr = [0xCCu8; 4096];
+        vbr[0..11].copy_from_slice(b"\xEB\x58\x90SYSLINUX");
+        for (index, slot) in vbr[BOOT_CODE_AREA].iter_mut().enumerate() {
+            *slot = (index % 251) as u8;
+        }
+        let grafted = graft_boot_code(&current, &vbr).expect("a long vbr grafts");
+        assert_eq!(&grafted[BOOT_CODE_AREA], &vbr[BOOT_CODE_AREA]);
+        assert_eq!(&grafted[0..11], &vbr[0..11]);
+        assert_eq!(
+            &grafted[11..BOOT_CODE_AREA.start],
+            &current[11..BOOT_CODE_AREA.start]
+        );
+        assert_eq!(
+            &grafted[BOOT_CODE_AREA.end..],
+            &current[BOOT_CODE_AREA.end..]
+        );
     }
 }

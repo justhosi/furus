@@ -9,8 +9,21 @@
 //! still wins but logs the reference conflict warning. [`locate`]
 //! finds the payload directory over a [`Source`](crate::copy::Source)
 //! and [`read`] fetches one file from it. This module decides and
-//! reads only: it writes nothing and patches no sectors, which later
-//! S19 slices own.
+//! reads only: [`install`] owns the write half —
+//! [`install::install_loader`] loads the family's embedded payloads
+//! and [`install::install_payloads`] (the testable core over explicit
+//! bytes) grafts the VBR boot code onto a FAT32 volume's boot sector
+//! and lays the core down as a contiguous `/ldlinux.sys` — while
+//! everything else in this file never patches a sector and never
+//! creates a file.
+//!
+//! [`install`]: self::install
+
+mod install;
+
+pub use install::Installed;
+pub use install::install_loader;
+pub use install::install_payloads;
 
 use super::Resource;
 use crate::copy::Source;
@@ -290,9 +303,11 @@ fn display_dir(dir: &[Vec<u8>]) -> String {
 }
 
 /// True when `name` is one of the marker files a payload directory
-/// must hold. The comparison is ASCII-case-insensitive (image trees
-/// commonly spell these names in upper case); symlinks never count as
-/// holders (see [`locate`]).
+/// must hold. Only the marker and file *names* fold case here (image
+/// trees commonly spell these names in upper case); the directory
+/// components of [`DIRS`] do not — the ISO and UDF adapters resolve
+/// each component exactly, so an upper-case `ISOLINUX` directory is
+/// never found. Symlinks never count as holders (see [`locate`]).
 fn is_marker(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"isolinux.bin")
         || name.eq_ignore_ascii_case(b"isolinux.cfg")
@@ -409,8 +424,8 @@ fn ascii_safe(text: &str) -> String {
 /// The size comes from the directory listing and the bytes stream
 /// through [`Source::read_bytes`] in 4 KiB windows (read to EOF with
 /// the listed size, never read-then-discard past the cap). Returns
-/// `None` when the name is absent or names a directory (a directory of
-/// that name reads as absent, not as an error). Refuses a name that
+/// `None` when the name is absent, names a directory, or names a
+/// symlink (each reads as absent, not as an error). Refuses a name that
 /// carries a `/`, `\` or NUL byte, or that is `.` or `..`, and refuses
 /// a file larger than [`MAX_READ_BYTES`]. A listing I/O error
 /// propagates like in [`locate`]; any other listing refusal reads as
@@ -737,6 +752,18 @@ mod tests {
         }
     }
 
+    fn link_entry(name: &[u8]) -> Entry {
+        Entry {
+            name: name.to_vec(),
+            is_dir: false,
+            size: 0,
+            mode: None,
+            modified: None,
+            accessed: None,
+            link: Some(b"target".to_vec()),
+        }
+    }
+
     impl Source for MemSource {
         fn root_entries(&self) -> Result<Vec<Entry>> {
             match self.dirs.get(&Vec::new()) {
@@ -895,5 +922,86 @@ mod tests {
         }
         let backslash = read(&source, &dir, "a\\b").expect_err("backslash refuses");
         assert!(backslash.to_string().contains("refuses"));
+    }
+
+    #[test]
+    fn read_spans_more_than_one_window() {
+        // 10 000 bytes need three 4 KiB windows (4096 + 4096 + 1808):
+        // the chunks must join back into the exact file bytes.
+        let bytes: Vec<u8> = (0..10_000).map(|index| (index % 251) as u8).collect();
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"isolinux")])
+            .with_dir(
+                &[b"isolinux"],
+                vec![file_entry(b"isolinux.cfg", bytes.len() as u64)],
+            )
+            .with_file(&[b"isolinux", b"isolinux.cfg"], &bytes);
+        let dir = vec![b"isolinux".to_vec()];
+        let read = read(&source, &dir, "isolinux.cfg")
+            .expect("a multi-window file reads")
+            .expect("present is some");
+        assert_eq!(read, bytes, "every window lands in order");
+    }
+
+    #[test]
+    fn read_refuses_a_file_past_the_cap() {
+        // The listing alone drives the refusal: no file bytes are ever
+        // read, so none are seeded.
+        let over = MAX_READ_BYTES + 1;
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"isolinux")])
+            .with_dir(&[b"isolinux"], vec![file_entry(b"big.bin", over)]);
+        let dir = vec![b"isolinux".to_vec()];
+        let error = read(&source, &dir, "big.bin").expect_err("past the cap refuses");
+        let text = error.to_string();
+        assert!(text.contains("1 MiB"), "the refusal names the cap: {text}");
+        assert!(
+            text.contains(&over.to_string()),
+            "the refusal names the size: {text}"
+        );
+    }
+
+    #[test]
+    fn read_refuses_a_short_read() {
+        // The listing claims 100 bytes but the store holds 10: the
+        // second window reads 0 bytes, which is corruption, not EOF.
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"isolinux")])
+            .with_dir(&[b"isolinux"], vec![file_entry(b"short.bin", 100)])
+            .with_file(&[b"isolinux", b"short.bin"], b"0123456789");
+        let dir = vec![b"isolinux".to_vec()];
+        let error = read(&source, &dir, "short.bin").expect_err("a short read refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("short read"),
+            "the refusal names the shape: {text}"
+        );
+    }
+
+    #[test]
+    fn locate_ignores_a_symlink_marker() {
+        // A symlink named like a marker is not a holder: the directory
+        // reads as marker-less, so the lookup finds nothing.
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"isolinux")])
+            .with_dir(&[b"isolinux"], vec![link_entry(b"isolinux.bin")]);
+        assert!(
+            locate(&source).expect("locate reads").is_none(),
+            "a symlink marker never locates a payload directory"
+        );
+    }
+
+    #[test]
+    fn read_treats_a_symlink_as_absent() {
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"isolinux")])
+            .with_dir(&[b"isolinux"], vec![link_entry(b"isolinux.cfg")]);
+        let dir = vec![b"isolinux".to_vec()];
+        assert!(
+            read(&source, &dir, "isolinux.cfg")
+                .expect("a symlink reads")
+                .is_none(),
+            "a symlink of that name reads as absent"
+        );
     }
 }

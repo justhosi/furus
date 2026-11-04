@@ -6,9 +6,10 @@
 //! file name, exact size and SHA-256, and [`load_from`] refuses anything
 //! that does not match all of them. [`load`] is the production entry
 //! point (it resolves through [`asset_path`](crate::paths::asset_path));
-//! [`load_from`] is the testable core over an explicit directory. No
-//! installer lives here yet: the Syslinux / GRUB2 / GRUB4DOS installers
-//! land in later slices.
+//! [`load_from`] is the testable core over an explicit directory. The
+//! Syslinux installer lives next to the family decision (see
+//! [`syslinux::install_loader`]); the GRUB2 / GRUB4DOS installers land
+//! in later slices.
 //!
 //! [`syslinux`] decides the embedded Syslinux family from a detected
 //! version or the `ldlinux.c32` presence and locates the payload

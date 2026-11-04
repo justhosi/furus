@@ -512,6 +512,30 @@ impl Fat32 {
     }
 
     // ------------------------------------------------------------------
+    // Boot code
+    // ------------------------------------------------------------------
+
+    /// Graft a Syslinux VBR's boot code onto this volume's boot sector.
+    ///
+    /// Reads sector 0 and writes the 512 grafted bytes back at offset 0
+    /// ([`bpb::graft_boot_code`]): the VBR's `0..11` jump/OEM entry, the
+    /// volume's own `11..90` BPB/EBPB geometry, the VBR's `90..510` boot
+    /// code and the volume's `510..512` `0x55AA` signature. Refuses a VBR
+    /// shorter than a sector, naming both lengths. The FAT32 backup boot
+    /// sector in the reserved area is deliberately not rewritten (it
+    /// keeps the formatter's image; a later slice owns the backup
+    /// policy). The caller is responsible for the payload being a real
+    /// Syslinux VBR: this moves bytes, it never checks them. Does not
+    /// flush: the caller flushes after its last write.
+    pub fn write_boot_code(&mut self, vbr: &[u8]) -> Result<()> {
+        let mut current = [0u8; bpb::BOOT_SECTOR_BYTES];
+        self.volume.read_exact_at(0, &mut current)?;
+        let grafted = bpb::graft_boot_code(&current, vbr)?;
+        self.volume.write_all_at(0, &grafted)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Creation: mkdir / create_file / link_file
     // ------------------------------------------------------------------
 
