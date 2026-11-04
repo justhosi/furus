@@ -685,6 +685,7 @@ mod tests {
             &super::super::CopyOptions {
                 free_bytes: None,
                 replacer: None,
+                fat32_limit: false,
             },
             &mut WarnLog { warns: Vec::new() },
         )
@@ -749,6 +750,7 @@ mod tests {
             &super::super::CopyOptions {
                 free_bytes: None,
                 replacer: None,
+                fat32_limit: false,
             },
             &mut progress,
         )
@@ -789,6 +791,7 @@ mod tests {
             &super::super::CopyOptions {
                 free_bytes: None,
                 replacer: None,
+                fat32_limit: false,
             },
             &mut Sink,
         )
@@ -883,6 +886,7 @@ mod tests {
             &super::super::CopyOptions {
                 free_bytes: None,
                 replacer: None,
+                fat32_limit: false,
             },
             &mut Sink,
         )
@@ -1055,6 +1059,7 @@ mod tests {
             &super::super::CopyOptions {
                 free_bytes: None,
                 replacer: None,
+                fat32_limit: false,
             },
             &mut progress,
         )
@@ -1465,6 +1470,7 @@ mod tests {
             &super::super::CopyOptions {
                 free_bytes: None,
                 replacer: None,
+                fat32_limit: false,
             },
             &mut progress,
         )

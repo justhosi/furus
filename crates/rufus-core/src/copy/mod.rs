@@ -46,6 +46,12 @@
 //!   land like any other entry at their root paths. The ext4
 //!   persistence *partition* itself is S12's formatter, not the
 //!   copier — this module never partitions anything.
+//! * FAT32 pre-flight (this slice): with
+//!   [`CopyOptions::fat32_limit`] set, a file landing larger than 4
+//!   GiB - 1 refuses before anything copies, naming the path, the
+//!   size and the limit. The split itself is S21 (wimlib): until
+//!   then such an image cannot land on FAT32, and the refusal says
+//!   splitting is required.
 //!
 //! Not here yet: ownership (never applied —
 //! it needs privileges), boot/extended attributes, and any CLI
@@ -75,7 +81,6 @@ pub use source::UdfSource;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -94,6 +99,29 @@ const COPY_BUF_LEN: usize = 128 * 1024;
 /// readers' own caps (`MAX_DIR_DEPTH`/`MAX_WALK_DEPTH`, 32 each).
 const MAX_COPY_DEPTH: usize = 64;
 
+/// Largest file a FAT32 filesystem holds: 4 GiB - 1. Rufus refuses a
+/// larger file before copying anything when the caller sets
+/// [`CopyOptions::fat32_limit`] (the split itself is S21's wimlib —
+/// until then such an image cannot land on FAT32, and this refusal
+/// says so).
+const FAT32_MAX_FILE: u64 = 0xFFFF_FFFF;
+
+/// Refuse a file larger than [`FAT32_MAX_FILE`], naming the source
+/// path, the file's size and the limit: FAT32 cannot hold it, and
+/// only splitting the image (S21) can change that. A file exactly at
+/// the limit passes. `subject` is the grammar for the size — `"it"`
+/// for a file, `"its target"` for a dereferenced link (whose own
+/// size is 0).
+fn check_fat32_size(display: &str, size: u64, subject: &str) -> Result<()> {
+    if size > FAT32_MAX_FILE {
+        return Err(CoreError::invalid(format!(
+            "copy refuses '{display}': {subject} is {size} bytes, past the FAT32 file limit of \
+             {FAT32_MAX_FILE} bytes (4 GiB - 1): splitting the image is required"
+        )));
+    }
+    Ok(())
+}
+
 /// Copy options: capacity plus the bootloader replacement seam.
 /// Later slices add knobs here (filters, symlink policy, metadata
 /// handling) without touching [`walk`]'s signature shape.
@@ -104,12 +132,15 @@ pub struct CopyOptions<'a> {
     /// refuses before any write when the tree's declared total exceeds
     /// it.
     pub free_bytes: Option<u64>,
-    /// Obsolete-bootloader replacer (the S19 seam): consulted for
-    /// every regular file before its bytes move. `None` copies every
-    /// file verbatim. Must be deterministic — the sizing pass and the
-    /// copy pass each call it once per file, and the two calls must
-    /// agree.
+    /// Obsolete-bootloader replacer (the S19 seam): consulted once
+    /// per regular file, in the sizing pass, whose answers the copy
+    /// reuses. `None` copies every file verbatim.
     pub replacer: Option<&'a dyn Replacer>,
+    /// FAT32 file-size limit: when true, any file landing larger than
+    /// 4 GiB - 1 refuses up front (see [`FAT32_MAX_FILE`]). The caller
+    /// knows the destination filesystem; this copier does not probe
+    /// it — set this when the target is FAT32.
+    pub fat32_limit: bool,
 }
 
 impl<'a> Clone for CopyOptions<'a> {
@@ -126,6 +157,7 @@ impl<'a> std::fmt::Debug for CopyOptions<'a> {
             .debug_struct("CopyOptions")
             .field("free_bytes", &self.free_bytes)
             .field("replacer", &self.replacer.is_some())
+            .field("fat32_limit", &self.fat32_limit)
             .finish()
     }
 }
@@ -148,9 +180,11 @@ pub struct Replacement {
 /// (`source_path`, `/`-joined source name bytes relative to the
 /// source root — empty at the root) and its source file name,
 /// return the payload to write instead of the source data, or `None`
-/// to copy the file verbatim. Never consulted for directories or
-/// symlinks — not even dereferenced ones, which read their target's
-/// source bytes — and never for anything but a direct tree entry.
+/// to copy the file verbatim. Consulted once per file, in the sizing
+/// pass; the copy reuses the collected answers. Never consulted for
+/// directories or symlinks — not even dereferenced ones, which read
+/// their target's source bytes — and never for anything but a direct
+/// tree entry.
 pub trait Replacer {
     /// The replacement for one file, or `None` to copy it verbatim.
     fn replacement(&self, source_path: &[u8], name: &[u8]) -> Option<Replacement>;
@@ -185,8 +219,8 @@ pub struct Summary {
 
 /// Progress sink for [`walk`]: `done_bytes` of `total_bytes` copied
 /// so far. Called once up front with `(0, total)`, after every file
-/// chunk, and once at completion — a consumer can always tell "done
-/// instantly" from "never reported".
+/// chunk (a short write reports mid-chunk), and once at completion —
+/// a consumer can always tell "done instantly" from "never reported".
 pub trait Progress {
     /// Report progress: `done_bytes` of `total_bytes` copied so far.
     fn report(&mut self, done_bytes: u64, total_bytes: u64);
@@ -241,10 +275,14 @@ pub trait Progress {
 /// Order of checks: the destination must exist as a directory, then
 /// the tree's declared total is summed (a second traversal — sources
 /// are cheap listings, and the total must be known before any write),
-/// then the capacity check, then the copy. An I/O error mid-copy
-/// surfaces as [`CoreError::io`](crate::error::CoreError::io) naming
-/// the path, and whatever landed before it stays (a copy is not a
-/// transaction); cancellation arrives in a later slice.
+/// then the capacity check, then the copy. The sizing pass keeps one
+/// stored-name entry per file and directory for the whole tree, which
+/// recreated links rewrite through. A read or open failure surfaces
+/// as [`CoreError::io`](crate::error::CoreError::io) naming the path;
+/// a write failure surfaces as [`CoreError::io`] too and removes the
+/// partial file it was writing, while entries already written stay (a
+/// copy is still not a transaction); cancellation arrives in a later
+/// slice.
 pub fn walk(
     source: &dyn Source,
     dest: &Path,
@@ -252,11 +290,12 @@ pub fn walk(
     progress: &mut dyn Progress,
 ) -> Result<Summary> {
     let dest = DestDir::open(dest)?;
-    let (total, maps) = total_bytes(source, options.replacer)?;
+    let sizing = total_bytes(source, options.replacer, options.fat32_limit)?;
     match options.free_bytes {
-        Some(free) if total > free => {
+        Some(free) if sizing.total > free => {
             return Err(CoreError::invalid(format!(
-                "copy needs {total} bytes but the destination reports {free} free: refusing before any write"
+                "copy needs {} bytes but the destination reports {free} free: refusing before any write",
+                sizing.total,
             )));
         }
         _ => {}
@@ -272,13 +311,13 @@ pub fn walk(
             renamed: 0,
         },
         done: 0,
-        total,
+        total: sizing.total,
         progress,
         taken: HashSet::new(),
-        maps,
-        replacer: options.replacer,
+        maps: sizing.maps,
+        replacements: sizing.replacements,
     };
-    copier.progress.report(0, total);
+    copier.progress.report(0, copier.total);
     let mut rel = Vec::new();
     let mut abs = copier.dest.root().to_path_buf();
     copier.copy_dir(&mut rel, &mut abs, 0)?;
@@ -829,6 +868,26 @@ fn rewrite_link_target(maps: &NameMaps, base: &[Vec<u8>], target: &[u8]) -> Vec<
 /// same names the copy pass assigns — including collision suffixes.
 type NameMaps = BTreeMap<Vec<Vec<u8>>, BTreeMap<Vec<u8>, Vec<u8>>>;
 
+/// Replacement payloads keyed by directory path plus file name: the
+/// sizing pass consults the [`Replacer`] once per file and hands the
+/// answers to the copy, which reuses them instead of asking again —
+/// so a replacer that would answer differently on a second call
+/// cannot make the free-space check lie.
+type ReplacementMap = BTreeMap<Vec<Vec<u8>>, BTreeMap<Vec<u8>, Replacement>>;
+
+/// What the sizing pass hands the copy: the byte total plus the two
+/// whole-tree maps — stored names for link rewrites, replacement
+/// payloads for the S19 seam. One traversal builds all three, so the
+/// passes cannot disagree.
+struct Sizing {
+    /// File payload bytes the copy will write.
+    total: u64,
+    /// Source-to-stored name maps, one per directory.
+    maps: NameMaps,
+    /// Replacement payloads, keyed by directory path plus file name.
+    replacements: ReplacementMap,
+}
+
 /// Assign the destination name for one sanitised component in a
 /// directory whose taken names are `taken`: first-come keeps its name
 /// (entries arrive byte-sorted, so this is deterministic); a taken
@@ -910,9 +969,10 @@ struct Copier<'a> {
     /// by the sizing pass: recreated links rewrite through them so a
     /// link to a collision-renamed file points at the renamed file.
     maps: NameMaps,
-    /// Obsolete-bootloader replacer, consulted for every regular file
-    /// before its bytes move (never for directories or symlinks).
-    replacer: Option<&'a dyn Replacer>,
+    /// Replacement payloads for the whole tree, collected up front
+    /// by the sizing pass: the copy reuses them instead of consulting
+    /// the [`Replacer`] again, so the free-space check cannot lie.
+    replacements: ReplacementMap,
 }
 
 /// What placing one name decided: the destination name plus the
@@ -949,15 +1009,33 @@ impl Copier<'_> {
     /// Write a replacement payload (see [`Replacer`]) into the
     /// already-open `file` at destination `abs`, in buffer-sized
     /// windows so progress counts exactly like a streamed file.
-    fn stream_slice(&mut self, abs: &Path, payload: &[u8], file: &mut std::fs::File) -> Result<()> {
+    /// `src` is the file's source path (name bytes from the root),
+    /// for error messages only. A write error removes the partial
+    /// file first (see `cleanup_partial` below).
+    fn stream_slice(
+        &mut self,
+        abs: &Path,
+        src: &[Vec<u8>],
+        payload: &[u8],
+        file: &mut dyn std::io::Write,
+    ) -> Result<()> {
         let width = self.buf.len();
+        let mut meter = Meter {
+            done: &mut self.done,
+            total: self.total,
+            progress: &mut *self.progress,
+        };
+        let mut written = 0u64;
         for window in payload.chunks(width.max(1)) {
-            file.write_all(window)
-                .map_err(|error| CoreError::io(abs, error))?;
-            self.done = self.done.checked_add(window.len() as u64).ok_or_else(|| {
-                CoreError::invalid("copy byte count overflows the counter".to_string())
-            })?;
-            self.progress.report(self.done, self.total);
+            written = write_window(
+                &mut meter,
+                abs,
+                src,
+                payload.len() as u64,
+                written,
+                window,
+                file,
+            )?;
         }
         Ok(())
     }
@@ -967,8 +1045,13 @@ impl Copier<'_> {
         abs: &Path,
         src: &[Vec<u8>],
         size: u64,
-        file: &mut std::fs::File,
+        file: &mut dyn std::io::Write,
     ) -> Result<()> {
+        let mut meter = Meter {
+            done: &mut self.done,
+            total: self.total,
+            progress: &mut *self.progress,
+        };
         let mut offset = 0u64;
         while offset < size {
             let placed = self.source.read_bytes(src, offset, &mut self.buf)?;
@@ -984,18 +1067,7 @@ impl Copier<'_> {
                     self.buf.len()
                 ))
             })?;
-            file.write_all(window)
-                .map_err(|error| CoreError::io(abs, error))?;
-            offset = offset.checked_add(placed as u64).ok_or_else(|| {
-                CoreError::invalid(format!(
-                    "copy offset of '{}' overflows past {size} bytes",
-                    abs.display(),
-                ))
-            })?;
-            self.done = self.done.checked_add(placed as u64).ok_or_else(|| {
-                CoreError::invalid("copy byte count overflows the counter".to_string())
-            })?;
-            self.progress.report(self.done, self.total);
+            offset = write_window(&mut meter, abs, src, size, offset, window, file)?;
         }
         Ok(())
     }
@@ -1139,23 +1211,28 @@ impl Copier<'_> {
                     ));
                 }
             } else {
-                // Regular files consult the replacer first (the S19
-                // seam — never directories or symlinks): a payload
-                // lands under the destination name instead of the
-                // source data, with exactly one `Will replace
+                // Regular files reuse the sizing pass's replacement
+                // (the S19 seam — never directories or symlinks): a
+                // payload lands under the destination name instead of
+                // the source data, with exactly one `Will replace
                 // obsolete` warning naming the source path.
                 let parent: &[Vec<u8>] = match rel.split_last() {
                     Some((_, parent)) => parent,
                     None => &[],
                 };
-                let dir_path = replacer_dir_path(parent);
+                // The payload clones out of the map: peak memory is
+                // the map plus one payload (S19's bootloader payloads
+                // are small), and borrowing it would need splitting
+                // `self` around the streaming calls below.
                 let replacement = self
-                    .replacer
-                    .and_then(|known| known.replacement(&dir_path, &child.name));
+                    .replacements
+                    .get(parent)
+                    .and_then(|dir| dir.get(&child.name))
+                    .cloned();
                 if let Some(payload) = replacement {
                     let size = payload.bytes.len() as u64;
                     let mut file = self.dest.replace_file(abs)?;
-                    self.stream_slice(abs, &payload.bytes, &mut file)?;
+                    self.stream_slice(abs, rel, &payload.bytes, &mut file)?;
                     self.summary.files = self.summary.files.checked_add(1).ok_or_else(|| {
                         CoreError::invalid("copy file count overflows the counter".to_string())
                     })?;
@@ -1214,6 +1291,106 @@ impl Copier<'_> {
     }
 }
 
+/// Split borrow of the walk's counters for the streaming helpers:
+/// one write loop serves both file bytes and replacement payloads
+/// without borrowing all of [`Copier`] at once (the read buffer stays
+/// with the copier while the counters move here).
+struct Meter<'p> {
+    /// Bytes written so far, across every file.
+    done: &'p mut u64,
+    /// Byte total the sizing pass measured.
+    total: u64,
+    /// Progress sink.
+    progress: &'p mut dyn Progress,
+}
+
+/// Write one `window` of the file at `abs` (source path `src`, `size`
+/// bytes in all, `offset` already written): loops `write` to the end
+/// of the window so the returned offset counts every byte the
+/// destination holds — even when a later write fails halfway. A zero
+/// write refuses as invalid input (an impossible writer, not a device
+/// error); a failed write removes the partial file first (see
+/// `cleanup_partial`), then refuses as an I/O error naming the source
+/// path, the destination path, the bytes written and the original
+/// error text.
+fn write_window(
+    meter: &mut Meter<'_>,
+    abs: &Path,
+    src: &[Vec<u8>],
+    size: u64,
+    mut offset: u64,
+    window: &[u8],
+    file: &mut dyn std::io::Write,
+) -> Result<u64> {
+    let mut wrote = 0usize;
+    while wrote < window.len() {
+        let step = window.get(wrote..).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "copy window of {} bytes runs past its {} written bytes",
+                window.len(),
+                wrote,
+            ))
+        })?;
+        match file.write(step) {
+            Ok(0) => {
+                return Err(CoreError::invalid(format!(
+                    "copy of '{}' from '{}' stalls at {offset} of {size} bytes: \
+                     refusing a write that makes no progress",
+                    abs.display(),
+                    display_path(src),
+                )));
+            }
+            Ok(step) => {
+                wrote = wrote.saturating_add(step);
+                offset = offset.checked_add(step as u64).ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "copy offset of '{}' overflows past {size} bytes",
+                        abs.display(),
+                    ))
+                })?;
+                *meter.done = meter.done.checked_add(step as u64).ok_or_else(|| {
+                    CoreError::invalid("copy byte count overflows the counter".to_string())
+                })?;
+                meter.progress.report(*meter.done, meter.total);
+            }
+            Err(error) => {
+                cleanup_partial(meter.progress, abs, offset, &error);
+                return Err(CoreError::io(
+                    abs,
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "copy of '{}' from '{}' failed at {offset} of {size} bytes: {error}",
+                            abs.display(),
+                            display_path(src),
+                        ),
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(offset)
+}
+
+/// Remove the partial destination file at `abs` after a failed write
+/// of `written` bytes: on `StorageFull`, or on any write error once
+/// bytes landed. A first-write failure with nothing written leaves
+/// the empty file the caller created — there is no partial content
+/// to clean. Best-effort: a removal failure warns instead of masking
+/// the original error.
+fn cleanup_partial(progress: &mut dyn Progress, abs: &Path, written: u64, error: &std::io::Error) {
+    let full = error.kind() == std::io::ErrorKind::StorageFull;
+    if !full && written == 0 {
+        return;
+    }
+    if let Err(remove) = std::fs::remove_file(abs) {
+        progress.warn(&format!(
+            "copy cannot remove partial '{}' after a failed write: {remove}; continuing",
+            abs.display(),
+        ));
+    }
+}
+
 /// Sum every file size in the tree: the up-front total the capacity
 /// check and the progress meter need before any write — alongside the
 /// whole tree's source-to-stored name maps, which recreated links
@@ -1223,13 +1400,19 @@ impl Copier<'_> {
 /// they store under. Replacement payloads (see [`Replacer`]) count
 /// by their own length here — the same consultation the copy pass
 /// runs, so the free-space check measures what will actually land.
-fn total_bytes(source: &dyn Source, replacer: Option<&dyn Replacer>) -> Result<(u64, NameMaps)> {
+fn total_bytes(
+    source: &dyn Source,
+    replacer: Option<&dyn Replacer>,
+    fat32_limit: bool,
+) -> Result<Sizing> {
     fn sum(
         source: &dyn Source,
         dir: &mut Vec<Vec<u8>>,
         depth: usize,
         maps: &mut NameMaps,
+        replacements: &mut ReplacementMap,
         replacer: Option<&dyn Replacer>,
+        fat32_limit: bool,
     ) -> Result<u64> {
         check_depth(dir, depth)?;
         let mut taken = HashSet::new();
@@ -1253,10 +1436,18 @@ fn total_bytes(source: &dyn Source, replacer: Option<&dyn Replacer>) -> Result<(
                 // strictly-inside target costs nothing (recreated as a
                 // link), a dereferenced one costs its file's size, and
                 // a dangling one costs nothing (warned and skipped).
+                // A dereferenced landing is a regular file, so the
+                // FAT32 limit watches its size too — naming the link
+                // being placed, whose target holds the bytes.
                 if strict_link_inside(source, dir, target) {
                     continue;
                 }
                 if let Some((_, size)) = dereference_file(source, dir, target) {
+                    if fat32_limit {
+                        let mut landed = dir.clone();
+                        landed.push(child.name.clone());
+                        check_fat32_size(&display_path(&landed), size, "its target")?;
+                    }
                     total = total.checked_add(size).ok_or_else(|| {
                         CoreError::invalid("copy total overflows the byte arithmetic".to_string())
                     })?;
@@ -1265,7 +1456,15 @@ fn total_bytes(source: &dyn Source, replacer: Option<&dyn Replacer>) -> Result<(
             }
             if child.is_dir {
                 dir.push(child.name.clone());
-                let sub = sum(source, dir, depth.saturating_add(1), maps, replacer)?;
+                let sub = sum(
+                    source,
+                    dir,
+                    depth.saturating_add(1),
+                    maps,
+                    replacements,
+                    replacer,
+                    fat32_limit,
+                )?;
                 dir.pop().ok_or_else(|| {
                     CoreError::invalid("copy path stack underflows its push".to_string())
                 })?;
@@ -1274,14 +1473,27 @@ fn total_bytes(source: &dyn Source, replacer: Option<&dyn Replacer>) -> Result<(
                 })?;
             } else {
                 // Regular files count their replacement's length when
-                // the replacer claims them — the same consultation the
-                // copy pass runs, so the check stays honest.
+                // the replacer claims them — the payload is stored
+                // for the copy pass to reuse, so the check measures
+                // what will actually land.
                 let dir_path = replacer_dir_path(dir);
                 let size =
                     match replacer.and_then(|known| known.replacement(&dir_path, &child.name)) {
-                        Some(replacement) => replacement.bytes.len() as u64,
+                        Some(replacement) => {
+                            let size = replacement.bytes.len() as u64;
+                            replacements
+                                .entry(dir.clone())
+                                .or_default()
+                                .insert(child.name.clone(), replacement);
+                            size
+                        }
                         None => child.size,
                     };
+                if fat32_limit {
+                    let mut landed = dir.clone();
+                    landed.push(child.name.clone());
+                    check_fat32_size(&display_path(&landed), size, "it")?;
+                }
                 total = total.checked_add(size).ok_or_else(|| {
                     CoreError::invalid("copy total overflows the byte arithmetic".to_string())
                 })?;
@@ -1291,8 +1503,21 @@ fn total_bytes(source: &dyn Source, replacer: Option<&dyn Replacer>) -> Result<(
     }
 
     let mut maps: NameMaps = BTreeMap::new();
-    let total = sum(source, &mut Vec::new(), 0, &mut maps, replacer)?;
-    Ok((total, maps))
+    let mut stored_replacements: ReplacementMap = BTreeMap::new();
+    let total = sum(
+        source,
+        &mut Vec::new(),
+        0,
+        &mut maps,
+        &mut stored_replacements,
+        replacer,
+        fat32_limit,
+    )?;
+    Ok(Sizing {
+        total,
+        maps,
+        replacements: stored_replacements,
+    })
 }
 
 #[cfg(test)]
@@ -1342,6 +1567,10 @@ mod tests {
         /// Per-path mode overrides, keyed by full path from the root;
         /// entries without one keep the fixed defaults below.
         modes: BTreeMap<Vec<Vec<u8>>, u32>,
+        /// Per-path file-size overrides, keyed by full path: files
+        /// without one size from their payload. Lets tests declare
+        /// huge files (like the FAT32 limit) no fixture could hold.
+        sizes: BTreeMap<Vec<Vec<u8>>, u64>,
     }
 
     impl MemSource {
@@ -1354,6 +1583,12 @@ mod tests {
             let mut full = dir.to_vec();
             full.push(name.to_vec());
             full
+        }
+
+        /// Override size for the file at `full_path`, if the fixture
+        /// pins one.
+        fn size_for(sizes: &BTreeMap<Vec<Vec<u8>>, u64>, full_path: &[Vec<u8>]) -> Option<u64> {
+            sizes.get(full_path).copied()
         }
 
         /// Override mode for the entry at `full_path`, if the fixture
@@ -1384,7 +1619,7 @@ mod tests {
                 out.push(Entry {
                     name: file.name.clone(),
                     is_dir: false,
-                    size: file.bytes.len() as u64,
+                    size: Self::size_for(&self.sizes, &full).unwrap_or(file.bytes.len() as u64),
                     // Synthetic sources carry a fixed mode (like a
                     // real listing would), so the walk exercises the
                     // metadata path on every entry; stamps stay
@@ -1480,6 +1715,7 @@ mod tests {
         CopyOptions {
             free_bytes: None,
             replacer: None,
+            fat32_limit: false,
         }
     }
 
@@ -1587,6 +1823,7 @@ mod tests {
             &CopyOptions {
                 free_bytes: Some(12),
                 replacer: None,
+                fat32_limit: false,
             },
             &mut progress,
         )
@@ -2565,6 +2802,7 @@ mod tests {
             &CopyOptions {
                 free_bytes: Some(17),
                 replacer: None,
+                fat32_limit: false,
             },
             &mut progress,
         )
@@ -2649,6 +2887,141 @@ mod tests {
         }
     }
 
+    /// A [`Replacer`](super::Replacer) answering differently every
+    /// call: the copy must still write the sized (first) payload,
+    /// because it reuses the sizing pass's answer instead of asking
+    /// again.
+    struct FlipFlop {
+        calls: RefCell<u32>,
+    }
+
+    impl super::Replacer for FlipFlop {
+        fn replacement(&self, _source_path: &[u8], _name: &[u8]) -> Option<super::Replacement> {
+            let mut calls = self.calls.borrow_mut();
+            *calls = calls.saturating_add(1);
+            if *calls == 1 {
+                Some(super::Replacement {
+                    bytes: vec![7u8; 64],
+                    mode: None,
+                })
+            } else {
+                Some(super::Replacement {
+                    bytes: vec![9u8; 1],
+                    mode: None,
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn sized_payload_wins_over_a_second_answer() {
+        // F's source is 10 bytes; the replacer's first answer is 64
+        // bytes, its second a single byte. The copy writes the 64
+        // sized bytes — and consults the trait exactly once, in
+        // sizing — so a divergent second answer cannot move the
+        // check or the bytes.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"F".to_vec(),
+            bytes: b"0123456789".to_vec(),
+        });
+        let flip = FlipFlop {
+            calls: RefCell::new(0),
+        };
+        let options = CopyOptions {
+            free_bytes: None,
+            replacer: Some(&flip),
+            fat32_limit: false,
+        };
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &options, &mut progress).expect("a replaced file copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 1,
+                bytes: 64,
+                renamed: 0,
+            }
+        );
+        assert_eq!(
+            progress.warns,
+            ["Will replace obsolete 'F'".to_string()],
+            "exactly one replacement warning"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("F")).expect("the sized payload reads back"),
+            vec![7u8; 64]
+        );
+        assert_eq!(
+            flip.calls.borrow().clone(),
+            1,
+            "the trait answers once, in sizing"
+        );
+    }
+
+    #[test]
+    fn fat32_limit_refuses_over_before_any_write() {
+        // A file declared one byte past 4 GiB - 1 (no fixture could
+        // hold it — the size override stands in) refuses before any
+        // write when the limit is set: the message names the source
+        // path, the size and the limit, and says splitting is
+        // required. Without the limit the sizing passes untouched.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"BIG".to_vec(),
+            bytes: b"tiny".to_vec(),
+        });
+        source.sizes.insert(vec![b"BIG".to_vec()], 0xFFFF_FFFF + 1);
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let error = walk(
+            &source,
+            scratch.path(),
+            &CopyOptions {
+                free_bytes: None,
+                replacer: None,
+                fat32_limit: true,
+            },
+            &mut progress,
+        )
+        .expect_err("one past the FAT32 limit refuses");
+        let text = error.to_string();
+        assert!(text.contains("BIG"), "{text}");
+        assert!(text.contains("4294967296"), "{text}");
+        assert!(text.contains("4294967295"), "{text}");
+        assert!(text.contains("splitting"), "{text}");
+        assert_eq!(
+            std::fs::read_dir(scratch.path())
+                .expect("the destination lists")
+                .count(),
+            0,
+            "no entry lands before the refusal"
+        );
+        assert!(progress.reports.is_empty(), "nothing reported");
+    }
+
+    #[test]
+    fn fat32_limit_accepts_the_exact_limit() {
+        // The boundary itself, pinned without writing 4 GiB anywhere:
+        // the helper accepts the limit and refuses one past it, and
+        // the sizing pass totals a file declared exactly at it.
+        assert!(check_fat32_size("F", 0xFFFF_FFFF - 1, "it").is_ok());
+        assert!(check_fat32_size("F", 0xFFFF_FFFF, "it").is_ok());
+        let error = check_fat32_size("F", 0xFFFF_FFFF + 1, "it").expect_err("one past refuses");
+        assert!(error.to_string().contains("4294967295"), "{error:?}");
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"EDGE".to_vec(),
+            bytes: b"tiny".to_vec(),
+        });
+        source.sizes.insert(vec![b"EDGE".to_vec()], 0xFFFF_FFFF);
+        let sizing = total_bytes(&source, None, true).expect("the exact limit sizes");
+        assert_eq!(sizing.total, 0xFFFF_FFFF);
+    }
+
     #[test]
     fn replacer_swaps_one_files_bytes_and_size() {
         // OLD.BIN (4 bytes) is swapped for a 19-byte payload with its
@@ -2673,6 +3046,7 @@ mod tests {
         let options = CopyOptions {
             free_bytes: None,
             replacer: Some(&swap),
+            fat32_limit: false,
         };
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let control = scratch.path().join("control");
@@ -2734,6 +3108,7 @@ mod tests {
             &CopyOptions {
                 free_bytes: Some(8),
                 replacer: Some(&swap),
+                fat32_limit: false,
             },
             &mut progress,
         )
@@ -2752,6 +3127,7 @@ mod tests {
         let options = CopyOptions {
             free_bytes: None,
             replacer: Some(&super::NoReplacements),
+            fat32_limit: false,
         };
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
@@ -2823,6 +3199,7 @@ mod tests {
         let options = CopyOptions {
             free_bytes: None,
             replacer: Some(&greedy),
+            fat32_limit: false,
         };
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
@@ -2842,11 +3219,9 @@ mod tests {
             [
                 (b"SUB".to_vec(), b"F".to_vec()),
                 (b"".to_vec(), b"TOP".to_vec()),
-                (b"SUB".to_vec(), b"F".to_vec()),
-                (b"".to_vec(), b"TOP".to_vec()),
             ],
-            "only the two files are consulted, with dir path and name — \
-             once in sizing, once in copy"
+            "only the two files are consulted, with dir path and name, \
+             once in sizing and never again in copy"
         );
         assert_eq!(
             progress.warns,
@@ -2921,5 +3296,253 @@ mod tests {
                 .expect("the nested copy reads"),
             b"nested\n"
         );
+    }
+
+    /// A [`Write`](std::io::Write) double failing writes on demand:
+    /// the first `succeed` bytes pass through (counted, discarded),
+    /// then every write fails with `kind` and `what`.
+    struct FailAfter {
+        succeed: usize,
+        kind: std::io::ErrorKind,
+        what: &'static str,
+    }
+
+    /// A [`Write`](std::io::Write) double that accepts nothing: every
+    /// write returns `Ok(0)`, the impossible writer the copy must
+    /// refuse instead of spinning on.
+    struct StallWriter;
+
+    impl std::io::Write for StallWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl std::io::Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.succeed == 0 {
+                return Err(std::io::Error::new(self.kind, self.what));
+            }
+            let take = buf.len().min(self.succeed);
+            self.succeed -= take;
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One [`Copier`] over `source` writing under `dest`, for
+    /// exercising the streaming helpers below walk level: a
+    /// destination double stands in for the open file.
+    fn test_copier<'a>(
+        source: &'a MemSource,
+        dest: DestDir,
+        progress: &'a mut Recorder,
+    ) -> Copier<'a> {
+        Copier {
+            source,
+            dest,
+            buf: vec![0u8; COPY_BUF_LEN],
+            summary: Summary {
+                directories: 0,
+                files: 0,
+                bytes: 0,
+                renamed: 0,
+            },
+            done: 0,
+            total: 300,
+            progress,
+            taken: HashSet::new(),
+            maps: BTreeMap::new(),
+            replacements: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn storage_full_mid_file_removes_the_partial() {
+        // B's 300 bytes stream through a writer failing StorageFull
+        // after 100: the error (not a summary) names the source path,
+        // the destination path, the 100 written bytes and the original
+        // text; B's partial file is gone; A, completed earlier, stays
+        // intact with its bytes.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"B".to_vec(),
+            bytes: vec![1u8; 300],
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        std::fs::write(scratch.path().join("A"), b"done").expect("A completes first");
+        let dest_file = scratch.path().join("B");
+        std::fs::write(&dest_file, b"").expect("B is created empty, like replace_file");
+        let dest = DestDir::open(scratch.path()).expect("the destination opens");
+        let mut progress = Recorder::default();
+        let mut copier = test_copier(&source, dest, &mut progress);
+        let mut failer = FailAfter {
+            succeed: 100,
+            kind: std::io::ErrorKind::StorageFull,
+            what: "test disk is full",
+        };
+        let error = copier
+            .stream_from(&dest_file, &[b"B".to_vec()], 300, &mut failer)
+            .expect_err("a full disk fails the stream");
+        assert!(
+            matches!(error, CoreError::Io { .. }),
+            "a device failure is I/O, not invalid input: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains('B'), "{text}");
+        assert!(text.contains("100"), "{text}");
+        assert!(text.contains("300"), "{text}");
+        assert!(text.contains("test disk is full"), "{text}");
+        assert!(
+            text.contains(&dest_file.display().to_string()),
+            "the destination path is named: {text}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&dest_file).is_err(),
+            "the partial file is gone"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("A")).expect("A reads back"),
+            b"done",
+            "completed files stay intact"
+        );
+    }
+
+    #[test]
+    fn first_write_failure_without_progress_keeps_the_empty_file() {
+        // A non-full error on the very first write (nothing landed)
+        // still fails the stream, but leaves the empty file the
+        // caller created — there is no partial content to clean.
+        // StorageFull on the first write still removes it.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"B".to_vec(),
+            bytes: vec![1u8; 10],
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let dest = DestDir::open(scratch.path()).expect("the destination opens");
+        let mut progress = Recorder::default();
+        let mut copier = test_copier(&source, dest, &mut progress);
+        let kept = scratch.path().join("KEPT");
+        std::fs::write(&kept, b"").expect("the empty file is created");
+        let mut failer = FailAfter {
+            succeed: 0,
+            kind: std::io::ErrorKind::Other,
+            what: "test write refused",
+        };
+        let error = copier
+            .stream_from(&kept, &[b"B".to_vec()], 10, &mut failer)
+            .expect_err("a refused write fails the stream");
+        assert!(
+            matches!(error, CoreError::Io { .. }),
+            "a device failure is I/O, not invalid input: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("test write refused"),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&kept).expect("the empty file stays"),
+            b"",
+            "nothing landed, nothing removed"
+        );
+        let gone = scratch.path().join("GONE");
+        std::fs::write(&gone, b"").expect("the empty file is created");
+        let mut fuller = FailAfter {
+            succeed: 0,
+            kind: std::io::ErrorKind::StorageFull,
+            what: "test disk is full",
+        };
+        copier
+            .stream_from(&gone, &[b"B".to_vec()], 10, &mut fuller)
+            .expect_err("a full disk fails the stream");
+        assert!(
+            std::fs::symlink_metadata(&gone).is_err(),
+            "StorageFull removes even the empty file"
+        );
+    }
+
+    #[test]
+    fn failed_removal_warns_without_masking() {
+        // The partial path is really a directory, so removing it
+        // fails: the warning records that, and the returned error is
+        // still the write failure, not the removal one.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"B".to_vec(),
+            bytes: vec![1u8; 10],
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let no_file = scratch.path().join("SUB");
+        std::fs::create_dir(&no_file).expect("a directory stands in for the file");
+        let dest = DestDir::open(scratch.path()).expect("the destination opens");
+        let mut progress = Recorder::default();
+        let mut copier = test_copier(&source, dest, &mut progress);
+        let mut failer = FailAfter {
+            succeed: 0,
+            kind: std::io::ErrorKind::StorageFull,
+            what: "test disk is full",
+        };
+        let error = copier
+            .stream_from(&no_file, &[b"B".to_vec()], 10, &mut failer)
+            .expect_err("a full disk fails the stream");
+        assert!(
+            matches!(error, CoreError::Io { .. }),
+            "a device failure is I/O, not invalid input: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("test disk is full"), "{text}");
+        assert!(
+            !text.contains("cannot remove partial"),
+            "the removal failure must not mask the write error: {text}"
+        );
+        assert_eq!(
+            progress.warns.len(),
+            1,
+            "exactly one removal warning: {:?}",
+            progress.warns
+        );
+        assert!(
+            progress.warns[0].contains("cannot remove partial"),
+            "{}",
+            progress.warns[0]
+        );
+        assert!(no_file.is_dir(), "the directory itself is untouched");
+    }
+
+    #[test]
+    fn zero_write_refuses_instead_of_spinning() {
+        // A writer returning `Ok(0)` forever would spin a naive loop:
+        // the copy refuses at the first no-progress write instead.
+        // The stall is an impossible writer, not a device error, so
+        // the class stays invalid input — and it returns promptly
+        // (no progress is possible, so one call suffices).
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"B".to_vec(),
+            bytes: vec![1u8; 10],
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let stalled = scratch.path().join("STALLED");
+        std::fs::write(&stalled, b"").expect("the empty file is created");
+        let dest = DestDir::open(scratch.path()).expect("the destination opens");
+        let mut progress = Recorder::default();
+        let mut copier = test_copier(&source, dest, &mut progress);
+        let mut staller = StallWriter;
+        let error = copier
+            .stream_from(&stalled, &[b"B".to_vec()], 10, &mut staller)
+            .expect_err("a stalled writer fails the stream");
+        assert!(
+            matches!(error, CoreError::InvalidInput { .. }),
+            "a stall is invalid input, not I/O: {error:?}"
+        );
+        assert!(error.to_string().contains("no progress"), "{error:?}");
     }
 }
