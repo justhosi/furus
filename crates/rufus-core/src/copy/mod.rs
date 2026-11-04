@@ -1,4 +1,4 @@
-//! File-tree copy foundation (S18, slices 1-4 of 7): move an ISO/UDF
+//! File-tree copy foundation (S18, slices 1-7 of 7): move an ISO/UDF
 //! filesystem onto a real directory, exactly as Rufus does — one
 //! directory at a time, deterministic order, progress by bytes,
 //! symlinks recreated or dereferenced.
@@ -2864,6 +2864,214 @@ mod tests {
         assert_eq!(
             std::fs::read_link(&link).expect("the target reads"),
             Path::new("DIR")
+        );
+    }
+
+    #[test]
+    fn symlink_policy_matrix() {
+        // Every link shape in one tree, each asserting the documented
+        // policy: inside links recreate verbatim (including `.` and
+        // `..` navigation and links to links and directories),
+        // escaping-but-resolvable links dereference to files, and
+        // absolute or dangling links warn once and leave nothing.
+        // Only the two unresolvable links warn, in sorted order.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"FILE.TXT".to_vec(),
+            bytes: b"file-bytes".to_vec(),
+        });
+        for (name, target) in [
+            (b"L-INSIDE".to_vec(), b"FILE.TXT".to_vec()),
+            (b"L-ABS".to_vec(), b"/NOPE".to_vec()),
+            (b"L-DANGLING".to_vec(), b"NOPE".to_vec()),
+            (b"L-S9".to_vec(), b"s9/F".to_vec()),
+            (b"C1".to_vec(), b"C2".to_vec()),
+            (b"C2".to_vec(), b"C3".to_vec()),
+            (b"C3".to_vec(), b"FILE.TXT".to_vec()),
+        ] {
+            source.dir(&[]).links.push(MemLink {
+                name,
+                target,
+                is_dir: false,
+            });
+        }
+        source.dir(&[]).dirs.push(b"S9".to_vec());
+        source.dir(&[b"S9".to_vec()]);
+        source.dir(&[]).dirs.push(b"SUB".to_vec());
+        source.dir(&[b"SUB".to_vec()]).files.push(MemFile {
+            name: b"FILE2".to_vec(),
+            bytes: b"sub-bytes".to_vec(),
+        });
+        source.dir(&[b"SUB".to_vec()]).dirs.push(b"DEEP".to_vec());
+        source.dir(&[b"SUB".to_vec(), b"DEEP".to_vec()]);
+        for (name, target) in [
+            (b"L-UP".to_vec(), b"../FILE.TXT".to_vec()),
+            (b"L-DOT".to_vec(), b"./FILE2".to_vec()),
+            (b"L-ESC".to_vec(), b"../../FILE.TXT".to_vec()),
+            (b"L-DIR".to_vec(), b".".to_vec()),
+        ] {
+            source.dir(&[b"SUB".to_vec()]).links.push(MemLink {
+                name,
+                target,
+                is_dir: false,
+            });
+        }
+        source
+            .dir(&[b"SUB".to_vec(), b"DEEP".to_vec()])
+            .links
+            .push(MemLink {
+                name: b"L-DEEP".to_vec(),
+                target: b"../../FILE.TXT".to_vec(),
+                is_dir: false,
+            });
+        source.dir(&[]).dirs.push(b"s9".to_vec());
+        source.dir(&[b"s9".to_vec()]).files.push(MemFile {
+            name: b"F".to_vec(),
+            bytes: b"s9-bytes".to_vec(),
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a link tree copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 4,
+                files: 13,
+                bytes: 37,
+                renamed: 1,
+            }
+        );
+        assert_eq!(
+            progress.warns,
+            [
+                "copy skips link 'L-ABS': its target does not resolve to a file inside \
+                 the image; continuing"
+                    .to_string(),
+                "copy skips link 'L-DANGLING': its target does not resolve to a file inside \
+                 the image; continuing"
+                    .to_string(),
+            ],
+            "only the unresolvable links warn, in sorted order"
+        );
+        let is_link = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .expect("the entry stats")
+                .file_type()
+                .is_symlink()
+        };
+        let root = scratch.path();
+        for (parent, leaf, target) in [
+            ("", "L-INSIDE", "FILE.TXT"),
+            ("SUB", "L-UP", "../FILE.TXT"),
+            ("SUB", "L-DOT", "./FILE2"),
+            ("SUB", "L-DIR", "."),
+            ("SUB/DEEP", "L-DEEP", "../../FILE.TXT"),
+            ("", "L-S9", "s9~1/F"),
+            ("", "C1", "C2"),
+            ("", "C2", "C3"),
+            ("", "C3", "FILE.TXT"),
+        ] {
+            let mut dir = root.to_path_buf();
+            if !parent.is_empty() {
+                dir.push(parent);
+            }
+            let link = dir.join(leaf);
+            assert!(is_link(&link), "{leaf} lands as a link");
+            assert_eq!(
+                std::fs::read_link(&link).expect("the target reads"),
+                Path::new(target),
+                "{leaf} keeps its target text"
+            );
+        }
+        // The escaping link lands as a regular file with the target's
+        // bytes; the absolute and dangling links leave nothing.
+        let escaped = root.join("SUB").join("L-ESC");
+        assert!(
+            !is_link(&escaped),
+            "an escaping link dereferences to a file"
+        );
+        assert_eq!(
+            std::fs::read(&escaped).expect("the dereferenced file reads"),
+            b"file-bytes"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("L-ABS")).is_err(),
+            "an absolute dangling link leaves nothing"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("L-DANGLING")).is_err(),
+            "a dangling link leaves nothing"
+        );
+        // Chains and the renamed-directory link resolve to content.
+        assert_eq!(
+            std::fs::read(root.join("C1")).expect("the chain resolves"),
+            b"file-bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.join("L-S9")).expect("the renamed link resolves"),
+            b"s9-bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.join("FILE.TXT")).expect("the file reads back"),
+            b"file-bytes"
+        );
+    }
+
+    #[test]
+    fn three_way_collision_link_resolves() {
+        // The case-insensitive set with a link to the middle name:
+        // `FILE.TXT` keeps its name, `File.Txt` collides onto
+        // `File~1.Txt`, `file.txt` onto `file~2.txt`, and `LINK`
+        // points at the renamed middle file and resolves to its
+        // bytes — never dangling, never the wrong sibling.
+        let mut source = MemSource::default();
+        for (name, bytes) in [
+            (b"FILE.TXT".to_vec(), b"upper".to_vec()),
+            (b"File.Txt".to_vec(), b"mixed".to_vec()),
+            (b"file.txt".to_vec(), b"lower".to_vec()),
+        ] {
+            source.dir(&[]).files.push(MemFile { name, bytes });
+        }
+        source.dir(&[]).links.push(MemLink {
+            name: b"LINK".to_vec(),
+            target: b"File.Txt".to_vec(),
+            is_dir: false,
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("collisions copy");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 4,
+                bytes: 15,
+                renamed: 2,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "silent collisions warn nothing: {:?}",
+            progress.warns
+        );
+        let link = scratch.path().join("LINK");
+        assert_eq!(
+            std::fs::read_link(&link).expect("the target reads"),
+            Path::new("File~1.Txt")
+        );
+        assert_eq!(
+            std::fs::read(&link).expect("the link resolves to the middle file"),
+            b"mixed"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("FILE.TXT")).expect("first reads back"),
+            b"upper"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("file~2.txt")).expect("third reads back"),
+            b"lower"
         );
     }
 

@@ -103,7 +103,8 @@ write side is the most complete part:
   finalize — with per-event JSON (`--json`) or a throttled progress
   line, Ctrl-C cancellation (exit 6), and typed refusals (exit 7 only
   for the steps no slice implements yet: bootloader installation
-  (S19) and file-tree copy (S18)). `--device-file` runs the same plan
+  (S19); file-tree copy (S18) is implemented and awaits its
+  write-path wiring). `--device-file` runs the same plan
   against a regular file for tests. `rufus plan --verify` records a
   read-back of the whole image against the plan digest, doubling the
   I/O; `rufus plan --badblocks` records a surface scan that runs in

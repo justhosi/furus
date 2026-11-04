@@ -17,7 +17,9 @@
 //! * `write` — validates the plan file (schema version + confirm
 //!   hash) and runs it through the S17 pipeline against the planned
 //!   device, or against the `--device-file` seam in tests; exit 7 only
-//!   for the steps no slice implements yet (bootloader, copy). `write`
+//!   for the steps no slice implements yet (bootloader; the copy
+//!   engine is implemented, its plan and write-path wiring is not).
+//!   `write`
 //!   is the one command whose failure goes to stderr in both modes:
 //!   `--json` streams one `Event` object per stdout line, so the
 //!   failure object (one compact JSON line, same `{"error","message"}`)
@@ -61,7 +63,8 @@ mod plan;
 // ---------------------------------------------------------------------------
 
 /// Exit codes (PLAN §9-S03 table, plus `NotImplemented` for the plan
-/// steps no slice implements yet — bootloader, copy). `UnsupportedImage`
+/// steps no slice implements yet — bootloader, and copy wiring (the
+/// copy engine itself is implemented)). `UnsupportedImage`
 /// has no producer yet (images the executor cannot serve arrive with a
 /// later slice); the contract above is authoritative for callers, hence
 /// the `dead_code` allowance.
@@ -597,7 +600,7 @@ enum Command {
     /// With --plan the file is checked (schema version + confirm hash)
     /// and then run through the S17 pipeline: wipe, table, partition,
     /// format, write, finalize. Mismatches exit 1; steps no slice
-    /// implements yet (bootloader, copy) exit 7. `--device-file` runs
+    /// implements yet (bootloader, and copy wiring) exit 7. `--device-file` runs
     /// the same plan against a regular file instead of the planned
     /// device (a test seam; the planned device is never opened then).
     /// Failures report on stderr in both modes, so `--json` stdout

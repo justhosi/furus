@@ -8,7 +8,8 @@
 //! [`Dd`](rufus_proto::WriteMode::Dd) write path. Two refuse by name:
 //! [`Bootloader`](rufus_proto::Step::Bootloader) (no installer until
 //! S19) and [`Copy`](rufus_proto::WriteMode::Copy) (file-tree copying
-//! arrives in slice 18).
+//! is implemented; its plan and write-path wiring arrives in slice
+//! 19).
 //!
 //! [`step_name`] is the one shared snake_case vocabulary for step
 //! identifiers, so the CLI and the machine cannot drift apart.

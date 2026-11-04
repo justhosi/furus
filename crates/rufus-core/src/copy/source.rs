@@ -398,6 +398,10 @@ mod tests {
         sector[84..88].copy_from_slice(&IMAGE_SECTORS.to_be_bytes());
         sector[128..130].copy_from_slice(&2048u16.to_le_bytes());
         sector[130..132].copy_from_slice(&2048u16.to_be_bytes());
+        // File structure version 1 at byte 881: our reader never
+        // reads it, but third-party extractors (libarchive's ISO
+        // bidder) refuse a primary descriptor without it.
+        sector[881] = 1;
         let root = encode_record(root_extent, root_len, FLAG_DIRECTORY, b"\x00");
         sector[156..156 + root.len()].copy_from_slice(&root);
         sector
@@ -1107,6 +1111,582 @@ mod tests {
             std::path::Path::new("../FILE.TXT")
         );
     }
+    /// An `NM` entry over a plain name (flags 0). Copied pattern
+    /// (see [`susp_entry`]).
+    fn nm_entry(name: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0];
+        payload.extend_from_slice(name);
+        susp_entry(b"NM", &payload)
+    }
+
+    /// The obsolete 4-byte `RR` entry: real images carry one in the
+    /// root dot record, and libarchive's reader refuses a root `.`
+    /// whose system-use area holds only `SP` (nothing left to parse
+    /// past it). Our reader skips `RR` silently, so both sides read
+    /// on with it present.
+    fn rr_entry() -> Vec<u8> {
+        susp_entry(b"RR", &[])
+    }
+
+    /// Minimal path-table sector (little- then big-endian root
+    /// entry): libarchive's primary-descriptor check requires a
+    /// Type-L table location inside the volume. Our reader never
+    /// consults path tables; the sector only satisfies the
+    /// third-party bid. Root record: length byte 1, no extended
+    /// attributes, extent 20, parent 1, one NUL name byte, one pad.
+    fn path_table_sector() -> [u8; SECTOR_BYTES] {
+        let mut sector = [0u8; SECTOR_BYTES];
+        let little = [1u8, 0, 20, 0, 0, 0, 1, 0, 0, 0];
+        let big = [1u8, 0, 0, 0, 0, 20, 0, 1, 0, 0];
+        sector[..10].copy_from_slice(&little);
+        sector[10..20].copy_from_slice(&big);
+        sector
+    }
+
+    /// Whether the host can run the independent extraction below.
+    /// Fully qualified so no import churns; test-only.
+    fn bsdtar_available() -> bool {
+        std::process::Command::new("bsdtar")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Re-open owner traversal under `root` after a bsdtar
+    /// extraction (see the comparison test below): extracted
+    /// directories may land without search permission, which blocks
+    /// `read_dir` beneath them. Files and links are left alone.
+    /// Test-only.
+    fn reopen_traversal(root: &std::path::Path) {
+        let listing = std::fs::read_dir(root).expect("the walked directory lists");
+        for child in listing {
+            let child = child.expect("a directory entry reads");
+            if !child
+                .file_type()
+                .expect("an entry types without following")
+                .is_dir()
+            {
+                continue;
+            }
+            let path = child.path();
+            let mode = std::fs::symlink_metadata(&path)
+                .expect("a directory stats")
+                .permissions()
+                .mode()
+                | 0o700;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("traversal re-opens");
+            reopen_traversal(&path);
+        }
+    }
+
+    /// Look one relative path up in a walked tree. Test-only.
+    fn find_entry(tree: &[(String, Found)], path: &str) -> Found {
+        tree.iter()
+            .find(|(name, _)| name == path)
+            .unwrap_or_else(|| panic!("{path} is listed"))
+            .1
+            .clone()
+    }
+
+    /// Pin one walked tree against the hand-declared tables above:
+    /// first the exact path set, then kinds, every file's bytes,
+    /// modes and stamps, and every link target, field by field.
+    /// `who` names the tree under test in failure messages.
+    /// Test-only.
+    fn assert_tree_matches_table(tree: &[(String, Found)], who: &str) {
+        use std::time::Duration;
+
+        let mut paths: Vec<String> = tree.iter().map(|(path, _)| path.clone()).collect();
+        paths.sort();
+        let mut expected: Vec<String> = BSDTAR_FILES
+            .iter()
+            .map(|(path, _, _, _)| (*path).to_string())
+            .chain(BSDTAR_DIRS.iter().map(|(path, _, _)| (*path).to_string()))
+            .chain(BSDTAR_LINKS.iter().map(|(path, _)| (*path).to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(paths, expected, "{who} holds the declared tree");
+        for (path, bytes, mode, mtime) in BSDTAR_FILES {
+            let found = find_entry(tree, path);
+            let expected_mtime = UNIX_EPOCH + Duration::new(mtime, 0);
+            assert_eq!(found.kind, FoundKind::File, "{who}: {path} is a file");
+            assert_eq!(found.bytes, bytes, "{who}: {path} reads byte-identical");
+            assert_eq!(found.mode, mode, "{who}: {path} carries its PX mode");
+            assert_eq!(
+                found.mtime,
+                Some(expected_mtime),
+                "{who}: {path} carries its TF stamp"
+            );
+        }
+        for (path, mode, mtime) in BSDTAR_DIRS {
+            let found = find_entry(tree, path);
+            let expected_mtime = UNIX_EPOCH + Duration::new(mtime, 0);
+            assert_eq!(found.kind, FoundKind::Dir, "{who}: {path} is a directory");
+            assert_eq!(found.mode, mode, "{who}: {path} carries its PX mode");
+            assert_eq!(
+                found.mtime,
+                Some(expected_mtime),
+                "{who}: {path} carries its TF stamp"
+            );
+        }
+        for (path, target) in BSDTAR_LINKS {
+            let found = find_entry(tree, path);
+            assert_eq!(found.kind, FoundKind::Link, "{who}: {path} is a link");
+            assert_eq!(
+                found.target.as_deref(),
+                Some(target),
+                "{who}: {path} carries its target"
+            );
+        }
+    }
+
+    /// Pin the bsdtar-extracted tree against the same tables, minus
+    /// the two corners the extractor demonstrably cannot hold (see
+    /// the comparison test): extracted modes (libarchive lands some
+    /// entries at 0400 although it parses 0644) and directory stamps
+    /// (the second extraction pass bumps `docs/`, and `docs/deep`
+    /// keeps extraction time). File bytes, file stamps, kinds and
+    /// link targets are still asserted. Test-only.
+    fn assert_extracted_matches_table(tree: &[(String, Found)]) {
+        use std::time::Duration;
+
+        let mut paths: Vec<String> = tree.iter().map(|(path, _)| path.clone()).collect();
+        paths.sort();
+        let mut expected: Vec<String> = BSDTAR_FILES
+            .iter()
+            .map(|(path, _, _, _)| (*path).to_string())
+            .chain(BSDTAR_DIRS.iter().map(|(path, _, _)| (*path).to_string()))
+            .chain(BSDTAR_LINKS.iter().map(|(path, _)| (*path).to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(paths, expected, "bsdtar holds the declared tree");
+        for (path, bytes, _, mtime) in BSDTAR_FILES {
+            let found = find_entry(tree, path);
+            let expected_mtime = UNIX_EPOCH + Duration::new(mtime, 0);
+            assert_eq!(found.kind, FoundKind::File, "bsdtar: {path} is a file");
+            assert_eq!(found.bytes, bytes, "bsdtar: {path} reads byte-identical");
+            assert_eq!(
+                found.mtime,
+                Some(expected_mtime),
+                "bsdtar: {path} carries its TF stamp"
+            );
+        }
+        for (path, _, _) in BSDTAR_DIRS {
+            assert_eq!(
+                find_entry(tree, path).kind,
+                FoundKind::Dir,
+                "bsdtar: {path} is a directory"
+            );
+        }
+        for (path, target) in BSDTAR_LINKS {
+            let found = find_entry(tree, path);
+            assert_eq!(found.kind, FoundKind::Link, "bsdtar: {path} is a link");
+            assert_eq!(
+                found.target.as_deref(),
+                Some(target),
+                "bsdtar: {path} carries its target"
+            );
+        }
+    }
+
+    /// One found destination entry for the tree comparison below.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FoundKind {
+        File,
+        Dir,
+        Link,
+    }
+    /// What `walk_dest` records per relative path: kinds always,
+    /// bytes for files, mode/mtime for files and directories, the
+    /// target for links. Link mtimes are deliberately absent (both
+    /// sides stamp creation time there — creation, not content).
+    #[derive(Debug, Clone, PartialEq)]
+    struct Found {
+        kind: FoundKind,
+        bytes: Vec<u8>,
+        mode: u32,
+        mtime: Option<SystemTime>,
+        target: Option<String>,
+    }
+
+    /// Walk `root` with `std::fs` (never following links) into
+    /// `(relative path, entry)` pairs. Test-only directory walk, kept
+    /// next to its one caller on purpose.
+    fn walk_dest(root: &std::path::Path) -> Vec<(String, Found)> {
+        fn rec(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, Found)>) {
+            let mut names: Vec<std::ffi::OsString> = Vec::new();
+            let listing = std::fs::read_dir(dir).expect("the walked directory lists");
+            for child in listing {
+                names.push(child.expect("a directory entry reads").file_name());
+            }
+            names.sort();
+            for name in names {
+                let path = dir.join(&name);
+                let meta =
+                    std::fs::symlink_metadata(&path).expect("an entry stats without following");
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("walked paths stay under the root")
+                    .to_string_lossy()
+                    .into_owned();
+                let kind = if meta.file_type().is_symlink() {
+                    FoundKind::Link
+                } else if meta.is_dir() {
+                    FoundKind::Dir
+                } else {
+                    FoundKind::File
+                };
+                let found = Found {
+                    bytes: if kind == FoundKind::File {
+                        std::fs::read(&path).expect("a found file reads")
+                    } else {
+                        Vec::new()
+                    },
+                    mode: meta.permissions().mode() & 0o7777,
+                    mtime: if kind == FoundKind::Link {
+                        None
+                    } else {
+                        Some(meta.modified().expect("an mtime reads"))
+                    },
+                    target: if kind == FoundKind::Link {
+                        Some(
+                            std::fs::read_link(&path)
+                                .expect("a found link reads")
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    } else {
+                        None
+                    },
+                    kind,
+                };
+                out.push((rel, found.clone()));
+                if found.kind == FoundKind::Dir {
+                    rec(&path, root, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        rec(root, root, &mut out);
+        out
+    }
+
+    /// Fixture image for the bsdtar comparison: Rock Ridge names,
+    /// `PX` modes and one `TF` modification stamp on every file and
+    /// directory (like real mastering tools write — libarchive
+    /// requires an RR entry on every file it lists), `SL` targets on
+    /// the links, `SP` plus `RR` on the root dot, a path table at
+    /// sector 19, and the byte-881 file-structure version the
+    /// third-party bid requires (see [`primary_sector`]).
+    /// T1 is 2024-02-29T12:34:56Z, T2 is 2023-11-14T22:13:20Z (both
+    /// per `date -u`, shared with the expectations below).
+    /// Synthetic layout only, claims nothing about real mastering
+    /// tools.
+    fn bsdtar_fixture_bytes() -> Vec<u8> {
+        const DOCS_SECTOR: u32 = 21;
+        const DEEP_SECTOR: u32 = 22;
+        const README_SECTOR: u32 = 23;
+        const TOOL_SECTOR: u32 = 24;
+        const NOTES_SECTOR: u32 = 25;
+        const MEMO_SECTOR: u32 = 26;
+        const MODE_EXEC_FILE: u32 = 0o100755;
+        const MODE_FILE: u32 = 0o100644;
+        const MODE_DIR: u32 = 0o40755;
+        let stamp_t1 = || tf_entry(124, 2, 29, 12, 34, 56);
+        let stamp_t2 = || tf_entry(123, 11, 14, 22, 13, 20);
+        let px_tf = |mode: u32, stamp: &[u8]| {
+            let mut su = px_entry(mode);
+            su.extend_from_slice(stamp);
+            su
+        };
+        let t1 = stamp_t1();
+        let t2 = stamp_t2();
+        let mut image = vec![0u8; IMAGE_SECTORS as usize * SECTOR_BYTES];
+        let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut image,
+            16,
+            &primary_sector("LABEL", ROOT_SECTOR, SECTOR_BYTES as u32),
+        );
+        // Path-table size and locations live only in this fixture's
+        // copy of the primary descriptor: the shared builder leaves
+        // them zeroed (our reader never consults path tables), while
+        // libarchive's bid requires a Type-L location inside the
+        // volume. Sector 19 above holds the minimal table.
+        let base = 16 * SECTOR_BYTES;
+        image[base + 132..base + 136].copy_from_slice(&10u32.to_le_bytes());
+        image[base + 136..base + 140].copy_from_slice(&10u32.to_be_bytes());
+        image[base + 140..base + 144].copy_from_slice(&19u32.to_le_bytes());
+        image[base + 148..base + 152].copy_from_slice(&19u32.to_be_bytes());
+        put(&mut image, 17, &boot_sector());
+        put(&mut image, 18, &terminator_sector());
+        put(&mut image, 19, &path_table_sector());
+        let dot = encode_record_su(
+            ROOT_SECTOR,
+            SECTOR_BYTES as u32,
+            FLAG_DIRECTORY,
+            b"\x00",
+            &[sp_marker(), rr_entry()].concat(),
+        );
+        let parent = encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01");
+        put(
+            &mut image,
+            ROOT_SECTOR,
+            &dir_sector(&[
+                dot,
+                parent,
+                encode_record_su(
+                    README_SECTOR,
+                    13,
+                    0,
+                    b"README.TXT;1",
+                    &[nm_entry(b"readme.txt"), px_tf(MODE_FILE, &t1)].concat(),
+                ),
+                encode_record_su(
+                    TOOL_SECTOR,
+                    10,
+                    0,
+                    b"TOOL.SH;1",
+                    &[nm_entry(b"tool.sh"), px_tf(MODE_EXEC_FILE, &t1)].concat(),
+                ),
+                encode_record_su(
+                    DOCS_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"DOCS",
+                    &[nm_entry(b"docs"), px_tf(MODE_DIR, &t1)].concat(),
+                ),
+                encode_record_su(
+                    0,
+                    0,
+                    0,
+                    b"LINK-HERE;1",
+                    &[nm_entry(b"link-here"), sl_entry(&[(0, b"readme.txt")])].concat(),
+                ),
+                encode_record_su(
+                    0,
+                    0,
+                    0,
+                    b"LINK-TO-DOCS;1",
+                    &[nm_entry(b"link-to-docs"), sl_entry(&[(0, b"docs")])].concat(),
+                ),
+            ]),
+        );
+        put(
+            &mut image,
+            DOCS_SECTOR,
+            &dir_sector(&[
+                encode_record(DOCS_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(DOCS_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(
+                    NOTES_SECTOR,
+                    6,
+                    0,
+                    b"NOTES.TXT;1",
+                    &[nm_entry(b"notes.txt"), px_tf(MODE_FILE, &t2)].concat(),
+                ),
+                encode_record_su(
+                    DEEP_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"DEEP",
+                    &[nm_entry(b"deep"), px_tf(MODE_DIR, &t1)].concat(),
+                ),
+                encode_record_su(
+                    0,
+                    0,
+                    0,
+                    b"DOT;1",
+                    &[
+                        nm_entry(b"dot"),
+                        sl_entry(&[(0x02, b""), (0, b"notes.txt")]),
+                    ]
+                    .concat(),
+                ),
+            ]),
+        );
+        put(
+            &mut image,
+            DEEP_SECTOR,
+            &dir_sector(&[
+                encode_record(DEEP_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(DEEP_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(
+                    MEMO_SECTOR,
+                    5,
+                    0,
+                    b"MEMO.TXT;1",
+                    &[nm_entry(b"memo.txt"), px_tf(MODE_FILE, &t2)].concat(),
+                ),
+            ]),
+        );
+        put(&mut image, README_SECTOR, b"readme bytes\n");
+        put(&mut image, TOOL_SECTOR, b"#!/bin/sh\n");
+        put(&mut image, NOTES_SECTOR, b"notes\n");
+        put(&mut image, MEMO_SECTOR, b"deep\n");
+        image
+    }
+
+    /// Expected files as `(path, bytes, mode, mtime seconds)`:
+    /// hand-declared from the fixture above, never read back from
+    /// the copier — the independent corner of the comparison.
+    const BSDTAR_FILES: [(&str, &[u8], u32, u64); 4] = [
+        ("readme.txt", b"readme bytes\n", 0o644, 1_709_210_096),
+        ("tool.sh", b"#!/bin/sh\n", 0o755, 1_709_210_096),
+        ("docs/notes.txt", b"notes\n", 0o644, 1_700_000_000),
+        ("docs/deep/memo.txt", b"deep\n", 0o644, 1_700_000_000),
+    ];
+
+    /// Expected directories as `(path, mode, mtime seconds)`.
+    const BSDTAR_DIRS: [(&str, u32, u64); 2] = [
+        ("docs", 0o755, 1_709_210_096),
+        ("docs/deep", 0o755, 1_709_210_096),
+    ];
+
+    /// Expected links as `(path, target)`: the target text both
+    /// extractors must reproduce verbatim. Only targets without `..`
+    /// appear here: bsdtar's secure extraction refuses dot-dot link
+    /// targets (probed: a `../f` link fails its exit path even when
+    /// the target resolves), so `..` shapes live in the table matrix
+    /// instead — see the symlink policy test in `copy/mod.rs`. A `.`
+    /// target extracts cleanly, as probed.
+    const BSDTAR_LINKS: [(&str, &str); 3] = [
+        ("link-here", "readme.txt"),
+        ("link-to-docs", "docs"),
+        ("docs/dot", "./notes.txt"),
+    ];
+
+    #[test]
+    fn bsdtar_extraction_matches_the_copy() {
+        // Acceptance against an independent extractor: the host's
+        // bsdtar reads the same fixture image into one tree while the
+        // copier (`IsoSource` plus `walk`) writes another, and the two
+        // trees must agree field by field — kinds, every file's bytes
+        // (the byte corner), mtimes and link targets — with the
+        // hand-declared tables above as the third corner. Nothing here
+        // is compared against `Summary` or any other value the copier
+        // produced.
+        //
+        // The copier-against-table corner always runs, extractor or
+        // not: without bsdtar on PATH the test pins the copy below and
+        // then passes after saying the cross-check could not run (host
+        // survey for the record: bsdtar 3.8.10 present; 7z, xorriso,
+        // isoinfo and genisoimage absent; cpio present but ISO-opaque).
+        //
+        // Three probed libarchive behaviours shape the extraction
+        // below, each reproduced by hand against this fixture before
+        // encoding it here. First, `bsdtar -tv` parses every PX mode
+        // correctly (0644 files, 0755 directories) but extraction
+        // lands some entries at 0400 (probed: `readme.txt`,
+        // `docs/notes.txt`), so extracted modes are never asserted.
+        // Second, directories extract without traversal permission
+        // mid-run and bsdtar stats each link through its parent as it
+        // goes, so a single pass fails on `docs/dot` with "Could not
+        // stat: Permission denied" even though the link itself is
+        // well-formed; the test therefore extracts in two passes
+        // (everything but `docs/dot`, then `docs/dot` alone, both with
+        // `-p` so directory modes restore) and re-opens owner
+        // traversal before walking. Third, directory stamps do not
+        // survive those two passes (the second pass bumps `docs/`,
+        // and `docs/deep` keeps extraction time), so directory stamps
+        // are asserted copier-against-table only. Every listed file
+        // also needs an RR entry, which real images always carry, so
+        // the fixture provides one throughout.
+        let bytes = bsdtar_fixture_bytes();
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let copied = scratch.path().join("copied");
+        std::fs::create_dir(&copied).expect("the copied tree creates");
+        let total = bytes.len() as u64;
+        let mut volume = VecVolume::new(total, 512).expect("the fixture fits in RAM");
+        volume.write_all_at(0, &bytes).expect("the fixture writes");
+        let source = IsoSource::new(IsoReader::open(Box::new(volume)).expect("the fixture opens"));
+        let mut progress = WarnLog { warns: Vec::new() };
+        super::super::walk(
+            &source,
+            &copied,
+            &super::super::CopyOptions {
+                free_bytes: None,
+                replacer: None,
+                fat32_limit: false,
+            },
+            &mut progress,
+        )
+        .expect("the bsdtar tree copies");
+        assert!(
+            progress.warns.is_empty(),
+            "a clean tree warns nothing: {:?}",
+            progress.warns
+        );
+        assert_tree_matches_table(&walk_dest(&copied), "the copy");
+        if !bsdtar_available() {
+            // No independent extractor to compare against: the tables
+            // above still pin the copier side field by field, so this
+            // is the honest fallback, not a silent skip.
+            eprintln!("skipping bsdtar cross-check: no bsdtar on PATH");
+            return;
+        }
+        let iso = scratch.path().join("fixture.iso");
+        std::fs::write(&iso, &bytes).expect("the fixture image writes");
+        let extracted = scratch.path().join("bsdtar");
+        std::fs::create_dir(&extracted).expect("the bsdtar tree creates");
+        // First pass: everything but the dot link (see the comment
+        // above); the `--exclude` match is against the member names
+        // `bsdtar -tf` lists.
+        let first = std::process::Command::new("bsdtar")
+            .arg("-xpf")
+            .arg(&iso)
+            .arg("-C")
+            .arg(&extracted)
+            .arg("--exclude")
+            .arg("docs/dot")
+            .output()
+            .expect("bsdtar runs");
+        assert!(
+            first.status.success(),
+            "bsdtar extracts the first pass: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        // Second pass: the dot link alone, now that its parent is
+        // traversable again.
+        reopen_traversal(&extracted);
+        let second = std::process::Command::new("bsdtar")
+            .arg("-xpf")
+            .arg(&iso)
+            .arg("-C")
+            .arg(&extracted)
+            .arg("docs/dot")
+            .output()
+            .expect("bsdtar runs");
+        assert!(
+            second.status.success(),
+            "bsdtar extracts the dot link: {}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        reopen_traversal(&extracted);
+        let from_bsdtar = walk_dest(&extracted);
+        assert_extracted_matches_table(&from_bsdtar);
+        // Both trees match the same tables; the byte corner agrees
+        // across extractors too.
+        let from_copy = walk_dest(&copied);
+        for (path, bytes, _, _) in BSDTAR_FILES {
+            assert_eq!(
+                find_entry(&from_copy, path).bytes,
+                find_entry(&from_bsdtar, path).bytes,
+                "{path} agrees across extractors"
+            );
+            assert_eq!(
+                find_entry(&from_copy, path).bytes,
+                bytes,
+                "{path} matches the declared bytes on both sides"
+            );
+        }
+    }
+
     /// One [`RockTime`] from parts: the conversion tests below build
     /// stamps directly (the TF decoder is the reader's tested
     /// business, not this slice's).
