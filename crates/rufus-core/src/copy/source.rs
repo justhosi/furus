@@ -692,6 +692,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut WarnLog { warns: Vec::new() },
+            &|| false,
         )
         .expect("the metadata tree copies");
         assert_eq!(
@@ -757,6 +758,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut progress,
+            &|| false,
         )
         .expect("a metadata-free tree copies");
         // The control file itself is untouched by the walk (not part
@@ -798,6 +800,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut Sink,
+            &|| false,
         )
         .expect("the iso tree copies");
         assert_eq!(
@@ -893,6 +896,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut Sink,
+            &|| false,
         )
         .expect("the dotted tree copies");
         assert_eq!(
@@ -1066,6 +1070,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut progress,
+            &|| false,
         )
         .expect("the symlink tree copies");
         assert_eq!(
@@ -1615,6 +1620,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut progress,
+            &|| false,
         )
         .expect("the bsdtar tree copies");
         assert!(
@@ -2053,6 +2059,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut progress,
+            &|| false,
         )
         .expect("the UDF link tree copies");
         assert_eq!(

@@ -40,7 +40,7 @@
 //!   move — sizing counts the payload, the copy warns `Will replace
 //!   obsolete '<path>'` once and keeps the source mode when the
 //!   payload carries none. The payloads live in
-//!   [`crate::boot::syslinux::obsolete`]; [`NoReplacements`]
+//!   [`Obsolete`](crate::boot::syslinux::Obsolete); [`NoReplacements`]
 //!   is the declining default. Wiring a table into `WriteMode::Copy`
 //!   remains a later slice.
 //! * Persistence (this slice pins it): `/persistence.conf` and
@@ -135,7 +135,7 @@ pub struct CopyOptions<'a> {
     /// it.
     pub free_bytes: Option<u64>,
     /// Obsolete-bootloader replacer (see
-    /// [`crate::boot::syslinux::obsolete`]): consulted once
+    /// [`Obsolete`](crate::boot::syslinux::Obsolete)): consulted once
     /// per regular file, in the sizing pass, whose answers the copy
     /// reuses. `None` copies every file verbatim.
     pub replacer: Option<&'a dyn Replacer>,
@@ -237,6 +237,14 @@ pub trait Progress {
     fn warn(&mut self, _text: &str) {}
 }
 
+/// True stops the walk with `CoreError::Cancelled`; see [`walk`].
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<()> {
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Copy `source` under the existing directory `dest`: depth-first,
 /// children sorted by name bytes at every level, files streamed
 /// through one fixed buffer. Returns the [`Summary`] counts.
@@ -284,16 +292,27 @@ pub trait Progress {
 /// as [`CoreError::io`](crate::error::CoreError::io) naming the path;
 /// a write failure surfaces as [`CoreError::io`] too and removes the
 /// partial file it was writing, while entries already written stay (a
-/// copy is still not a transaction); cancellation arrives in a later
-/// slice.
+/// copy is still not a transaction).
+///
+/// Cancellation polls the `cancelled` closure — the same
+/// `&dyn Fn() -> bool` shape [`run`](crate::pipeline::run) threads
+/// through the write path: before opening the destination, once per
+/// entry in the sizing pass, once per entry before it is copied, and
+/// between file chunks while bytes stream. A true reading stops the
+/// walk with [`CoreError::Cancelled`]; a file left half-written is
+/// removed exactly like a write failure removes it, while entries
+/// already written stay. An always-false closure reproduces today's
+/// behaviour exactly.
 pub fn walk(
     source: &dyn Source,
     dest: &Path,
     options: &CopyOptions,
     progress: &mut dyn Progress,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Summary> {
+    check_cancelled(cancelled)?;
     let dest = DestDir::open(dest)?;
-    let sizing = total_bytes(source, options.replacer, options.fat32_limit)?;
+    let sizing = total_bytes(source, options.replacer, options.fat32_limit, cancelled)?;
     match options.free_bytes {
         Some(free) if sizing.total > free => {
             return Err(CoreError::invalid(format!(
@@ -316,6 +335,7 @@ pub fn walk(
         done: 0,
         total: sizing.total,
         progress,
+        cancelled,
         taken: HashSet::new(),
         maps: sizing.maps,
         replacements: sizing.replacements,
@@ -963,6 +983,9 @@ struct Copier<'a> {
     done: u64,
     total: u64,
     progress: &'a mut dyn Progress,
+    /// Cancellation closure, polled per entry and between file chunks
+    /// (see [`walk`]).
+    cancelled: &'a dyn Fn() -> bool,
     /// Destination names taken in the current directory (ASCII
     /// lowercase keys): cleared on entry to every directory and
     /// saved/restored around each descent, so collisions never leak
@@ -1039,6 +1062,18 @@ impl Copier<'_> {
                 window,
                 file,
             )?;
+            if written < payload.len() as u64 && (self.cancelled)() {
+                // Stopped with bytes still to go: drop the partial
+                // file through the write-failure path, then report
+                // the cancellation. A finished payload stays.
+                cleanup_partial(
+                    &mut *meter.progress,
+                    abs,
+                    written,
+                    &std::io::Error::new(std::io::ErrorKind::Interrupted, "copy cancelled"),
+                );
+                return Err(CoreError::Cancelled);
+            }
         }
         Ok(())
     }
@@ -1071,6 +1106,18 @@ impl Copier<'_> {
                 ))
             })?;
             offset = write_window(&mut meter, abs, src, size, offset, window, file)?;
+            if offset < size && (self.cancelled)() {
+                // Stopped with bytes still to go: drop the partial
+                // file through the write-failure path, then report
+                // the cancellation. A finished file stays.
+                cleanup_partial(
+                    &mut *meter.progress,
+                    abs,
+                    offset,
+                    &std::io::Error::new(std::io::ErrorKind::Interrupted, "copy cancelled"),
+                );
+                return Err(CoreError::Cancelled);
+            }
         }
         Ok(())
     }
@@ -1083,6 +1130,7 @@ impl Copier<'_> {
         check_depth(rel, depth)?;
         self.taken.clear();
         for child in sorted_children(self.source, rel)? {
+            check_cancelled(self.cancelled)?;
             check_reserved(&child.name)?;
             let sanitised = sanitise(&child.name);
             let placed = self.assign_unique(&child.name, &sanitised.name)?;
@@ -1375,12 +1423,12 @@ fn write_window(
     Ok(offset)
 }
 
-/// Remove the partial destination file at `abs` after a failed write
-/// of `written` bytes: on `StorageFull`, or on any write error once
-/// bytes landed. A first-write failure with nothing written leaves
-/// the empty file the caller created — there is no partial content
-/// to clean. Best-effort: a removal failure warns instead of masking
-/// the original error.
+/// Remove the partial destination file at `abs` after a failed or
+/// cancelled write of `written` bytes: on `StorageFull`, or on any
+/// write error or cancellation once bytes landed. A first-write
+/// failure with nothing written leaves the empty file the caller
+/// created — there is no partial content to clean. Best-effort: a
+/// removal failure warns instead of masking the original error.
 fn cleanup_partial(progress: &mut dyn Progress, abs: &Path, written: u64, error: &std::io::Error) {
     let full = error.kind() == std::io::ErrorKind::StorageFull;
     if !full && written == 0 {
@@ -1388,7 +1436,7 @@ fn cleanup_partial(progress: &mut dyn Progress, abs: &Path, written: u64, error:
     }
     if let Err(remove) = std::fs::remove_file(abs) {
         progress.warn(&format!(
-            "copy cannot remove partial '{}' after a failed write: {remove}; continuing",
+            "copy cannot remove partial '{}' after a failed or cancelled write: {remove}; continuing",
             abs.display(),
         ));
     }
@@ -1407,7 +1455,12 @@ fn total_bytes(
     source: &dyn Source,
     replacer: Option<&dyn Replacer>,
     fat32_limit: bool,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Sizing> {
+    // Eight threading parameters (the sizing state plus the
+    // cancellation closure): a private helper, kept flat like the
+    // copy pass it mirrors rather than bundled.
+    #[allow(clippy::too_many_arguments)]
     fn sum(
         source: &dyn Source,
         dir: &mut Vec<Vec<u8>>,
@@ -1416,11 +1469,13 @@ fn total_bytes(
         replacements: &mut ReplacementMap,
         replacer: Option<&dyn Replacer>,
         fat32_limit: bool,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<u64> {
         check_depth(dir, depth)?;
         let mut taken = HashSet::new();
         let mut total = 0u64;
         for child in sorted_children(source, dir)? {
+            check_cancelled(cancelled)?;
             // Reserved names refuse here exactly like the copy pass
             // (see `copy_dir`): sizing never touches the destination,
             // so only the traversal-blocking rules apply, not the
@@ -1467,6 +1522,7 @@ fn total_bytes(
                     replacements,
                     replacer,
                     fat32_limit,
+                    cancelled,
                 )?;
                 dir.pop().ok_or_else(|| {
                     CoreError::invalid("copy path stack underflows its push".to_string())
@@ -1515,6 +1571,7 @@ fn total_bytes(
         &mut stored_replacements,
         replacer,
         fat32_limit,
+        cancelled,
     )?;
     Ok(Sizing {
         total,
@@ -1750,8 +1807,10 @@ mod tests {
         let source = two_dir_source();
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a small tree copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("a small tree copies");
         assert_eq!(
             source.reads.borrow().clone(),
             [
@@ -1802,7 +1861,7 @@ mod tests {
         let file = scratch.path().join("file");
         std::fs::write(&file, b"untouched").expect("the decoy writes");
         let mut progress = Recorder::default();
-        let error = walk(&source, &file, &no_limit(), &mut progress)
+        let error = walk(&source, &file, &no_limit(), &mut progress, &|| false)
             .expect_err("a file destination refuses");
         assert!(error.to_string().contains("not a directory"), "{error:?}");
         assert!(error.to_string().contains("file"), "{error:?}");
@@ -1829,6 +1888,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut progress,
+            &|| false,
         )
         .expect_err("short space refuses");
         let text = error.to_string();
@@ -1852,8 +1912,10 @@ mod tests {
         source.dir(&[]).dirs.push(b"..".to_vec());
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let error = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect_err("a dot-dot entry refuses");
+        let error = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect_err("a dot-dot entry refuses");
         assert!(error.to_string().contains(".."), "{error:?}");
         assert_eq!(
             std::fs::read_dir(scratch.path())
@@ -1887,8 +1949,10 @@ mod tests {
         source.dir(&[b"DIR.;1".to_vec()]);
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("strips copy");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("strips copy");
         assert_eq!(
             summary,
             Summary {
@@ -1915,8 +1979,10 @@ mod tests {
         let source = one_file_source(b"a/b\x01c\td".to_vec(), b"data".to_vec());
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("mapped copy");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("mapped copy");
         assert_eq!(
             summary,
             Summary {
@@ -1948,8 +2014,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("versions copy");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("versions copy");
         assert_eq!(
             summary,
             Summary {
@@ -1976,8 +2044,10 @@ mod tests {
         let source = one_file_source(b"...".to_vec(), b"data".to_vec());
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("empty maps");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("empty maps");
         assert_eq!(
             summary,
             Summary {
@@ -2001,8 +2071,10 @@ mod tests {
         let source = one_file_source(long.clone(), b"data".to_vec());
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("truncated copy");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("truncated copy");
         assert_eq!(
             summary,
             Summary {
@@ -2072,8 +2144,10 @@ mod tests {
         }
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("collisions copy");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("collisions copy");
         assert_eq!(
             summary,
             Summary {
@@ -2116,8 +2190,10 @@ mod tests {
         }
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let error = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect_err("the 1001st collision refuses");
+        let error = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect_err("the 1001st collision refuses");
         let text = error.to_string();
         assert!(text.contains("999"), "{text}");
         assert!(text.contains("DUP.TXT;1000"), "{text}");
@@ -2156,8 +2232,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("scoped copy");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("scoped copy");
         assert_eq!(
             summary,
             Summary {
@@ -2199,8 +2277,10 @@ mod tests {
         let source = one_file_source(name, b"data".to_vec());
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("retrimmed copy");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("retrimmed copy");
         assert_eq!(
             summary,
             Summary {
@@ -2245,8 +2325,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("dotted collision");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("dotted collision");
         assert_eq!(
             summary,
             Summary {
@@ -2277,8 +2359,10 @@ mod tests {
         source.dir(&[]).dirs.push(b"..".to_vec());
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let error = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect_err("a dot-dot entry refuses");
+        let error = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect_err("a dot-dot entry refuses");
         assert!(error.to_string().contains("reserved"), "{error:?}");
         assert_eq!(
             std::fs::read_dir(scratch.path())
@@ -2334,8 +2418,10 @@ mod tests {
         let source = LoopSource;
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let error = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect_err("a cyclic tree refuses");
+        let error = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect_err("a cyclic tree refuses");
         let text = error.to_string();
         assert!(text.contains('X'), "{text}");
         assert!(text.contains("possible directory loop"), "{text}");
@@ -2357,11 +2443,15 @@ mod tests {
         let source = two_dir_source();
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let first =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("first copy runs");
+        let first = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("first copy runs");
         let mut progress = Recorder::default();
-        let second =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("second copy resumes");
+        let second = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("second copy resumes");
         assert_eq!(first, second);
         assert_eq!(
             std::fs::read(scratch.path().join("TOP.TXT")).expect("top reads back"),
@@ -2413,8 +2503,10 @@ mod tests {
             target,
             warns: Vec::new(),
         };
-        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect("a metadata failure still copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("a metadata failure still copies");
         assert_eq!(
             summary,
             Summary {
@@ -2458,8 +2550,10 @@ mod tests {
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         for run in 1..=2 {
             let mut progress = Recorder::default();
-            walk(&source, scratch.path(), &no_limit(), &mut progress)
-                .expect("a read-only directory re-enters");
+            walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+                false
+            })
+            .expect("a read-only directory re-enters");
             assert_eq!(
                 std::fs::read(scratch.path().join("B").join("M.TXT"))
                     .expect("the child reads back"),
@@ -2494,8 +2588,10 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
             .expect("the stale directory chmods");
         let mut progress = Recorder::default();
-        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect("a partial file under a read-only directory resumes");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("a partial file under a read-only directory resumes");
         assert_eq!(
             summary,
             Summary {
@@ -2530,8 +2626,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a link tree copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("a link tree copies");
         assert_eq!(
             summary,
             Summary {
@@ -2587,8 +2685,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a link tree copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("a link tree copies");
         assert_eq!(
             summary,
             Summary {
@@ -2639,8 +2739,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a link tree copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("a link tree copies");
         assert_eq!(
             summary,
             Summary {
@@ -2686,8 +2788,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect("an escaping link copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("an escaping link copies");
         assert_eq!(
             summary,
             Summary {
@@ -2737,8 +2841,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect("unresolvable links skip");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("unresolvable links skip");
         assert_eq!(
             summary,
             Summary {
@@ -2808,6 +2914,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut progress,
+            &|| false,
         )
         .expect_err("17 bytes refuse an 18 byte tree");
         let text = error.to_string();
@@ -2840,8 +2947,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
-            .expect("a directory-slot link copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("a directory-slot link copies");
         assert_eq!(
             summary,
             Summary {
@@ -2934,8 +3043,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a link tree copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("a link tree copies");
         assert_eq!(
             summary,
             Summary {
@@ -3043,8 +3154,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("collisions copy");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("collisions copy");
         assert_eq!(
             summary,
             Summary {
@@ -3146,8 +3259,8 @@ mod tests {
         };
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &options, &mut progress).expect("a replaced file copies");
+        let summary = walk(&source, scratch.path(), &options, &mut progress, &|| false)
+            .expect("a replaced file copies");
         assert_eq!(
             summary,
             Summary {
@@ -3197,6 +3310,7 @@ mod tests {
                 fat32_limit: true,
             },
             &mut progress,
+            &|| false,
         )
         .expect_err("one past the FAT32 limit refuses");
         let text = error.to_string();
@@ -3229,7 +3343,7 @@ mod tests {
             bytes: b"tiny".to_vec(),
         });
         source.sizes.insert(vec![b"EDGE".to_vec()], 0xFFFF_FFFF);
-        let sizing = total_bytes(&source, None, true).expect("the exact limit sizes");
+        let sizing = total_bytes(&source, None, true, &|| false).expect("the exact limit sizes");
         assert_eq!(sizing.total, 0xFFFF_FFFF);
     }
 
@@ -3268,8 +3382,8 @@ mod tests {
             .mode();
         std::fs::remove_file(&control).expect("the control removes");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &options, &mut progress).expect("a replaced tree copies");
+        let summary = walk(&source, scratch.path(), &options, &mut progress, &|| false)
+            .expect("a replaced tree copies");
         assert_eq!(
             summary,
             Summary {
@@ -3322,6 +3436,7 @@ mod tests {
                 fat32_limit: false,
             },
             &mut progress,
+            &|| false,
         )
         .expect_err("8 bytes refuse a 23 byte replaced tree");
         let text = error.to_string();
@@ -3342,8 +3457,8 @@ mod tests {
         };
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &options, &mut progress).expect("a declined tree copies");
+        let summary = walk(&source, scratch.path(), &options, &mut progress, &|| false)
+            .expect("a declined tree copies");
         assert_eq!(
             summary,
             Summary {
@@ -3414,7 +3529,7 @@ mod tests {
         };
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary = walk(&source, scratch.path(), &options, &mut progress)
+        let summary = walk(&source, scratch.path(), &options, &mut progress, &|| false)
             .expect("a greedily replaced tree copies");
         assert_eq!(
             summary,
@@ -3478,8 +3593,10 @@ mod tests {
         });
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let mut progress = Recorder::default();
-        let summary =
-            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("the tree copies");
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("the tree copies");
         assert_eq!(
             summary,
             Summary {
@@ -3551,6 +3668,10 @@ mod tests {
     /// One [`Copier`] over `source` writing under `dest`, for
     /// exercising the streaming helpers below walk level: a
     /// destination double stands in for the open file.
+    fn never_cancelled() -> bool {
+        false
+    }
+
     fn test_copier<'a>(
         source: &'a MemSource,
         dest: DestDir,
@@ -3569,6 +3690,7 @@ mod tests {
             done: 0,
             total: 300,
             progress,
+            cancelled: &never_cancelled,
             taken: HashSet::new(),
             maps: BTreeMap::new(),
             replacements: BTreeMap::new(),
@@ -3623,6 +3745,301 @@ mod tests {
             std::fs::read(scratch.path().join("A")).expect("A reads back"),
             b"done",
             "completed files stay intact"
+        );
+    }
+
+    /// Two small files at the root: `A` copies first (byte-sorted
+    /// listings visit it first), then `B`.
+    fn two_small_files() -> MemSource {
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"A".to_vec(),
+            bytes: b"aaa".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"B".to_vec(),
+            bytes: b"bbb".to_vec(),
+        });
+        source
+    }
+
+    /// Sorted destination entry names, for remnant checks.
+    fn dest_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("the destination lists")
+            .map(|entry| {
+                entry
+                    .expect("the entry reads")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn cancelled_before_the_first_entry_leaves_nothing() {
+        // A closure that is already true stops the walk before the
+        // destination even opens: the error is Cancelled and the
+        // scratch directory stays empty.
+        let source = two_small_files();
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let error = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            true
+        })
+        .expect_err("a cancelled walk refuses");
+        assert!(
+            matches!(error, CoreError::Cancelled),
+            "cancellation reports Cancelled: {error:?}"
+        );
+        assert!(
+            dest_names(scratch.path()).is_empty(),
+            "no entry was created"
+        );
+    }
+
+    #[test]
+    fn cancelled_after_a_file_keeps_finished_files() {
+        // The switch flips once `A` exists on disk: `A` stays present
+        // and byte-correct, `B` never lands, and no partial file
+        // remains anywhere.
+        let source = two_small_files();
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let target = scratch.path().to_path_buf();
+        let stop_after_a = move || target.join("A").exists();
+        let mut progress = Recorder::default();
+        let error = walk(
+            &source,
+            scratch.path(),
+            &no_limit(),
+            &mut progress,
+            &stop_after_a,
+        )
+        .expect_err("a mid-walk cancel refuses");
+        assert!(
+            matches!(error, CoreError::Cancelled),
+            "cancellation reports Cancelled: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("A")).expect("A reads back"),
+            b"aaa",
+            "the finished file stays byte-correct"
+        );
+        assert_eq!(
+            dest_names(scratch.path()),
+            vec!["A".to_string()],
+            "only the finished file is on disk"
+        );
+    }
+
+    #[test]
+    fn cancelled_mid_file_removes_the_partial() {
+        // `BIG` spans 3 chunks of the 128 KiB copy buffer; the switch
+        // flips once its on-disk length passes 100 KiB, so the stop
+        // lands mid-file with bytes on disk. The partial file is gone
+        // while `A`, finished earlier, survives.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"A".to_vec(),
+            bytes: b"aaa".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"BIG".to_vec(),
+            bytes: vec![0xAAu8; 300 * 1024],
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let target = scratch.path().to_path_buf();
+        let stop_mid_big = move || {
+            target
+                .join("BIG")
+                .metadata()
+                .map(|meta| meta.len() > 100_000)
+                .unwrap_or(false)
+        };
+        let mut progress = Recorder::default();
+        let error = walk(
+            &source,
+            scratch.path(),
+            &no_limit(),
+            &mut progress,
+            &stop_mid_big,
+        )
+        .expect_err("a mid-file cancel refuses");
+        assert!(
+            matches!(error, CoreError::Cancelled),
+            "cancellation reports Cancelled: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("A")).expect("A reads back"),
+            b"aaa",
+            "the finished file stays byte-correct"
+        );
+        assert_eq!(
+            dest_names(scratch.path()),
+            vec!["A".to_string()],
+            "the partial file is gone"
+        );
+    }
+
+    #[test]
+    fn always_false_matches_the_uncancelled_run() {
+        // The same fixture as the cancel-after test, run with a
+        // closure that never fires: the summary counts and every byte
+        // equal the pre-cancellation behaviour, asserted as numbers.
+        let source = two_small_files();
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress, &|| {
+            false
+        })
+        .expect("an uncancelled walk runs");
+        assert_eq!(summary.directories, 0, "a flat tree makes no directories");
+        assert_eq!(summary.files, 2, "both files copy");
+        assert_eq!(summary.bytes, 6, "3 payload bytes per file");
+        assert_eq!(summary.renamed, 0, "plain names need no renames");
+        assert_eq!(
+            std::fs::read(scratch.path().join("A")).expect("A reads back"),
+            b"aaa",
+            "A lands byte-correct"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("B")).expect("B reads back"),
+            b"bbb",
+            "B lands byte-correct"
+        );
+    }
+
+    #[test]
+    fn cancelled_in_the_sizing_pass_touches_nothing() {
+        // The switch flips exactly on the second listing call, which
+        // lands inside the sizing traversal: the error is Cancelled
+        // and the destination stays empty. Flipping on equality (not
+        // at-or-past) is what isolates this poll — with the sizing
+        // poll removed the copy pass would see later counts, finish
+        // the walk, and this `expect_err` would fail.
+        let mut inner = MemSource::default();
+        inner.dir(&[]).dirs.push(b"D".to_vec());
+        inner.dir(&[b"D".to_vec()]).files.push(MemFile {
+            name: b"F".to_vec(),
+            bytes: b"data".to_vec(),
+        });
+        let listings = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        struct Counting<'a> {
+            inner: &'a MemSource,
+            listings: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Source for Counting<'_> {
+            fn root_entries(&self) -> Result<Vec<Entry>> {
+                self.listings.set(self.listings.get() + 1);
+                self.inner.root_entries()
+            }
+
+            fn child_entries(&self, dir: &[Vec<u8>]) -> Result<Vec<Entry>> {
+                self.listings.set(self.listings.get() + 1);
+                self.inner.child_entries(dir)
+            }
+
+            fn read_bytes(&self, file: &[Vec<u8>], offset: u64, buf: &mut [u8]) -> Result<usize> {
+                self.inner.read_bytes(file, offset, buf)
+            }
+        }
+        let source = Counting {
+            inner: &inner,
+            listings: std::rc::Rc::clone(&listings),
+        };
+        let stop_in_sizing = || listings.get() == 2;
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let error = walk(
+            &source,
+            scratch.path(),
+            &no_limit(),
+            &mut progress,
+            &stop_in_sizing,
+        )
+        .expect_err("a sizing-pass cancel refuses");
+        assert!(
+            matches!(error, CoreError::Cancelled),
+            "cancellation reports Cancelled: {error:?}"
+        );
+        assert!(
+            dest_names(scratch.path()).is_empty(),
+            "no entry was created"
+        );
+    }
+
+    #[test]
+    fn cancelled_mid_replacement_removes_the_partial() {
+        // A 300 KiB replacement payload streams in 128 KiB chunks; the
+        // switch flips once its on-disk length passes 100 KiB, so the
+        // stop lands mid-stream. The destination file is gone while
+        // `A`, finished earlier, survives.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"A".to_vec(),
+            bytes: b"aaa".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"OLD.BIN".to_vec(),
+            bytes: b"stale".to_vec(),
+        });
+        struct SwapOld {
+            bytes: Vec<u8>,
+        }
+        impl Replacer for SwapOld {
+            fn replacement(&self, _source_path: &[u8], name: &[u8]) -> Option<Replacement> {
+                if name == b"OLD.BIN" {
+                    Some(Replacement {
+                        bytes: self.bytes.clone(),
+                        mode: None,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+        let swap = SwapOld {
+            bytes: vec![7u8; 300 * 1024],
+        };
+        let options = CopyOptions {
+            free_bytes: None,
+            replacer: Some(&swap),
+            fat32_limit: false,
+        };
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let target = scratch.path().to_path_buf();
+        let stop_mid_payload = move || {
+            target
+                .join("OLD.BIN")
+                .metadata()
+                .map(|meta| meta.len() > 100_000)
+                .unwrap_or(false)
+        };
+        let mut progress = Recorder::default();
+        let error = walk(
+            &source,
+            scratch.path(),
+            &options,
+            &mut progress,
+            &stop_mid_payload,
+        )
+        .expect_err("a mid-payload cancel refuses");
+        assert!(
+            matches!(error, CoreError::Cancelled),
+            "cancellation reports Cancelled: {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("A")).expect("A reads back"),
+            b"aaa",
+            "the finished file stays byte-correct"
+        );
+        assert_eq!(
+            dest_names(scratch.path()),
+            vec!["A".to_string()],
+            "the partial payload is gone"
         );
     }
 

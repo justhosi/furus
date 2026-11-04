@@ -397,8 +397,8 @@ mod tests {
             replacer: Some(&table),
             fat32_limit: false,
         };
-        let summary =
-            walk(&source, scratch.path(), &options, &mut progress).expect("the walk runs");
+        let summary = walk(&source, scratch.path(), &options, &mut progress, &|| false)
+            .expect("the walk runs");
         assert_eq!(summary.files, 2, "two files copied");
         assert_eq!(
             std::fs::read(scratch.path().join("isolinux").join("menu.c32"))
