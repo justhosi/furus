@@ -126,8 +126,9 @@ const PC_RESERVED: u8 = 0;
 /// marker to skip, and a bare type 1 as root — see
 /// [`decode_symlink_target`]).
 const PC_ROOT: u8 = 1;
-/// Path component type 2: root in the Linux driver (volume root in
-/// the OpenBSD header) — treated as root here too.
+/// Path component type 2: the volume (mount) root — undecodable
+/// here (it names the volume, not a path inside it), so it refuses;
+/// see [`decode_symlink_target`].
 const PC_MOUNTROOT: u8 = 2;
 /// Path component type 3: the parent directory (`..`).
 const PC_PARENT: u8 = 3;
@@ -273,8 +274,9 @@ pub fn parse_timestamp(block: &[u8], at: usize, what: &str) -> Result<Timestamp>
 ///
 /// Type 1 means local time with the signed 12-bit quarter-hour
 /// offset applied (multiplied by 900); any other type reads as UTC.
-/// The unspecified offset (-2047, all low bits set but one) reads as
-/// UTC too, like the kernel. Refused rather than placed: months
+/// The unspecified offset (-2047, all low bits set but one) — and any
+/// offset outside a plausible zone (±12 h, 48 quarters) — reads as
+/// UTC too, like the kernel treats the unknown zone. Refused rather than placed: months
 /// outside 1..12, days outside the month's length (leap years
 /// counted), hours past 23, minutes/seconds past 59, any sub-second
 /// past 99. `i64` carries millennia either way, so no checked
@@ -287,11 +289,15 @@ pub fn timestamp_to_system_time(stamp: &Timestamp) -> Option<std::time::SystemTi
     let raw_offset = (stamp.type_and_timezone & 0x0FFF) as i16;
     let sign_extended = ((i32::from(raw_offset) << 20) >> 20) as i16;
     let kind = stamp.type_and_timezone >> 12;
-    let quarters: i64 = if kind == 1 && sign_extended != -2047 {
-        i64::from(sign_extended)
-    } else {
-        0
-    };
+    // Type 1 carries a quarter-hour offset, but only within a
+    // plausible zone (±12 h, 48 quarters): anything wider — and the
+    // unspecified -2047 — is an unknown zone, read as UTC.
+    let quarters: i64 =
+        if kind == 1 && sign_extended != -2047 && (-48..=48).contains(&sign_extended) {
+            i64::from(sign_extended)
+        } else {
+            0
+        };
     if stamp.centiseconds > 99 || stamp.hundreds > 99 || stamp.microseconds > 99 {
         return None;
     }
@@ -365,10 +371,10 @@ pub fn permissions_to_mode(permissions: u32, icb_flags: u16) -> u32 {
 /// identifier bytes, padding to a 4-byte boundary}` with no version
 /// word) and the bare shape real images carry (no prefix, each
 /// component `{u8 component type, u8 identifier length, u16 version,
-/// identifier bytes}`, the version parsed and ignored). Types map as
-/// the Linux and OpenBSD drivers agree for the cases that matter: 3
-/// is `..`, 4 is `.`, 5 is a name, 1 and 2 are roots (`/`); type 0
-/// and anything past 5 refuses.
+/// identifier bytes}`, the version parsed and ignored). Types map:
+/// 1 is the filesystem root (`/`), 3 is `..`, 4 is `.`, 5 is a name;
+/// 2 is the volume (mount) root and refuses — it names the volume,
+/// not a path inside it — and 0 and anything past 5 refuse.
 ///
 /// Malformed lists refuse naming the byte offset and the reason —
 /// empty data, a length prefix covering more than the data holds,
@@ -466,14 +472,21 @@ pub fn decode_symlink_target(data: &[u8], what: &str) -> Result<String> {
             "{what} symlink data carries no path components"
         )));
     }
-    // A single root (empty part) is `/`; otherwise join with `/`,
-    // keeping a leading empty part as the leading slash.
+    // A lone root (one empty part) is `/`; otherwise join with
+    // `/`, keeping a leading empty part as the leading slash.
     let mut target: Vec<u8> = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
-        if index > 0 {
-            target.push(b'/');
+    if let [single] = parts.as_slice()
+        && single.is_empty()
+    {
+        target.push(b'/');
+    }
+    if target.is_empty() {
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                target.push(b'/');
+            }
+            target.extend_from_slice(part);
         }
-        target.extend_from_slice(part);
     }
     String::from_utf8(target)
         .map_err(|_| CoreError::invalid(format!("{what} symlink target is not valid UTF-8")))
@@ -505,12 +518,12 @@ fn skip_component_pad(bytes: &[u8], at: usize, ident_end: usize, what: &str) -> 
     Ok(next)
 }
 
-/// Map one symlink component onto the target parts: roots push an
-/// empty part (the leading slash), `..`/`.` push literally, names
-/// decode as OSTA CS0. A type-1 root carrying identifier bytes is an
-/// agreed-place marker the Linux driver skips, so it advances past
-/// the component with no part pushed (handled by returning `None`);
-/// every other arm pushes exactly one part (returning `Some`).
+/// Map one symlink component onto the target parts: a bare type-1
+/// root pushes an empty part (the leading slash), `..`/`.` push
+/// literally, names decode as OSTA CS0. A type-1 root carrying
+/// identifier bytes is an agreed-place marker the Linux driver skips,
+/// so it pushes nothing; a type-2 mount root refuses (it names the
+/// volume, not a path). Every other arm pushes exactly one part.
 fn push_symlink_component(
     parts: &mut Vec<Vec<u8>>,
     comp_type: u8,
@@ -525,21 +538,19 @@ fn push_symlink_component(
         PC_RESERVED => Err(CoreError::invalid(format!(
             "{what} symlink component at offset {at} has reserved type 0"
         ))),
-        PC_ROOT | PC_MOUNTROOT => {
+        PC_ROOT => {
             if id_len > 0 {
                 // Linux skips an agreed-place component carrying
-                // data; a bare one is the root.
-                if comp_type == PC_ROOT {
-                    return Ok(());
-                }
-                return Err(CoreError::invalid(format!(
-                    "{what} symlink component at offset {at} is a root with \
-                     {id_len} identifier bytes: roots carry none"
-                )));
+                // data; a bare one is the filesystem root.
+                return Ok(());
             }
             parts.push(Vec::new());
             Ok(())
         }
+        PC_MOUNTROOT => Err(CoreError::invalid(format!(
+            "{what} symlink component at offset {at} is a volume (mount) root: \
+             mount roots name the volume, not a path inside it, so they do not decode"
+        ))),
         PC_PARENT => {
             if id_len != 0 {
                 return Err(CoreError::invalid(format!(
@@ -583,7 +594,7 @@ fn push_symlink_component(
         }
         other => Err(CoreError::invalid(format!(
             "{what} symlink component at offset {at} has unknown type {other}: \
-             only 1 (root), 2 (root), 3 (parent), 4 (current) and 5 (name) decode"
+             only 1 (root), 3 (parent), 4 (current) and 5 (name) decode"
         ))),
     }
 }
@@ -1882,6 +1893,12 @@ mod tests {
             decode_symlink_target(&data, "link `L`").expect("the bare list decodes"),
             "link"
         );
+        // A lone filesystem root decodes to `/` (not to the empty
+        // string the join would otherwise yield).
+        assert_eq!(
+            decode_symlink_target(&[1, 0, 0, 0], "link `R`").expect("the root decodes"),
+            "/"
+        );
     }
 
     #[test]
@@ -1897,6 +1914,7 @@ mod tests {
             (vec![4, 0, 5, 9, 8, b'F'], "runs past"),
             (vec![5, 0, 8], "empty name"),
             (vec![5, 2, 0, 0, 3, b'x'], "3"),
+            (vec![2, 0], "mount"),
         ] {
             let error =
                 decode_symlink_target(&data, "link `L`").expect_err("a malformed list refuses");
@@ -1969,6 +1987,27 @@ mod tests {
         assert_eq!(
             timestamp_to_system_time(&stamp(0x1000, 2000, 2, 29, 0, 0, 0)),
             Some(UNIX_EPOCH + Duration::new(951_782_400, 0))
+        );
+        // The zone edge applies: +48 quarters (+12 h) backs 2024-06-01
+        // 12:00 local to 00:00Z (1717200000), -48 pushes it to
+        // 2024-06-02 00:00Z (1717286400).
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1030, 2024, 6, 1, 12, 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(1_717_200_000, 0))
+        );
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1FD0, 2024, 6, 1, 12, 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(1_717_286_400, 0))
+        );
+        // Past the edge (±49 quarters) the zone is unknown, read as
+        // UTC: 2024-06-01 12:00 places at 1717243200 either way.
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1031, 2024, 6, 1, 12, 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(1_717_243_200, 0))
+        );
+        assert_eq!(
+            timestamp_to_system_time(&stamp(0x1FCF, 2024, 6, 1, 12, 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(1_717_243_200, 0))
         );
     }
 

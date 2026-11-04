@@ -25,13 +25,27 @@
 //!   opens), restoring the prior mode afterwards unless the source
 //!   carries its own — then applying it is the restore.
 //! * Links (this slice): a relative target resolving lexically inside
-//!   the copied tree is recreated with the sanitised target; a target
-//!   that escapes, is absolute, or names no copied entry is
+//!   the copied tree is recreated with its components rewritten through
+//!   their directories' stored-name maps (so a link to a
+//!   collision-renamed file points at the renamed file, and `.`/`..`
+//!   navigation survives — the stored tree mirrors the source one); a
+//!   target that escapes, is absolute, or names no copied entry is
 //!   dereferenced (the resolved file's bytes land under the link's
 //!   own name, as Rufus does); a link with no file behind it warns
 //!   once naming the link and leaves nothing behind. Links never
 //!   descend, even in a directory slot, and no created link ever
 //!   points outside the destination.
+//! * Replacements (this slice, the S19 seam): [`Replacer`] swaps
+//!   obsolete bootloader payloads per regular file before its bytes
+//!   move — sizing counts the payload, the copy warns `Will replace
+//!   obsolete '<path>'` once and keeps the source mode when the
+//!   payload carries none. S19 owns the payloads; [`NoReplacements`]
+//!   is the declining default.
+//! * Persistence (this slice pins it): `/persistence.conf` and
+//!   `/live-persistence.conf` are ordinary files to the copier and
+//!   land like any other entry at their root paths. The ext4
+//!   persistence *partition* itself is S12's formatter, not the
+//!   copier — this module never partitions anything.
 //!
 //! Not here yet: ownership (never applied —
 //! it needs privileges), boot/extended attributes, and any CLI
@@ -58,6 +72,7 @@ pub use source::IsoSource;
 pub use source::Source;
 pub use source::UdfSource;
 
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write as _;
@@ -79,17 +94,77 @@ const COPY_BUF_LEN: usize = 128 * 1024;
 /// readers' own caps (`MAX_DIR_DEPTH`/`MAX_WALK_DEPTH`, 32 each).
 const MAX_COPY_DEPTH: usize = 64;
 
-/// Copy options: capacity only, for now. Later slices add knobs here
-/// (filters, symlink policy, metadata handling) without touching
-/// [`walk`]'s signature shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CopyOptions {
+/// Copy options: capacity plus the bootloader replacement seam.
+/// Later slices add knobs here (filters, symlink policy, metadata
+/// handling) without touching [`walk`]'s signature shape.
+pub struct CopyOptions<'a> {
     /// Free bytes on the destination filesystem, when the caller knows
     /// them (`None` skips the up-front capacity check). `std` has no
     /// `statvfs`, so supplying this is the CLI/adapter's job; the copy
     /// refuses before any write when the tree's declared total exceeds
     /// it.
     pub free_bytes: Option<u64>,
+    /// Obsolete-bootloader replacer (the S19 seam): consulted for
+    /// every regular file before its bytes move. `None` copies every
+    /// file verbatim. Must be deterministic — the sizing pass and the
+    /// copy pass each call it once per file, and the two calls must
+    /// agree.
+    pub replacer: Option<&'a dyn Replacer>,
+}
+
+impl<'a> Clone for CopyOptions<'a> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a> Copy for CopyOptions<'a> {}
+
+impl<'a> std::fmt::Debug for CopyOptions<'a> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CopyOptions")
+            .field("free_bytes", &self.free_bytes)
+            .field("replacer", &self.replacer.is_some())
+            .finish()
+    }
+}
+
+/// A replacement payload for one source file: the bytes to write
+/// under the destination name instead of the source data, with an
+/// optional mode (the source entry's mode wins when this is `None`).
+/// S19 owns the actual bootloader payloads; this struct is only the
+/// seam they arrive through (see [`Replacer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacement {
+    /// The bytes to write.
+    pub bytes: Vec<u8>,
+    /// The mode to apply (`None` keeps the source entry's mode).
+    pub mode: Option<u32>,
+}
+
+/// The S19 seam for obsolete-bootloader replacement (PLAN S18: `Will
+/// replace obsolete '%s'`): given a regular file's parent directory
+/// (`source_path`, `/`-joined source name bytes relative to the
+/// source root — empty at the root) and its source file name,
+/// return the payload to write instead of the source data, or `None`
+/// to copy the file verbatim. Never consulted for directories or
+/// symlinks — not even dereferenced ones, which read their target's
+/// source bytes — and never for anything but a direct tree entry.
+pub trait Replacer {
+    /// The replacement for one file, or `None` to copy it verbatim.
+    fn replacement(&self, source_path: &[u8], name: &[u8]) -> Option<Replacement>;
+}
+
+/// A [`Replacer`] that declines everything: the default copy, with
+/// every file verbatim and no replacement warnings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoReplacements;
+
+impl Replacer for NoReplacements {
+    fn replacement(&self, _source_path: &[u8], _name: &[u8]) -> Option<Replacement> {
+        None
+    }
 }
 
 /// What one [`walk`] moved.
@@ -157,6 +232,12 @@ pub trait Progress {
 /// recreated link costs nothing, a dereferenced one costs its file's
 /// bytes, a skipped one costs nothing.
 ///
+/// Regular files pass the [`Replacer`] first: a payload lands under
+/// the destination name instead of the source data, warns `Will
+/// replace obsolete '<path>'` once (the source path, display form),
+/// and keeps the source entry's mode when the payload carries none.
+/// The hook never runs for directories or symlinks.
+///
 /// Order of checks: the destination must exist as a directory, then
 /// the tree's declared total is summed (a second traversal — sources
 /// are cheap listings, and the total must be known before any write),
@@ -171,7 +252,7 @@ pub fn walk(
     progress: &mut dyn Progress,
 ) -> Result<Summary> {
     let dest = DestDir::open(dest)?;
-    let total = total_bytes(source)?;
+    let (total, maps) = total_bytes(source, options.replacer)?;
     match options.free_bytes {
         Some(free) if total > free => {
             return Err(CoreError::invalid(format!(
@@ -194,6 +275,8 @@ pub fn walk(
         total,
         progress,
         taken: HashSet::new(),
+        maps,
+        replacer: options.replacer,
     };
     copier.progress.report(0, total);
     let mut rel = Vec::new();
@@ -439,6 +522,36 @@ fn display_name(name: &[u8]) -> String {
     device_text(&String::from_utf8_lossy(name))
 }
 
+/// Render a source path (name bytes from the root) for messages:
+/// components joined with `/`, then the same lossy ASCII device
+/// sanitiser as [`display_name`], so warning lines stay ASCII.
+fn display_path(path: &[Vec<u8>]) -> String {
+    let mut joined = Vec::new();
+    for (index, part) in path.iter().enumerate() {
+        if index > 0 {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(part);
+    }
+    device_text(&String::from_utf8_lossy(&joined))
+}
+
+/// Render a parent directory (name bytes from the root) as the
+/// `/`-joined form [`Replacer::replacement`] receives: empty at the
+/// root, otherwise components joined with `/`, source bytes
+/// untouched (matching happens on source names, never sanitised
+/// ones).
+fn replacer_dir_path(dir: &[Vec<u8>]) -> Vec<u8> {
+    let mut joined = Vec::new();
+    for (index, part) in dir.iter().enumerate() {
+        if index > 0 {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(part);
+    }
+    joined
+}
+
 /// Refuse entry names that could escape the destination or confuse
 /// the walk: empty names, `.`/`..`, and anything holding `/` (one
 /// component must stay one component). Applied to sanitised names as
@@ -595,24 +708,34 @@ fn lookup_source(source: &dyn Source, path: &[Vec<u8>]) -> Result<Option<Entry>>
     Ok(None)
 }
 
+/// Strictly resolve `target` against `base` and confirm the result
+/// names an existing entry (the root counts as existing — it always
+/// lands): the shape recreated as a symlink. Returns the resolved
+/// source path, or `None` for absolute, escaping, dangling, or
+/// link-passing targets.
+fn strict_resolve_existing(
+    source: &dyn Source,
+    base: &[Vec<u8>],
+    target: &[u8],
+) -> Option<Vec<Vec<u8>>> {
+    let resolved = strict_resolve(base, target)?;
+    if resolved.is_empty() {
+        return Some(resolved);
+    }
+    match lookup_source(source, &resolved) {
+        Ok(Some(_)) => Some(resolved),
+        Ok(None) => None,
+        Err(_) => None,
+    }
+}
+
 /// True when `target` (relative to `base`) strictly resolves inside
 /// and names an existing entry (or the root): the shape recreated as
 /// a symlink. Anything else — absolute, escaping, dangling, or
 /// passing through a link — reads as `false` and falls to
 /// dereference.
 fn strict_link_inside(source: &dyn Source, base: &[Vec<u8>], target: &[u8]) -> bool {
-    let resolved = match strict_resolve(base, target) {
-        Some(path) => path,
-        None => return false,
-    };
-    if resolved.is_empty() {
-        return true;
-    }
-    match lookup_source(source, &resolved) {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(_) => false,
-    }
+    strict_resolve_existing(source, base, target).is_some()
 }
 
 /// Resolve `target` (relative to `base`) to a regular file for
@@ -655,32 +778,117 @@ fn dereference_file(
     None
 }
 
-/// Sanitise a symlink target for recreation: split on `/`, keep `.`
-/// and `..` as navigation, sanitise every other component with
-/// [`sanitise`] (no warnings — target shortening stays silent, and a
-/// colliding rename may leave the link dangling, see the walk docs),
-/// rejoin with `/`. Absolute targets never reach here (they
-/// dereference), so no leading slash is preserved.
-fn sanitised_target(target: &[u8]) -> Vec<u8> {
-    let mut parts: Vec<Vec<u8>> = Vec::new();
+/// Rewrite a strictly-inside symlink target for recreation: walk the
+/// target's components against `base` tracking the source directory,
+/// keep `.` and `..` as navigation (the stored tree mirrors the
+/// source one, so they still land), and rewrite every other
+/// component through that directory's source-to-stored map — so a
+/// link to a collision-renamed file points at the renamed file, not
+/// at a dangling name or (on case-insensitive targets) the wrong
+/// file. A component missing from its map (unreachable when the maps
+/// and the walk agree — the caller checked strictness first) falls
+/// back to its sanitised form, never a refusal. Absolute targets
+/// never reach here (they dereference), so no leading slash is
+/// preserved.
+fn rewrite_link_target(maps: &NameMaps, base: &[Vec<u8>], target: &[u8]) -> Vec<u8> {
+    let mut cur = base.to_vec();
+    let mut out: Vec<Vec<u8>> = Vec::new();
     for part in target.split(|byte| *byte == b'/') {
         if part.is_empty() {
             continue;
         }
-        if part == b"." || part == b".." {
-            parts.push(part.to_vec());
+        if part == b"." {
+            out.push(b".".to_vec());
             continue;
         }
-        parts.push(sanitise(part).name);
-    }
-    let mut out = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
-        if index > 0 {
-            out.push(b'/');
+        if part == b".." {
+            cur.pop();
+            out.push(b"..".to_vec());
+            continue;
         }
-        out.extend_from_slice(part);
+        let stored = match maps.get(&cur).and_then(|dir| dir.get(part)) {
+            Some(stored) => stored.clone(),
+            None => sanitise(part).name,
+        };
+        out.push(stored);
+        cur.push(part.to_vec());
     }
-    out
+    let mut joined = Vec::new();
+    for (index, part) in out.iter().enumerate() {
+        if index > 0 {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(part);
+    }
+    joined
+}
+
+/// Source-name to stored-name maps, one per directory (keyed by the
+/// directory's source path from the root): the sizing pass builds the
+/// whole tree's maps up front so recreated links rewrite through the
+/// same names the copy pass assigns — including collision suffixes.
+type NameMaps = BTreeMap<Vec<Vec<u8>>, BTreeMap<Vec<u8>, Vec<u8>>>;
+
+/// Assign the destination name for one sanitised component in a
+/// directory whose taken names are `taken`: first-come keeps its name
+/// (entries arrive byte-sorted, so this is deterministic); a taken
+/// name (ASCII case-insensitive — see [`ascii_lower`]) earns `~N`
+/// before the extension, `N` from 1 to [`MAX_COLLISION_SUFFIX`], then
+/// refuses naming the source entry. The room rule trims a stem the
+/// suffix would overflow (same trailing-dot trim as sanitising, so no
+/// candidate ends dirty). Both the copy pass (per-directory pool) and
+/// the sizing pass (per-directory maps) share this one function, so
+/// the two passes always assign the same names.
+fn assign_unique_in(
+    taken: &mut HashSet<Vec<u8>>,
+    source: &[u8],
+    sanitised: &[u8],
+) -> Result<PlacedName> {
+    let mut key = ascii_lower(sanitised);
+    if !taken.contains(&key) {
+        taken.insert(key);
+        return Ok(PlacedName {
+            dest: sanitised.to_vec(),
+            shortened_from: None,
+        });
+    }
+    let (stem, ext) = split_ext(sanitised);
+    for n in 1..=MAX_COLLISION_SUFFIX {
+        let suffix = format!("~{n}");
+        let room = MAX_COMPONENT_LEN
+            .saturating_sub(suffix.len())
+            .saturating_sub(ext.len());
+        let mut stem_part = stem.to_vec();
+        let shortened = stem_part.len() > room;
+        if shortened {
+            let cut = clean_cut_len(&stem_part, room);
+            stem_part.truncate(cut);
+            trim_trailing_dots_spaces(&mut stem_part);
+        }
+        let mut candidate = stem_part;
+        candidate.extend_from_slice(suffix.as_bytes());
+        candidate.extend_from_slice(ext);
+        key = ascii_lower(&candidate);
+        if !taken.contains(&key) {
+            taken.insert(key);
+            let shortened_from = if shortened {
+                let mut overlong = stem.to_vec();
+                overlong.extend_from_slice(suffix.as_bytes());
+                overlong.extend_from_slice(ext);
+                Some(overlong)
+            } else {
+                None
+            };
+            return Ok(PlacedName {
+                dest: candidate,
+                shortened_from,
+            });
+        }
+    }
+    Err(CoreError::invalid(format!(
+        "copy refuses '{}': more than {MAX_COLLISION_SUFFIX} case-insensitive collisions in one directory",
+        display_name(source),
+    )))
 }
 
 /// The walk state: everything [`copy_dir`](Copier::copy_dir) threads
@@ -698,6 +906,13 @@ struct Copier<'a> {
     /// saved/restored around each descent, so collisions never leak
     /// across directories in either direction.
     taken: HashSet<Vec<u8>>,
+    /// Source-to-stored name maps for the whole tree, built up front
+    /// by the sizing pass: recreated links rewrite through them so a
+    /// link to a collision-renamed file points at the renamed file.
+    maps: NameMaps,
+    /// Obsolete-bootloader replacer, consulted for every regular file
+    /// before its bytes move (never for directories or symlinks).
+    replacer: Option<&'a dyn Replacer>,
 }
 
 /// What placing one name decided: the destination name plus the
@@ -711,60 +926,18 @@ struct PlacedName {
 }
 
 impl Copier<'_> {
-    /// Assign the destination name for one sanitised component in the    /// current directory: first-come keeps its name (entries arrive
+    /// Assign the destination name for one sanitised component in the
+    /// current directory: first-come keeps its name (entries arrive
     /// byte-sorted, so this is deterministic); a taken name (ASCII
     /// case-insensitive — see [`ascii_lower`]) earns `~N` before the
     /// extension, `N` from 1 to [`MAX_COLLISION_SUFFIX`], then refuses
     /// naming the source entry. The room rule trims a stem the suffix
     /// would overflow (same trailing-dot trim as sanitising, so no
     /// candidate ends dirty); the caller warns at most once per entry
-    /// from the returned [`PlacedName`].
+    /// from the returned [`PlacedName`]. Shared with the sizing pass
+    /// through [`assign_unique_in`].
     fn assign_unique(&mut self, source: &[u8], sanitised: &[u8]) -> Result<PlacedName> {
-        let mut key = ascii_lower(sanitised);
-        if !self.taken.contains(&key) {
-            self.taken.insert(key);
-            return Ok(PlacedName {
-                dest: sanitised.to_vec(),
-                shortened_from: None,
-            });
-        }
-        let (stem, ext) = split_ext(sanitised);
-        for n in 1..=MAX_COLLISION_SUFFIX {
-            let suffix = format!("~{n}");
-            let room = MAX_COMPONENT_LEN
-                .saturating_sub(suffix.len())
-                .saturating_sub(ext.len());
-            let mut stem_part = stem.to_vec();
-            let shortened = stem_part.len() > room;
-            if shortened {
-                let cut = clean_cut_len(&stem_part, room);
-                stem_part.truncate(cut);
-                trim_trailing_dots_spaces(&mut stem_part);
-            }
-            let mut candidate = stem_part;
-            candidate.extend_from_slice(suffix.as_bytes());
-            candidate.extend_from_slice(ext);
-            key = ascii_lower(&candidate);
-            if !self.taken.contains(&key) {
-                self.taken.insert(key);
-                let shortened_from = if shortened {
-                    let mut overlong = stem.to_vec();
-                    overlong.extend_from_slice(suffix.as_bytes());
-                    overlong.extend_from_slice(ext);
-                    Some(overlong)
-                } else {
-                    None
-                };
-                return Ok(PlacedName {
-                    dest: candidate,
-                    shortened_from,
-                });
-            }
-        }
-        Err(CoreError::invalid(format!(
-            "copy refuses '{}': more than {MAX_COLLISION_SUFFIX} case-insensitive collisions in one directory",
-            display_name(source),
-        )))
+        assign_unique_in(&mut self.taken, source, sanitised)
     }
 
     /// Stream `size` bytes of the source file at `src` (name bytes
@@ -773,6 +946,22 @@ impl Copier<'_> {
     /// links, so both count progress identically. A short read
     /// refuses naming the destination and both counts, exactly like
     /// the capacity check measured them.
+    /// Write a replacement payload (see [`Replacer`]) into the
+    /// already-open `file` at destination `abs`, in buffer-sized
+    /// windows so progress counts exactly like a streamed file.
+    fn stream_slice(&mut self, abs: &Path, payload: &[u8], file: &mut std::fs::File) -> Result<()> {
+        let width = self.buf.len();
+        for window in payload.chunks(width.max(1)) {
+            file.write_all(window)
+                .map_err(|error| CoreError::io(abs, error))?;
+            self.done = self.done.checked_add(window.len() as u64).ok_or_else(|| {
+                CoreError::invalid("copy byte count overflows the counter".to_string())
+            })?;
+            self.progress.report(self.done, self.total);
+        }
+        Ok(())
+    }
+
     fn stream_from(
         &mut self,
         abs: &Path,
@@ -856,12 +1045,14 @@ impl Copier<'_> {
                     None => &[],
                 };
                 if strict_link_inside(self.source, base, target) {
-                    // Inside: recreate as a link with the sanitised
-                    // target. Counts as a file with no bytes; no
-                    // metadata is applied (setting times or modes
-                    // through the link would touch the target).
-                    let sanitised = sanitised_target(target);
-                    let link_to = Path::new(OsStr::from_bytes(&sanitised));
+                    // Inside: recreate as a link, rewriting each
+                    // component through its directory's stored-name
+                    // map so collision renames carry over. Counts as
+                    // a file with no bytes; no metadata is applied
+                    // (setting times or modes through the link would
+                    // touch the target).
+                    let rewritten = rewrite_link_target(&self.maps, base, target);
+                    let link_to = Path::new(OsStr::from_bytes(&rewritten));
                     self.dest.replace_symlink(abs, link_to)?;
                     self.summary.files = self.summary.files.checked_add(1).ok_or_else(|| {
                         CoreError::invalid("copy file count overflows the counter".to_string())
@@ -948,6 +1139,50 @@ impl Copier<'_> {
                     ));
                 }
             } else {
+                // Regular files consult the replacer first (the S19
+                // seam — never directories or symlinks): a payload
+                // lands under the destination name instead of the
+                // source data, with exactly one `Will replace
+                // obsolete` warning naming the source path.
+                let parent: &[Vec<u8>] = match rel.split_last() {
+                    Some((_, parent)) => parent,
+                    None => &[],
+                };
+                let dir_path = replacer_dir_path(parent);
+                let replacement = self
+                    .replacer
+                    .and_then(|known| known.replacement(&dir_path, &child.name));
+                if let Some(payload) = replacement {
+                    let size = payload.bytes.len() as u64;
+                    let mut file = self.dest.replace_file(abs)?;
+                    self.stream_slice(abs, &payload.bytes, &mut file)?;
+                    self.summary.files = self.summary.files.checked_add(1).ok_or_else(|| {
+                        CoreError::invalid("copy file count overflows the counter".to_string())
+                    })?;
+                    self.summary.bytes = self.summary.bytes.checked_add(size).ok_or_else(|| {
+                        CoreError::invalid("copy byte count overflows the counter".to_string())
+                    })?;
+                    self.progress
+                        .warn(&format!("Will replace obsolete '{}'", display_path(rel),));
+                    // The payload's own mode wins; without one the
+                    // source entry's mode still lands (with its
+                    // stamps), best-effort like every metadata write.
+                    let mut effective = child.clone();
+                    if payload.mode.is_some() {
+                        effective.mode = payload.mode;
+                    }
+                    if let Err(error) = self.dest.apply_metadata(abs, &effective) {
+                        self.progress.warn(&format!(
+                            "copy cannot apply metadata to '{}': {error}; continuing",
+                            abs.display(),
+                        ));
+                    }
+                    rel.pop().ok_or_else(|| {
+                        CoreError::invalid("copy path stack underflows its push".to_string())
+                    })?;
+                    abs.pop();
+                    continue;
+                }
                 let mut file = self.dest.replace_file(abs)?;
                 self.stream_from(abs, rel, child.size, &mut file)?;
                 self.summary.files = self.summary.files.checked_add(1).ok_or_else(|| {
@@ -980,13 +1215,24 @@ impl Copier<'_> {
 }
 
 /// Sum every file size in the tree: the up-front total the capacity
-/// check and the progress meter need before any write. A second
-/// traversal is deliberate (see [`walk`]); it enforces the same
-/// depth bound and name rules as the copy pass, so both passes agree
-/// on which trees are copyable.
-fn total_bytes(source: &dyn Source) -> Result<u64> {
-    fn sum(source: &dyn Source, dir: &mut Vec<Vec<u8>>, depth: usize) -> Result<u64> {
+/// check and the progress meter need before any write — alongside the
+/// whole tree's source-to-stored name maps, which recreated links
+/// rewrite through. A second traversal is deliberate (see [`walk`]);
+/// it enforces the same depth bound and name rules as the copy pass,
+/// so both passes agree on which trees are copyable and which names
+/// they store under. Replacement payloads (see [`Replacer`]) count
+/// by their own length here — the same consultation the copy pass
+/// runs, so the free-space check measures what will actually land.
+fn total_bytes(source: &dyn Source, replacer: Option<&dyn Replacer>) -> Result<(u64, NameMaps)> {
+    fn sum(
+        source: &dyn Source,
+        dir: &mut Vec<Vec<u8>>,
+        depth: usize,
+        maps: &mut NameMaps,
+        replacer: Option<&dyn Replacer>,
+    ) -> Result<u64> {
         check_depth(dir, depth)?;
+        let mut taken = HashSet::new();
         let mut total = 0u64;
         for child in sorted_children(source, dir)? {
             // Reserved names refuse here exactly like the copy pass
@@ -994,6 +1240,14 @@ fn total_bytes(source: &dyn Source) -> Result<u64> {
             // so only the traversal-blocking rules apply, not the
             // sanitiser.
             check_reserved(&child.name)?;
+            // The stored name is assigned here exactly like the copy
+            // pass assigns it (same order, same per-directory pool),
+            // so the maps the links rewrite through match the copy.
+            let sanitised = sanitise(&child.name);
+            let placed = assign_unique_in(&mut taken, &child.name, &sanitised.name)?;
+            maps.entry(dir.clone())
+                .or_default()
+                .insert(child.name.clone(), placed.dest);
             if let Some(target) = child.link.as_ref() {
                 // Links never descend (even in a directory slot): a
                 // strictly-inside target costs nothing (recreated as a
@@ -1011,7 +1265,7 @@ fn total_bytes(source: &dyn Source) -> Result<u64> {
             }
             if child.is_dir {
                 dir.push(child.name.clone());
-                let sub = sum(source, dir, depth.saturating_add(1))?;
+                let sub = sum(source, dir, depth.saturating_add(1), maps, replacer)?;
                 dir.pop().ok_or_else(|| {
                     CoreError::invalid("copy path stack underflows its push".to_string())
                 })?;
@@ -1019,7 +1273,16 @@ fn total_bytes(source: &dyn Source) -> Result<u64> {
                     CoreError::invalid("copy total overflows the byte arithmetic".to_string())
                 })?;
             } else {
-                total = total.checked_add(child.size).ok_or_else(|| {
+                // Regular files count their replacement's length when
+                // the replacer claims them — the same consultation the
+                // copy pass runs, so the check stays honest.
+                let dir_path = replacer_dir_path(dir);
+                let size =
+                    match replacer.and_then(|known| known.replacement(&dir_path, &child.name)) {
+                        Some(replacement) => replacement.bytes.len() as u64,
+                        None => child.size,
+                    };
+                total = total.checked_add(size).ok_or_else(|| {
                     CoreError::invalid("copy total overflows the byte arithmetic".to_string())
                 })?;
             }
@@ -1027,7 +1290,9 @@ fn total_bytes(source: &dyn Source) -> Result<u64> {
         Ok(total)
     }
 
-    sum(source, &mut Vec::new(), 0)
+    let mut maps: NameMaps = BTreeMap::new();
+    let total = sum(source, &mut Vec::new(), 0, &mut maps, replacer)?;
+    Ok((total, maps))
 }
 
 #[cfg(test)]
@@ -1211,8 +1476,11 @@ mod tests {
     }
 
     /// [`CopyOptions`] with no capacity limit.
-    fn no_limit() -> CopyOptions {
-        CopyOptions { free_bytes: None }
+    fn no_limit() -> CopyOptions<'static> {
+        CopyOptions {
+            free_bytes: None,
+            replacer: None,
+        }
     }
 
     /// Two directories under the root (`B/` before `A/` on purpose),
@@ -1318,6 +1586,7 @@ mod tests {
             scratch.path(),
             &CopyOptions {
                 free_bytes: Some(12),
+                replacer: None,
             },
             &mut progress,
         )
@@ -2056,6 +2325,108 @@ mod tests {
     }
 
     #[test]
+    fn recreated_link_tracks_collision_renames() {
+        // The slice-4 gap, pinned: `FILE.TXT` keeps its name while
+        // `file.txt` collides onto `file~1.txt`, and `LINK -> file.txt`
+        // must point at the renamed file — a bare sanitised target
+        // would dangle on a case-sensitive target (and hit the wrong
+        // file on FAT32). Only the colliding file counts as renamed.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"FILE.TXT".to_vec(),
+            bytes: b"upper".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"file.txt".to_vec(),
+            bytes: b"lower".to_vec(),
+        });
+        source.dir(&[]).links.push(MemLink {
+            name: b"LINK".to_vec(),
+            target: b"file.txt".to_vec(),
+            is_dir: false,
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a link tree copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 3,
+                bytes: 10,
+                renamed: 1,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "a renamed-target link warns nothing: {:?}",
+            progress.warns
+        );
+        let link = scratch.path().join("LINK");
+        assert_eq!(
+            std::fs::read_link(&link).expect("the target reads"),
+            Path::new("file~1.txt")
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("file~1.txt")).expect("the renamed file reads back"),
+            b"lower"
+        );
+        assert_eq!(
+            std::fs::read(&link).expect("the link resolves to the renamed file"),
+            b"lower"
+        );
+    }
+
+    #[test]
+    fn recreated_link_rewrites_across_two_levels() {
+        // The same rewrite one level down: `sub/` collides onto
+        // `sub~1/` while `SUB/` keeps its name, and root `L ->
+        // sub/F.TXT` must point at `sub~1/F.TXT`. The `..`-free walk
+        // maps each component through its own directory's map.
+        let mut source = MemSource::default();
+        source.dir(&[]).dirs.push(b"SUB".to_vec());
+        source.dir(&[]).dirs.push(b"sub".to_vec());
+        source.dir(&[b"SUB".to_vec()]);
+        source.dir(&[b"sub".to_vec()]).files.push(MemFile {
+            name: b"F.TXT".to_vec(),
+            bytes: b"deep".to_vec(),
+        });
+        source.dir(&[]).links.push(MemLink {
+            name: b"L".to_vec(),
+            target: b"sub/F.TXT".to_vec(),
+            is_dir: false,
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("a link tree copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 2,
+                files: 2,
+                bytes: 4,
+                renamed: 1,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "a rewritten link warns nothing: {:?}",
+            progress.warns
+        );
+        let link = scratch.path().join("L");
+        assert_eq!(
+            std::fs::read_link(&link).expect("the target reads"),
+            Path::new("sub~1/F.TXT")
+        );
+        assert_eq!(
+            std::fs::read(&link).expect("the link resolves into the renamed directory"),
+            b"deep"
+        );
+    }
+
+    #[test]
     fn escaping_link_dereferenced_to_file() {
         // SUB/LINK climbs past the root (`../../FILE.TXT`): lexically
         // outside, so the walk copies the resolved file's bytes as a
@@ -2193,6 +2564,7 @@ mod tests {
             scratch.path(),
             &CopyOptions {
                 free_bytes: Some(17),
+                replacer: None,
             },
             &mut progress,
         )
@@ -2254,6 +2626,300 @@ mod tests {
         assert_eq!(
             std::fs::read_link(&link).expect("the target reads"),
             Path::new("DIR")
+        );
+    }
+
+    /// A [`Replacer`](super::Replacer) swapping one file's bytes (and
+    /// its mode): the S19 seam in miniature.
+    struct SwapOne {
+        bytes: Vec<u8>,
+        mode: Option<u32>,
+    }
+
+    impl super::Replacer for SwapOne {
+        fn replacement(&self, source_path: &[u8], name: &[u8]) -> Option<super::Replacement> {
+            if source_path.is_empty() && name == b"OLD.BIN" {
+                Some(super::Replacement {
+                    bytes: self.bytes.clone(),
+                    mode: self.mode,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn replacer_swaps_one_files_bytes_and_size() {
+        // OLD.BIN (4 bytes) is swapped for a 19-byte payload with its
+        // own mode: the summary counts 23 bytes, the free-space check
+        // measures the payload (8 free bytes refuse the 23-byte tree
+        // even though the source holds 8), exactly one `Will replace
+        // obsolete` warning names the source path, and the payload's
+        // mode lands while the untouched file keeps the default.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"OLD.BIN".to_vec(),
+            bytes: b"old!".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"KEEP".to_vec(),
+            bytes: b"keep".to_vec(),
+        });
+        let swap = SwapOne {
+            bytes: b"replacement-payload".to_vec(),
+            mode: Some(0o600),
+        };
+        let options = CopyOptions {
+            free_bytes: None,
+            replacer: Some(&swap),
+        };
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let control = scratch.path().join("control");
+        std::fs::write(&control, b"").expect("the control writes");
+        let control_mode = std::fs::metadata(&control)
+            .expect("control stats")
+            .permissions()
+            .mode();
+        std::fs::remove_file(&control).expect("the control removes");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &options, &mut progress).expect("a replaced tree copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 2,
+                bytes: 23,
+                renamed: 0,
+            }
+        );
+        assert_eq!(
+            progress.warns,
+            ["Will replace obsolete 'OLD.BIN'".to_string()],
+            "exactly one replacement warning"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("OLD.BIN")).expect("the payload reads back"),
+            b"replacement-payload"
+        );
+        assert_eq!(
+            std::fs::metadata(scratch.path().join("OLD.BIN"))
+                .expect("payload stats")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the payload's own mode lands"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("KEEP")).expect("the kept file reads back"),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::metadata(scratch.path().join("KEEP"))
+                .expect("kept stats")
+                .permissions()
+                .mode(),
+            control_mode,
+            "no payload means the source mode stands"
+        );
+        // The free-space check follows the payload, not the source:
+        // 8 free bytes hold the 8-byte source tree but not the
+        // 23-byte replaced one.
+        let mut progress = Recorder::default();
+        let error = walk(
+            &source,
+            scratch.path(),
+            &CopyOptions {
+                free_bytes: Some(8),
+                replacer: Some(&swap),
+            },
+            &mut progress,
+        )
+        .expect_err("8 bytes refuse a 23 byte replaced tree");
+        let text = error.to_string();
+        assert!(text.contains("23"), "{text}");
+        assert!(text.contains('8'), "{text}");
+    }
+
+    #[test]
+    fn declining_replacer_leaves_tree_untouched() {
+        // [`NoReplacements`](super::NoReplacements) declines every
+        // file: the tree lands verbatim with no warnings, exactly like
+        // a `None` replacer.
+        let source = two_dir_source();
+        let options = CopyOptions {
+            free_bytes: None,
+            replacer: Some(&super::NoReplacements),
+        };
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &options, &mut progress).expect("a declined tree copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 2,
+                files: 2,
+                bytes: 13,
+                renamed: 0,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "a declining replacer warns nothing: {:?}",
+            progress.warns
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("TOP.TXT")).expect("top reads back"),
+            b"top-txt"
+        );
+    }
+
+    /// A [`Replacer`](super::Replacer) claiming every file, recording
+    /// each consultation: proves the hook never runs for directories
+    /// or symlinks.
+    struct GreedySwap {
+        calls: RefCell<Vec<(Vec<u8>, Vec<u8>)>>,
+    }
+
+    impl super::Replacer for GreedySwap {
+        fn replacement(&self, source_path: &[u8], name: &[u8]) -> Option<super::Replacement> {
+            self.calls
+                .borrow_mut()
+                .push((source_path.to_vec(), name.to_vec()));
+            Some(super::Replacement {
+                bytes: b"R".to_vec(),
+                mode: None,
+            })
+        }
+    }
+
+    #[test]
+    fn replacement_never_runs_for_symlinks_or_directories() {
+        // TOP, SUB/F and the SUB directory plus a link L -> TOP: the
+        // greedy replacer is consulted for the two files only — never
+        // for SUB (a directory) nor L (a symlink, still recreated as
+        // a link). Both files land with the 1-byte payload.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"TOP".to_vec(),
+            bytes: b"top-bytes".to_vec(),
+        });
+        source.dir(&[]).dirs.push(b"SUB".to_vec());
+        source.dir(&[b"SUB".to_vec()]).files.push(MemFile {
+            name: b"F".to_vec(),
+            bytes: b"f-bytes".to_vec(),
+        });
+        source.dir(&[]).links.push(MemLink {
+            name: b"L".to_vec(),
+            target: b"TOP".to_vec(),
+            is_dir: false,
+        });
+        let greedy = GreedySwap {
+            calls: RefCell::new(Vec::new()),
+        };
+        let options = CopyOptions {
+            free_bytes: None,
+            replacer: Some(&greedy),
+        };
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary = walk(&source, scratch.path(), &options, &mut progress)
+            .expect("a greedily replaced tree copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 1,
+                files: 3,
+                bytes: 2,
+                renamed: 0,
+            }
+        );
+        assert_eq!(
+            greedy.calls.borrow().clone(),
+            [
+                (b"SUB".to_vec(), b"F".to_vec()),
+                (b"".to_vec(), b"TOP".to_vec()),
+                (b"SUB".to_vec(), b"F".to_vec()),
+                (b"".to_vec(), b"TOP".to_vec()),
+            ],
+            "only the two files are consulted, with dir path and name — \
+             once in sizing, once in copy"
+        );
+        assert_eq!(
+            progress.warns,
+            [
+                "Will replace obsolete 'SUB/F'".to_string(),
+                "Will replace obsolete 'TOP'".to_string(),
+            ]
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("TOP")).expect("the payload reads back"),
+            b"R"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("SUB").join("F")).expect("nested payload reads"),
+            b"R"
+        );
+        assert_eq!(
+            std::fs::read_link(scratch.path().join("L")).expect("the link target reads"),
+            Path::new("TOP")
+        );
+    }
+
+    #[test]
+    fn persistence_files_survive_at_their_root_paths() {
+        // The Part 2 pin: `/persistence.conf` and
+        // `/live-persistence.conf` are ordinary files to the copier
+        // and land byte-identical at their root paths with no
+        // warnings; a nested same-named file follows the standard
+        // rules (no persistence treatment below the root).
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"persistence.conf".to_vec(),
+            bytes: b"/ union\n".to_vec(),
+        });
+        source.dir(&[]).files.push(MemFile {
+            name: b"live-persistence.conf".to_vec(),
+            bytes: b"/home\n".to_vec(),
+        });
+        source.dir(&[]).dirs.push(b"SUB".to_vec());
+        source.dir(&[b"SUB".to_vec()]).files.push(MemFile {
+            name: b"persistence.conf".to_vec(),
+            bytes: b"nested\n".to_vec(),
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let mut progress = Recorder::default();
+        let summary =
+            walk(&source, scratch.path(), &no_limit(), &mut progress).expect("the tree copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 1,
+                files: 3,
+                bytes: 21,
+                renamed: 0,
+            }
+        );
+        assert!(
+            progress.warns.is_empty(),
+            "kept persistence files warn nothing: {:?}",
+            progress.warns
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("persistence.conf")).expect("persistence reads"),
+            b"/ union\n"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("live-persistence.conf")).expect("live reads"),
+            b"/home\n"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path().join("SUB").join("persistence.conf"))
+                .expect("the nested copy reads"),
+            b"nested\n"
         );
     }
 }

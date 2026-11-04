@@ -101,6 +101,24 @@ impl Entry {
 }
 
 /// Metadata read for one listed child: the symlink target with the
+/// Why one child's metadata read failed: a malformed symlink target
+/// aborts the listing (the target is the listing's own business),
+/// while any other failure (unresolvable ICB, corrupt file entry)
+/// still lists with absent metadata — opening the child refuses
+/// later. The split is typed so a child merely *named* with the word
+/// "symlink" cannot abort a listing; both arms surface as the same
+/// invalid-input exit class.
+#[derive(Debug)]
+enum ChildMetaError {
+    /// The child's file entry is a symlink with a malformed target.
+    Symlink(CoreError),
+    /// Anything else: resolution, window or file-entry failure. The
+    /// listing drops the detail on purpose (absent metadata, with the
+    /// refusal deferred to open), so the variant carries nothing.
+    Other,
+}
+
+/// Metadata read for one listed child: the symlink target with the
 /// mode and stamps. A small struct so the helper stays under the
 /// type-complexity lint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,7 +371,10 @@ impl UdfReader {
     /// symlink gets its own message: symlinks are never followed),
     /// unresolvable ICBs and malformed directory data, naming the entry.
     /// A directory whose identifiers span several extents lists all of
-    /// them: the extents join in order before parsing.
+    /// them: the extents join in order before parsing. Each listed child
+    /// costs one extra ICB read for its mode, stamps and (for links)
+    /// target — listings trade one block read per child for carrying
+    /// the copy's metadata inline, instead of a second pass.
     pub fn read_dir(&self, entry: &Entry) -> Result<Vec<Entry>> {
         let display = short_name(&entry.name);
         let (home, abs, rel) = self.resolve(&entry.icb, &display)?;
@@ -402,23 +423,23 @@ impl UdfReader {
             // existing callers keep their shape; opening or reading it
             // refuses with the kind named. A present symlink with a
             // malformed target still refuses here — that target is the
-            // listing's own business, not a later open.
+            // listing's own business, not a later open. The split is
+            // typed ([`ChildMetaError`]), never a message substring:
+            // a child merely *named* something-with-symlink still
+            // lists.
             let meta = match self.entry_metadata(&id.icb, &name) {
                 Ok(meta) => meta,
-                Err(error) => {
-                    let text = error.to_string();
-                    if text.contains("symlink") {
-                        return Err(CoreError::invalid(format!(
-                            "cannot list `{display}`: {error}"
-                        )));
-                    }
-                    ChildMeta {
-                        symlink_target: None,
-                        mode: None,
-                        modified: None,
-                        accessed: None,
-                    }
+                Err(ChildMetaError::Symlink(error)) => {
+                    return Err(CoreError::invalid(format!(
+                        "cannot list `{display}`: {error}"
+                    )));
                 }
+                Err(ChildMetaError::Other) => ChildMeta {
+                    symlink_target: None,
+                    mode: None,
+                    modified: None,
+                    accessed: None,
+                },
             };
             out.push(Entry {
                 name,
@@ -437,16 +458,27 @@ impl UdfReader {
     /// Metadata for one listed child: its symlink target (for type-12
     /// entries), mode and stamps. Reads the child's file entry through
     /// its ICB; a malformed entry or target refuses naming the child.
-    fn entry_metadata(&self, icb: &LongAd, name: &str) -> Result<ChildMeta> {
+    fn entry_metadata(
+        &self,
+        icb: &LongAd,
+        name: &str,
+    ) -> std::result::Result<ChildMeta, ChildMetaError> {
         let display = short_name(name);
-        let (home, abs, rel) = self.resolve(icb, &display)?;
-        check_icb_window(self.block_size, self.total, icb, abs, &display)?;
-        let file_entry = file::read_file_entry(&*self.volume, self.block_size, abs, rel)?;
+        let (home, abs, rel) = self
+            .resolve(icb, &display)
+            .map_err(|_| ChildMetaError::Other)?;
+        check_icb_window(self.block_size, self.total, icb, abs, &display)
+            .map_err(|_| ChildMetaError::Other)?;
+        let file_entry = file::read_file_entry(&*self.volume, self.block_size, abs, rel)
+            .map_err(|_| ChildMetaError::Other)?;
         let mode = Some(file_entry.mode());
         let modified = file_entry.modified_time();
         let accessed = file_entry.accessed_time();
         let symlink_target = if file_entry.file_type == file::TYPE_SYMLINK {
-            Some(self.symlink_target(&file_entry, &home, &display)?)
+            Some(
+                self.symlink_target(&file_entry, &home, &display)
+                    .map_err(ChildMetaError::Symlink)?,
+            )
         } else {
             None
         };

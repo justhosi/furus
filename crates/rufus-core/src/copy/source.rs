@@ -682,7 +682,10 @@ mod tests {
         let summary = super::super::walk(
             &source,
             scratch.path(),
-            &super::super::CopyOptions { free_bytes: None },
+            &super::super::CopyOptions {
+                free_bytes: None,
+                replacer: None,
+            },
             &mut WarnLog { warns: Vec::new() },
         )
         .expect("the metadata tree copies");
@@ -743,7 +746,10 @@ mod tests {
         super::super::walk(
             &source,
             scratch.path(),
-            &super::super::CopyOptions { free_bytes: None },
+            &super::super::CopyOptions {
+                free_bytes: None,
+                replacer: None,
+            },
             &mut progress,
         )
         .expect("a metadata-free tree copies");
@@ -780,7 +786,10 @@ mod tests {
         let summary = super::super::walk(
             &source,
             scratch.path(),
-            &super::super::CopyOptions { free_bytes: None },
+            &super::super::CopyOptions {
+                free_bytes: None,
+                replacer: None,
+            },
             &mut Sink,
         )
         .expect("the iso tree copies");
@@ -871,7 +880,10 @@ mod tests {
         let summary = super::super::walk(
             &source,
             scratch.path(),
-            &super::super::CopyOptions { free_bytes: None },
+            &super::super::CopyOptions {
+                free_bytes: None,
+                replacer: None,
+            },
             &mut Sink,
         )
         .expect("the dotted tree copies");
@@ -1040,7 +1052,10 @@ mod tests {
         let summary = super::super::walk(
             &source,
             scratch.path(),
-            &super::super::CopyOptions { free_bytes: None },
+            &super::super::CopyOptions {
+                free_bytes: None,
+                replacer: None,
+            },
             &mut progress,
         )
         .expect("the symlink tree copies");
@@ -1447,7 +1462,10 @@ mod tests {
         let summary = super::super::walk(
             &source,
             scratch.path(),
-            &super::super::CopyOptions { free_bytes: None },
+            &super::super::CopyOptions {
+                free_bytes: None,
+                replacer: None,
+            },
             &mut progress,
         )
         .expect("the UDF link tree copies");
