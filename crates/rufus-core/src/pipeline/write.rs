@@ -747,7 +747,7 @@ pub(crate) fn run(ctx: &mut RunContext<'_>, mode: &WriteMode, image: &ImageRef) 
             }
         }
         WriteMode::Copy => Err(CoreError::NotImplemented {
-            what: "write mode 'copy' (file-tree copying is implemented; wiring it into the plan and write path remains for slice 19)",
+            what: "write mode 'copy' (file-tree copying is implemented; wiring it into the plan and write path remains for a later slice)",
         }),
     }
 }

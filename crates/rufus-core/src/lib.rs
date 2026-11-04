@@ -32,6 +32,12 @@
 //! * [`log`] — [`Logger`](log::Logger): an `Arc`-shared in-memory ring
 //!   (10,000 records) with level filtering and an optional append-only
 //!   file sink; UTC timestamps without a date/time dependency.
+//! * [`boot`] — the S19 bootloader payload foundation: the six
+//!   embedded bootloader resources pinned by `assets/manifest.json`
+//!   (Syslinux 4.07 VBR/core ids 400/401, Syslinux 6.04 VBR/core ids
+//!   402/403, Grub4DOS MBR/core ids 450/451) with exact size and SHA-256
+//!   verification behind [`load`](boot::load). The Syslinux, GRUB2 and
+//!   GRUB4DOS installers land in later slices.
 //! * [`config`] — [`Config`](config::Config): serde/TOML settings with
 //!   forward-compatible parsing, atomic save, and corrupt-file recovery
 //!   ([`LoadedConfig`](config::LoadedConfig)).
@@ -110,6 +116,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod boot;
 pub mod config;
 pub mod copy;
 pub mod distro;
