@@ -9,11 +9,21 @@
 //! [`load_from`] is the testable core over an explicit directory. No
 //! installer lives here yet: the Syslinux / GRUB2 / GRUB4DOS installers
 //! land in later slices.
+//!
+//! [`syslinux`] decides the embedded Syslinux family from a detected
+//! version or the `ldlinux.c32` presence and locates the payload
+//! directory over a tree source; it writes nothing and patches no
+//! sectors, which later S19 slices own.
+
+pub mod syslinux;
 
 use std::path::Path;
 
 use crate::error::CoreError;
 use crate::error::Result;
+use crate::hash::Algo;
+use crate::hash::hash_reader;
+use crate::paths::asset_path;
 
 /// One embedded bootloader payload, pinned against `assets/manifest.json`.
 ///
@@ -169,7 +179,7 @@ impl Payload {
 /// Resolves through [`asset_path`](crate::paths::asset_path), then
 /// delegates to [`load_from`] so the file-name join lives in one place.
 pub fn load(resource: Resource) -> Result<Payload> {
-    let path = crate::paths::asset_path(resource.file())?;
+    let path = asset_path(resource.file())?;
     // `asset_path` hands back the file itself; its parent is the
     // directory `load_from` joins against. The parent always exists in
     // practice (resolution joins a file onto a directory), but there is
@@ -207,7 +217,7 @@ pub fn load_from(dir: &Path, resource: Resource) -> Result<Payload> {
     // Hash the bytes just read rather than re-reading the file: one
     // read, one failure mode, no window for the file to change between
     // the size check and the digest.
-    let actual_sha = crate::hash::hash_reader(crate::Algo::Sha256, bytes.as_slice())?;
+    let actual_sha = hash_reader(Algo::Sha256, &bytes as &[u8])?;
     if actual_sha != resource.sha256() {
         return Err(CoreError::invalid(format!(
             "payload {} ({}) has SHA-256 {actual_sha}, expected {}",
@@ -252,8 +262,7 @@ mod tests {
                 resource,
                 "the payload remembers its resource"
             );
-            let actual = crate::hash::hash_reader(crate::Algo::Sha256, payload.bytes())
-                .expect("in-memory bytes hash");
+            let actual = hash_reader(Algo::Sha256, payload.bytes()).expect("in-memory bytes hash");
             assert_eq!(
                 actual,
                 resource.sha256(),
@@ -295,6 +304,74 @@ mod tests {
                 "RCDATA_451.bin",
             ],
             "the six pinned file names"
+        );
+    }
+
+    #[test]
+    fn resource_ids_are_the_six_manifest_ids() {
+        // Sibling to the file-name guard: the numeric ids ride the same
+        // manifest entries, so they pin in lockstep too.
+        let ids: Vec<u16> = Resource::ALL.iter().map(|r| r.id()).collect();
+        assert_eq!(
+            ids,
+            [400, 401, 402, 403, 450, 451],
+            "the six manifest resource ids"
+        );
+    }
+
+    #[test]
+    fn truncated_file_is_an_error_naming_both_byte_counts() {
+        // Copy a real payload and truncate it: the size check fires
+        // before the digest, naming the file and both counts.
+        let resource = Resource::Syslinux407Vbr;
+        let bytes =
+            std::fs::read(resources_dir().join(resource.file())).expect("the pinned file reads");
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let kept = bytes.len().saturating_sub(12);
+        std::fs::write(scratch.path().join(resource.file()), &bytes[..kept])
+            .expect("the truncated copy writes");
+        let error = load_from(scratch.path(), resource).expect_err("a truncated payload refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains(resource.file()),
+            "the error names the file: {text}"
+        );
+        assert!(
+            text.contains(&kept.to_string()),
+            "the error names the actual count: {text}"
+        );
+        assert!(
+            text.contains(&resource.size().to_string()),
+            "the error names the expected count: {text}"
+        );
+    }
+
+    #[test]
+    fn flipped_byte_is_an_error_naming_both_digests() {
+        // Copy a real payload with one byte flipped at the same size:
+        // the digest check fires, naming the file and both digests.
+        let resource = Resource::Syslinux407Vbr;
+        let mut bytes =
+            std::fs::read(resources_dir().join(resource.file())).expect("the pinned file reads");
+        bytes[0] ^= 0x01;
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        std::fs::write(scratch.path().join(resource.file()), &bytes)
+            .expect("the flipped copy writes");
+        let error = load_from(scratch.path(), resource).expect_err("a flipped payload refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains(resource.file()),
+            "the error names the file: {text}"
+        );
+        let actual = hash_reader(Algo::Sha256, &bytes as &[u8]).expect("the flipped bytes hash");
+        assert_ne!(actual, resource.sha256(), "the flip changes the digest");
+        assert!(
+            text.contains(&actual),
+            "the error names the actual digest: {text}"
+        );
+        assert!(
+            text.contains(resource.sha256()),
+            "the error names the expected digest: {text}"
         );
     }
 }
