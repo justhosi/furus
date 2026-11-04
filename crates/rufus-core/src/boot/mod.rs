@@ -8,8 +8,9 @@
 //! point (it resolves through [`asset_path`](crate::paths::asset_path));
 //! [`load_from`] is the testable core over an explicit directory. The
 //! Syslinux installer lives next to the family decision (see
-//! [`syslinux::install_loader`]); the GRUB2 BIOS installer lives in
-//! [`grub2`]; the GRUB4DOS installer lands in a later slice.
+//! [`syslinux::install_loader`]); the GRUB2 BIOS installer and the
+//! UEFI GRUB placement live in [`grub2`]; the GRUB4DOS installer lives
+//! in [`grub4dos`].
 //!
 //! [`syslinux`] decides the embedded Syslinux family from a detected
 //! version or the `ldlinux.c32` presence and locates the payload
@@ -17,10 +18,16 @@
 //! sectors, which later S19 slices own.
 //!
 //! [`grub2`] installs a GRUB2 BIOS boot record from image-supplied
-//! `boot.img`/`core.img` payloads; the bytes must come from the image
-//! or a caller-supplied directory — no embedded copy exists.
+//! `boot.img`/`core.img` payloads and places a `grubx64.efi` image at
+//! `efi/boot/bootx64.efi`; the bytes must come from the image or a
+//! caller-supplied directory — no embedded copy exists.
+//!
+//! [`grub4dos`] writes the 423-byte GRUB4DOS MBR window plus the SBR at
+//! offset 512 and the `grldr` loader at the volume root; upstream
+//! writes no `menu.lst`, so neither does this crate.
 
 pub mod grub2;
+pub mod grub4dos;
 pub mod syslinux;
 
 use std::path::Path;

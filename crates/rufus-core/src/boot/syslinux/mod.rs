@@ -422,7 +422,7 @@ pub fn locate(source: &dyn Source) -> Result<Option<Located>> {
     Ok(None)
 }
 
-/// Cap on a single [`read`] in bytes (1 MiB): the same ceiling the
+/// Cap [`read`] passes to [`read_capped`]: the same 1 MiB ceiling the
 /// report uses for its version scans (`MAX_BINARY_SCAN`), so a hostile
 /// image cannot make this module buffer a crafted multi-gigabyte
 /// config or binary.
@@ -446,7 +446,8 @@ fn ascii_safe(text: &str) -> String {
         .collect()
 }
 
-/// Read one whole file from the located directory.
+/// Read one whole file from the located directory, capped at
+/// `max_bytes`.
 ///
 /// The size comes from the directory listing and the bytes stream
 /// through [`Source::read_bytes`] in 4 KiB windows (read to EOF with
@@ -454,11 +455,17 @@ fn ascii_safe(text: &str) -> String {
 /// `None` when the name is absent, names a directory, or names a
 /// symlink (each reads as absent, not as an error). Refuses a name that
 /// carries a `/`, `\` or NUL byte, or that is `.` or `..`, and refuses
-/// a file larger than [`MAX_READ_BYTES`]. A listing I/O error
-/// propagates like in [`locate`]; any other listing refusal reads as
-/// absent. Read errors propagate: the file was listed, so a short read
-/// is corruption, not absence.
-pub fn read(source: &dyn Source, dir: &[Vec<u8>], name: &str) -> Result<Option<Vec<u8>>> {
+/// a file larger than `max_bytes`. A listing I/O error propagates like
+/// in [`locate`]; any other listing refusal reads as absent. Read
+/// errors propagate: the file was listed, so a short read is
+/// corruption, not absence. Cap refusals name the actual cap in bytes,
+/// except the 1 MiB default, which keeps its historic `1 MiB` words.
+pub fn read_capped(
+    source: &dyn Source,
+    dir: &[Vec<u8>],
+    name: &str,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>> {
     if name.is_empty() {
         return Err(CoreError::invalid(
             "syslinux read refuses an empty file name".to_string(),
@@ -505,10 +512,11 @@ pub fn read(source: &dyn Source, dir: &[Vec<u8>], name: &str) -> Result<Option<V
         Some(size) => size,
         None => return Ok(None),
     };
-    if size > MAX_READ_BYTES {
+    if size > max_bytes {
         return Err(CoreError::invalid(format!(
-            "syslinux read of '{}' is {size} bytes, past the 1 MiB read cap of {MAX_READ_BYTES} bytes: refusing",
-            ascii_safe(name)
+            "syslinux read of '{}' is {size} bytes, past the {}: refusing",
+            ascii_safe(name),
+            describe_cap(max_bytes),
         )));
     }
     let count = usize::try_from(size).map_err(|_| {
@@ -569,14 +577,32 @@ pub fn read(source: &dyn Source, dir: &[Vec<u8>], name: &str) -> Result<Option<V
                 ascii_safe(name)
             ))
         })?;
-        if (out.len() as u64) > MAX_READ_BYTES {
+        if (out.len() as u64) > max_bytes {
             return Err(CoreError::invalid(format!(
-                "syslinux read of '{}' runs past the 1 MiB read cap: refusing",
-                ascii_safe(name)
+                "syslinux read of '{}' runs past the {}: refusing",
+                ascii_safe(name),
+                describe_cap(max_bytes),
             )));
         }
     }
     Ok(Some(out))
+}
+
+/// Read one whole file from the located directory, capped at the 1
+/// MiB [`MAX_READ_BYTES`] default: [`read_capped`] with the historic
+/// cap, byte-identical behaviour down to the message words.
+pub fn read(source: &dyn Source, dir: &[Vec<u8>], name: &str) -> Result<Option<Vec<u8>>> {
+    read_capped(source, dir, name, MAX_READ_BYTES)
+}
+
+/// Words for a cap refusal: the historic `1 MiB` phrasing for the
+/// default cap, the bare byte count for any other.
+fn describe_cap(max_bytes: u64) -> String {
+    if max_bytes == MAX_READ_BYTES {
+        format!("1 MiB read cap of {MAX_READ_BYTES} bytes")
+    } else {
+        format!("read cap of {max_bytes} bytes")
+    }
 }
 
 #[cfg(test)]
@@ -1003,6 +1029,28 @@ mod tests {
             text.contains("short read"),
             "the refusal names the shape: {text}"
         );
+    }
+
+    #[test]
+    fn read_capped_honours_a_small_cap() {
+        // A 32-byte file refuses at cap 16 (naming the actual cap) and
+        // reads whole at cap 32.
+        let bytes: Vec<u8> = (0..32).collect();
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"isolinux")])
+            .with_dir(&[b"isolinux"], vec![file_entry(b"small.bin", 32)])
+            .with_file(&[b"isolinux", b"small.bin"], &bytes);
+        let dir = vec![b"isolinux".to_vec()];
+        let error = read_capped(&source, &dir, "small.bin", 16)
+            .expect_err("a 32 byte file refuses at cap 16");
+        let text = error.to_string();
+        assert!(text.contains("16"), "the refusal names the cap: {text}");
+        assert!(text.contains("32"), "the refusal names the size: {text}");
+        assert!(text.is_ascii(), "the refusal stays ASCII: {text}");
+        let back = read_capped(&source, &dir, "small.bin", 32)
+            .expect("a 32 byte file reads at cap 32")
+            .expect("present is some");
+        assert_eq!(back, bytes, "the capped read is byte-identical");
     }
 
     #[test]

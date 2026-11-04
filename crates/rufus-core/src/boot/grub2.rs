@@ -5,7 +5,8 @@
 //! array taken from GRUB2's `boot.img` at disk offset 0, then the
 //! `55 AA` boot mark; its header comment reads "First 432 bytes of
 //! MBR from Grub2 (boot.img), with 2 bytes NOPed @0x66". The array
-//! opens `EB 63 90`, pads with zeros to `0x5B`, carries `01 00 00 00`
+//! opens `EB 63 90`, pads with zeros to `0x5A` with `0x80` at `0x5B`,
+//! carries `01 00 00 00`
 //! at `0x5C` (kernel sector = 1) and `00 00 00 00` at `0x60` (high
 //! dword), and runs code from `0x64`: `boot.img` loads that field as
 //! `mov ebx,[0x7c5c]` / `[0x7c60]`, i.e. an 8-byte little-endian LBA
@@ -18,9 +19,10 @@
 //! [`install`] writes it every time.
 //!
 //! No embedded fallback: the assets hold no GRUB2 `boot.img` or
-//! `core.img`, so these bytes must come from the image (see
-//! [`payloads`]) or a caller-supplied directory — an embedded copy is
-//! never pretended.
+//! `core.img`. [`install`] takes explicit bytes only; [`payloads`] is
+//! the ISO-side lookup that produces them from the image, and any
+//! other caller passes its own directory bytes straight in — an
+//! embedded copy is never pretended.
 
 use crate::copy::Source;
 use crate::error::CoreError;
@@ -294,12 +296,180 @@ pub fn payloads(source: &dyn Source) -> Result<Option<Payloads>> {
     Ok(None)
 }
 
+// ------------------------------------------------------------------
+// UEFI placement (the PLAN's step, not a Rufus port)
+// ------------------------------------------------------------------
+
+// Honesty first: Rufus does not install UEFI GRUB itself. It extracts
+// the ISO and only applies a workaround that deletes
+// `EFI\boot\bootx64.efi` when the ISO's copy is detected as broken
+// (`0x14001c640.c:731-743`, log
+// `Broken UEFI bootloader detected - Applying workaround:`). The PLAN
+// instead asks us to place `grubx64.efi` at `efi/boot/bootx64.efi`:
+// `install_uefi` is that placement step, not a port of a Rufus
+// install function, and the broken-bootloader workaround is not
+// implemented here.
+//
+// UEFI GRUB placement: the `grubx64.efi` image lands at
+// `/EFI/boot/bootx64.efi` on the FAT32 volume (via `install_uefi`).
+// The bytes come from the image through `efi_payload`: the first
+// candidate directory below that holds a readable payload wins.
+
+/// Destination directory of the UEFI bootloader on the volume.
+pub const EFI_BOOT_DIR: &str = "/EFI/boot";
+
+/// File name of the UEFI bootloader in [`EFI_BOOT_DIR`].
+pub const EFI_BOOT_NAME: &str = "bootx64.efi";
+
+/// Read cap for a UEFI payload in bytes (16 MiB): a real `grubx64.efi`
+/// is some 2-4 MiB, which the 1 MiB syslinux cap cannot hold.
+pub const MAX_EFI_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What [`install_uefi`] wrote: the payload byte count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UefiInstalled {
+    bytes: usize,
+}
+
+impl UefiInstalled {
+    /// Bytes of the UEFI image landed at the [`path`](Self::path).
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Destination path on the volume (`/EFI/boot/bootx64.efi`,
+    /// `EFI_BOOT_DIR` plus `/` plus `EFI_BOOT_NAME` as one string).
+    #[must_use]
+    pub fn path(&self) -> String {
+        format!("{EFI_BOOT_DIR}/{EFI_BOOT_NAME}")
+    }
+}
+
+/// Place the `grubx64.efi` `image` at `/EFI/boot/bootx64.efi`.
+///
+/// Refuses an empty image, ensures `/EFI` and `/EFI/boot` exist (each
+/// listed first and created with `mkdir` only when its listing errors
+/// — single-level creation, the same rule as syslinux
+/// `install_companions`), refuses an existing `bootx64.efi` there
+/// (compared case-insensitively on the short name, `BOOTX64.EFI`),
+/// then `create_file` plus a zero-offset `write_at` and one `flush()`.
+pub fn install_uefi(fat: &mut crate::fs::fat32::Fat32, image: &[u8]) -> Result<UefiInstalled> {
+    if image.is_empty() {
+        return Err(CoreError::invalid(
+            "grub2 uefi image is empty (0 bytes): refusing".to_string(),
+        ));
+    }
+    for dir in ["/EFI", EFI_BOOT_DIR] {
+        match fat.list_dir(dir) {
+            Ok(_) => {}
+            Err(_) => {
+                fat.mkdir(dir)?;
+            }
+        }
+    }
+    let present = fat
+        .list_dir(EFI_BOOT_DIR)?
+        .iter()
+        .any(|entry| entry.short_name.eq_ignore_ascii_case("BOOTX64.EFI"));
+    if present {
+        return Err(CoreError::invalid(format!(
+            "grub2 uefi image is already present at '{EFI_BOOT_DIR}/{EFI_BOOT_NAME}': refusing to overwrite it"
+        )));
+    }
+    let dest = format!("{EFI_BOOT_DIR}/{EFI_BOOT_NAME}");
+    let len = u64::try_from(image.len())
+        .map_err(|_| CoreError::invalid("a grub2 uefi image longer than u64: refusing"))?;
+    fat.create_file(&dest, len)?;
+    fat.write_at(&dest, 0, image)?;
+    fat.flush()?;
+    Ok(UefiInstalled { bytes: image.len() })
+}
+
+/// One UEFI payload candidate: a directory stack plus the file name
+/// to read there.
+const EFI_CANDIDATES: [(&[&[u8]], &str); 3] = [
+    (&[b"efi" as &[u8], b"boot" as &[u8]], "grubx64.efi"),
+    (&[b"efi" as &[u8], b"boot" as &[u8]], "bootx64.efi"),
+    (
+        &[b"boot" as &[u8], b"grub" as &[u8], b"x86_64-efi" as &[u8]],
+        "grubx64.efi",
+    ),
+];
+
+/// A UEFI payload found in an image: the directory stack, the file
+/// name read there, and the payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EfiPayload {
+    dir: Vec<Vec<u8>>,
+    name: String,
+    bytes: Vec<u8>,
+}
+
+impl EfiPayload {
+    /// Directory stack as name bytes from the source root.
+    #[must_use]
+    pub fn dir(&self) -> &[Vec<u8>] {
+        &self.dir
+    }
+
+    /// `/`-joined display form: bytes outside printable ASCII become
+    /// `?`, the same shape as [`Payloads::path`].
+    #[must_use]
+    pub fn path(&self) -> String {
+        display_dir(&self.dir)
+    }
+
+    /// File name read in the directory (`grubx64.efi` or
+    /// `bootx64.efi`).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The payload bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Find the UEFI payload over a [`Source`]: the first
+/// `efi/boot/grubx64.efi`, `efi/boot/bootx64.efi`,
+/// `boot/grub/x86_64-efi/grubx64.efi` that reads wins, each through
+/// `syslinux::read_capped` at [`MAX_EFI_BYTES`].
+///
+/// Directories and symlinks read as absent (that is the reader's
+/// contract). A listing error that is a real I/O error
+/// ([`CoreError::Io`]) propagates; any other listing refusal is a
+/// no-match for that candidate. Returns `None` when no candidate
+/// holds a readable payload.
+pub fn efi_payload(source: &dyn Source) -> Result<Option<EfiPayload>> {
+    for (candidate, name) in EFI_CANDIDATES {
+        let mut dir: Vec<Vec<u8>> = Vec::new();
+        for component in candidate.iter() {
+            dir.push(component.to_vec());
+        }
+        let Some(bytes) = syslinux::read_capped(source, &dir, name, MAX_EFI_BYTES)? else {
+            continue;
+        };
+        return Ok(Some(EfiPayload {
+            dir,
+            name: name.to_string(),
+            bytes,
+        }));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::copy::Entry;
     use crate::fs::VecVolume;
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     /// 4 KiB scratch disk: sector 0 plus room for a small core.
     const DISK_BYTES: u64 = 4096;
@@ -705,5 +875,225 @@ mod tests {
             payloads(&source).expect("the lookup reads").is_none(),
             "a symlinked boot.img never locates"
         );
+    }
+
+    /// A [`Volume`] over shared bytes, the same shim the syslinux
+    /// installer tests use: `Fat32` keeps its store private, so the
+    /// tests watch the image through the shared handle.
+    #[derive(Debug, Clone)]
+    struct SharedVolume {
+        bytes: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl SharedVolume {
+        fn blank(len: u64) -> Self {
+            let size = usize::try_from(len).expect("the ram size fits usize");
+            Self {
+                bytes: Rc::new(RefCell::new(vec![0u8; size])),
+            }
+        }
+    }
+
+    impl crate::fs::Volume for SharedVolume {
+        fn total_bytes(&self) -> u64 {
+            self.bytes.borrow().len() as u64
+        }
+
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let borrowed = self.bytes.borrow();
+            let start = usize::try_from(offset).expect("the test offset fits usize");
+            let end = start.checked_add(buf.len()).expect("the test window fits");
+            let window = borrowed.get(start..end).expect("the test read fits");
+            buf.copy_from_slice(window);
+            Ok(())
+        }
+
+        fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+            let mut borrowed = self.bytes.borrow_mut();
+            let start = usize::try_from(offset).expect("the test offset fits usize");
+            let end = start.checked_add(buf.len()).expect("the test window fits");
+            let window = borrowed.get_mut(start..end).expect("the test write fits");
+            window.copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    /// A freshly formatted 64 MiB volume plus the shared handle that
+    /// still observes its bytes.
+    fn formatted() -> (SharedVolume, crate::fs::fat32::Fat32) {
+        use crate::fs::fat32::format::FormatOptions;
+        let backing = SharedVolume::blank(64 * 1024 * 1024);
+        let fat = crate::fs::fat32::Fat32::format(
+            Box::new(backing.clone()),
+            &FormatOptions {
+                volume_id: 0x1234_5678,
+                ..Default::default()
+            },
+        )
+        .expect("the volume formats");
+        (backing, fat)
+    }
+
+    /// Synthetic UEFI image: 3 MiB of distinct bytes, inside the
+    /// 16 MiB cap and above the 1 MiB syslinux one.
+    fn uefi_image() -> Vec<u8> {
+        (0..3 * 1024 * 1024)
+            .map(|index| ((index * 5 + 1) % 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn install_uefi_creates_dirs_and_round_trips() {
+        let (backing, mut fat) = formatted();
+        let image = uefi_image();
+        let done = install_uefi(&mut fat, &image).expect("the install runs");
+        assert_eq!(
+            done.bytes(),
+            3 * 1024 * 1024,
+            "the report counts 3145728 bytes"
+        );
+        assert_eq!(
+            done.path(),
+            "/EFI/boot/bootx64.efi",
+            "the path joins dir and name"
+        );
+        let efi = fat.list_dir("/EFI").expect("/EFI lists");
+        assert_eq!(efi.len(), 1, "one entry under /EFI");
+        let boot = fat.list_dir("/EFI/boot").expect("/EFI/boot lists");
+        assert_eq!(boot.len(), 1, "one entry under /EFI/boot");
+        assert_eq!(
+            boot[0].short_name, "BOOTX64.EFI",
+            "the entry is BOOTX64.EFI"
+        );
+        let back = fat
+            .read_file("/EFI/boot/bootx64.efi")
+            .expect("the image reads back");
+        assert_eq!(back, image, "the payload is byte-identical");
+        let error = install_uefi(&mut fat, &image).expect_err("a second install refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("/EFI/boot/bootx64.efi"),
+            "the refusal names the path: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let picture = scratch.path().join("uefi.img");
+        std::fs::write(&picture, backing.bytes.borrow().as_slice()).expect("the image dumps");
+        let output = match std::process::Command::new("fsck.fat")
+            .arg("-n")
+            .arg(&picture)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "fsck.fat -n exits 0 after the uefi write ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    #[test]
+    fn install_uefi_refuses_an_empty_image() {
+        let (_backing, mut fat) = formatted();
+        let error = install_uefi(&mut fat, &[]).expect_err("empty refuses");
+        let text = error.to_string();
+        assert!(text.contains("0 bytes"), "names the empty length: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+    }
+
+    /// All three UEFI candidates present: the first directory's
+    /// `grubx64.efi` must win.
+    fn all_efi_tree() -> MemSource {
+        MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"efi"), dir_entry(b"boot")])
+            .with_dir(&[b"efi"], vec![dir_entry(b"boot")])
+            .with_dir(
+                &[b"efi", b"boot"],
+                vec![file_entry(b"grubx64.efi", 4), file_entry(b"bootx64.efi", 5)],
+            )
+            .with_dir(&[b"boot"], vec![dir_entry(b"grub")])
+            .with_dir(&[b"boot", b"grub"], vec![dir_entry(b"x86_64-efi")])
+            .with_dir(
+                &[b"boot", b"grub", b"x86_64-efi"],
+                vec![file_entry(b"grubx64.efi", 6)],
+            )
+            .with_file(&[b"efi", b"boot", b"grubx64.efi"], b"one!")
+            .with_file(&[b"efi", b"boot", b"bootx64.efi"], b"two!!")
+            .with_file(
+                &[b"boot", b"grub", b"x86_64-efi", b"grubx64.efi"],
+                b"three!",
+            )
+    }
+
+    #[test]
+    fn efi_payload_prefers_the_first_candidate() {
+        let found = efi_payload(&all_efi_tree())
+            .expect("the lookup reads")
+            .expect("a payload exists");
+        assert_eq!(
+            found.dir(),
+            &[b"efi".to_vec(), b"boot".to_vec()],
+            "the first directory wins"
+        );
+        assert_eq!(found.path(), "/efi/boot");
+        assert_eq!(found.name(), "grubx64.efi");
+        assert_eq!(found.bytes(), b"one!", "the first payload bytes win");
+    }
+
+    #[test]
+    fn efi_payload_falls_through_and_returns_none() {
+        // Only the third candidate holds a payload: the first two
+        // directories read as absent.
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"boot")])
+            .with_dir(&[b"boot"], vec![dir_entry(b"grub")])
+            .with_dir(&[b"boot", b"grub"], vec![dir_entry(b"x86_64-efi")])
+            .with_dir(
+                &[b"boot", b"grub", b"x86_64-efi"],
+                vec![file_entry(b"grubx64.efi", 6)],
+            )
+            .with_file(
+                &[b"boot", b"grub", b"x86_64-efi", b"grubx64.efi"],
+                b"three!",
+            );
+        let found = efi_payload(&source)
+            .expect("the lookup reads")
+            .expect("the third candidate exists");
+        assert_eq!(found.path(), "/boot/grub/x86_64-efi");
+        assert_eq!(found.name(), "grubx64.efi");
+        assert_eq!(found.bytes(), b"three!", "the exact bytes return");
+        // A bare tree holds nothing.
+        let bare = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", 1)]);
+        assert!(
+            efi_payload(&bare).expect("the lookup reads").is_none(),
+            "a bare tree reads as none"
+        );
+    }
+
+    #[test]
+    fn efi_payload_ignores_a_symlinked_candidate() {
+        // A symlinked grubx64.efi reads as absent, so the lookup falls
+        // past the first candidate to the second directory's real
+        // bootx64.efi.
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"efi")])
+            .with_dir(&[b"efi"], vec![dir_entry(b"boot")])
+            .with_dir(
+                &[b"efi", b"boot"],
+                vec![link_entry(b"grubx64.efi"), file_entry(b"bootx64.efi", 5)],
+            )
+            .with_file(&[b"efi", b"boot", b"bootx64.efi"], b"two!!");
+        let found = efi_payload(&source)
+            .expect("the lookup reads")
+            .expect("the second name exists");
+        assert_eq!(found.name(), "bootx64.efi");
+        assert_eq!(found.bytes(), b"two!!", "the fall-through bytes return");
     }
 }
