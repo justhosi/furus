@@ -1,11 +1,10 @@
 //! The write step: stream the image to the device.
 //!
 //! Layout choice: one file with an inline `mod raw` for the
-//! straight-through path and an inline `mod compressed` for the host
-//! decompressor path, so slice 6 (sparse) adds one more sibling
-//! without renaming files or churning paths. Only
-//! [`Dd`](rufus_proto::WriteMode::Dd) exists this slice; `Copy`
-//! refuses by name (see [`run`]).
+//! straight-through path, an inline `mod compressed` for the host
+//! decompressor path, and the [`Copy`](rufus_proto::WriteMode::Copy)
+//! arm below (a source builder plus the mount/walk/release flow — no
+//! submodule, it delegates the tree work to [`crate::copy`]).
 //!
 //! Evidence ported here (`0x140010a40` is the write thread: open the
 //! image, allocate a write buffer — 256 KiB, `0x40000`, on the
@@ -28,18 +27,31 @@
 
 use std::fs::File;
 use std::io::Read;
+use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
+use rufus_proto::Filesystem;
+use rufus_proto::ImageKind;
 use rufus_proto::ImageRef;
 use rufus_proto::WriteMode;
 
+use crate::copy::CopyOptions;
+use crate::copy::IsoSource;
+use crate::copy::Source as TreeSource;
+use crate::copy::UdfSource;
 use crate::error::CoreError;
 use crate::error::Result;
+use crate::fs::FileVolume;
+use crate::iso::IsoReader;
 use crate::pipeline::decompress::ToolStream;
+use crate::pipeline::decompress::kind_name;
 use crate::pipeline::decompress::tool_for;
 use crate::pipeline::event::Event;
+use crate::pipeline::event::Reporter;
+use crate::pipeline::opener::MountedPartition;
 use crate::pipeline::steps::RunContext;
+use crate::udf::UdfReader;
 
 /// Chunk size in bytes (256 KiB, the compressed path's `0x40000`
 /// buffer): both loops below share it.
@@ -543,11 +555,26 @@ pub(crate) fn emit_progress(
     last_emit: &mut Instant,
     force: bool,
 ) {
+    emit_progress_to(&mut *ctx.reporter, step, done, total, ema, last_emit, force);
+}
+
+/// The reporter half of [`emit_progress`]: the same cadence for
+/// producers that own no [`RunContext`] (the copy walk's
+/// [`CopyProgress`] bridge), so every producer throttles alike.
+fn emit_progress_to(
+    reporter: &mut dyn Reporter,
+    step: &'static str,
+    done: u64,
+    total: Option<u64>,
+    ema: &RateEma,
+    last_emit: &mut Instant,
+    force: bool,
+) {
     if !force && last_emit.elapsed() < PROGRESS_INTERVAL {
         return;
     }
     *last_emit = Instant::now();
-    ctx.reporter.event(Event::Progress {
+    reporter.event(Event::Progress {
         step,
         done,
         total,
@@ -704,8 +731,16 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64, path: &str) -> Result
 /// [`raw`] (every other [`ImageKind`] stays raw) or through
 /// [`compressed`] when [`tool_for`] names a host decompressor, then —
 /// for raw images only — reads the bytes back when `verify` is set;
-/// anything else refuses (see [`run`]).
-pub(crate) fn run(ctx: &mut RunContext<'_>, mode: &WriteMode, image: &ImageRef) -> Result<()> {
+/// [`Copy`](rufus_proto::WriteMode::Copy) copies the image's file
+/// tree onto the freshly formatted data partition (see [`run_copy`]).
+/// `filesystem` is the plan's filesystem: only the `Copy` arm reads
+/// it (for the mount and the FAT32 pre-flight).
+pub(crate) fn run(
+    ctx: &mut RunContext<'_>,
+    mode: &WriteMode,
+    image: &ImageRef,
+    filesystem: &Filesystem,
+) -> Result<()> {
     match mode {
         WriteMode::Dd => {
             let verify = ctx.options.verify;
@@ -731,7 +766,7 @@ pub(crate) fn run(ctx: &mut RunContext<'_>, mode: &WriteMode, image: &ImageRef) 
                             level: "warn",
                             text: format!(
                                 "verify of a {} image is skipped: the plan digest covers the compressed archive, not the decoded stream",
-                                super::decompress::kind_name(&image.kind)
+                                kind_name(&image.kind)
                             ),
                         });
                     }
@@ -746,9 +781,238 @@ pub(crate) fn run(ctx: &mut RunContext<'_>, mode: &WriteMode, image: &ImageRef) 
                 }
             }
         }
-        WriteMode::Copy => Err(CoreError::NotImplemented {
-            what: "write mode 'copy' (file-tree copying is implemented; wiring it into the plan and write path remains for a later slice)",
+        WriteMode::Copy => run_copy(ctx, image, filesystem),
+    }
+}
+
+/// Refuse image kinds with no tree reader before the image file is
+/// even opened: the WIM and disk-container kinds name the reader the
+/// later slices still owe ([`NotImplemented`](CoreError::NotImplemented),
+/// one static string each), while compressed archives and unknown
+/// kinds refuse as invalid input naming the kind. `Iso` and `Raw`
+/// pass through to the source builder in [`run_copy`].
+fn refuse_unsupported_kind(kind: &ImageKind) -> Result<()> {
+    match kind {
+        ImageKind::Iso | ImageKind::Raw => Ok(()),
+        ImageKind::Wim => Err(CoreError::NotImplemented {
+            what: "copy of a wim image (the wim reader arrives in a later slice)",
         }),
+        ImageKind::Vhd => Err(CoreError::NotImplemented {
+            what: "copy of a vhd image (the vhd reader arrives in a later slice)",
+        }),
+        ImageKind::Vhdx => Err(CoreError::NotImplemented {
+            what: "copy of a vhdx image (the vhdx reader arrives in a later slice)",
+        }),
+        ImageKind::Ffu => Err(CoreError::NotImplemented {
+            what: "copy of an ffu image (the ffu reader arrives in a later slice)",
+        }),
+        ImageKind::Qcow2 => Err(CoreError::NotImplemented {
+            what: "copy of a qcow2 image (the qcow2 reader arrives in a later slice)",
+        }),
+        ImageKind::Pe => Err(CoreError::NotImplemented {
+            what: "copy of a pe image (the pe reader arrives in a later slice)",
+        }),
+        ImageKind::Gzip | ImageKind::Xz | ImageKind::Bzip2 | ImageKind::Zstd => {
+            Err(CoreError::invalid(format!(
+                "copy refuses a {} image: a compressed archive cannot be walked as a tree without decoding it first",
+                kind_name(kind)
+            )))
+        }
+        ImageKind::Unknown => Err(CoreError::invalid(
+            "copy refuses an image of unknown kind: it names no readable file tree",
+        )),
+    }
+}
+
+/// The [`crate::copy::Progress`] bridge to the run's event stream:
+/// every walk report becomes a step-`"write"` [`Event::Progress`]
+/// rated by the shared [`RateEma`] (no second estimator), and every
+/// walk warning becomes an unchanged `"warn"`
+/// [`Message`](Event::Message). Reports throttle through
+/// [`emit_progress_to`] at the pipeline's [`PROGRESS_INTERVAL`]
+/// cadence (plus always the final one), so a large tree costs a
+/// handful of lines, not one per 128 KiB chunk. `last_emit` is the
+/// throttle clock alone: `last` stays the EMA sampler and must see
+/// every report, throttled or not.
+struct CopyProgress<'r> {
+    reporter: &'r mut dyn Reporter,
+    ema: RateEma,
+    last: Instant,
+    last_emit: Instant,
+    done: u64,
+}
+
+impl<'r> CopyProgress<'r> {
+    fn new(reporter: &'r mut dyn Reporter) -> Self {
+        let now = Instant::now();
+        Self {
+            reporter,
+            ema: RateEma::new(),
+            last: now,
+            last_emit: now,
+            done: 0,
+        }
+    }
+}
+
+impl crate::copy::Progress for CopyProgress<'_> {
+    fn report(&mut self, done_bytes: u64, total_bytes: u64) {
+        let now = Instant::now();
+        if done_bytes > self.done {
+            self.ema
+                .observe(done_bytes - self.done, now.duration_since(self.last));
+        }
+        self.last = now;
+        self.done = done_bytes;
+        emit_progress_to(
+            self.reporter,
+            "write",
+            done_bytes,
+            Some(total_bytes),
+            &self.ema,
+            &mut self.last_emit,
+            done_bytes >= total_bytes,
+        );
+    }
+
+    fn warn(&mut self, text: &str) {
+        self.reporter.event(Event::Message {
+            level: "warn",
+            text: text.to_string(),
+        });
+    }
+}
+
+/// Release `mounted` after a failed pre-flight or walk: a release
+/// failure warns naming both errors, while the run still reports the
+/// error that matters (the earlier one, never the teardown's). The
+/// warn path itself (a failure plus a failed release) is implemented
+/// but not exercised by a test — no fake mount fails its release.
+fn release_after_failure(
+    ctx: &mut RunContext<'_>,
+    mounted: &mut dyn MountedPartition,
+    during: &str,
+) {
+    if let Err(error) = mounted.release() {
+        ctx.reporter.event(Event::Message {
+            level: "warn",
+            text: format!(
+                "mount release failed after {during}: {error}; reporting the earlier error"
+            ),
+        });
+    }
+}
+
+/// Copy the image's file tree onto the freshly formatted data
+/// partition. The order below is the contract, and it reads in
+/// order: build the tree source first (a malformed image never
+/// mounts anything), mount through the opener, read the free space,
+/// walk the tree, then release the mount.
+///
+/// Source by [`ImageKind`]: `Iso` opens through [`IsoReader`] plus
+/// [`IsoSource`]; `Raw` (a pure-UDF image carries no `CD001`, so it
+/// detects as `Raw`) opens through [`UdfReader`] plus [`UdfSource`],
+/// refusing — naming the kind and carrying the UDF reader's message
+/// — when it is neither an ISO9660 nor a UDF tree. The `Raw` UDF
+/// path has no test (nothing in the tree opens a real UDF image
+/// through this arm); the neither-ISO-nor-UDF failure branch is
+/// tested. Every other kind refused earlier in
+/// [`refuse_unsupported_kind`], before the image file was even
+/// opened.
+///
+/// [`CopyOptions`]: `free_bytes` is the mount's own reading (the copy
+/// refuses up front when the tree does not fit), `replacer` stays
+/// `None` (the bootloader replacement table is the next slice's
+/// work, so every file copies verbatim here), and `fat32_limit` is
+/// set for `Fat32` targets. Cancellation passes `ctx.cancelled`
+/// straight through to the walk. Release rule: the mount is always
+/// released — a failed walk returns the walk error (a release failure
+/// only warns), while a release failure after a good walk returns
+/// the release error.
+fn run_copy(ctx: &mut RunContext<'_>, image: &ImageRef, filesystem: &Filesystem) -> Result<()> {
+    refuse_unsupported_kind(&image.kind)?;
+    let volume = FileVolume::open(Path::new(&image.path))?;
+    let source: Box<dyn TreeSource> = match &image.kind {
+        ImageKind::Iso => Box::new(IsoSource::new(IsoReader::open(Box::new(volume))?)),
+        ImageKind::Raw => match UdfReader::open(Box::new(volume)) {
+            Ok(reader) => Box::new(UdfSource::new(reader)),
+            Err(udf_error) => {
+                return Err(CoreError::invalid(format!(
+                    "copy refuses a raw image: it is neither an ISO9660 nor a UDF tree (UDF open failed: {udf_error})"
+                )));
+            }
+        },
+        // Every other kind refused above; this names the kind rather
+        // than assuming the match is exhaustive forever.
+        other => {
+            return Err(CoreError::invalid(format!(
+                "copy refuses an image of kind '{}': no tree reader takes it",
+                kind_name(other)
+            )));
+        }
+    };
+    let mut mounted = ctx.opener.mount_partition(filesystem)?;
+    run_copy_mounted(ctx, image, filesystem, &*source, mounted.as_mut())
+}
+
+/// The mounted half of [`run_copy`]: pre-flight the mount's free
+/// space, walk the tree under [`CopyProgress`], then release the
+/// mount on every path (see [`run_copy`] for the release rule). On
+/// success the release lands before the completion line, so a failed
+/// release returns without printing `copied ...`.
+/// Factored out so tests can drive the mount and release flow with a
+/// source no image builds (say one huge file for the FAT32
+/// pre-flight) without a real image or a real mount.
+fn run_copy_mounted(
+    ctx: &mut RunContext<'_>,
+    image: &ImageRef,
+    filesystem: &Filesystem,
+    source: &dyn TreeSource,
+    mounted: &mut dyn MountedPartition,
+) -> Result<()> {
+    let free = match mounted.free_bytes() {
+        Ok(free) => free,
+        Err(error) => {
+            release_after_failure(ctx, mounted, "the free-space check");
+            return Err(error);
+        }
+    };
+    ctx.reporter.event(Event::Message {
+        level: "info",
+        text: format!(
+            "copying '{}' ({}) to the mounted data partition",
+            image.path,
+            kind_name(&image.kind)
+        ),
+    });
+    let options = CopyOptions {
+        free_bytes: Some(free),
+        // No bootloader replacement table yet: the next slice wires
+        // it in, so every file copies verbatim here.
+        replacer: None,
+        fat32_limit: matches!(filesystem, Filesystem::Fat32),
+    };
+    let cancelled = ctx.cancelled;
+    let summary = {
+        let mut progress = CopyProgress::new(&mut *ctx.reporter);
+        crate::copy::walk(source, mounted.path(), &options, &mut progress, cancelled)
+    };
+    match summary {
+        Ok(summary) => {
+            mounted.release()?;
+            ctx.reporter.event(Event::Message {
+                level: "info",
+                text: format!(
+                    "copied {} files in {} directories ({} bytes), {} renamed",
+                    summary.files, summary.directories, summary.bytes, summary.renamed
+                ),
+            });
+            Ok(())
+        }
+        Err(error) => {
+            release_after_failure(ctx, mounted, "the copy");
+            Err(error)
+        }
     }
 }
 
@@ -1164,6 +1428,11 @@ mod compressed {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
     use super::*;
     use crate::fs::VecVolume;
     use crate::fs::Volume;
@@ -1175,7 +1444,9 @@ mod tests {
     use crate::pipeline::target::Target;
     use crate::pipeline::target::VecTarget;
 
+    use rufus_proto::Filesystem;
     use rufus_proto::ImageKind;
+    use rufus_proto::WriteMode;
 
     /// Minimal [`Opener`] serving one [`VecTarget`]: the locator test
     /// below never touches partitions or hole maps.
@@ -1321,5 +1592,617 @@ mod tests {
             kind: ImageKind::Raw,
         };
         assert_eq!(locate_mismatch(&mut ctx, &image, 300_001), Some(300_000));
+    }
+
+    /// A test [`Opener`](super::super::Opener) whose `mount_partition`
+    /// hands out its scratch directory as the mounted data partition:
+    /// no privileges, no real mounts. Counts mounts and releases so
+    /// the copy arm's ordering (mount, walk, release) is observable;
+    /// `free` answers `free_bytes`; `fail_mount` refuses the mount
+    /// itself.
+    struct CopyOpener {
+        scratch: tempfile::TempDir,
+        mounts: Cell<usize>,
+        releases: Rc<Cell<usize>>,
+        free: u64,
+        fail_mount: bool,
+    }
+
+    impl CopyOpener {
+        fn new(free: u64) -> Self {
+            Self {
+                scratch: tempfile::tempdir().expect("scratch fits"),
+                mounts: Cell::new(0),
+                releases: Rc::new(Cell::new(0)),
+                free,
+                fail_mount: false,
+            }
+        }
+
+        fn refusing() -> Self {
+            Self {
+                fail_mount: true,
+                ..Self::new(0)
+            }
+        }
+
+        fn mounts(&self) -> usize {
+            self.mounts.get()
+        }
+
+        fn releases(&self) -> usize {
+            self.releases.get()
+        }
+    }
+
+    /// The directory guard [`CopyOpener`] hands out: the scratch
+    /// directory as the mount point, a fixed `free_bytes` answer, and
+    /// a counted `release`.
+    struct CopyGuard {
+        path: PathBuf,
+        releases: Rc<Cell<usize>>,
+        free: u64,
+    }
+
+    impl MountedPartition for CopyGuard {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn free_bytes(&self) -> Result<u64> {
+            Ok(self.free)
+        }
+
+        fn release(&mut self) -> Result<()> {
+            self.releases.set(self.releases.get() + 1);
+            Ok(())
+        }
+    }
+
+    impl Opener for CopyOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Err(CoreError::invalid("test opener has no device"))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Err(CoreError::invalid("test opener has no partition"))
+        }
+
+        fn partition_path(&self) -> Result<PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+
+        fn mount_partition(&self, _filesystem: &Filesystem) -> Result<Box<dyn MountedPartition>> {
+            self.mounts.set(self.mounts.get() + 1);
+            if self.fail_mount {
+                return Err(CoreError::NotImplemented {
+                    what: "mounting the data partition",
+                });
+            }
+            Ok(Box::new(CopyGuard {
+                path: self.scratch.path().to_path_buf(),
+                releases: Rc::clone(&self.releases),
+                free: self.free,
+            }))
+        }
+    }
+
+    /// A [`RunContext`] over `opener`/`reporter`/`cancelled` for
+    /// driving [`run`](super::run) directly: the copy arm never
+    /// touches the device, so the opener only needs its mount seam.
+    fn copy_context<'a>(
+        opener: &'a CopyOpener,
+        reporter: &'a mut VecReporter,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> RunContext<'a> {
+        RunContext {
+            opener,
+            target: None,
+            table: None,
+            partitioned: false,
+            logger: Logger::new(Level::Info),
+            reporter,
+            cancelled,
+            options: crate::pipeline::RunOptions {
+                verify: false,
+                badblocks: false,
+                retries: 3,
+                retry_delay: Duration::ZERO,
+                reset_usb: false,
+            },
+        }
+    }
+
+    /// An [`ImageRef`] over the file at `path` (`size` bytes) of
+    /// container `kind`.
+    fn copy_image(path: &Path, size: u64, kind: ImageKind) -> ImageRef {
+        ImageRef {
+            path: path.to_str().expect("scratch path is UTF-8").to_string(),
+            size_bytes: size,
+            sha256: "0".repeat(64),
+            kind,
+        }
+    }
+
+    /// The shared
+    /// [`fixture_bytes`](crate::copy::source::fixture::fixture_bytes)
+    /// ISO on disk: returns its path and length. The tree holds
+    /// `TOP.TXT` (`top-txt`, 7 bytes), `A/NESTED.TXT` (`nested`, 6
+    /// bytes) and an empty `B/`: 2 files in 2 directories, 13 bytes,
+    /// nothing renamed.
+    fn iso_fixture(scratch: &tempfile::TempDir) -> (PathBuf, u64) {
+        let bytes = crate::copy::source::fixture::fixture_bytes();
+        let path = scratch.path().join("fixture.iso");
+        std::fs::write(&path, &bytes).expect("fixture image writes");
+        (path, bytes.len() as u64)
+    }
+
+    /// The info-level [`Message`](Event::Message) texts in emission
+    /// order.
+    fn infos(reporter: &VecReporter) -> Vec<&str> {
+        reporter
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Message {
+                    level: "info",
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copy_refuses_kinds_with_no_tree_reader_before_mounting() {
+        // Every kind without a tree reader refuses — the WIM and
+        // disk-container kinds as not-implemented naming the missing
+        // reader, compressed archives and unknown kinds as invalid
+        // input — and none of them mounts anything (zero mount calls
+        // on the counting opener). The refusals land before the image
+        // file is opened, so the path needs no fixture behind it.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let missing = scratch.path().join("absent.iso");
+        for (kind, tag, fragment, not_implemented) in [
+            (
+                ImageKind::Wim,
+                "wim",
+                "reader arrives in a later slice",
+                true,
+            ),
+            (
+                ImageKind::Vhd,
+                "vhd",
+                "reader arrives in a later slice",
+                true,
+            ),
+            (
+                ImageKind::Vhdx,
+                "vhdx",
+                "reader arrives in a later slice",
+                true,
+            ),
+            (
+                ImageKind::Ffu,
+                "ffu",
+                "reader arrives in a later slice",
+                true,
+            ),
+            (
+                ImageKind::Qcow2,
+                "qcow2",
+                "reader arrives in a later slice",
+                true,
+            ),
+            (ImageKind::Pe, "pe", "reader arrives in a later slice", true),
+            (
+                ImageKind::Gzip,
+                "gzip",
+                "cannot be walked as a tree without decoding it first",
+                false,
+            ),
+            (
+                ImageKind::Xz,
+                "xz",
+                "cannot be walked as a tree without decoding it first",
+                false,
+            ),
+            (
+                ImageKind::Bzip2,
+                "bzip2",
+                "cannot be walked as a tree without decoding it first",
+                false,
+            ),
+            (
+                ImageKind::Zstd,
+                "zstd",
+                "cannot be walked as a tree without decoding it first",
+                false,
+            ),
+            (
+                ImageKind::Unknown,
+                "unknown",
+                "names no readable file tree",
+                false,
+            ),
+        ] {
+            let opener = CopyOpener::new(u64::MAX);
+            let mut reporter = VecReporter::new();
+            let never = || false;
+            let mut ctx = copy_context(&opener, &mut reporter, &never);
+            let image = copy_image(&missing, 0, kind);
+            let error = run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect_err("a kind with no tree reader refuses");
+            let text = error.to_string();
+            assert!(text.contains(tag), "the refusal names the kind: {text}");
+            assert!(text.contains(fragment), "{text}");
+            assert!(text.is_ascii(), "{text}");
+            assert_eq!(
+                matches!(error, CoreError::NotImplemented { .. }),
+                not_implemented,
+                "the refusal variant names its shape: {error:?}"
+            );
+            assert_eq!(opener.mounts(), 0, "no mount for {tag}");
+        }
+    }
+
+    #[test]
+    fn copy_walks_an_iso_tree_onto_the_mount() {
+        // End to end through `write::run`: the fixture ISO lands
+        // byte-for-byte in the mounted directory, the completion line
+        // reports the concrete counts, the opening line names the
+        // image path and kind, at least one step-`write` progress
+        // sample arrived, and the mount was released.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let (path, size) = iso_fixture(&scratch);
+        let opener = CopyOpener::new(1024 * 1024);
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        {
+            let mut ctx = copy_context(&opener, &mut reporter, &never);
+            let image = copy_image(&path, size, ImageKind::Iso);
+            run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect("the iso tree copies");
+        }
+        let dest = opener.scratch.path();
+        assert_eq!(
+            std::fs::read(dest.join("TOP.TXT")).expect("top reads back"),
+            b"top-txt"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("A").join("NESTED.TXT")).expect("nested reads back"),
+            b"nested"
+        );
+        assert_eq!(
+            std::fs::read_dir(dest.join("B")).expect("B lists").count(),
+            0
+        );
+        let found = infos(&reporter);
+        assert!(
+            found
+                .iter()
+                .any(|text| text.contains("fixture.iso") && text.contains("(iso)")),
+            "the opening line names the image path and kind: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|text| text == &"copied 2 files in 2 directories (13 bytes), 0 renamed"),
+            "the completion line reports the concrete result: {found:?}"
+        );
+        assert!(
+            found.iter().all(|text| text.is_ascii()),
+            "messages stay ASCII: {found:?}"
+        );
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::Progress { step: "write", .. })),
+            "a copy reports progress: {:?}",
+            reporter.events()
+        );
+        assert_eq!(opener.mounts(), 1);
+        assert_eq!(opener.releases(), 1, "the mount is released");
+    }
+
+    #[test]
+    fn copy_reports_a_refused_mount_and_writes_nothing() {
+        // The source builds (a real ISO fixture), then the mount
+        // refuses: the step fails with the mount error and no file
+        // lands in the would-be mount directory.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let (path, size) = iso_fixture(&scratch);
+        let opener = CopyOpener::refusing();
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        {
+            let mut ctx = copy_context(&opener, &mut reporter, &never);
+            let image = copy_image(&path, size, ImageKind::Iso);
+            let error = run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect_err("a refused mount fails the step");
+            assert!(
+                matches!(error, CoreError::NotImplemented { .. }),
+                "the mount refusal propagates: {error:?}"
+            );
+            assert!(error.to_string().contains("mounting"), "{error:?}");
+        }
+        assert_eq!(opener.mounts(), 1);
+        assert_eq!(
+            opener.releases(),
+            0,
+            "nothing mounted means nothing to release"
+        );
+        assert_eq!(
+            std::fs::read_dir(opener.scratch.path())
+                .expect("the dir lists")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn copy_releases_the_mount_when_the_free_space_check_refuses() {
+        // A mount reporting zero free bytes refuses the 13-byte tree
+        // up front: the error surfaces, the mount is still released,
+        // and nothing was written.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let (path, size) = iso_fixture(&scratch);
+        let opener = CopyOpener::new(0);
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        {
+            let mut ctx = copy_context(&opener, &mut reporter, &never);
+            let image = copy_image(&path, size, ImageKind::Iso);
+            let error = run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect_err("an empty destination refuses");
+            let text = error.to_string();
+            assert!(text.contains("13"), "{text}");
+            assert!(text.contains("free"), "{text}");
+        }
+        assert_eq!(opener.mounts(), 1);
+        assert_eq!(opener.releases(), 1, "a failed pre-flight still releases");
+        assert_eq!(
+            std::fs::read_dir(opener.scratch.path())
+                .expect("the dir lists")
+                .count(),
+            0,
+            "the refusal lands before any write"
+        );
+    }
+
+    #[test]
+    fn copy_cancels_mid_walk_releases_and_leaves_no_partial_file() {
+        // The probe stays false for the walk entry and the first
+        // sizing entry, then reads true: the walk stops with
+        // `Cancelled`, the mount is released, and whatever landed is
+        // whole (a cancelled file is removed like a write failure
+        // removes it — a surviving file always reads back
+        // byte-identical, never partial).
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let (path, size) = iso_fixture(&scratch);
+        let opener = CopyOpener::new(1024 * 1024);
+        let mut reporter = VecReporter::new();
+        let calls = Cell::new(0u32);
+        let cancelled = || {
+            let seen = calls.get();
+            calls.set(seen + 1);
+            seen >= 2
+        };
+        {
+            let mut ctx = copy_context(&opener, &mut reporter, &cancelled);
+            let image = copy_image(&path, size, ImageKind::Iso);
+            let error = run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect_err("a cancelled copy refuses");
+            assert!(
+                matches!(error, CoreError::Cancelled),
+                "cancellation surfaces bare: {error:?}"
+            );
+        }
+        assert_eq!(opener.mounts(), 1);
+        assert_eq!(opener.releases(), 1, "a cancelled walk still releases");
+        let dest = opener.scratch.path();
+        for (name, bytes) in [
+            ("TOP.TXT", b"top-txt".as_slice()),
+            ("A/NESTED.TXT", b"nested".as_slice()),
+        ] {
+            let landed = dest.join(name);
+            if landed.exists() {
+                assert_eq!(
+                    std::fs::read(&landed).expect("a surviving file reads"),
+                    bytes,
+                    "{name} is whole or absent, never partial"
+                );
+            }
+        }
+    }
+
+    /// A [`Source`](crate::copy::Source) declaring one file above the
+    /// FAT32 limit without holding any bytes: the limit check fires
+    /// up front, so `read_bytes` never needs real data (it answers
+    /// end-of-file, which the non-limited walk then reports as the
+    /// short read it is).
+    struct HugeSource;
+
+    impl crate::copy::Source for HugeSource {
+        fn root_entries(&self) -> Result<Vec<crate::copy::Entry>> {
+            Ok(vec![crate::copy::Entry {
+                name: b"big.bin".to_vec(),
+                is_dir: false,
+                size: u64::MAX,
+                mode: None,
+                modified: None,
+                accessed: None,
+                link: None,
+            }])
+        }
+
+        fn child_entries(&self, _dir: &[Vec<u8>]) -> Result<Vec<crate::copy::Entry>> {
+            Ok(Vec::new())
+        }
+
+        fn read_bytes(&self, _file: &[Vec<u8>], _offset: u64, _buf: &mut [u8]) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn copy_passes_the_fat32_limit_only_for_fat32_targets() {
+        // The same huge-file source refuses on a `Fat32` plan (naming
+        // the limit and the size) and walks past the limit on an
+        // `Exfat` plan (failing later as the short read it is,
+        // proving the limit flag was off); the mount is released in
+        // both cases.
+        for (filesystem, limited) in [(Filesystem::Fat32, true), (Filesystem::Exfat, false)] {
+            let opener = CopyOpener::new(u64::MAX);
+            let mut reporter = VecReporter::new();
+            let never = || false;
+            {
+                let mut ctx = copy_context(&opener, &mut reporter, &never);
+                let image = copy_image(Path::new("big.iso"), u64::MAX, ImageKind::Iso);
+                let mut mounted = opener
+                    .mount_partition(&filesystem)
+                    .expect("the test mount opens");
+                let error =
+                    run_copy_mounted(&mut ctx, &image, &filesystem, &HugeSource, mounted.as_mut())
+                        .expect_err("the huge file refuses or fails");
+                let text = error.to_string();
+                assert_eq!(
+                    text.contains("FAT32"),
+                    limited,
+                    "{filesystem:?} carries the limit flag it was given: {text}"
+                );
+                if limited {
+                    assert!(text.contains(&u64::MAX.to_string()), "{text}");
+                }
+            }
+            assert_eq!(opener.mounts(), 1);
+            assert_eq!(
+                opener.releases(),
+                1,
+                "{filesystem:?} releases after the refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_refuses_a_raw_image_that_is_neither_iso_nor_udf() {
+        // Zeroed bytes are neither an ISO9660 nor a UDF tree: the arm
+        // refuses naming the kind and carrying the UDF reader's
+        // message (never swallowing it), before mounting anything.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let path = scratch.path().join("blank.bin");
+        std::fs::write(&path, vec![0u8; 64 * 1024]).expect("blank image writes");
+        let opener = CopyOpener::new(u64::MAX);
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        {
+            let mut ctx = copy_context(&opener, &mut reporter, &never);
+            let image = copy_image(&path, 64 * 1024, ImageKind::Raw);
+            let error = run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect_err("a tree-less raw image refuses");
+            assert!(
+                matches!(error, CoreError::InvalidInput { .. }),
+                "the refusal names its shape: {error:?}"
+            );
+            let text = error.to_string();
+            assert!(text.contains("raw"), "{text}");
+            assert!(text.contains("ISO9660"), "{text}");
+            assert!(text.contains("UDF open failed"), "{text}");
+            assert!(text.is_ascii(), "{text}");
+        }
+        assert_eq!(opener.mounts(), 0, "a malformed image never mounts");
+    }
+
+    /// A single-file ISO holding `size` patterned bytes under
+    /// `BIG.BIN`, built from the shared
+    /// [`fixture`](crate::copy::source::fixture) builders: several
+    /// 128 KiB copy chunks, so the progress throttle has something
+    /// to chew on. Returns its path and length.
+    fn big_iso_fixture(scratch: &tempfile::TempDir, size: usize) -> (PathBuf, u64) {
+        use crate::copy::source::fixture::boot_sector;
+        use crate::copy::source::fixture::dir_sector;
+        use crate::copy::source::fixture::encode_record;
+        use crate::copy::source::fixture::primary_sector;
+        use crate::copy::source::fixture::terminator_sector;
+        use crate::iso::FLAG_DIRECTORY;
+        use crate::iso::SECTOR_BYTES;
+
+        const ROOT: u32 = 20;
+        const CONTENT: u32 = 23;
+        let content_sectors = (size as u32).div_ceil(SECTOR_BYTES as u32);
+        let sectors = CONTENT + content_sectors;
+        let mut image = vec![0u8; sectors as usize * SECTOR_BYTES];
+        let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut image,
+            16,
+            &primary_sector("LABEL", ROOT, SECTOR_BYTES as u32),
+        );
+        put(&mut image, 17, &boot_sector());
+        put(&mut image, 18, &terminator_sector());
+        put(
+            &mut image,
+            ROOT,
+            &dir_sector(&[
+                encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record(CONTENT, size as u32, 0, b"BIG.BIN;1"),
+            ]),
+        );
+        let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        put(&mut image, CONTENT, &body);
+        let path = scratch.path().join("big.iso");
+        std::fs::write(&path, &image).expect("big fixture writes");
+        (path, image.len() as u64)
+    }
+
+    #[test]
+    fn copy_progress_is_throttled_to_a_handful_of_lines() {
+        // A 300001-byte file streams as three 128 KiB chunks: without
+        // the [`PROGRESS_INTERVAL`] throttle the walk would emit at
+        // least 3 progress lines (initial, per-chunk, final), so the
+        // cap below fails if the throttle is ever removed. With it,
+        // only the forced final line is guaranteed — one line, two at
+        // most if a 100 ms boundary slips mid-copy — and the last line
+        // still reports `done == total`.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let (path, len) = big_iso_fixture(&scratch, 300_001);
+        let opener = CopyOpener::new(u64::MAX);
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        {
+            let mut ctx = copy_context(&opener, &mut reporter, &never);
+            let image = copy_image(&path, len, ImageKind::Iso);
+            run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect("the big tree copies");
+        }
+        let progress: Vec<(u64, Option<u64>)> = reporter
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Progress { done, total, .. } => Some((*done, *total)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !progress.is_empty() && progress.len() <= 2,
+            "throttled to a forced final line plus at most one sample: {progress:?}"
+        );
+        assert_eq!(
+            progress.last().copied(),
+            Some((300_001, Some(300_001))),
+            "the last line still reports done == total: {progress:?}"
+        );
+        let landed =
+            std::fs::read(opener.scratch.path().join("BIG.BIN")).expect("the big file reads back");
+        assert_eq!(landed.len(), 300_001);
+        assert_eq!(
+            landed,
+            (0..300_001).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
+        );
     }
 }

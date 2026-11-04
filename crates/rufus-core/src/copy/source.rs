@@ -321,32 +321,45 @@ impl Source for UdfSource {
     }
 }
 
+/// Shared ISO fixture builders for tests: the plain primary-only
+/// image the [`IsoSource`](IsoSource) walk tests pin, reused by the
+/// pipeline write-copy tests so the tree is built once, not copied
+/// per module. Test-only on purpose: no production code may depend
+/// on these bytes. Synthetic layout only, claims nothing about real
+/// mastering tools.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fs::VecVolume;
-    use crate::fs::Volume;
+pub(crate) mod fixture {
     use crate::iso::FLAG_DIRECTORY;
     use crate::iso::SECTOR_BYTES;
     use crate::iso::descriptor::TYPE_BOOT;
     use crate::iso::descriptor::TYPE_PRIMARY;
     use crate::iso::descriptor::TYPE_TERMINATOR;
     use crate::iso::record::RECORD_FIXED_LEN;
-    use std::os::unix::fs::PermissionsExt;
 
-    const ROOT_SECTOR: u32 = 20;
-    const DIR_A_SECTOR: u32 = 21;
-    const DIR_B_SECTOR: u32 = 22;
-    const FILE_TOP_SECTOR: u32 = 23;
-    const FILE_NESTED_SECTOR: u32 = 24;
-    const IMAGE_SECTORS: u32 = 32;
+    /// Root directory sector of the fixture images.
+    pub(crate) const ROOT_SECTOR: u32 = 20;
+    /// `A/` directory sector.
+    pub(crate) const DIR_A_SECTOR: u32 = 21;
+    /// `B/` directory sector.
+    pub(crate) const DIR_B_SECTOR: u32 = 22;
+    /// `TOP.TXT` content sector.
+    pub(crate) const FILE_TOP_SECTOR: u32 = 23;
+    /// `NESTED.TXT` content sector.
+    pub(crate) const FILE_NESTED_SECTOR: u32 = 24;
+    /// Whole image size in sectors.
+    pub(crate) const IMAGE_SECTORS: u32 = 32;
 
     /// Encode one directory record, mirroring the on-disk layout the
     /// parser reads (both-endian words, zero date, sequence 1, the
     /// even-length pad, no system-use tail). Copied from the
     /// `iso/reader.rs` test builders, not refactored: those helpers
     /// are private to their module on purpose.
-    fn encode_record(extent: u32, data_len: u32, flags: u8, identifier: &[u8]) -> Vec<u8> {
+    pub(crate) fn encode_record(
+        extent: u32,
+        data_len: u32,
+        flags: u8,
+        identifier: &[u8],
+    ) -> Vec<u8> {
         let pad = if identifier.len().is_multiple_of(2) {
             1
         } else {
@@ -370,7 +383,7 @@ mod tests {
     /// Pack records back to back at the start of one zeroed sector.
     /// Copied from the `iso/reader.rs` test builders (see
     /// [`encode_record`]).
-    fn dir_sector(records: &[Vec<u8>]) -> [u8; SECTOR_BYTES] {
+    pub(crate) fn dir_sector(records: &[Vec<u8>]) -> [u8; SECTOR_BYTES] {
         let mut sector = [0u8; SECTOR_BYTES];
         let mut offset = 0;
         for record in records {
@@ -383,7 +396,11 @@ mod tests {
     /// Primary-descriptor sector with `label` and the root at
     /// (`root_extent`, `root_len`). Copied from the `iso/reader.rs`
     /// test builders (see [`encode_record`]).
-    fn primary_sector(label: &str, root_extent: u32, root_len: u32) -> [u8; SECTOR_BYTES] {
+    pub(crate) fn primary_sector(
+        label: &str,
+        root_extent: u32,
+        root_len: u32,
+    ) -> [u8; SECTOR_BYTES] {
         let mut sector = [0u8; SECTOR_BYTES];
         sector[0] = TYPE_PRIMARY;
         sector[1..6].copy_from_slice(b"CD001");
@@ -409,7 +426,7 @@ mod tests {
 
     /// Boot-record sector. Copied from the `iso/reader.rs` test
     /// builders (see [`encode_record`]).
-    fn boot_sector() -> [u8; SECTOR_BYTES] {
+    pub(crate) fn boot_sector() -> [u8; SECTOR_BYTES] {
         let mut sector = [0u8; SECTOR_BYTES];
         sector[0] = TYPE_BOOT;
         sector[1..6].copy_from_slice(b"CD001");
@@ -419,7 +436,7 @@ mod tests {
 
     /// Terminator sector. Copied from the `iso/reader.rs` test builders
     /// (see [`encode_record`]).
-    fn terminator_sector() -> [u8; SECTOR_BYTES] {
+    pub(crate) fn terminator_sector() -> [u8; SECTOR_BYTES] {
         let mut sector = [0u8; SECTOR_BYTES];
         sector[0] = TYPE_TERMINATOR;
         sector[1..6].copy_from_slice(b"CD001");
@@ -430,9 +447,10 @@ mod tests {
     /// Whole primary-only fixture image: descriptors at 16..18, root
     /// at 20 holding `B/`, `TOP.TXT;1` and `A/` in that (unsorted)
     /// on-disk order, `A/` at 21 holding `NESTED.TXT;1`, `B/` at 22
-    /// empty, file contents after. Synthetic layout only, claims
-    /// nothing about real mastering tools.
-    fn fixture_bytes() -> Vec<u8> {
+    /// empty, file contents after. The walked tree is two directories,
+    /// two files (`top-txt`, 7 bytes; `nested`, 6 bytes), 13 bytes,
+    /// nothing renamed.
+    pub(crate) fn fixture_bytes() -> Vec<u8> {
         let mut image = vec![0u8; IMAGE_SECTORS as usize * SECTOR_BYTES];
         let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
             let base = sector as usize * SECTOR_BYTES;
@@ -477,6 +495,18 @@ mod tests {
         put(&mut image, FILE_NESTED_SECTOR, b"nested");
         image
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::*;
+    use super::*;
+    use crate::fs::VecVolume;
+    use crate::fs::Volume;
+    use crate::iso::FLAG_DIRECTORY;
+    use crate::iso::SECTOR_BYTES;
+    use crate::iso::record::RECORD_FIXED_LEN;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Fixture image opened as an [`IsoSource`].
     fn fixture_source() -> IsoSource {

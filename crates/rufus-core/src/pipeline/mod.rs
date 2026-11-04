@@ -3,14 +3,14 @@
 //! contract.
 //!
 //! The machine walks `plan.steps` in order through [`run`], emitting
-//! [`Event`]s to a [`Reporter`] and timing every step. Five of the
-//! seven steps run: wipe, mklabel, mkpart, mkfs and finalize, plus the
-//! [`Dd`](rufus_proto::WriteMode::Dd) write path. Two refuse by name:
+//! [`Event`]s to a [`Reporter`] and timing every step. Six of the
+//! seven steps run: wipe, mklabel, mkpart, mkfs and finalize, plus
+//! both write paths (the [`Dd`](rufus_proto::WriteMode::Dd) stream
+//! and the [`Copy`](rufus_proto::WriteMode::Copy) file-tree copy).
+//! One refuses by name:
 //! [`Bootloader`](rufus_proto::Step::Bootloader) (the installers exist
 //! in [`crate::boot`] but are not wired into the pipeline yet — a
-//! later slice) and [`Copy`](rufus_proto::WriteMode::Copy) (file-tree
-//! copying is implemented; its plan and write-path wiring arrives in
-//! a later slice).
+//! later slice).
 //!
 //! [`step_name`] is the one shared snake_case vocabulary for step
 //! identifiers, so the CLI and the machine cannot drift apart.
@@ -139,7 +139,7 @@ fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result
             cluster_bytes,
             quick,
         } => mkfs::run(ctx, filesystem, label, cluster_bytes, *quick),
-        Step::Write { mode } => write::run(ctx, mode, &plan.image),
+        Step::Write { mode } => write::run(ctx, mode, &plan.image, &plan.options.filesystem),
         Step::Bootloader { .. } => Err(CoreError::NotImplemented {
             what: "bootloader installation (not wired yet)",
         }),
@@ -1312,22 +1312,26 @@ mod tests {
     }
 
     #[test]
-    fn write_mode_copy_is_refused_by_name() {
+    fn write_mode_copy_refuses_a_kind_with_no_tree_reader() {
+        // Copy of a WIM refuses before mounting anything: the
+        // `NotImplemented` passes through unwrapped (its `what`
+        // already names the step) and names the kind. The mount and
+        // release flow itself is pinned in the `write` module tests.
         let opener = TestOpener::new(4096);
         let mut reporter = VecReporter::new();
-        let error = run(
-            &test_plan(vec![Step::Write {
-                mode: WriteMode::Copy,
-            }]),
-            &opener,
-            &run_options(),
-            &mut reporter,
-            &|| false,
-        )
-        .expect_err("copy is not implemented yet");
+        let mut plan = test_plan(vec![Step::Write {
+            mode: WriteMode::Copy,
+        }]);
+        plan.image.kind = ImageKind::Wim;
+        let error = run(&plan, &opener, &run_options(), &mut reporter, &|| false)
+            .expect_err("a wim copy refuses");
         let text = error.to_string();
-        assert!(text.contains("copy"), "{text}");
+        assert!(text.contains("wim"), "{text}");
         assert!(text.contains("not implemented"), "{text}");
+        assert!(
+            !matches!(error, CoreError::Step { .. }),
+            "a named refusal is never step-wrapped: {error:?}"
+        );
     }
 
     #[test]
