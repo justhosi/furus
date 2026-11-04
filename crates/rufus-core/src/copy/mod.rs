@@ -18,12 +18,15 @@
 //!   Nesting past the depth cap refuses as a possible directory loop,
 //!   in both passes; re-running into a partial destination resumes
 //!   it — existing directories are reused and files rewritten whole —
-//!   so an interrupted copy recovers by running again.
+//!   so an interrupted copy recovers by running again. Entering a
+//!   reused directory widens `u+wx` for the descent when the stored
+//!   mode lacks it (a `0555` directory from an earlier run still
+//!   opens), restoring the prior mode afterwards unless the source
+//!   carries its own — then applying it is the restore.
 //!
-//! Not here yet: entry metadata (modes, stamps, link targets — the
-//! Part A audit found the fields, slices 3-4 decide them), symlinks
-//! (refused, never skipped: skipping would lose data silently),
-//! boot/extended attributes, and any CLI wiring.
+//! Not here yet: link targets (slice 4), ownership (never applied —
+//! it needs privileges), boot/extended attributes, and any CLI
+//! wiring.
 //!
 //! On progress reporting: [`Progress`] is one method on purpose. The
 //! pipeline's [`Event`](crate::pipeline::Event)/[`Reporter`](crate::pipeline::Reporter) would
@@ -566,6 +569,21 @@ impl Copier<'_> {
                     self.summary.directories.checked_add(1).ok_or_else(|| {
                         CoreError::invalid("copy directory count overflows the counter".to_string())
                     })?;
+                // Widen a reused read-only directory for the descent:
+                // removing and recreating children needs `u+w` on the
+                // parent, which an earlier run's mode may lack. Best
+                // effort with one warning — the children report for
+                // themselves if the directory truly stays shut.
+                let saved = match self.dest.enter_writable_dir(abs) {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        self.progress.warn(&format!(
+                            "copy cannot widen '{}': {error}; continuing",
+                            abs.display(),
+                        ));
+                        None
+                    }
+                };
                 // The child's pool must not replace this directory's:
                 // save it aside, scan the child with a fresh pool, and
                 // restore afterwards — otherwise the parent loses its
@@ -574,6 +592,31 @@ impl Copier<'_> {
                 let result = self.copy_dir(rel, abs, depth.saturating_add(1));
                 self.taken = taken;
                 result?;
+                // Metadata lands after the children, as POSIX does: a
+                // read-only directory must not block its own children.
+                // Best effort (see below): a refused timestamp or mode
+                // warns and the copy continues.
+                if let Err(error) = self.dest.apply_metadata(abs, &child) {
+                    self.progress.warn(&format!(
+                        "copy cannot apply metadata to '{}': {error}; continuing",
+                        abs.display(),
+                    ));
+                }
+                // No source mode means the entry widened nothing
+                // permanent: put back whatever mode it had before, so
+                // the destination keeps no trace of the descent.
+                // No source mode means the widen left nothing
+                // permanent: put back whatever mode the directory had
+                // before.
+                if child.mode.is_none()
+                    && let Some(prior) = saved
+                    && let Err(error) = self.dest.restore_mode(abs, prior)
+                {
+                    self.progress.warn(&format!(
+                        "copy cannot restore mode on '{}': {error}; continuing",
+                        abs.display(),
+                    ));
+                }
             } else {
                 let mut file = self.dest.replace_file(abs)?;
                 let mut offset = 0u64;
@@ -613,6 +656,18 @@ impl Copier<'_> {
                     self.summary.bytes.checked_add(child.size).ok_or_else(|| {
                         CoreError::invalid("copy byte count overflows the counter".to_string())
                     })?;
+                // Metadata lands after the bytes are complete — and
+                // the mode last inside (see `apply_metadata`) so a
+                // read-only mode cannot block the timestamp write.
+                // Best effort: an unsettable timestamp on vfat must
+                // not abort a valid image, so a refusal warns naming
+                // the path and the copy continues.
+                if let Err(error) = self.dest.apply_metadata(abs, &child) {
+                    self.progress.warn(&format!(
+                        "copy cannot apply metadata to '{}': {error}; continuing",
+                        abs.display(),
+                    ));
+                }
             }
             rel.pop().ok_or_else(|| {
                 CoreError::invalid("copy path stack underflows its push".to_string())
@@ -664,6 +719,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
     use std::rc::Rc;
 
     /// One in-memory file: payload bytes under a name.
@@ -690,11 +746,27 @@ mod tests {
     struct MemSource {
         dirs: BTreeMap<Vec<Vec<u8>>, MemDir>,
         reads: Rc<RefCell<Vec<Vec<Vec<u8>>>>>,
+        /// Per-path mode overrides, keyed by full path from the root;
+        /// entries without one keep the fixed defaults below.
+        modes: BTreeMap<Vec<Vec<u8>>, u32>,
     }
 
     impl MemSource {
         fn dir(&mut self, path: &[Vec<u8>]) -> &mut MemDir {
             self.dirs.entry(path.to_vec()).or_default()
+        }
+
+        /// Full path of `name` under `dir`, for the mode overrides.
+        fn full_path(dir: &[Vec<u8>], name: &[u8]) -> Vec<Vec<u8>> {
+            let mut full = dir.to_vec();
+            full.push(name.to_vec());
+            full
+        }
+
+        /// Override mode for the entry at `full_path`, if the fixture
+        /// pins one.
+        fn mode_for(modes: &BTreeMap<Vec<Vec<u8>>, u32>, full_path: &[Vec<u8>]) -> Option<u32> {
+            modes.get(full_path).copied()
         }
     }
 
@@ -715,17 +787,29 @@ mod tests {
             })?;
             let mut out = Vec::new();
             for file in &found.files {
+                let full = Self::full_path(dir, &file.name);
                 out.push(Entry {
                     name: file.name.clone(),
                     is_dir: false,
                     size: file.bytes.len() as u64,
+                    // Synthetic sources carry a fixed mode (like a
+                    // real listing would), so the walk exercises the
+                    // metadata path on every entry; stamps stay
+                    // absent. Per-path overrides win when present.
+                    mode: Some(Self::mode_for(&self.modes, &full).unwrap_or(0o644)),
+                    modified: None,
+                    accessed: None,
                 });
             }
-            for dir in &found.dirs {
+            for name in &found.dirs {
+                let full = Self::full_path(dir, name);
                 out.push(Entry {
-                    name: dir.clone(),
+                    name: name.clone(),
                     is_dir: true,
                     size: 0,
+                    mode: Some(Self::mode_for(&self.modes, &full).unwrap_or(0o755)),
+                    modified: None,
+                    accessed: None,
                 });
             }
             Ok(out)
@@ -1364,6 +1448,9 @@ mod tests {
                 name: b"X".to_vec(),
                 is_dir: true,
                 size: 0,
+                mode: None,
+                modified: None,
+                accessed: None,
             }])
         }
 
@@ -1372,6 +1459,9 @@ mod tests {
                 name: b"X".to_vec(),
                 is_dir: true,
                 size: 0,
+                mode: None,
+                modified: None,
+                accessed: None,
             }])
         }
 
@@ -1426,5 +1516,144 @@ mod tests {
             std::fs::read(scratch.path().join("A").join("NESTED.TXT")).expect("nested reads back"),
             b"nested"
         );
+    }
+
+    /// [`Progress`] deleting one path the moment the grand total is
+    /// reported: the file's last chunk already landed, so only its
+    /// metadata application can still fail. Deterministic — no timing,
+    /// no threads — the report order guarantees the deletion lands
+    /// between the last write and the apply.
+    #[derive(Debug)]
+    struct DeleteHook {
+        target: PathBuf,
+        warns: Vec<String>,
+    }
+
+    impl Progress for DeleteHook {
+        fn report(&mut self, done_bytes: u64, total_bytes: u64) {
+            if done_bytes == total_bytes && total_bytes > 0 {
+                let _ = std::fs::remove_file(&self.target);
+            }
+        }
+
+        fn warn(&mut self, text: &str) {
+            self.warns.push(text.to_string());
+        }
+    }
+
+    #[test]
+    fn metadata_failure_warns_and_continues() {
+        // One 300 KiB file (three chunks): its last chunk's report
+        // deletes it before metadata applies, so the copy still
+        // returns `Ok` with exactly one warning naming it — never an
+        // error — and the counts stand.
+        let mut source = MemSource::default();
+        source.dir(&[]).files.push(MemFile {
+            name: b"BIG".to_vec(),
+            bytes: vec![0x5Au8; 300 * 1024],
+        });
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let target = scratch.path().join("BIG");
+        let mut progress = DeleteHook {
+            target,
+            warns: Vec::new(),
+        };
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
+            .expect("a metadata failure still copies");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 0,
+                files: 1,
+                bytes: 300 * 1024,
+                renamed: 0,
+            }
+        );
+        assert_eq!(progress.warns.len(), 1, "one warning, not an error");
+        assert!(
+            progress.warns[0].contains("BIG"),
+            "the warning names the path: {}",
+            progress.warns[0]
+        );
+    }
+
+    /// Permission bits of `path`, masked to the mode proper.
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("entry stats")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn resumed_copy_reenters_a_read_only_directory() {
+        // `B/` carries `0o500` with a child inside: the first run
+        // creates it, writes the child, then chmods it; the second
+        // run must widen it back for the descent, rewrite the child,
+        // and leave `0o500` again — both runs `Ok`, bytes matching
+        // both times.
+        let mut source = MemSource::default();
+        source.dir(&[]).dirs.push(b"B".to_vec());
+        source.dir(&[b"B".to_vec()]).files.push(MemFile {
+            name: b"M.TXT".to_vec(),
+            bytes: b"m!".to_vec(),
+        });
+        source.modes.insert(vec![b"B".to_vec()], 0o500);
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        for run in 1..=2 {
+            let mut progress = Recorder::default();
+            walk(&source, scratch.path(), &no_limit(), &mut progress)
+                .expect("a read-only directory re-enters");
+            assert_eq!(
+                std::fs::read(scratch.path().join("B").join("M.TXT"))
+                    .expect("the child reads back"),
+                b"m!",
+                "run {run} leaves matching bytes"
+            );
+            assert_eq!(
+                mode_of(&scratch.path().join("B")),
+                0o500,
+                "run {run} leaves B at 0o500"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_file_in_a_read_only_directory_is_rewritten() {
+        // A stale partial file under a `0o500` directory (the shape an
+        // interrupted run leaves behind): the second run widens the
+        // directory, replaces the partial file whole, and finishes
+        // with correct bytes and the stored mode.
+        let mut source = MemSource::default();
+        source.dir(&[]).dirs.push(b"B".to_vec());
+        source.dir(&[b"B".to_vec()]).files.push(MemFile {
+            name: b"BIG".to_vec(),
+            bytes: vec![0x5Au8; 300 * 1024],
+        });
+        source.modes.insert(vec![b"B".to_vec()], 0o500);
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let dir = scratch.path().join("B");
+        std::fs::create_dir(&dir).expect("the stale directory creates");
+        std::fs::write(dir.join("BIG"), vec![0xAAu8; 100 * 1024]).expect("partial writes");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("the stale directory chmods");
+        let mut progress = Recorder::default();
+        let summary = walk(&source, scratch.path(), &no_limit(), &mut progress)
+            .expect("a partial file under a read-only directory resumes");
+        assert_eq!(
+            summary,
+            Summary {
+                directories: 1,
+                files: 1,
+                bytes: 300 * 1024,
+                renamed: 0,
+            }
+        );
+        assert_eq!(
+            std::fs::read(dir.join("BIG")).expect("the rewritten file reads back"),
+            vec![0x5Au8; 300 * 1024]
+        );
+        assert_eq!(mode_of(&dir), 0o500, "B ends at its stored mode");
     }
 }

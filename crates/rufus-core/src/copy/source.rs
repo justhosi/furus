@@ -9,21 +9,28 @@
 //! the ISO adapter renders the reader's `/`-separated path form from
 //! them (see [`IsoSource`] for that fidelity boundary).
 //!
-//! What is NOT here yet, by slice plan: entry metadata (modes,
-//! stamps, link targets) and symlinks. Part A found those fields on
-//! both readers (`Entry::symlink_target`/`posix`/`times` on ISO,
-//! `FileEntry::file_type` on UDF) but slices 3-4 decide their
-//! handling — this slice copies data only, so an entry the adapters
-//! cannot size as data refuses here, before any byte moves, instead
-//! of copying something wrong.
+//! Metadata rides the listings too: POSIX modes and UTC stamps where
+//! the reader has them (ISO `PX`/`TF`; UDF entries carry `None` — the
+//! UDF reader parses neither extended attributes nor timestamps, and
+//! UDF on a stick is a data volume, so carrying the gap is the honest
+//! choice for now — the UDF reader itself is untouched). Link targets
+//! stay out (slice 4); an entry the adapters cannot size as data
+//! still refuses here, before any byte moves, instead of copying
+//! something wrong.
+
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::error::CoreError;
 use crate::error::Result;
 use crate::iso::IsoReader;
+use crate::iso::rock::RockTime;
 use crate::udf::UdfReader;
 
-/// One listed entry: name, kind and size. Metadata (modes, stamps,
-/// link targets) is deliberately absent — see the module docs.
+/// One listed entry: name, kind, size and metadata. Link targets stay
+/// absent (slice 4); ownership never rides along (needs privileges —
+/// see [`DestDir::apply_metadata`](super::DestDir::apply_metadata)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// File name as stored: raw identifier bytes on ISO
@@ -34,6 +41,16 @@ pub struct Entry {
     pub is_dir: bool,
     /// File size in bytes; 0 for directories.
     pub size: u64,
+    /// POSIX mode from `PX` (file type bits included — the destination
+    /// masks); `None` where the record carries no `PX`, and always on
+    /// UDF.
+    pub mode: Option<u32>,
+    /// Modification time from `TF`, converted to UTC; `None` where the
+    /// record carries none, where conversion refuses, and always on
+    /// UDF.
+    pub modified: Option<SystemTime>,
+    /// Last-access time from `TF`, converted like [`modified`](Entry::modified).
+    pub accessed: Option<SystemTime>,
 }
 
 /// A readable filesystem tree: listings plus chunked file reads. The
@@ -52,6 +69,58 @@ pub trait Source {
     /// from the root) at `offset`: returns the bytes placed, 0 at end
     /// of file. Refuses offsets past the length, naming both.
     fn read_bytes(&self, file: &[Vec<u8>], offset: u64, buf: &mut [u8]) -> Result<usize>;
+}
+
+/// Convert a [`RockTime`] stamp (UTC plus `offset_quarters` signed
+/// quarters of an hour) to [`SystemTime`]: civil-days arithmetic
+/// (Howard Hinnant's days-from-civil), no dependency, total — out
+/// means `None`, never a guess.
+///
+/// Refused rather than placed: months outside 1..12, days outside
+/// the month's length (leap years counted), hours past 23,
+/// minutes/seconds past 59, centiseconds past 99. A stamp the reader
+/// accepted but this cannot place (a leap second, a February 30th)
+/// reads as absent in the adapter, not as an error. `i64` carries
+/// millennia either way, so no checked arithmetic is needed at these
+/// magnitudes — and every result stays far inside [`SystemTime`]'s
+/// range, so no conversion here can panic.
+fn rock_time_to_system_time(stamp: &RockTime) -> Option<SystemTime> {
+    let leap = stamp.year.is_multiple_of(4)
+        && (!stamp.year.is_multiple_of(100) || stamp.year.is_multiple_of(400));
+    let max_day: u16 = match stamp.month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if stamp.day == 0 || u16::from(stamp.day) > max_day {
+        return None;
+    }
+    if stamp.hour > 23 || stamp.minute > 59 || stamp.second > 59 || stamp.centiseconds > 99 {
+        return None;
+    }
+    let year = i64::from(stamp.year);
+    let month = i64::from(stamp.month);
+    let day = i64::from(stamp.day);
+    let adjusted = if month <= 2 { year - 1 } else { year };
+    let era = adjusted.div_euclid(400);
+    let yoe = adjusted - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86_400
+        + i64::from(stamp.hour) * 3_600
+        + i64::from(stamp.minute) * 60
+        + i64::from(stamp.second)
+        - i64::from(stamp.offset_quarters) * 900;
+    let nanos = u32::from(stamp.centiseconds) * 10_000_000;
+    if secs >= 0 {
+        Some(UNIX_EPOCH + Duration::new(secs as u64, nanos))
+    } else {
+        Some(UNIX_EPOCH - Duration::new(secs.unsigned_abs(), 0) + Duration::new(0, nanos))
+    }
 }
 
 /// [`Source`] over an [`IsoReader`]: listings translate
@@ -93,7 +162,9 @@ impl IsoSource {
     }
 
     /// Translate one reader listing, refusing symlink entries: they
-    /// are never followed, and skipping them would lose data.
+    /// are never followed, and skipping them would lose data. Modes
+    /// ride whole (the destination masks); stamps convert to UTC, and
+    /// a stamp the converter cannot place reads as absent.
     fn translate(&self, entries: Vec<crate::iso::reader::Entry>) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
         for entry in &entries {
@@ -111,6 +182,17 @@ impl IsoSource {
                 } else {
                     u64::from(entry.data_len)
                 },
+                mode: entry.posix.as_ref().map(|posix| posix.mode),
+                modified: entry
+                    .times
+                    .as_ref()
+                    .and_then(|times| times.modification.as_ref())
+                    .and_then(rock_time_to_system_time),
+                accessed: entry
+                    .times
+                    .as_ref()
+                    .and_then(|times| times.access.as_ref())
+                    .and_then(rock_time_to_system_time),
             });
         }
         Ok(out)
@@ -180,7 +262,9 @@ impl UdfSource {
 
     /// Translate one reader listing, sizing files through `open_file`
     /// (which is also what refuses symlinks and special files with
-    /// their kind named).
+    /// their kind named). Modes and stamps stay `None`: the UDF
+    /// reader parses neither extended attributes nor timestamps (see
+    /// the module docs).
     fn translate(&self, entries: Vec<crate::udf::reader::Entry>) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
         for entry in &entries {
@@ -193,6 +277,9 @@ impl UdfSource {
                 name: entry.name.clone().into_bytes(),
                 is_dir: entry.is_directory,
                 size,
+                mode: None,
+                modified: None,
+                accessed: None,
             });
         }
         Ok(out)
@@ -228,6 +315,7 @@ mod tests {
     use crate::iso::descriptor::TYPE_PRIMARY;
     use crate::iso::descriptor::TYPE_TERMINATOR;
     use crate::iso::record::RECORD_FIXED_LEN;
+    use std::os::unix::fs::PermissionsExt;
 
     const ROOT_SECTOR: u32 = 20;
     const DIR_A_SECTOR: u32 = 21;
@@ -376,6 +464,285 @@ mod tests {
         let mut volume = VecVolume::new(total, 512).expect("the fixture fits in RAM");
         volume.write_all_at(0, &bytes).expect("the fixture writes");
         IsoSource::new(IsoReader::open(Box::new(volume)).expect("the fixture opens"))
+    }
+
+    /// Encode one directory record with a raw system-use tail (the
+    /// `len` byte covers the tail): same fixed fields as
+    /// [`encode_record`], then `system_use` after the even-length
+    /// pad. Copied pattern (see [`encode_record`]).
+    fn encode_record_su(
+        extent: u32,
+        data_len: u32,
+        flags: u8,
+        identifier: &[u8],
+        system_use: &[u8],
+    ) -> Vec<u8> {
+        let pad = if identifier.len().is_multiple_of(2) {
+            1
+        } else {
+            0
+        };
+        let len = RECORD_FIXED_LEN + identifier.len() + pad + system_use.len();
+        let mut out = vec![0u8; len];
+        out[0] = len as u8;
+        out[2..6].copy_from_slice(&extent.to_le_bytes());
+        out[6..10].copy_from_slice(&extent.to_be_bytes());
+        out[10..14].copy_from_slice(&data_len.to_le_bytes());
+        out[14..18].copy_from_slice(&data_len.to_be_bytes());
+        out[25] = flags;
+        out[28..30].copy_from_slice(&1u16.to_le_bytes());
+        out[30..32].copy_from_slice(&1u16.to_be_bytes());
+        out[32] = identifier.len() as u8;
+        out[33..33 + identifier.len()].copy_from_slice(identifier);
+        let tail_at = RECORD_FIXED_LEN + identifier.len() + pad;
+        out[tail_at..tail_at + system_use.len()].copy_from_slice(system_use);
+        out
+    }
+
+    /// SUSP `SP` marker (7 bytes, skip 0): the root `.` record carries
+    /// this so the reader parses Rock Ridge on the volume.
+    fn sp_marker() -> Vec<u8> {
+        vec![b'S', b'P', 7, 1, 0xBE, 0xEF, 0]
+    }
+
+    /// A 36-byte `PX` entry (no serial, like `xorriso` writes): full
+    /// `mode` with file type bits, one link, root ownership, both
+    /// endian words.
+    fn px_entry(mode: u32) -> Vec<u8> {
+        let mut entry = vec![0u8; 36];
+        entry[0..2].copy_from_slice(b"PX");
+        entry[2] = 36;
+        entry[3] = 1;
+        entry[4..8].copy_from_slice(&mode.to_le_bytes());
+        entry[8..12].copy_from_slice(&mode.to_be_bytes());
+        entry[12..16].copy_from_slice(&1u32.to_le_bytes());
+        entry[16..20].copy_from_slice(&1u32.to_be_bytes());
+        entry
+    }
+
+    /// A 12-byte `TF` entry carrying one 7-byte modification stamp.
+    fn tf_entry(
+        year_from_1900: u8,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> Vec<u8> {
+        let mut entry = vec![0u8; 12];
+        entry[0..2].copy_from_slice(b"TF");
+        entry[2] = 12;
+        entry[3] = 1;
+        entry[4] = 0x02;
+        entry[5..12].copy_from_slice(&[year_from_1900, month, day, hour, minute, second, 0]);
+        entry
+    }
+
+    /// SUSP fixture image: root at 20 holding `A/` (`0o40755`) and
+    /// `F.TXT;1` (`0o100644`), `A/` at 21 holding `N.TXT;1`
+    /// (`0o100644`), `B/` at 24 (`0o40500`) holding `M.TXT;1`
+    /// (`0o100644`) — every entry with a `TF` modification stamp for
+    /// 2024-02-29T12:34:56Z. Synthetic layout only, claims nothing
+    /// about real mastering tools.
+    fn metadata_fixture_bytes() -> Vec<u8> {
+        const DIR_B_SECTOR: u32 = 24;
+        const FILE_M_SECTOR: u32 = 25;
+        const FILE_F_SECTOR: u32 = 26;
+        const FILE_N_SECTOR: u32 = 27;
+        const MODE_DIR: u32 = 0o40755;
+        const MODE_NARROW_DIR: u32 = 0o40500;
+        const MODE_FILE: u32 = 0o100644;
+        let stamp = || tf_entry(124, 2, 29, 12, 34, 56);
+        let px_tf = |mode: u32| {
+            let mut su = px_entry(mode);
+            su.extend_from_slice(&stamp());
+            su
+        };
+        let mut image = vec![0u8; IMAGE_SECTORS as usize * SECTOR_BYTES];
+        let put = |image: &mut Vec<u8>, sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(
+            &mut image,
+            16,
+            &primary_sector("LABEL", ROOT_SECTOR, SECTOR_BYTES as u32),
+        );
+        put(&mut image, 17, &boot_sector());
+        put(&mut image, 18, &terminator_sector());
+        let dot = encode_record_su(
+            ROOT_SECTOR,
+            SECTOR_BYTES as u32,
+            FLAG_DIRECTORY,
+            b"\x00",
+            &sp_marker(),
+        );
+        let parent = encode_record(ROOT_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01");
+        put(
+            &mut image,
+            ROOT_SECTOR,
+            &dir_sector(&[
+                dot,
+                parent,
+                encode_record_su(
+                    DIR_A_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"A",
+                    &px_tf(MODE_DIR),
+                ),
+                encode_record_su(
+                    DIR_B_SECTOR,
+                    SECTOR_BYTES as u32,
+                    FLAG_DIRECTORY,
+                    b"B",
+                    &px_tf(MODE_NARROW_DIR),
+                ),
+                encode_record_su(FILE_F_SECTOR, 2, 0, b"F.TXT;1", &px_tf(MODE_FILE)),
+            ]),
+        );
+        put(
+            &mut image,
+            DIR_A_SECTOR,
+            &dir_sector(&[
+                encode_record(DIR_A_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(DIR_A_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(FILE_N_SECTOR, 2, 0, b"N.TXT;1", &px_tf(MODE_FILE)),
+            ]),
+        );
+        put(
+            &mut image,
+            DIR_B_SECTOR,
+            &dir_sector(&[
+                encode_record(DIR_B_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+                encode_record(DIR_B_SECTOR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+                encode_record_su(FILE_M_SECTOR, 2, 0, b"M.TXT;1", &px_tf(MODE_FILE)),
+            ]),
+        );
+        put(&mut image, FILE_F_SECTOR, b"f!");
+        put(&mut image, FILE_N_SECTOR, b"n!");
+        put(&mut image, FILE_M_SECTOR, b"m!");
+        image
+    }
+
+    /// Metadata fixture opened as an [`IsoSource`].
+    fn metadata_source() -> IsoSource {
+        let bytes = metadata_fixture_bytes();
+        let total = bytes.len() as u64;
+        let mut volume = VecVolume::new(total, 512).expect("the fixture fits in RAM");
+        volume.write_all_at(0, &bytes).expect("the fixture writes");
+        IsoSource::new(IsoReader::open(Box::new(volume)).expect("the fixture opens"))
+    }
+
+    /// A recording no-op [`Progress`](super::super::Progress) that
+    /// keeps warning lines: metadata-quiet runs must warn nothing.
+    struct WarnLog {
+        warns: Vec<String>,
+    }
+
+    impl super::super::Progress for WarnLog {
+        fn report(&mut self, _done_bytes: u64, _total_bytes: u64) {}
+
+        fn warn(&mut self, text: &str) {
+            self.warns.push(text.to_string());
+        }
+    }
+
+    #[test]
+    fn copies_modes_and_mtimes_from_px_tf() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+
+        // Every entry carries PX + TF: after the walk, file modes are
+        // 0o644, A/ is 0o755, narrow B/ is 0o500 (its child still
+        // copied — the mode landed after the children), and every
+        // mtime is the stamped instant (`date -u` says
+        // 2024-02-29T12:34:56Z is 1709210096).
+        let source = metadata_source();
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let summary = super::super::walk(
+            &source,
+            scratch.path(),
+            &super::super::CopyOptions { free_bytes: None },
+            &mut WarnLog { warns: Vec::new() },
+        )
+        .expect("the metadata tree copies");
+        assert_eq!(
+            summary,
+            super::super::Summary {
+                directories: 2,
+                files: 3,
+                bytes: 6,
+                renamed: 0,
+            }
+        );
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("entry stats")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let mtime = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("entry stats")
+                .modified()
+                .expect("mtime reads")
+        };
+        let expected = UNIX_EPOCH + Duration::new(1_709_210_096, 0);
+        for (name, contents) in [
+            ("F.TXT", b"f!".as_slice()),
+            ("A/N.TXT", b"n!".as_slice()),
+            ("B/M.TXT", b"m!".as_slice()),
+        ] {
+            let path = scratch.path().join(name);
+            assert_eq!(std::fs::read(&path).expect("file reads back"), contents);
+            assert_eq!(mode(&path), 0o644, "{name} carries its PX mode");
+            assert_eq!(mtime(&path), expected, "{name} carries its TF stamp");
+        }
+        for (name, mode_bits) in [("A", 0o755), ("B", 0o500)] {
+            let path = scratch.path().join(name);
+            assert_eq!(mode(&path), mode_bits, "{name}/ carries its PX mode");
+            assert_eq!(mtime(&path), expected, "{name}/ carries its TF stamp");
+        }
+    }
+
+    #[test]
+    fn entries_without_metadata_copy_with_defaults_and_no_warnings() {
+        // The plain fixture carries no PX/TF: the copy succeeds, warns
+        // nothing, and modes match a control file created the same
+        // way (whatever the ambient umask).
+        let source = fixture_source();
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let control = scratch.path().join("control");
+        std::fs::write(&control, b"").expect("the control writes");
+        let control_mode = std::fs::metadata(&control)
+            .expect("control stats")
+            .permissions()
+            .mode();
+        let mut progress = WarnLog { warns: Vec::new() };
+        super::super::walk(
+            &source,
+            scratch.path(),
+            &super::super::CopyOptions { free_bytes: None },
+            &mut progress,
+        )
+        .expect("a metadata-free tree copies");
+        // The control file itself is untouched by the walk (not part
+        // of the source tree): remove it before asserting contents.
+        std::fs::remove_file(&control).expect("the control removes");
+        let top_mode = std::fs::metadata(scratch.path().join("TOP.TXT"))
+            .expect("top stats")
+            .permissions()
+            .mode();
+        assert_eq!(top_mode, control_mode, "no PX means the default mode");
+        assert!(
+            progress.warns.is_empty(),
+            "no metadata means no warnings: {:?}",
+            progress.warns
+        );
     }
 
     /// A no-op [`Progress`](super::super::Progress) for the walk test
@@ -557,5 +924,94 @@ mod tests {
             .expect_err("a past-the-end read refuses");
         assert!(error.to_string().contains('8'), "{error:?}");
         assert!(error.to_string().contains('7'), "{error:?}");
+    }
+
+    /// One [`RockTime`] from parts: the conversion tests below build
+    /// stamps directly (the TF decoder is the reader's tested
+    /// business, not this slice's).
+    fn stamp(year: u16, mdhms: [u8; 5], centiseconds: u8, offset_quarters: i8) -> RockTime {
+        RockTime {
+            year,
+            month: mdhms[0],
+            day: mdhms[1],
+            hour: mdhms[2],
+            minute: mdhms[3],
+            second: mdhms[4],
+            centiseconds,
+            offset_quarters,
+        }
+    }
+
+    #[test]
+    fn rock_time_conversion_places_known_instants() {
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+
+        // The epoch itself.
+        assert_eq!(
+            rock_time_to_system_time(&stamp(1970, [1, 1, 0, 0, 0], 0, 0)),
+            Some(UNIX_EPOCH)
+        );
+        // A leap day at noon-plus-change (`date -u` says
+        // 2024-02-29T12:34:56Z is 1709210096).
+        assert_eq!(
+            rock_time_to_system_time(&stamp(2024, [2, 29, 12, 34, 56], 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(1_709_210_096, 0))
+        );
+        // A pre-epoch date lands before the epoch (`1969-12-31 is
+        // -86400).
+        assert_eq!(
+            rock_time_to_system_time(&stamp(1969, [12, 31, 0, 0, 0], 0, 0)),
+            Some(UNIX_EPOCH - Duration::new(86_400, 0))
+        );
+        // An offset-bearing record converts to UTC (`2024-06-01
+        // 12:00 at +8 quarters is 10:00Z, 1717236000).
+        assert_eq!(
+            rock_time_to_system_time(&stamp(2024, [6, 1, 12, 0, 0], 0, 8)),
+            Some(UNIX_EPOCH + Duration::new(1_717_236_000, 0))
+        );
+        // Centiseconds ride along as nanos (`2000-01-01 plus a
+        // quarter second is 946684800.25).
+        assert_eq!(
+            rock_time_to_system_time(&stamp(2000, [1, 1, 0, 0, 0], 25, 0)),
+            Some(UNIX_EPOCH + Duration::new(946_684_800, 250_000_000))
+        );
+        // A leap century places (`2000-02-29T00:00:00Z` is 951782400
+        // per `date -u`: divisible by 400, so February holds 29 days).
+        assert_eq!(
+            rock_time_to_system_time(&stamp(2000, [2, 29, 0, 0, 0], 0, 0)),
+            Some(UNIX_EPOCH + Duration::new(951_782_400, 0))
+        );
+    }
+
+    #[test]
+    fn rock_time_conversion_refuses_impossible_dates() {
+        // Each field outside its range refuses rather than placing a
+        // guess — and February 29th honours the full leap rule
+        // (1900 and 2100 refuse, 2000 and 2024 place), not just the
+        // 31-day ceiling.
+        for bad in [
+            stamp(2024, [0, 15, 0, 0, 0], 0, 0),
+            stamp(2024, [13, 15, 0, 0, 0], 0, 0),
+            stamp(2024, [2, 0, 0, 0, 0], 0, 0),
+            stamp(2024, [2, 32, 0, 0, 0], 0, 0),
+            stamp(2023, [2, 29, 0, 0, 0], 0, 0),
+            stamp(2023, [2, 30, 0, 0, 0], 0, 0),
+            stamp(1900, [2, 29, 0, 0, 0], 0, 0),
+            stamp(2100, [2, 29, 0, 0, 0], 0, 0),
+            stamp(2024, [4, 31, 0, 0, 0], 0, 0),
+            stamp(2024, [1, 1, 24, 0, 0], 0, 0),
+            stamp(2024, [1, 1, 0, 60, 0], 0, 0),
+            stamp(2024, [1, 1, 0, 0, 60], 0, 0),
+            stamp(2024, [1, 1, 0, 0, 0], 100, 0),
+        ] {
+            assert_eq!(rock_time_to_system_time(&bad), None, "{bad:?}");
+        }
+        // ...while a leap February 29th places
+        // (`2024-02-29T00:00:00Z` is 1709164800).
+        assert_eq!(
+            rock_time_to_system_time(&stamp(2024, [2, 29, 0, 0, 0], 0, 0)),
+            Some(std::time::UNIX_EPOCH + std::time::Duration::new(1_709_164_800, 0))
+        );
     }
 }

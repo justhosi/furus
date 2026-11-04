@@ -9,9 +9,11 @@
 
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 
+use super::Entry;
 use crate::error::CoreError;
 use crate::error::Result;
 
@@ -71,6 +73,36 @@ impl DestDir {
         }
     }
 
+    /// Ensure owner write+execute on the directory at `path` while its
+    /// children copy: when the existing mode lacks those bits (a reused
+    /// `0555` directory from an earlier run, say), add them and return
+    /// the prior bits so the caller can restore them with
+    /// [`restore_mode`](DestDir::restore_mode) afterwards. Returns
+    /// `None` when nothing needed changing. Only ever called on
+    /// directories this walk just created or reused as a copy
+    /// destination — never on the destination root, never elsewhere.
+    pub fn enter_writable_dir(&self, path: &Path) -> Result<Option<u32>> {
+        let mode = std::fs::metadata(path)
+            .map_err(|error| CoreError::io(path, error))?
+            .permissions()
+            .mode()
+            & 0o7777;
+        if mode & 0o300 == 0o300 {
+            return Ok(None);
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o300))
+            .map_err(|error| CoreError::io(path, error))?;
+        Ok(Some(mode))
+    }
+
+    /// Restore permission bits saved by
+    /// [`enter_writable_dir`](DestDir::enter_writable_dir) once the
+    /// directory's children are done.
+    pub fn restore_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|error| CoreError::io(path, error))
+    }
+
     /// Create the file at `path`, refusing one that already exists:
     /// the first-creation half of the pair with [`replace_file`](DestDir::replace_file)
     /// (a second copy over the first would silently merge trees).
@@ -107,5 +139,73 @@ impl DestDir {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.create_file(path),
             Err(error) => Err(CoreError::io(path, error)),
         }
+    }
+
+    /// Apply an entry's metadata to the already-written `path`:
+    /// timestamps first, then the mode. The order matters — the mode
+    /// goes last so a read-only mode cannot block the timestamp write
+    /// (the file still carries its creation mode at that point, and
+    /// the copier owns it either way). Masked to `0o7777`, never the
+    /// file type bits; an absent stamp is skipped, not zeroed.
+    /// Ownership (`uid`/`gid`) is deliberately never applied: it needs
+    /// privileges the copy must not require.
+    pub fn apply_metadata(&self, path: &Path, entry: &Entry) -> Result<()> {
+        if entry.modified.is_some() || entry.accessed.is_some() {
+            // Read-only handle suffices: the copier owns the file, so
+            // setting explicit times is permitted.
+            let file = File::open(path).map_err(|error| CoreError::io(path, error))?;
+            let mut times = std::fs::FileTimes::new();
+            if let Some(accessed) = entry.accessed {
+                times = times.set_accessed(accessed);
+            }
+            if let Some(modified) = entry.modified {
+                times = times.set_modified(modified);
+            }
+            file.set_times(times)
+                .map_err(|error| CoreError::io(path, error))?;
+        }
+        if let Some(mode) = entry.mode {
+            let permissions = std::fs::Permissions::from_mode(mode & 0o7777);
+            std::fs::set_permissions(path, permissions)
+                .map_err(|error| CoreError::io(path, error))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Permission bits of `path`, masked to the mode proper.
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path)
+            .expect("entry stats")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[test]
+    fn enter_widens_and_restore_returns_prior_bits() {
+        // A `0555` directory widens to `0755` for the descent and
+        // restores afterwards; an already-wide directory is a no-op.
+        // Both halves are pure `DestDir` behaviour, independent of
+        // any walk.
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let dir = scratch.path().join("sub");
+        std::fs::create_dir(&dir).expect("subdir creates");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))
+            .expect("subdir chmods");
+        let dest = DestDir::open(scratch.path()).expect("root opens");
+        assert_eq!(dest.enter_writable_dir(&dir).expect("widens"), Some(0o555));
+        assert_eq!(mode_of(&dir), 0o755);
+        dest.restore_mode(&dir, 0o555).expect("restores");
+        assert_eq!(mode_of(&dir), 0o555);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("subdir chmods");
+        assert_eq!(dest.enter_writable_dir(&dir).expect("no-op"), None);
     }
 }
