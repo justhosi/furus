@@ -423,6 +423,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rufus-core",
+ "rufus-proto",
  "rustix",
  "serde",
  "tempfile",

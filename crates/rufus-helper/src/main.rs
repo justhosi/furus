@@ -37,7 +37,12 @@
 
 mod dbus;
 mod exec;
-mod mount;
+// The mount seam lives in `rufus-linux` now (copy wiring): this
+// re-export keeps every existing `crate::mount::...` path working.
+// Only the `namespace` tests name it, so the allow keeps normal builds
+// quiet without hiding a genuinely dropped use (the tests pin it).
+#[allow(unused_imports)]
+pub(crate) use rufus_linux::mount;
 mod namespace;
 mod process;
 mod progress;

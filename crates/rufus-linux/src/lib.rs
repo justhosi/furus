@@ -11,6 +11,14 @@
 //!   and [`Transport`](model::Transport): the facts PLAN §9-S04 pins,
 //!   plus [`Device::identity`](model::Device::identity), the stable
 //!   configuration key.
+//!
+//! * [`mount`] — the S06 mount seam moved here for the copy wiring:
+//!   [`MountOps`](mount::MountOps) (the injectable mount/unmount
+//!   surface), [`LiveOps`](mount::LiveOps) (the flag-pinned `NOSUID |
+//!   NODEV` syscalls) and [`Recorder`](mount::Recorder) (the reverse
+//!   sweep with the `MNT_DETACH` fallback), plus
+//!   [`partition`](mount::partition) (the single-mount guard the copy
+//!   step mounts, stats and releases).
 //! * [`sysfs`] — [`SysfsRoot`](sysfs::SysfsRoot) (where to read),
 //!   [`enumerate`](sysfs::enumerate) (discovery from `class/block` plus
 //!   the udev data records) and [`filter`](sysfs::filter) (the
@@ -75,6 +83,7 @@ pub mod block;
 pub mod inspect;
 mod ioctl;
 pub mod model;
+pub mod mount;
 pub mod mounts;
 pub mod signal;
 pub mod sysfs;

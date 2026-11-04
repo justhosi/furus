@@ -47,8 +47,10 @@ use rufus_core::error::Result;
 use rufus_core::fs::Volume;
 use rufus_core::part::TableKind;
 use rufus_core::part::plan::single_data_window;
+use rufus_core::pipeline::MountedPartition;
 use rufus_core::pipeline::Opener;
 use rufus_core::pipeline::Target;
+use rufus_proto::Filesystem;
 
 use crate::block::BlockDevice;
 use crate::block::Sink;
@@ -413,6 +415,18 @@ impl Opener for DeviceOpener {
         self.0.release()
     }
 
+    /// Mount the data partition node (resolved through
+    /// [`partition_path`](DeviceOpener::partition_path), so the kernel
+    /// knows the node first) for `filesystem` through
+    /// [`mount`](crate::mount::partition::mount): the guard owns the
+    /// mount until its explicit release or its best-effort drop, and
+    /// answers the copy pre-flight with `statvfs`.
+    fn mount_partition(&self, filesystem: &Filesystem) -> Result<Box<dyn MountedPartition>> {
+        let path = self.partition_path()?;
+        let mounted = crate::mount::partition::mount(&path, filesystem)?;
+        Ok(Box::new(mounted))
+    }
+
     fn reset_device(&self) -> Result<bool> {
         let Backend::Device {
             disk_name,
@@ -466,7 +480,10 @@ impl Opener for DeviceOpener {
 ///
 /// There is no partition node behind a file: `partition_path` refuses
 /// honestly, so tool-based filesystems (NTFS, ext2/3/4, UDF) stay
-/// real-device-only while the native engines run unchanged.
+/// real-device-only while the native engines run unchanged. Mounting
+/// keeps the same default refusal for the same reason: a file seam has
+/// no partition node to mount, so
+/// [`mount_partition`](Opener::mount_partition) is not overridden here.
 #[derive(Debug)]
 pub struct FileOpener(Arc<Shared>);
 

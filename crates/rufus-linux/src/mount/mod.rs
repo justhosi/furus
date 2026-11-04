@@ -1,7 +1,8 @@
-//! Mount/unmount behind an injectable seam (S06 part 4).
+//! Mount/unmount behind an injectable seam (S06 part 4, now owned by
+//! `rufus-linux` for the copy wiring).
 //!
-//! The helper owns whatever it mounts: mounting a filesystem for the
-//! device-writing pipeline (S07+) must never leave a live mount on the
+//! The CLI process owns whatever it mounts: mounting a filesystem for
+//! the device-writing pipeline must never leave a live mount on the
 //! host when the run ends — planned or crashed. The split this module
 //! makes is the one the rest of S06 uses: the *policy* (record what
 //! succeeded, sweep it back in reverse, detach stubborn targets) is
@@ -14,6 +15,12 @@
 //! [`Recorder::unmount_all`] with the documented `MNT_DETACH` fallback,
 //! and implements [`Drop`] to sweep everything still mounted — reverse
 //! order, every failure ignored, bookkeeping cleared, never panicking.
+//!
+//! [`partition`] is the single-mount guard the copy step uses: it mounts
+//! one data partition through this seam, answers `free_bytes` with
+//! `statvfs`, and unmounts (explicitly through
+//! [`Recorder::unmount_all`], best-effort on drop) before removing its
+//! mount point.
 //!
 //! # The `MNT_DETACH` fallback
 //!
@@ -37,12 +44,13 @@
 //! fail-closed; S07/S17 mount named filesystems, so the slot is a
 //! declared hole, not a latent bug.
 //
-// The whole seam below is complete but only *wired* by the S07/S17
-// writing executor (the same reason the `process` seam carries its
-// allow); everything is transitively dead until then, which the tests
-// pin. The allow is module-level for that one reason — remove it when
-// the executor arrives.
-#![allow(dead_code)]
+// The seam is wired by the copy path through [`partition`]: [`LiveOps`]
+// and [`MountOps`] mount every data partition, and [`Recorder`] backs
+// the guard's explicit release (plus its best-effort drop), so nothing
+// below is dead: the former module-level `allow(dead_code)` (needed
+// while the seam sat in the helper binary with only tests naming it)
+// is gone, and clippy stays quiet without it.
+pub mod partition;
 
 use std::ffi::CStr;
 use std::io;
@@ -129,7 +137,13 @@ pub struct MountRecord {
 /// error the caller never asked for. After it, the books are empty.
 pub struct Recorder<'a> {
     ops: &'a mut dyn MountOps,
-    mounted: Vec<MountRecord>,
+    // Visible inside the crate so the single-mount [`partition`] guard
+    // can move its one record out of a transient recorder (after the
+    // single mount call) and back into one for the explicit release:
+    // that reuses [`Recorder::unmount_all`] with its detach fallback
+    // instead of duplicating the policy, without storing a borrow of
+    // the guard's own backend.
+    pub(crate) mounted: Vec<MountRecord>,
 }
 
 impl<'a> Recorder<'a> {
@@ -156,7 +170,6 @@ impl<'a> Recorder<'a> {
 
     /// Everything still recorded as mounted, in mount order (the most
     /// recent mount is the last entry).
-    #[allow(dead_code)] // the bookkeeping seam for the S07/S17 executor wiring; tests pin it meanwhile
     #[must_use]
     pub fn mounted(&self) -> &[MountRecord] {
         &self.mounted

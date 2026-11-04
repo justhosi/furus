@@ -30,6 +30,7 @@ pub mod write;
 pub use event::Event;
 pub use event::NullReporter;
 pub use event::Reporter;
+pub use opener::MountedPartition;
 pub use opener::Opener;
 pub use target::Target;
 
