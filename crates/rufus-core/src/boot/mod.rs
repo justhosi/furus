@@ -8,14 +8,19 @@
 //! point (it resolves through [`asset_path`](crate::paths::asset_path));
 //! [`load_from`] is the testable core over an explicit directory. The
 //! Syslinux installer lives next to the family decision (see
-//! [`syslinux::install_loader`]); the GRUB2 / GRUB4DOS installers land
-//! in later slices.
+//! [`syslinux::install_loader`]); the GRUB2 BIOS installer lives in
+//! [`grub2`]; the GRUB4DOS installer lands in a later slice.
 //!
 //! [`syslinux`] decides the embedded Syslinux family from a detected
 //! version or the `ldlinux.c32` presence and locates the payload
 //! directory over a tree source; it writes nothing and patches no
 //! sectors, which later S19 slices own.
+//!
+//! [`grub2`] installs a GRUB2 BIOS boot record from image-supplied
+//! `boot.img`/`core.img` payloads; the bytes must come from the image
+//! or a caller-supplied directory — no embedded copy exists.
 
+pub mod grub2;
 pub mod syslinux;
 
 use std::path::Path;
