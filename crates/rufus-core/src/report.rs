@@ -1281,7 +1281,7 @@ fn parse_decimal(digits: &[u8]) -> Option<u32> {
 /// [`MAX_VERSION_CHARS`] past the minor. The scan window is the whole
 /// buffer, while the C starts at `0x40` and stops at `len - 0x40`/`len -
 /// 0x20`.
-fn syslinux_banner(bytes: &[u8]) -> Option<String> {
+pub(crate) fn syslinux_banner(bytes: &[u8]) -> Option<String> {
     let mut from = 0usize;
     while from < bytes.len() {
         let start = find_sub(bytes, from, b"LINUX ")?;

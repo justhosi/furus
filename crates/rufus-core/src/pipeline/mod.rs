@@ -3,19 +3,18 @@
 //! contract.
 //!
 //! The machine walks `plan.steps` in order through [`run`], emitting
-//! [`Event`]s to a [`Reporter`] and timing every step. Six of the
-//! seven steps run: wipe, mklabel, mkpart, mkfs and finalize, plus
-//! both write paths (the [`Dd`](rufus_proto::WriteMode::Dd) stream
-//! and the [`Copy`](rufus_proto::WriteMode::Copy) file-tree copy).
-//! One refuses by name:
-//! [`Bootloader`](rufus_proto::Step::Bootloader) (the installers exist
-//! in [`crate::boot`] but are not wired into the pipeline yet — a
-//! later slice).
+//! [`Event`]s to a [`Reporter`] and timing every step. All seven steps
+//! run: wipe, mklabel, mkpart, mkfs and finalize, both write paths
+//! (the [`Dd`](rufus_proto::WriteMode::Dd) stream and the
+//! [`Copy`](rufus_proto::WriteMode::Copy) file-tree copy), and the
+//! bootloader step ([`bootloader`] installs Syslinux on FAT32; other
+//! modes and filesystems refuse naming themselves).
 //!
 //! [`step_name`] is the one shared snake_case vocabulary for step
 //! identifiers, so the CLI and the machine cannot drift apart.
 
 pub mod badblocks;
+pub mod bootloader;
 pub(crate) mod decompress;
 pub mod event;
 pub mod mkfs;
@@ -123,9 +122,9 @@ pub fn step_name(step: &Step) -> &'static str {
 }
 
 /// Run one step through the run context: wipe, label, partition,
-/// filesystem and write stages live in their own modules; the
-/// bootloader arm refuses because the installers are not wired in yet
-/// (see [`crate::boot`]). The match is exhaustive, so a new
+/// filesystem, write and bootloader stages live in their own modules
+/// (the bootloader arm runs [`bootloader::run`], Syslinux on FAT32).
+/// The match is exhaustive, so a new
 /// [`Step`] variant fails to compile here (and in [`step_name`]) until
 /// it is handled.
 fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result<()> {
@@ -140,9 +139,9 @@ fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result
             quick,
         } => mkfs::run(ctx, filesystem, label, cluster_bytes, *quick),
         Step::Write { mode } => write::run(ctx, mode, &plan.image, &plan.options.filesystem),
-        Step::Bootloader { .. } => Err(CoreError::NotImplemented {
-            what: "bootloader installation (not wired yet)",
-        }),
+        Step::Bootloader { mode } => {
+            bootloader::run(ctx, mode, &plan.image, &plan.options.filesystem)
+        }
         Step::Finalize => {
             let size = ctx.device()?.size();
             ctx.device()?.flush()?;
@@ -1797,7 +1796,8 @@ mod tests {
 
     #[test]
     fn device_opens_lazily_once_per_run() {
-        // An unimplemented-only plan never touches the device...
+        // A bootloader plan whose image file is missing refuses while
+        // opening the image, before the device is ever touched...
         let opener = TestOpener::new(4096);
         let mut reporter = VecReporter::new();
         run(
@@ -1809,7 +1809,7 @@ mod tests {
             &mut reporter,
             &|| false,
         )
-        .expect_err("bootloader is not implemented yet");
+        .expect_err("a missing image refuses before the device opens");
         assert_eq!(opener.device_calls(), 0);
         // ...nor does a run cancelled before the first step...
         let opener = TestOpener::new(4096);
@@ -2041,7 +2041,9 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_step_is_refused_by_name() {
+    fn bootloader_without_an_image_is_refused_by_name() {
+        // The test plan points at a missing image file: the bootloader
+        // step refuses while opening it, wrapped in the step name.
         let opener = TestOpener::new(4096);
         let mut reporter = VecReporter::new();
         let error = run(
@@ -2053,10 +2055,10 @@ mod tests {
             &mut reporter,
             &|| false,
         )
-        .expect_err("bootloader is not implemented yet");
+        .expect_err("a missing image refuses");
         let text = error.to_string();
         assert!(text.contains("bootloader"), "{text}");
-        assert!(text.contains("not implemented"), "{text}");
+        assert!(text.contains("test.iso"), "{text}");
     }
 
     #[test]

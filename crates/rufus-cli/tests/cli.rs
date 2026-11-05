@@ -1114,9 +1114,10 @@ fn write_sigint_cancels_with_exit_6() {
 }
 
 #[test]
-fn write_bootloader_maps_to_exit_7() {
+fn write_bootloader_without_payloads_maps_to_exit_1() {
     // The full plan keeps its `Bootloader` step here (no stripping):
-    // the pipeline refuses it by name without touching the device.
+    // the bare fixture ISO carries no Syslinux payloads, so the step
+    // refuses as invalid input without writing anything.
     let dir = tempfile::tempdir().expect("scratch dir");
     let iso = fixture(&dir.path().join("fixture.iso"));
     let plan_out = plan_run(&iso, "/dev/null", true);
@@ -1137,7 +1138,7 @@ fn write_bootloader_maps_to_exit_7() {
         "--device-file",
         seam_path.to_str().expect("path"),
     ]);
-    assert_eq!(out.code, 7, "{:?}", out);
+    assert_eq!(out.code, 1, "{:?}", out);
     let values = stdout_json(&out.stdout);
     // The refused step announces itself before refusing: one
     // `step_started` names `bootloader` (the earlier steps ran first).
@@ -1147,7 +1148,7 @@ fn write_bootloader_maps_to_exit_7() {
     assert!(announced, "bootloader step started: {values:?}");
     let error: serde_json::Value =
         serde_json::from_str(out.stderr.trim()).expect("stderr error parses");
-    assert_eq!(error["error"], "not_implemented");
+    assert_eq!(error["error"], "invalid_input");
 }
 
 #[test]

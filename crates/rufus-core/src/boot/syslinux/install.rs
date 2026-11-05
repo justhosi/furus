@@ -15,6 +15,8 @@
 
 use super::Family;
 use super::patch;
+use crate::boot::Payload;
+use crate::boot::Resource;
 use crate::boot::load;
 use crate::error::CoreError;
 use crate::error::Result;
@@ -206,6 +208,22 @@ pub fn install_payloads(
 /// pins) and delegates to [`install_payloads`], which carries the
 /// ordering and torn-state contract.
 pub fn install_loader(fat: &mut Fat32, family: Family) -> Result<Installed> {
+    install_payloads_from(fat, family, &load)
+}
+
+/// Install the Syslinux loader of `family` onto `fat`, resolving the
+/// embedded VBR and core through `load`.
+///
+/// The single loading path behind [`install_loader`] (which passes
+/// [`load`](crate::boot::load)): callers that resolve payloads
+/// differently — the pipeline passes its own closure so tests can
+/// point it at the asset tree without the runtime asset directory —
+/// inject that here instead of duplicating the two loads.
+pub fn install_payloads_from(
+    fat: &mut Fat32,
+    family: Family,
+    load: &dyn Fn(Resource) -> Result<Payload>,
+) -> Result<Installed> {
     let vbr = load(family.vbr())?;
     let core = load(family.core())?;
     install_payloads(fat, family, vbr.bytes(), core.bytes())

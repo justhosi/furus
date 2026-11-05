@@ -46,6 +46,7 @@ pub use files::write_config;
 pub use install::Installed;
 pub use install::install_loader;
 pub use install::install_payloads;
+pub use install::install_payloads_from;
 pub use obsolete::OBSOLETE_MODULES;
 pub use obsolete::Obsolete;
 pub use patch::Patched;
