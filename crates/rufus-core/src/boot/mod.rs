@@ -1,5 +1,6 @@
 //! Bootloader installation: the six embedded payloads plus one
-//! installer per family, all in this module.
+//! installer per family, and the 27 embedded FreeDOS payloads, all in
+//! this module.
 //!
 //! The bytes live in `assets/resources/` and are pinned by
 //! `assets/manifest.json`: each [`Resource`] carries its manifest id,
@@ -28,10 +29,16 @@
 //! byte-exact `CONFIG.SYS`/`AUTOEXEC.BAT` contents (`SetDOSLocale`):
 //! pure planning, no writes — placing the files on a stick is a later
 //! slice.
+//! [`freedos`] loads and verifies the 27 embedded FreeDOS payloads
+//! (`ExtractFreeDOS`, `src/dos.c:344-403`): the `COMMAND.COM` /
+//! `KERNEL.SYS` pair for the target root plus the 25 `LOCALE\` files —
+//! pure loading, no writes, so the install flow is a later slice.
 //! Wiring these installers into the copy and pipeline paths is a later
 //! slice, and no stick has been booted on hardware.
 
 pub mod dos_locale;
+
+pub mod freedos;
 
 pub mod grub2;
 pub mod grub4dos;
@@ -216,6 +223,40 @@ pub fn load(resource: Resource) -> Result<Payload> {
     load_from(dir, resource)
 }
 
+/// Check `bytes` against the pinned size and SHA-256, naming `label`
+/// and `file` on a mismatch.
+///
+/// Shared by [`load_from`] and [`freedos`](self::freedos) so both payload
+/// families verify byte-for-byte the same way: one size check, then one
+/// digest over the bytes already read (no second read, no window for the
+/// file to change between the checks). Extracted without any behaviour
+/// change — the two messages below are the exact strings [`load_from`]
+/// produced before the extraction.
+pub(crate) fn verify_payload(
+    label: &str,
+    file: &str,
+    size: u64,
+    sha256: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let actual_len = bytes.len() as u64;
+    if actual_len != size {
+        return Err(CoreError::invalid(format!(
+            "payload {label} ({file}) has size {actual_len} bytes, expected {size} bytes"
+        )));
+    }
+    // Hash the bytes just read rather than re-reading the file: one
+    // read, one failure mode, no window for the file to change between
+    // the size check and the digest.
+    let actual_sha = hash_reader(Algo::Sha256, bytes)?;
+    if actual_sha != sha256 {
+        return Err(CoreError::invalid(format!(
+            "payload {label} ({file}) has SHA-256 {actual_sha}, expected {sha256}"
+        )));
+    }
+    Ok(())
+}
+
 /// Load `resource` from `dir`, verifying exact size and SHA-256 against
 /// the pinned values.
 ///
@@ -227,27 +268,13 @@ pub fn load(resource: Resource) -> Result<Payload> {
 pub fn load_from(dir: &Path, resource: Resource) -> Result<Payload> {
     let path = dir.join(resource.file());
     let bytes = std::fs::read(&path).map_err(|source| CoreError::io(&path, source))?;
-    let actual_len = bytes.len() as u64;
-    if actual_len != resource.size() {
-        return Err(CoreError::invalid(format!(
-            "payload {} ({}) has size {actual_len} bytes, expected {} bytes",
-            resource.label(),
-            resource.file(),
-            resource.size()
-        )));
-    }
-    // Hash the bytes just read rather than re-reading the file: one
-    // read, one failure mode, no window for the file to change between
-    // the size check and the digest.
-    let actual_sha = hash_reader(Algo::Sha256, &bytes as &[u8])?;
-    if actual_sha != resource.sha256() {
-        return Err(CoreError::invalid(format!(
-            "payload {} ({}) has SHA-256 {actual_sha}, expected {}",
-            resource.label(),
-            resource.file(),
-            resource.sha256()
-        )));
-    }
+    verify_payload(
+        resource.label(),
+        resource.file(),
+        resource.size(),
+        resource.sha256(),
+        &bytes,
+    )?;
     Ok(Payload { resource, bytes })
 }
 
