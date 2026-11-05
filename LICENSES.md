@@ -20,7 +20,7 @@ licences below use SPDX identifiers.
 | FreeDOS (FreeCOM, CONFIG.SYS template, KEYB, boot stub, keyboard layouts, DOS utilities) | `GPL-2.0-or-later` | DOS boot payloads written to the target. |
 | Syslinux 4.07 / 6.04 | `GPL-2.0-or-later` | Bootloader payloads written to the target. |
 | GRUB4DOS | `GPL-2.0-or-later` | Legacy boot helper payload. |
-| GRUB2 | `GPL-3.0-or-later` | Future bootloader payload for S19 (not part of these 86 resources). |
+| GRUB2 | `GPL-3.0-or-later` | Bootloader payload read from the image's own `/boot/grub` tree in S19 (not part of these 86 embedded resources). |
 | UEFI:NTFS (`uefi-ntfs.img`) | `GPL-3.0-or-later` | NTFS UEFI driver payload written to the target. |
 | wimlib (not embedded; linked per A5) | `LGPL-3.0-or-later` | C library for WIM/ESD apply. |
 | ntfs-3g (`mkntfs`; external tool per A4) | `GPL-2.0-or-later` | Runtime system tool, not shipped in the binary. |
@@ -82,7 +82,7 @@ What: Syslinux 4.07 VBR + core (400/401), Syslinux 6.04 VBR + core (402/403),
 and the DOS installer `syslinux.com` (404). Licence: **`GPL-2.0-or-later`**
 (Syslinux, per decision A6) — compatible with GPLv3 use. Uncertainty: the
 4.07/6.04 version pair is inferred from embedded version strings; payload
-identity is confirmed by their role in `syslinux.c` (S19). The installer also
+identity is confirmed by their role in the S19 `syslinux` installer. The installer also
 patches files on FAT filesystems; Syslinux's own freestanding bits (ldlinux
 binaries) are GPLv2+ data/code reused, not absorbed.
 
@@ -94,8 +94,9 @@ UEFI-ONLY MEDIA" (452). Licence: **`GPL-2.0-or-later`** (GRUB4DOS per decision
 A6). Uncertainty: 452 might be a Rufus-authored custom message file for
 `grldr` rather than stock GRUB4DOS content (see `manifest.json` notes); either
 way the licence is GPL-2.0+ or GPL-3.0+ and the compatibility conclusion is
-unchanged — **re-verify against pbatard/rufus in S19**. GRUB2 (GPLv3+) is
-relevant for S19 but is not part of this resource set.
+unchanged — **re-verify against pbatard/rufus**. GRUB2 (GPLv3+) is read
+from the image's own `/boot/grub` tree by the S19 bootloader step, not
+this embedded resource set.
 
 ### `RCDATA_500` — `rufus.loc` (1 payload)
 
@@ -184,8 +185,8 @@ licence conflict but an attribution/identification task for S23.
 2. Certificate bundle exact contents (701–704): content-based inferences —
    re-verify in **S23**.
 3. `RCDATA_452` authorship (GRUB4DOS message file vs. Rufus-authored
-   screen): verify against upstream `pbatard/rufus` in **S19**; either answer
-   keeps the compatibility conclusion.
+   screen): verify against upstream `pbatard/rufus`; either answer keeps
+   the compatibility conclusion.
 4. uefi-md5sum licence id: confirm from the public project when copying
    assets in S01 and rebuilding in **S23**.
 5. Trademark: the public name is not "Rufus" (decision A2; working name

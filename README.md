@@ -99,12 +99,14 @@ write side is the most complete part:
   keep the output pipes open and stall the cancel.
 * The end-to-end write path runs: the CLI's `write` command validates
   its plan file (schema version + confirm hash) and executes it through
-  the pipeline — wipe, table, partition, format, raw write, verify,
-  finalize — with per-event JSON (`--json`) or a throttled progress
-  line, Ctrl-C cancellation (exit 6), and typed refusals (exit 7 only
-  for the steps no slice implements yet: bootloader installation
-  (S19); file-tree copy (S18) is implemented and awaits its
-  write-path wiring). `--device-file` runs the same plan
+  the pipeline — wipe, table, partition, format, write (a byte-for-byte
+  `Dd` or a file-tree `Copy`), bootloader, finalize — with per-event
+  JSON (`--json`) or a throttled progress line, Ctrl-C cancellation
+  (exit 6), and typed refusals (exit 7 only for what no slice wires
+  yet: the UEFI:NTFS and FreeDOS bootloader modes, the image kinds with
+  no tree reader — WIM, VHD, VHDX, FFU, qcow2, PE — and a `Copy` plan
+  run over the `--device-file` seam, which has no partition node to
+  mount). `--device-file` runs the same plan
   against a regular file for tests. `rufus plan --verify` records a
   read-back of the whole image against the plan digest, doubling the
   I/O; `rufus plan --badblocks` records a surface scan that runs in
@@ -118,6 +120,27 @@ write side is the most complete part:
   content. The `--json` stream (one `Event` object per stdout line) is
   documented in `crates/rufus-cli/src/main.rs` and on
   `rufus_core::pipeline::Event`.
+* The copy engine (S18) is wired into the write path. `rufus plan
+  --iso-mode` selects `WriteMode::Copy` for ISO and Raw images (the
+  recommended mode for bootable sticks); a `Copy` write walks the
+  ISO9660 or UDF tree onto the mounted data partition through a mount
+  seam (`Opener::mount_partition`, guarded by `rufus-linux`'s `Mounted`
+  helper with vfat/exfat, `NOSUID|NODEV` and a detach fallback). The
+  walk is cancellable, pre-flights free space, enforces the FAT32
+  file-size limit, and throttles its progress through the pipeline's
+  shared 100 ms cadence.
+* Bootloader installation (S19) is wired as the `bootloader` pipeline
+  step. The plan pairs `Bootloader`: `None` with a `Dd` write (the
+  image already carries its own loader) and `Auto` with a `Copy` write;
+  `Auto` probes Syslinux, then GRUB2, then GRUB4DOS in the image's own
+  tree. Syslinux installs from the image's payloads (family choice
+  4.07/6.04, a VBR graft, a contiguous stage file with sector map and
+  ADV, companions kept when the copy already placed identical bytes,
+  and a `syslinux.cfg` wrapper); GRUB2 BIOS writes its record into the
+  MBR with `core.img` bounded by the post-MBR gap and places a UEFI
+  GRUB payload at `/EFI/boot/bootx64.efi` when absent; GRUB4DOS writes
+  its MBR/SBR plus `/grldr`. The UEFI:NTFS and FreeDOS modes remain
+  unwired (exit 7).
 * The GUI is still a stub: it prints version/help and otherwise reports
   "GUI arrives in S24".
 
