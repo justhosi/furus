@@ -224,7 +224,11 @@ pub fn boot_sector(input: &BootSectorInput<'_>) -> Result<[u8; 512]> {
 
 /// The backup boot sector image at reserved sector 6 — a byte
 /// identical copy of the primary (FAT32 spec: the backup exists to be
-/// copied, not to be tweaked).
+/// copied, not to be tweaked). The formatter lays this copy down at
+/// format time, and
+/// [`Fat32::write_boot_code`](crate::fs::fat32::Fat32::write_boot_code)
+/// mirrors every grafted record into it as well, matching upstream
+/// `WritePBR`'s two-pass loop (`src/format.c`).
 #[must_use]
 pub fn backup_boot_sector(boot: &[u8; 512]) -> [u8; 512] {
     *boot
@@ -246,10 +250,13 @@ pub fn backup_boot_sector(boot: &[u8; 512]) -> [u8; 512] {
 /// and never reach the Syslinux code at `0x5A`. The payload's jump
 /// (`EB 58 90`, landing at `0x5A`) must win, and its OEM name with it:
 /// upstream identifies an installed volume by `"SYSLINUX"` at offset
-/// 3. Only the primary boot sector is grafted — the FAT32 backup boot
-/// sector in the reserved area is deliberately not rewritten, so it
-/// keeps the formatter's image until a later slice owns the backup
-/// policy.
+/// 3. The graft itself returns the primary-sector bytes only; the
+/// caller mirrors them:
+/// [`Fat32::write_boot_code`](crate::fs::fat32::Fat32::write_boot_code)
+/// writes the identical bytes at sector 0 and at the FAT32 backup boot
+/// sector (reserved sector 6), matching upstream `WritePBR`'s two-pass
+/// loop (`src/format.c`) — without the mirror `fsck.fat` reports
+/// differences between the boot sector and its backup.
 ///
 /// Refuses a `vbr` shorter than [`BOOT_SECTOR_BYTES`], naming both
 /// lengths, and likewise a `current` image shorter than a sector: a

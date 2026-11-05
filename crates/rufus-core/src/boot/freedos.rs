@@ -12,18 +12,21 @@
 //! `CONFIG.SYS` / `AUTOEXEC.BAT` contents (see
 //! [`dos_locale`](super::dos_locale)). The boot record lands where
 //! `WritePBR` puts it (`src/format.c:1006-1040`, the `BT_FREEDOS`
-//! branch at `:1033`). [`install`] follows that order — the payloads
-//! in id order, then the locale files, then the record — and the
-//! record goes through the BPB-preserving graft
+//! branch at `:1033`). [`install`] writes the payloads in id order,
+//! then the locale files — that half follows `ExtractFreeDOS` — and
+//! the record last through the BPB-preserving graft
 //! ([`records::write`](super::records::write)): the record's entry and
 //! code win, the volume's own `0x0B..0x5A` geometry — volume label
-//! included — survives, and sectors 1 (FSInfo) and 2 are untouched.
-//! The boot record runs last, the same invariant every installer in
-//! this crate keeps: a refusal anywhere earlier (a foreign file in the
-//! way) leaves sector 0 with the formatter's record, never a
-//! half-bootable stick. Nothing here flushes: the caller owns the
-//! flush, the same convention as the [`kolibri`](super::kolibri) and
-//! [`msdos`](super::msdos) installers.
+//! included — survives, sectors 1 (FSInfo) and 2 are untouched, and
+//! the grafted record is mirrored into the FAT32 backup boot sector
+//! (sector 6), matching `WritePBR`'s two-pass loop (`src/format.c`).
+//! Record-last is this crate's own invariant, not the reference's:
+//! upstream runs `WritePBR` (`src/format.c:1907`) before `ExtractDOS`
+//! (`:1932`), while here a refusal anywhere earlier (a foreign file in
+//! the way) leaves sector 0 and its backup with the formatter's
+//! record, never a half-bootable stick. Nothing here flushes: the
+//! caller owns the flush, the same convention as the
+//! [`kolibri`](super::kolibri) and [`msdos`](super::msdos) installers.
 //!
 //! The set is the FreeDOS kernel (`KERNEL.SYS`), its shell
 //! (`COMMAND.COM`), the `DISPLAY.EXE` / `KEYB.EXE` / `MODE.COM`
@@ -551,7 +554,9 @@ pub fn files_for(destination: Destination) -> impl Iterator<Item = FreeDosFile> 
 /// Goes through the BPB-preserving graft
 /// ([`records::write`](super::records::write)): the record's entry
 /// and code win, the volume's own `0x0B..0x5A` geometry — volume
-/// label included — survives, and sectors 1 (FSInfo) and 2 are
+/// label included — survives, the grafted record is mirrored into the
+/// FAT32 backup boot sector (sector 6, matching `WritePBR`'s two-pass
+/// loop in `src/format.c`), and sectors 1 (FSInfo) and 2 are
 /// untouched, unlike the reference's blank-FSInfo rewrite (see the
 /// module docs for why). Does not flush: the caller owns the flush.
 pub fn install_boot_record(fat: &mut Fat32) -> Result<()> {
@@ -687,23 +692,28 @@ fn place(
             "freedos file '{name}' is longer than u64: refusing"
         ))
     })?;
-    let present = fat.list_dir(dir)?.iter().any(|entry| {
+    let clash = fat.list_dir(dir)?.into_iter().find(|entry| {
         entry.name.eq_ignore_ascii_case(name) || entry.short_name.eq_ignore_ascii_case(name)
     });
-    if present {
-        let back = fat.read_file(dest)?;
-        if back.as_slice() == bytes {
-            kept.push(name);
-            return Ok(());
-        }
+    let Some(hit) = clash else {
+        fat.create_file(dest, len)?;
+        fat.write_at(dest, 0, bytes)?;
+        written.push(WrittenFile { name, bytes: len });
+        return Ok(());
+    };
+    if hit.is_dir {
         return Err(CoreError::invalid(format!(
-            "freedos file '{name}' already present at '{dir}' differs from the installer copy: refusing to overwrite it"
+            "freedos file '{name}' already present at '{dir}' as a directory, not a file: refusing"
         )));
     }
-    fat.create_file(dest, len)?;
-    fat.write_at(dest, 0, bytes)?;
-    written.push(WrittenFile { name, bytes: len });
-    Ok(())
+    let back = fat.read_file(dest)?;
+    if back.as_slice() == bytes {
+        kept.push(name);
+        return Ok(());
+    }
+    Err(CoreError::invalid(format!(
+        "freedos file '{name}' already present at '{dir}' differs from the installer copy: refusing to overwrite it"
+    )))
 }
 
 /// Install a complete FreeDOS volume: the 27 payloads in id order (the
@@ -712,11 +722,11 @@ fn place(
 /// locale files [`dos_locale::plan`] renders for
 /// [`DosFlavor::FreeDos`](dos_locale::DosFlavor) (`/CONFIG.SYS` when
 /// the plan carries one, `/AUTOEXEC.BAT` always), then the boot record
-/// through [`records::write`](super::records::write).
+/// through [`install_boot_record`].
 ///
 /// The record runs last — the "boot record last" invariant every
 /// installer in this crate follows — so a refusal anywhere earlier
-/// leaves sector 0 with the formatter's record. A failure between
+/// leaves sector 0 and its backup with the formatter's record. A failure between
 /// files leaves a partial set behind (the torn-state window, the same
 /// as the [`msdos`](super::msdos) installer), but with no record down
 /// nothing is half-bootable. Does not flush: the caller owns the
@@ -785,7 +795,7 @@ pub fn install_from(
         &mut written,
         &mut kept,
     )?;
-    records::write(fat, &records::freedos_fat32())?;
+    install_boot_record(fat)?;
     Ok(Installed {
         written,
         kept,
@@ -1177,20 +1187,23 @@ mod tests {
         // window (label included) survives byte-identical — the graft
         // takes only the record's `0x00..0x0B` entry and `0x5A..0x1FE`
         // code, so the payload legitimately owns exactly those two
-        // windows — the `55 AA` tail closes the sector, sectors 1
-        // (FSInfo, real counts kept) and 2 are byte-identical to
-        // before the call (the deliberate divergence from the
-        // reference's blank-FSInfo rewrite, see the module docs), a
-        // second write changes nothing, and the jump really moved off
-        // the formatter's own `EB 3C 90` (the OEM name is `MSWIN4.1`
-        // on both sides, so the jump — not the OEM — is the
-        // discriminator). The dumped image is `fsck.fat` clean; the
+        // windows — the `55 AA` tail closes the sector, the grafted
+        // record is mirrored byte-identical into the backup boot sector
+        // (sector 6, matching `WritePBR`'s two-pass loop in
+        // `src/format.c`), sectors 1 (FSInfo, real counts kept) through
+        // 5 are byte-identical to before the call (the deliberate
+        // divergence from the reference's blank-FSInfo rewrite, see the
+        // module docs), a second write changes nothing, and the jump
+        // really moved off the formatter's own `EB 3C 90` (the OEM name
+        // is `MSWIN4.1` on both sides, so the jump — not the OEM — is
+        // the discriminator). The dumped image is `fsck.fat` clean; the
         // tool resolves through `PATH` and the test skips when absent.
         let (backing, mut fat) = formatted();
         fat.flush().expect("the pre-write flush runs");
         let before = sector(&backing, 0);
         let before_fsinfo = sector(&backing, 1);
         let before_second = sector(&backing, 2);
+        let before_mid: Vec<[u8; 512]> = (3..6).map(|index| sector(&backing, index)).collect();
         install_boot_record(&mut fat).expect("the record writes");
         let record = crate::boot::records::freedos_fat32();
         let after = sector(&backing, 0);
@@ -1215,6 +1228,11 @@ mod tests {
             "the signature closes the sector"
         );
         assert_eq!(
+            sector(&backing, 6),
+            after,
+            "the backup boot sector mirrors the primary"
+        );
+        assert_eq!(
             sector(&backing, 1),
             before_fsinfo,
             "the write preserves the fsinfo sector with its real counts"
@@ -1224,6 +1242,14 @@ mod tests {
             before_second,
             "the write preserves sector 2"
         );
+        for (position, want) in before_mid.iter().enumerate() {
+            let index = position + 3;
+            assert_eq!(
+                &sector(&backing, index),
+                want,
+                "the write preserves sector {index}"
+            );
+        }
         assert_eq!(
             &before[0..3],
             &[0xEB, 0x3C, 0x90],
@@ -1236,28 +1262,13 @@ mod tests {
         );
         install_boot_record(&mut fat).expect("the second write runs");
         assert_eq!(sector(&backing, 0), after, "a second write changes nothing");
-        fat.flush().expect("the caller-side flush runs");
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let image = scratch.path().join("freedos-record.img");
-        std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
-        let output = match std::process::Command::new("fsck.fat")
-            .arg("-n")
-            .arg(&image)
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
-                return;
-            }
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "fsck.fat -n exits 0 after the record write ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
-            output.status
+        assert_eq!(
+            sector(&backing, 6),
+            after,
+            "a second write keeps the backup mirrored"
         );
+        fat.flush().expect("the caller-side flush runs");
+        assert_fsck_clean(&backing, "freedos-record.img");
     }
 
     /// Install through [`install_from`](super::install_from) with the
@@ -1290,16 +1301,22 @@ mod tests {
             .collect()
     }
 
-    /// Dump the image under test and require `fsck.fat -n` (read-only)
-    /// to exit 0. The tool resolves through `PATH`; when it is absent
-    /// the test skips. The caller flushes first: nothing in this module
-    /// flushes, so the image dumps only what the caller published.
+    /// Dump the image under test and require `fsck.fat -n -v`
+    /// (read-only) to exit 0 without reporting differences between the
+    /// boot sector and its backup. The verbose flag matters: without it
+    /// the checker exits 0 over a stale backup silently, and an
+    /// interactive "copy backup to original" would then destroy the
+    /// installed record. The tool resolves through `PATH`; when it is
+    /// absent the test skips. The caller flushes first: nothing in this
+    /// module flushes, so the image dumps only what the caller
+    /// published.
     fn assert_fsck_clean(backing: &SharedVolume, name: &str) {
         let scratch = tempfile::tempdir().expect("a scratch directory");
         let image = scratch.path().join(name);
         std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
         let output = match std::process::Command::new("fsck.fat")
             .arg("-n")
+            .arg("-v")
             .arg(&image)
             .output()
         {
@@ -1311,6 +1328,11 @@ mod tests {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !format!("{stdout}\n{stderr}")
+                .contains("differences between boot sector and its backup"),
+            "fsck.fat -v reports no boot/backup difference after the freedos install: stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             output.status.success(),
             "fsck.fat -n exits 0 after the freedos install ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
@@ -1325,7 +1347,8 @@ mod tests {
         // AUTOEXEC.BAT and LOCALE; LOCALE holds exactly the 25 locale
         // payload names; every payload reads back byte-identical to its
         // asset; AUTOEXEC.BAT equals the plan bytes; the boot record
-        // lands through the graft with sectors 1-2 untouched; and the
+        // lands through the graft with sectors 1-2 untouched and the
+        // backup mirror at sector 6; and the
         // image is fsck clean.
         let locale = Locale::us();
         let planned = plan(DosFlavor::FreeDos, &locale);
@@ -1338,6 +1361,7 @@ mod tests {
         let before = sector(&backing, 0);
         let before_fsinfo = sector(&backing, 1);
         let before_second = sector(&backing, 2);
+        let before_mid: Vec<[u8; 512]> = (3..6).map(|index| sector(&backing, index)).collect();
         let done = install_assets(&mut fat, &locale).expect("the install runs");
         assert!(done.kept().is_empty(), "a fresh install keeps nothing");
         assert!(done.record_written(), "the record went down");
@@ -1430,9 +1454,10 @@ mod tests {
             "AUTOEXEC.BAT equals the plan bytes"
         );
         // The record proof: the FreeDOS head and code land, the BPB
-        // window survives, the signature closes the sector, and sectors
-        // 1 (FSInfo, real counts kept) and 2 are byte-identical to
-        // before the call.
+        // window survives, the signature closes the sector, the
+        // grafted record is mirrored byte-identical into the backup
+        // boot sector (sector 6), and sectors 1 (FSInfo, real counts
+        // kept) through 5 are byte-identical to before the call.
         let after = sector(&backing, 0);
         assert_eq!(
             &after[0..3],
@@ -1451,6 +1476,11 @@ mod tests {
             "the graft keeps the whole bpb window, label included"
         );
         assert_eq!(
+            sector(&backing, 6),
+            after,
+            "the backup boot sector mirrors the primary"
+        );
+        assert_eq!(
             sector(&backing, 1),
             before_fsinfo,
             "the install preserves the fsinfo sector with its real counts"
@@ -1460,6 +1490,14 @@ mod tests {
             before_second,
             "the install preserves sector 2"
         );
+        for (position, want) in before_mid.iter().enumerate() {
+            let index = position + 3;
+            assert_eq!(
+                &sector(&backing, index),
+                want,
+                "the install preserves sector {index}"
+            );
+        }
         fat.flush().expect("the caller-side flush runs");
         assert_fsck_clean(&backing, "freedos-install.img");
     }
@@ -1642,6 +1680,43 @@ mod tests {
         assert!(text.is_ascii(), "stays ASCII: {text}");
         let back = fat.read_file("/COMMAND.COM").expect("the file still reads");
         assert_eq!(back, foreign, "foreign bytes untouched");
+    }
+
+    #[test]
+    fn directory_in_payload_slot_refuses() {
+        // A directory named `/COMMAND.COM` is not a file to compare
+        // against: the install refuses naming the file and the
+        // directory conflict — not incidentally through the read path
+        // — and writes nothing behind it. (`ensure_locale_dir` runs
+        // first, so the root also holds the fresh `LOCALE` directory;
+        // no payload file lands beside the two directories.)
+        let (_backing, mut fat) = formatted();
+        fat.mkdir("/COMMAND.COM").expect("a directory lands first");
+        let error =
+            install_assets(&mut fat, &Locale::us()).expect_err("a directory in the slot refuses");
+        let text = error.to_string();
+        assert!(text.contains("COMMAND.COM"), "names the file: {text}");
+        assert!(text.contains("directory"), "names the conflict: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        let listed = fat.list_dir("/").expect("the root lists");
+        let mut shorts: Vec<&str> = listed
+            .iter()
+            .map(|entry| entry.short_name.as_str())
+            .collect();
+        shorts.sort_unstable();
+        assert_eq!(
+            shorts,
+            ["COMMAND.COM", "LOCALE"],
+            "the root holds only the directory and LOCALE"
+        );
+        assert!(
+            listed.iter().all(|entry| entry.is_dir),
+            "no file was written behind the refusal"
+        );
+        assert!(
+            fat.read_file("/COMMAND.COM").is_err(),
+            "the slot is still a directory"
+        );
     }
 
     #[test]

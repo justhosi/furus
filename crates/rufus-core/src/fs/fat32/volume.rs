@@ -57,6 +57,7 @@ use crate::fs::fat32::dirent::SHORT_NAME_LEN;
 use crate::fs::fat32::fat;
 use crate::fs::fat32::fat::FatDelta;
 use crate::fs::fat32::format::FormatOptions;
+use crate::fs::fat32::geometry::BACKUP_BOOT_SECTOR;
 use crate::fs::fat32::geometry::Geometry;
 use crate::fs::fat32::geometry::ROOT_CLUSTER;
 
@@ -515,23 +516,72 @@ impl Fat32 {
     // Boot code
     // ------------------------------------------------------------------
 
-    /// Graft a Syslinux VBR's boot code onto this volume's boot sector.
+    /// Graft a Syslinux VBR's boot code onto this volume's boot sector,
+    /// primary and backup.
     ///
     /// Reads sector 0 and writes the 512 grafted bytes back at offset 0
     /// ([`bpb::graft_boot_code`]): the VBR's `0..11` jump/OEM entry, the
     /// volume's own `11..90` BPB/EBPB geometry, the VBR's `90..510` boot
-    /// code and the volume's `510..512` `0x55AA` signature. Refuses a VBR
-    /// shorter than a sector, naming both lengths. The FAT32 backup boot
-    /// sector in the reserved area is deliberately not rewritten (it
-    /// keeps the formatter's image; a later slice owns the backup
-    /// policy). The caller is responsible for the payload being a real
-    /// Syslinux VBR: this moves bytes, it never checks them. Does not
-    /// flush: the caller flushes after its last write.
+    /// code and the volume's `510..512` `0x55AA` signature. The identical
+    /// 512 bytes are then written at the BPB's backup pointer (offset 50,
+    /// falling back to `BACKUP_BOOT_SECTOR` — reserved sector 6 — when
+    /// the field is zero or outside the reserved area (the same field
+    /// and rule `patch_boot_label` reads), matching
+    /// upstream `WritePBR`'s two-pass loop
+    /// (`src/format.c`), which writes the same record at offset 0 and at
+    /// `6 * SectorSize`: without the mirror `fsck.fat` reports
+    /// differences between the boot sector and its backup, and an
+    /// interactive "copy backup to original" would destroy the installed
+    /// record. The record itself stays a 512-byte structure whatever the
+    /// sector size; only the backup's byte offset scales with the
+    /// volume's real sector size. Refuses a VBR shorter than a sector,
+    /// naming both lengths. When the backup sector would fall outside
+    /// the volume the call refuses before the first write — naming the
+    /// sector and the volume size — so nothing is half-applied. The
+    /// caller is responsible for the payload being a real Syslinux VBR:
+    /// this moves bytes, it never checks them. Does not flush: the
+    /// caller flushes after its last write.
     pub fn write_boot_code(&mut self, vbr: &[u8]) -> Result<()> {
         let mut current = [0u8; bpb::BOOT_SECTOR_BYTES];
         self.volume.read_exact_at(0, &mut current)?;
         let grafted = bpb::graft_boot_code(&current, vbr)?;
+        // The mirror target is the BPB's own backup pointer (offset 50),
+        // the same field `patch_boot_label` reads; a zero or
+        // out-of-reserved-area value falls back to `BACKUP_BOOT_SECTOR`
+        // (every volume this crate formats carries 6 there, so the two
+        // agree on our own images). The backup's byte offset scales with
+        // the volume's real sector size; the record itself stays the
+        // 512-byte structure above. Validated before the first write so
+        // a refusal leaves sector 0 with the formatter's record, never
+        // a half-mirrored stick.
+        let backup_ptr = u32::from(le_u16(&current, 50));
+        let backup_sector = if backup_ptr >= 1 && backup_ptr < self.geometry.reserved_sectors {
+            backup_ptr
+        } else {
+            BACKUP_BOOT_SECTOR
+        };
+        let backup_offset = u64::from(backup_sector)
+            .checked_mul(u64::from(self.geometry.bytes_per_sector))
+            .ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "fat32 backup boot sector {backup_sector} sits past u64 addressing: refusing"
+                ))
+            })?;
+        let backup_end = backup_offset
+            .checked_add(bpb::BOOT_SECTOR_BYTES as u64)
+            .ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "fat32 backup boot sector {backup_sector} ends past u64 addressing: refusing"
+                ))
+            })?;
+        let total = self.volume.total_bytes();
+        if backup_end > total {
+            return Err(CoreError::invalid(format!(
+                "fat32 backup boot sector {backup_sector} at byte offset {backup_offset} does not fit the {total} byte volume: refusing"
+            )));
+        }
         self.volume.write_all_at(0, &grafted)?;
+        self.volume.write_all_at(backup_offset, &grafted)?;
         Ok(())
     }
 
@@ -2621,6 +2671,209 @@ mod tests {
                 .expect("dir entry"),
             fat::EOC,
             "the directory keeps its single-cluster chain"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // write_boot_code: the backup mirror
+    // ------------------------------------------------------------------
+
+    /// A synthetic VBR: a real-shaped entry (a jump landing at 0x5A
+    /// plus an OEM name), a foreign BPB and a recognizable code window,
+    /// so the graft proof below can tell every window apart.
+    fn test_vbr() -> [u8; bpb::BOOT_SECTOR_BYTES] {
+        let mut vbr = [0xCCu8; bpb::BOOT_SECTOR_BYTES];
+        vbr[0..11].copy_from_slice(b"\xEB\x58\x90SYSLINUX");
+        for (index, slot) in vbr[bpb::BOOT_CODE_AREA].iter_mut().enumerate() {
+            *slot = (index % 251) as u8;
+        }
+        vbr
+    }
+
+    /// One raw 512-byte sector of the live volume's own store.
+    fn raw_sector(fs: &Fat32, index: u64) -> [u8; bpb::BOOT_SECTOR_BYTES] {
+        let bps = u64::from(fs.geometry.bytes_per_sector);
+        let mut sector = [0u8; bpb::BOOT_SECTOR_BYTES];
+        fs.volume
+            .read_exact_at(index * bps, &mut sector)
+            .expect("the test sector reads");
+        sector
+    }
+
+    #[test]
+    fn write_boot_code_mirrors_the_grafted_record_into_the_backup_sector() {
+        // The mirror proof on a real 64 MiB image: the grafted record
+        // lands at sector 0 (the payload entry and code win, the
+        // volume's own BPB window survives), the identical 512 bytes
+        // land at the backup boot sector (reserved sector 6, matching
+        // WritePBR's two-pass loop in src/format.c), and every sector
+        // between — FSInfo (1) through 5 — stays byte-identical.
+        let mut fs = live(SIXTY_FOUR_MIB);
+        fs.flush().expect("the pre-write flush runs");
+        let before = raw_sector(&fs, 0);
+        let before_mid: Vec<[u8; bpb::BOOT_SECTOR_BYTES]> = (1..u64::from(BACKUP_BOOT_SECTOR))
+            .map(|index| raw_sector(&fs, index))
+            .collect();
+        let vbr = test_vbr();
+        fs.write_boot_code(&vbr).expect("the graft writes");
+        let primary = raw_sector(&fs, 0);
+        assert_eq!(
+            &primary[0..11],
+            &vbr[0..11],
+            "the payload jump and oem name win"
+        );
+        assert_eq!(
+            &primary[11..bpb::BOOT_CODE_AREA.start],
+            &before[11..bpb::BOOT_CODE_AREA.start],
+            "the volume geometry survives the graft"
+        );
+        assert_eq!(
+            &primary[bpb::BOOT_CODE_AREA],
+            &vbr[bpb::BOOT_CODE_AREA],
+            "the boot code is the payload's"
+        );
+        assert_eq!(
+            &primary[510..512],
+            &[0x55, 0xAA],
+            "the signature closes the sector"
+        );
+        assert_eq!(
+            raw_sector(&fs, u64::from(BACKUP_BOOT_SECTOR)),
+            primary,
+            "the backup boot sector is byte-identical to the primary"
+        );
+        for (position, want) in before_mid.iter().enumerate() {
+            let index = position as u64 + 1;
+            assert_eq!(
+                &raw_sector(&fs, index),
+                want,
+                "sector {index} between primary and backup stays untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn write_boot_code_is_idempotent_over_both_sectors() {
+        // A second graft over the same VBR changes neither sector 0
+        // nor the backup: the mirror is a pure function of the same
+        // bytes.
+        let mut fs = live(SIXTY_FOUR_MIB);
+        let vbr = test_vbr();
+        fs.write_boot_code(&vbr).expect("the first graft writes");
+        let primary = raw_sector(&fs, 0);
+        let backup = raw_sector(&fs, u64::from(BACKUP_BOOT_SECTOR));
+        fs.write_boot_code(&vbr).expect("the second graft writes");
+        assert_eq!(raw_sector(&fs, 0), primary, "sector 0 is stable");
+        assert_eq!(
+            raw_sector(&fs, u64::from(BACKUP_BOOT_SECTOR)),
+            backup,
+            "the backup sector is stable"
+        );
+        assert_eq!(backup, primary, "the mirror still holds");
+    }
+
+    /// A [`Volume`](crate::fs::Volume) over shared bytes whose reported
+    /// extent can shrink after format: formatting needs the full 64
+    /// MiB, then the visible size drops so the backup boot sector falls
+    /// outside the volume without moving any byte.
+    #[derive(Debug, Clone)]
+    struct ShrinkVolume {
+        bytes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        visible: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl crate::fs::Volume for ShrinkVolume {
+        fn total_bytes(&self) -> u64 {
+            self.visible.get()
+        }
+
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let total = self.visible.get();
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| CoreError::invalid("a test read offset overflows a u64"))?;
+            if end > total {
+                return Err(CoreError::invalid(format!(
+                    "read of {} bytes at offset {offset} runs past the {total} byte test volume",
+                    buf.len()
+                )));
+            }
+            let borrowed = self.bytes.borrow();
+            let start = usize::try_from(offset).expect("the test offset fits usize");
+            let window = borrowed
+                .get(start..start + buf.len())
+                .expect("the test read fits");
+            buf.copy_from_slice(window);
+            Ok(())
+        }
+
+        fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+            let total = self.visible.get();
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| CoreError::invalid("a test write offset overflows a u64"))?;
+            if end > total {
+                return Err(CoreError::invalid(format!(
+                    "write of {} bytes at offset {offset} runs past the {total} byte test volume",
+                    buf.len()
+                )));
+            }
+            let mut borrowed = self.bytes.borrow_mut();
+            let start = usize::try_from(offset).expect("the test offset fits usize");
+            let window = borrowed
+                .get_mut(start..start + buf.len())
+                .expect("the test write fits");
+            window.copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_boot_code_refuses_when_the_backup_falls_outside_the_volume() {
+        // Format at full size, then shrink the visible extent to 2048
+        // bytes: the backup boot sector (6 * 512 = 3072) falls outside,
+        // so the graft refuses naming the sector and the volume size —
+        // before the first write, so sector 0 still carries the
+        // formatter's record (no half-applied mirror).
+        let bytes = std::rc::Rc::new(std::cell::RefCell::new(vec![0u8; SIXTY_FOUR_MIB as usize]));
+        let visible = std::rc::Rc::new(std::cell::Cell::new(SIXTY_FOUR_MIB));
+        let store = ShrinkVolume {
+            bytes: bytes.clone(),
+            visible: visible.clone(),
+        };
+        let mut fs =
+            Fat32::format(Box::new(store), &options()).expect("the volume formats and loads");
+        fs.flush().expect("the pre-write flush runs");
+        let before = {
+            let borrowed = bytes.borrow();
+            let mut sector = [0u8; bpb::BOOT_SECTOR_BYTES];
+            sector.copy_from_slice(&borrowed[..bpb::BOOT_SECTOR_BYTES]);
+            sector
+        };
+        visible.set(2048);
+        let vbr = test_vbr();
+        let error = fs
+            .write_boot_code(&vbr)
+            .expect_err("an out-of-range backup refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains(&BACKUP_BOOT_SECTOR.to_string()),
+            "the refusal names the backup sector: {text}"
+        );
+        assert!(
+            text.contains("2048"),
+            "the refusal names the volume size: {text}"
+        );
+        assert!(text.is_ascii(), "the refusal stays ASCII: {text}");
+        let after = {
+            let borrowed = bytes.borrow();
+            let mut sector = [0u8; bpb::BOOT_SECTOR_BYTES];
+            sector.copy_from_slice(&borrowed[..bpb::BOOT_SECTOR_BYTES]);
+            sector
+        };
+        assert_eq!(
+            after, before,
+            "sector 0 is untouched: the refusal lands before the first write"
         );
     }
 

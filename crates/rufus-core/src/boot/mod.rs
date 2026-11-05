@@ -20,15 +20,15 @@
 //! [`kolibri`] places the KolibriOS `MTLD_F32` loader at the volume
 //! root and writes the `FUN_140075d80` boot record through the
 //! BPB-preserving graft: the volume label survives instead of becoming
-//! `NO NAME    `, and only sector 0 is written.
+//! `NO NAME    `, and the grafted record is mirrored into the backup
+//! boot sector (sector 6, `src/format.c` two-pass loop).
 //! [`msdos`] writes caller-supplied `IO.SYS` (contiguous, first),
 //! `MSDOS.SYS` and `COMMAND.COM` with the WinME jump patch applied
 //! where the bytes match, and writes nothing to sector 0: nothing is
 //! bundled, so a plain run carries no MS-DOS files at all.
 //! [`dos_locale`] plans the DOS keyboard/codepage/EGA choice and the
 //! byte-exact `CONFIG.SYS`/`AUTOEXEC.BAT` contents (`SetDOSLocale`):
-//! pure planning, no writes — placing the files on a stick is a later
-//! slice.
+//! pure planning, no writes — [`freedos`] places the files (S20 part 6).
 //! [`freedos`] installs a complete FreeDOS volume (`ExtractFreeDOS`,
 //! `src/dos.c:344-403`): the `COMMAND.COM` / `KERNEL.SYS` pair at the
 //! target root plus the 25 `LOCALE\` files, the `CONFIG.SYS` /
@@ -37,9 +37,11 @@
 //! preserving (not rewriting) the FSInfo and sector 2 (see its module
 //! docs). [`records`] holds the two
 //! transcribed ms-sys FAT32 boot records (FreeDOS and KolibriOS) plus
-//! the sector-0-only [`write`](records::write) seam: 11-byte head,
+//! the primary-plus-backup [`write`](records::write) seam: 11-byte head,
 //! 430-byte body, `55 AA` tail, with the `0x0B..0x5A` BPB window left
-//! as placeholders for the graft. Wiring these installers into the
+//! as placeholders for the graft and the grafted record mirrored into
+//! the backup boot sector (sector 6, `src/format.c` two-pass loop).
+//! Wiring these installers into the
 //! copy and pipeline paths is a later
 //! slice, and no stick has been booted on hardware.
 

@@ -23,9 +23,9 @@
 //! that lookup inside `SetDOSLocale`, here there is nothing to call.
 //!
 //! This module writes nothing: [`plan`] returns the file bytes and the
-//! reference log lines for the caller to use. Placing these files onto a
-//! stick belongs to the FreeDOS install slice (5/8) and the wiring slice
-//! (7/8).
+//! reference log lines for the caller to use. Placing these files onto
+//! a stick is the FreeDOS install's job (S20 part 6); only the pipeline
+//! wiring remains.
 //!
 //! Line endings are LF (`\n`) throughout, exactly as the C `fprintf`
 //! calls emit them — DOS reads that fine and byte fidelity matters more

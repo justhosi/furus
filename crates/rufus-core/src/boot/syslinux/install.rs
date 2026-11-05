@@ -520,6 +520,19 @@ mod tests {
             &[0x55, 0xAA],
             "the signature closes the sector"
         );
+        // The backup boot sector mirrors the grafted primary,
+        // matching WritePBR's two-pass loop (src/format.c): without it
+        // fsck.fat -v reports differences between the boot sector and
+        // its backup.
+        {
+            let image = backing.bytes.borrow();
+            let primary = image.get(..512).expect("the primary sector fits");
+            let backup = image.get(6 * 512..7 * 512).expect("the backup sector fits");
+            assert_eq!(
+                backup, primary,
+                "the backup boot sector mirrors the primary"
+            );
+        }
 
         let listed = fat.list_dir("/").expect("the root lists");
         let entry = listed
@@ -778,8 +791,11 @@ mod tests {
     #[test]
     fn installed_volume_is_fsck_clean() {
         // Acceptance over the real checker: the image dumps to a
-        // tempfile and `fsck.fat -n` (read-only: `-n` answers no to
-        // every repair prompt) must exit 0. The tool resolves through
+        // tempfile and `fsck.fat -n -v` (read-only: `-n` answers no to
+        // every repair prompt) must exit 0 without reporting
+        // differences between the boot sector and its backup — the
+        // verbose flag matters, since without it the checker exits 0
+        // over a stale backup silently. The tool resolves through
         // `PATH` (never a hardcoded path); when it is absent the test
         // skips. A checker that objects to the Syslinux boot code is a
         // real finding: report it, never work around it.
@@ -794,6 +810,7 @@ mod tests {
         std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
         let output = match std::process::Command::new("fsck.fat")
             .arg("-n")
+            .arg("-v")
             .arg(&image)
             .output()
         {
@@ -805,6 +822,11 @@ mod tests {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !format!("{stdout}\n{stderr}")
+                .contains("differences between boot sector and its backup"),
+            "fsck.fat -v reports no boot/backup difference after the install: stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             output.status.success(),
             "fsck.fat -n exits 0 after the install ({}): stdout:\n{stdout}\nstderr:\n{stderr}",

@@ -33,11 +33,14 @@
 //! stick from this slice carries both the loader and its boot record.
 //! Two honest notes stay. First, the graft keeps the volume's own
 //! `0x0B..0x5A` BPB window, so the volume label is preserved rather
-//! than replaced with the reference's `NO NAME    `. Second, only
-//! sector 0 is written: the reference writes nothing past it for this
-//! record (unlike the FreeDOS one, which also touches sectors 1-2 —
-//! see [`freedos`](super::freedos)), and the FAT32 backup boot sector
-//! keeps the formatter's image. [`locate`] finds the loader in the
+//! than replaced with the reference's `NO NAME    `. Second, the
+//! reference writes nothing past sector 0 for this record (unlike the
+//! FreeDOS one, which also touches sectors 1-2 — see
+//! [`freedos`](super::freedos)), while this crate additionally mirrors
+//! the grafted record into the FAT32 backup boot sector (sector 6),
+//! matching `WritePBR`'s two-pass loop (`src/format.c`): without the
+//! mirror `fsck.fat` reports differences between the boot sector and
+//! its backup. [`locate`] finds the loader in the
 //! image and [`install_loader`] writes it at the volume root. Nothing
 //! here flushes: the caller owns the flush, the same convention as
 //! [`install_companions`](super::syslinux::install_companions) and
@@ -223,7 +226,9 @@ pub fn install_loader(fat: &mut Fat32, loader: &[u8]) -> Result<Installed> {
 /// Goes through the BPB-preserving graft
 /// ([`records::write`](super::records::write)): the record's entry
 /// and code win, the volume's own `0x0B..0x5A` geometry — volume
-/// label included — survives, and sectors 1 and 2 are untouched. Does
+/// label included — survives, the grafted record is mirrored into the
+/// FAT32 backup boot sector (sector 6, matching `WritePBR`'s two-pass
+/// loop in `src/format.c`), and sectors 1 and 2 are untouched. Does
 /// not flush: the caller owns the flush.
 pub fn install_boot_record(fat: &mut Fat32) -> Result<()> {
     records::write(fat, &records::kolibri_fat32())
@@ -716,18 +721,22 @@ mod tests {
         // window (label included) survives byte-identical — the graft
         // takes only the record's `0x00..0x0B` entry and `0x5A..0x1FE`
         // code, so the payload legitimately owns exactly those two
-        // windows — the `55 AA` tail closes the sector, sectors 1
-        // (FSInfo) and 2 are byte-identical to before the call, a
-        // second write changes nothing, and the jump really moved off
-        // the formatter's own `EB 3C 90` (the OEM name is `MSWIN4.1`
-        // on both sides, so the jump — not the OEM — is the
-        // discriminator). The dumped image is `fsck.fat` clean; the
-        // tool resolves through `PATH` and the test skips when absent.
+        // windows — the `55 AA` tail closes the sector, the grafted
+        // record is mirrored byte-identical into the backup boot sector
+        // (sector 6, matching `WritePBR`'s two-pass loop in
+        // `src/format.c`), sectors 1 (FSInfo) through 5 are
+        // byte-identical to before the call, a second write changes
+        // nothing, and the jump really moved off the formatter's own
+        // `EB 3C 90` (the OEM name is `MSWIN4.1` on both sides, so the
+        // jump — not the OEM — is the discriminator). The dumped image
+        // is `fsck.fat` clean with no boot/backup difference; the tool
+        // resolves through `PATH` and the test skips when absent.
         let (backing, mut fat) = formatted();
         fat.flush().expect("the pre-write flush runs");
         let before = sector(&backing, 0);
         let before_fsinfo = sector(&backing, 1);
         let before_second = sector(&backing, 2);
+        let before_mid: Vec<[u8; 512]> = (3..6).map(|index| sector(&backing, index)).collect();
         install_boot_record(&mut fat).expect("the record writes");
         let record = crate::boot::records::kolibri_fat32();
         let after = sector(&backing, 0);
@@ -752,6 +761,11 @@ mod tests {
             "the signature closes the sector"
         );
         assert_eq!(
+            sector(&backing, 6),
+            after,
+            "the backup boot sector mirrors the primary"
+        );
+        assert_eq!(
             sector(&backing, 1),
             before_fsinfo,
             "the write preserves the fsinfo sector"
@@ -761,6 +775,14 @@ mod tests {
             before_second,
             "the write preserves sector 2"
         );
+        for (position, want) in before_mid.iter().enumerate() {
+            let index = position + 3;
+            assert_eq!(
+                &sector(&backing, index),
+                want,
+                "the write preserves sector {index}"
+            );
+        }
         assert_eq!(
             &before[0..3],
             &[0xEB, 0x3C, 0x90],
@@ -773,12 +795,18 @@ mod tests {
         );
         install_boot_record(&mut fat).expect("the second write runs");
         assert_eq!(sector(&backing, 0), after, "a second write changes nothing");
+        assert_eq!(
+            sector(&backing, 6),
+            after,
+            "a second write keeps the backup mirrored"
+        );
         fat.flush().expect("the caller-side flush runs");
         let scratch = tempfile::tempdir().expect("a scratch directory");
         let image = scratch.path().join("kolibri-record.img");
         std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
         let output = match std::process::Command::new("fsck.fat")
             .arg("-n")
+            .arg("-v")
             .arg(&image)
             .output()
         {
@@ -790,6 +818,11 @@ mod tests {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !format!("{stdout}\n{stderr}")
+                .contains("differences between boot sector and its backup"),
+            "fsck.fat -v reports no boot/backup difference after the record write: stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             output.status.success(),
             "fsck.fat -n exits 0 after the record write ({}): stdout:\n{stdout}\nstderr:\n{stderr}",

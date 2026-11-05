@@ -44,7 +44,7 @@
 //! discarded by that graft — they describe the build machine's
 //! volume, never this one.
 //!
-//! Sector-0-only rule. The FreeDOS reference additionally rewrites
+//! Primary-plus-backup rule. The FreeDOS reference additionally rewrites
 //! sector 1 from its header's FSInfo image and zeroes sector 2,
 //! purely so 1024/2048-byte-sector media see a boot signature at
 //! `0x3FE`/`0x5FE` (that is what ms-sys `is_fat_32_br` checks) — but
@@ -53,7 +53,10 @@
 //! there. Our volumes use 512-byte sectors and the BIOS loads only
 //! sector 0 — so [`write`] preserves sectors 1 and 2 instead of
 //! rewriting them (see [`freedos`](super::freedos) for the full
-//! reasoning).
+//! reasoning) — while the grafted record is mirrored into the FAT32
+//! backup boot sector (sector 6), matching `WritePBR`'s two-pass loop
+//! (`src/format.c`): without the mirror `fsck.fat` reports differences
+//! between the boot sector and its backup.
 //!
 //! The FreeDOS FAT16 record is out of scope: this project formats
 //! FAT32 only (see `fs/fat32/geometry.rs`, which refuses FAT16
@@ -209,9 +212,11 @@ pub fn kolibri_fat32() -> [u8; 512] {
 /// [`Fat32::write_boot_code`](crate::fs::fat32::Fat32::write_boot_code):
 /// the record's `0x00..0x0B` entry and `0x5A..0x1FE` code win, the
 /// volume's own `0x0B..0x5A` BPB/EBPB geometry (volume label
-/// included) and the `55 AA` tail survive, and sectors 1 (FSInfo)
-/// and 2 are never touched. Does not flush: the caller owns the
-/// flush, the same convention as the [`kolibri`](super::kolibri) and
+/// included) and the `55 AA` tail survive, the grafted record is
+/// mirrored into the FAT32 backup boot sector (sector 6, matching
+/// `WritePBR`'s two-pass loop in `src/format.c`), and sectors 1
+/// (FSInfo) and 2 are never touched. Does not flush: the caller owns
+/// the flush, the same convention as the [`kolibri`](super::kolibri) and
 /// [`freedos`](super::freedos) installers.
 pub fn write(fat: &mut Fat32, record: &[u8; 512]) -> Result<()> {
     fat.write_boot_code(record)
@@ -408,14 +413,18 @@ mod tests {
 
     /// The full graft proof for `record` through [`write`]: the head
     /// and code land, the whole `0x0B..0x5A` BPB window (label
-    /// included) survives byte-identical, the tail closes, sectors 1
-    /// and 2 are untouched, a second write changes nothing, and the
-    /// jump really moved off the formatter's own `EB 3C 90`.
+    /// included) survives byte-identical, the tail closes, the grafted
+    /// record is mirrored byte-identical into the backup boot sector
+    /// (sector 6, matching `WritePBR`'s two-pass loop in `src/format.c`),
+    /// sectors 1 through 5 are untouched, a second write changes
+    /// nothing, and the jump really moved off the formatter's own
+    /// `EB 3C 90`.
     fn proves_write(backing: &SharedVolume, fat: &mut Fat32, name: &str, record: &[u8; 512]) {
         fat.flush().expect("the pre-write flush runs");
         let before = backing.sector(0);
         let before_fsinfo = backing.sector(1);
         let before_second = backing.sector(2);
+        let before_mid: Vec<[u8; 512]> = (3..6).map(|index| backing.sector(index)).collect();
         write(fat, record).expect("the record writes");
         let after = backing.sector(0);
         assert_eq!(
@@ -439,6 +448,11 @@ mod tests {
             "the {name} signature closes the sector"
         );
         assert_eq!(
+            backing.sector(6),
+            after,
+            "the {name} backup boot sector mirrors the primary"
+        );
+        assert_eq!(
             backing.sector(1),
             before_fsinfo,
             "the {name} write preserves the fsinfo sector"
@@ -448,6 +462,14 @@ mod tests {
             before_second,
             "the {name} write preserves sector 2"
         );
+        for (position, want) in before_mid.iter().enumerate() {
+            let index = position + 3;
+            assert_eq!(
+                &backing.sector(index),
+                want,
+                "the {name} write preserves sector {index}"
+            );
+        }
         // The write is real: the formatter's own jump was `EB 3C 90`
         // (landing at `0x3E` over its zeroed code area) and the record
         // moves it to `EB 58 90` (landing at `0x5A`). The OEM name is
@@ -470,6 +492,11 @@ mod tests {
             backing.sector(0),
             after,
             "a second {name} write changes nothing"
+        );
+        assert_eq!(
+            backing.sector(6),
+            after,
+            "a second {name} write keeps the backup mirrored"
         );
     }
 
