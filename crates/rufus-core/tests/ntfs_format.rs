@@ -776,11 +776,35 @@ fn the_kernel_mounts_the_written_tree() {
         eprintln!("skip: mounting needs root; run the documented container command");
         return;
     }
+    // The formatter, the post-session checker, and the loop helper are
+    // all absent-tool skips, never panics (README Tests policy): the
+    // ntfs-3g/ntfsprogs package split means root alone does not imply
+    // them. No ntfs-3g gate here on purpose: the mount path below tries
+    // the kernel ntfs3 driver first with no userspace helper, so a run
+    // that succeeds on ntfs3 alone must not skip for a missing fallback.
+    let what = "the kernel mount acceptance";
+    if skip_without_formatter(what) || skip_without_tool("ntfsfix", what) {
+        return;
+    }
+    // losetup carries its own hint: the shared gate's ntfsprogs advice
+    // would name the wrong package for the loop helper.
+    if Command::new("losetup").arg("--version").output().is_err() {
+        eprintln!(
+            "skip: {what} needs losetup, which this host does not ship \
+             (install util-linux and re-run)"
+        );
+        return;
+    }
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = image_path(dir.path());
     sparse_image(&path, 64 * MIB);
-    let run = mkntfs_forced(&path, Some("RUFUSMNT"), SMALL_IMAGE_CLUSTERS, None)
-        .expect("mkntfs runs (root implies the tools for an --ignored container run)");
+    let Some(run) = mkntfs_forced(&path, Some("RUFUSMNT"), SMALL_IMAGE_CLUSTERS, None) else {
+        eprintln!(
+            "skip: {what} needs mkntfs, which vanished between the probe and the call \
+             (install ntfsprogs, or ntfs-3g on Debian/Ubuntu, and re-run)"
+        );
+        return;
+    };
     assert!(run.status.success(), "mkntfs failed:\n{}", run.combined());
     let boot = boot_of(&path);
     assert_eq!(
