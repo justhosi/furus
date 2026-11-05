@@ -58,18 +58,36 @@
 //! the packed bytes verbatim and FreeDOS's own tools decompress them on
 //! the target.
 //!
-//! What this module is not: it only loads and verifies — the install
-//! flow and the `SetDOSLocale(path, TRUE)` call belong to a later slice.
-//! And the FreeDOS boot record is not among these resources (boot-record
-//! handling comes from ms-sys, per `license.h`), so a stick from this
-//! slice alone will not boot.
+//! What this module is not: it only loads and verifies — the file
+//! install flow and the `SetDOSLocale(path, TRUE)` call belong to a
+//! later slice. The FreeDOS boot record is not among these resources
+//! either (boot-record handling comes from ms-sys, per `license.h`)
+//! — it lives in [`records`](super::records) instead, transcribed
+//! from the ms-sys headers, and [`install_boot_record`] writes its
+//! sector-0 image through the BPB-preserving graft.
+//!
+//! One deliberate divergence from the reference, stated plainly.
+//! `write_fat_32_fd_br` (`src/ms-sys/fat32.c:101-125`, called with
+//! `bKeepLabel = 0`) also rewrites sector 1 with ms-sys's *blank*
+//! FSInfo (`free_count = 0`, from `br_fat32fd_0x52.h`'s last 488 bytes
+//! plus `br_fat32fd_0x3f0.h`) and zeroes sector 2 except `55 AA` —
+//! purely so 1024/2048-byte-sector media see a boot signature at
+//! `0x3FE`/`0x5FE` (that is what ms-sys `is_fat_32_br` checks). Our
+//! volumes use 512-byte sectors, the BIOS loads only sector 0, and
+//! our FSInfo carries the real free-cluster counts, so
+//! [`install_boot_record`] preserves both sectors instead of
+//! clobbering them. This is a fidelity difference with a reason, not
+//! an omission. The FreeDOS FAT16 record is out of scope: this project
+//! formats FAT32 only.
 //!
 //! All error and assertion text is ASCII.
 
 use std::path::Path;
 
+use super::records;
 use crate::error::CoreError;
 use crate::error::Result;
+use crate::fs::fat32::Fat32;
 use crate::paths::asset_path;
 
 /// Where `ExtractFreeDOS` writes a payload (`src/dos.c:344-403`): the
@@ -492,11 +510,30 @@ pub fn files_for(destination: Destination) -> impl Iterator<Item = FreeDosFile> 
         .filter(move |file| file.destination() == destination)
 }
 
+/// Write the FreeDOS FAT32 boot record onto the volume's boot sector:
+/// the `write_fat_32_fd_br` payload as transcribed in
+/// [`records`](super::records) (head at `0x0`, the ANI/FreeDOS boot
+/// code at `0x52`, `55 AA` at `0x1FE`).
+///
+/// Goes through the BPB-preserving graft
+/// ([`records::write`](super::records::write)): the record's entry
+/// and code win, the volume's own `0x0B..0x5A` geometry — volume
+/// label included — survives, and sectors 1 (FSInfo) and 2 are
+/// untouched, unlike the reference's blank-FSInfo rewrite (see the
+/// module docs for why). Does not flush: the caller owns the flush.
+pub fn install_boot_record(fat: &mut Fat32) -> Result<()> {
+    records::write(fat, &records::freedos_fat32())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::Volume;
+    use crate::fs::fat32::format::FormatOptions;
     use crate::hash::Algo;
     use crate::hash::hash_reader;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// `assets/resources/` next to the workspace root, without going
     /// through asset-dir resolution (resolution depends on the
@@ -792,5 +829,163 @@ mod tests {
                 file.asset_file()
             );
         }
+    }
+
+    /// A [`Volume`] over shared bytes, the same shim the kolibri
+    /// installer tests use: `Fat32` keeps its store private, so the
+    /// tests watch the image through the shared handle.
+    #[derive(Debug, Clone)]
+    struct SharedVolume {
+        bytes: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl SharedVolume {
+        fn blank(len: u64) -> Self {
+            let size = usize::try_from(len).expect("the ram size fits usize");
+            Self {
+                bytes: Rc::new(RefCell::new(vec![0u8; size])),
+            }
+        }
+    }
+
+    impl Volume for SharedVolume {
+        fn total_bytes(&self) -> u64 {
+            self.bytes.borrow().len() as u64
+        }
+
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let borrowed = self.bytes.borrow();
+            let start = usize::try_from(offset).expect("the test offset fits usize");
+            let end = start.checked_add(buf.len()).expect("the test window fits");
+            let window = borrowed.get(start..end).expect("the test read fits");
+            buf.copy_from_slice(window);
+            Ok(())
+        }
+
+        fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+            let mut borrowed = self.bytes.borrow_mut();
+            let start = usize::try_from(offset).expect("the test offset fits usize");
+            let end = start.checked_add(buf.len()).expect("the test write fits");
+            let window = borrowed.get_mut(start..end).expect("the test write fits");
+            window.copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    /// A freshly formatted 64 MiB volume plus the shared handle that
+    /// still observes its bytes.
+    fn formatted() -> (SharedVolume, Fat32) {
+        let backing = SharedVolume::blank(64 * 1024 * 1024);
+        let fat = Fat32::format(
+            Box::new(backing.clone()),
+            &FormatOptions {
+                volume_id: 0x1234_5678,
+                ..Default::default()
+            },
+        )
+        .expect("the volume formats");
+        (backing, fat)
+    }
+
+    /// A copy of one 512-byte sector of the image under test.
+    fn sector(backing: &SharedVolume, index: usize) -> [u8; 512] {
+        let borrowed = backing.bytes.borrow();
+        let start = index.checked_mul(512).expect("the test offset fits");
+        let window = borrowed
+            .get(start..start + 512)
+            .expect("the test sector fits");
+        let mut sector = [0u8; 512];
+        sector.copy_from_slice(window);
+        sector
+    }
+
+    #[test]
+    fn install_boot_record_writes_the_freedos_sector() {
+        // The record proof on a real 64 MiB image: the payload head
+        // and code land through the graft, the whole `0x0B..0x5A` BPB
+        // window (label included) survives byte-identical — the graft
+        // takes only the record's `0x00..0x0B` entry and `0x5A..0x1FE`
+        // code, so the payload legitimately owns exactly those two
+        // windows — the `55 AA` tail closes the sector, sectors 1
+        // (FSInfo, real counts kept) and 2 are byte-identical to
+        // before the call (the deliberate divergence from the
+        // reference's blank-FSInfo rewrite, see the module docs), a
+        // second write changes nothing, and the jump really moved off
+        // the formatter's own `EB 3C 90` (the OEM name is `MSWIN4.1`
+        // on both sides, so the jump — not the OEM — is the
+        // discriminator). The dumped image is `fsck.fat` clean; the
+        // tool resolves through `PATH` and the test skips when absent.
+        let (backing, mut fat) = formatted();
+        fat.flush().expect("the pre-write flush runs");
+        let before = sector(&backing, 0);
+        let before_fsinfo = sector(&backing, 1);
+        let before_second = sector(&backing, 2);
+        install_boot_record(&mut fat).expect("the record writes");
+        let record = crate::boot::records::freedos_fat32();
+        let after = sector(&backing, 0);
+        assert_eq!(
+            &after[0..11],
+            &record[0..11],
+            "the payload jump and oem name win"
+        );
+        assert_eq!(
+            &after[11..90],
+            &before[11..90],
+            "the graft keeps the whole bpb window, label included"
+        );
+        assert_eq!(
+            &after[90..510],
+            &record[90..510],
+            "the boot code is the payload's"
+        );
+        assert_eq!(
+            &after[510..512],
+            &[0x55, 0xAA],
+            "the signature closes the sector"
+        );
+        assert_eq!(
+            sector(&backing, 1),
+            before_fsinfo,
+            "the write preserves the fsinfo sector with its real counts"
+        );
+        assert_eq!(
+            sector(&backing, 2),
+            before_second,
+            "the write preserves sector 2"
+        );
+        assert_eq!(
+            &before[0..3],
+            &[0xEB, 0x3C, 0x90],
+            "the formatter's own jump"
+        );
+        assert_eq!(
+            &after[0..3],
+            &[0xEB, 0x58, 0x90],
+            "the payload jump replaces it"
+        );
+        install_boot_record(&mut fat).expect("the second write runs");
+        assert_eq!(sector(&backing, 0), after, "a second write changes nothing");
+        fat.flush().expect("the caller-side flush runs");
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let image = scratch.path().join("freedos-record.img");
+        std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
+        let output = match std::process::Command::new("fsck.fat")
+            .arg("-n")
+            .arg(&image)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "fsck.fat -n exits 0 after the record write ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
     }
 }

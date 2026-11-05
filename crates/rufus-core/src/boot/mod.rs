@@ -18,9 +18,9 @@
 //! GRUB2 BIOS boot record and places a `grubx64.efi` image;
 //! [`grub4dos`] writes the GRUB4DOS MBR window, SBR and root `grldr`;
 //! [`kolibri`] places the KolibriOS `MTLD_F32` loader at the volume
-//! root and writes nothing to sector 0: a KolibriOS stick also needs
-//! the `FUN_140075d80` boot record, which this project holds no
-//! embedded copy of, so a stick from this slice alone will not boot.
+//! root and writes the `FUN_140075d80` boot record through the
+//! BPB-preserving graft: the volume label survives instead of becoming
+//! `NO NAME    `, and only sector 0 is written.
 //! [`msdos`] writes caller-supplied `IO.SYS` (contiguous, first),
 //! `MSDOS.SYS` and `COMMAND.COM` with the WinME jump patch applied
 //! where the bytes match, and writes nothing to sector 0: nothing is
@@ -32,8 +32,15 @@
 //! [`freedos`] loads and verifies the 27 embedded FreeDOS payloads
 //! (`ExtractFreeDOS`, `src/dos.c:344-403`): the `COMMAND.COM` /
 //! `KERNEL.SYS` pair for the target root plus the 25 `LOCALE\` files —
-//! pure loading, no writes, so the install flow is a later slice.
-//! Wiring these installers into the copy and pipeline paths is a later
+//! pure loading, so the file install flow is a later slice — and
+//! writes the FreeDOS FAT32 boot record through the BPB-preserving
+//! graft, deliberately preserving (not blanking) the FSInfo and
+//! sector 2 (see its module docs). [`records`] holds the two
+//! transcribed ms-sys FAT32 boot records (FreeDOS and KolibriOS) plus
+//! the sector-0-only [`write`](records::write) seam: 11-byte head,
+//! 430-byte body, `55 AA` tail, with the `0x0B..0x5A` BPB window left
+//! as placeholders for the graft. Wiring these installers into the
+//! copy and pipeline paths is a later
 //! slice, and no stick has been booted on hardware.
 
 pub mod dos_locale;
@@ -44,6 +51,7 @@ pub mod grub2;
 pub mod grub4dos;
 pub mod kolibri;
 pub mod msdos;
+pub mod records;
 pub mod syslinux;
 
 use std::path::Path;

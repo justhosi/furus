@@ -27,17 +27,23 @@
 //! (FAT16) / `0x40` (FAT32) of sector 0 of the volume — the `BS_DrvNum`
 //! field, not the MBR partition-entry active flag.
 //!
-//! Honest gap: this project has the `MTLD_F32` copy but no embedded
-//! KolibriOS boot record — the record is code inside `FUN_140075d80`,
-//! not an RCDATA resource, and `assets/` is frozen — so this slice
-//! places the loader and writes nothing to sector 0. Without that boot
-//! record a KolibriOS stick will not boot, and sourcing the payload is
-//! a separate decision. [`locate`] finds the loader in the image and
-//! [`install_loader`] writes it at the volume root. Nothing here
-//! flushes: the caller owns the flush, the same convention as
+//! That record lives in this project now: [`install_boot_record`]
+//! writes the [`records`](super::records) transcription of the
+//! `FUN_140075d80` payload through the BPB-preserving graft, so a
+//! stick from this slice carries both the loader and its boot record.
+//! Two honest notes stay. First, the graft keeps the volume's own
+//! `0x0B..0x5A` BPB window, so the volume label is preserved rather
+//! than replaced with the reference's `NO NAME    `. Second, only
+//! sector 0 is written: the reference writes nothing past it for this
+//! record (unlike the FreeDOS one, which also touches sectors 1-2 —
+//! see [`freedos`](super::freedos)), and the FAT32 backup boot sector
+//! keeps the formatter's image. [`locate`] finds the loader in the
+//! image and [`install_loader`] writes it at the volume root. Nothing
+//! here flushes: the caller owns the flush, the same convention as
 //! [`install_companions`](super::syslinux::install_companions) and
 //! [`install_payloads`](super::syslinux::install_payloads).
 
+use super::records;
 use super::syslinux::read_capped;
 use crate::copy::Source;
 use crate::error::CoreError;
@@ -207,6 +213,20 @@ pub fn install_loader(fat: &mut Fat32, loader: &[u8]) -> Result<Installed> {
     fat.create_file(DEST_PATH, bytes)?;
     fat.write_at(DEST_PATH, 0, loader)?;
     Ok(Installed { bytes, kept: false })
+}
+
+/// Write the KolibriOS FAT32 boot record onto the volume's boot
+/// sector: the `FUN_140075d80` payload as transcribed in
+/// [`records`](super::records) (head at `0x0`, the `MTLD_F32` boot
+/// code at `0x52`, `55 AA` at `0x1FE`).
+///
+/// Goes through the BPB-preserving graft
+/// ([`records::write`](super::records::write)): the record's entry
+/// and code win, the volume's own `0x0B..0x5A` geometry — volume
+/// label included — survives, and sectors 1 and 2 are untouched. Does
+/// not flush: the caller owns the flush.
+pub fn install_boot_record(fat: &mut Fat32) -> Result<()> {
+    records::write(fat, &records::kolibri_fat32())
 }
 
 #[cfg(test)]
@@ -673,6 +693,106 @@ mod tests {
         assert!(
             output.status.success(),
             "fsck.fat -n exits 0 after the loader write ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    /// A copy of one 512-byte sector of the image under test.
+    fn sector(backing: &SharedVolume, index: usize) -> [u8; 512] {
+        let borrowed = backing.bytes.borrow();
+        let start = index.checked_mul(512).expect("the test offset fits");
+        let window = borrowed
+            .get(start..start + 512)
+            .expect("the test sector fits");
+        let mut sector = [0u8; 512];
+        sector.copy_from_slice(window);
+        sector
+    }
+
+    #[test]
+    fn install_boot_record_writes_the_kolibri_sector() {
+        // The record proof on a real 64 MiB image: the payload head
+        // and code land through the graft, the whole `0x0B..0x5A` BPB
+        // window (label included) survives byte-identical — the graft
+        // takes only the record's `0x00..0x0B` entry and `0x5A..0x1FE`
+        // code, so the payload legitimately owns exactly those two
+        // windows — the `55 AA` tail closes the sector, sectors 1
+        // (FSInfo) and 2 are byte-identical to before the call, a
+        // second write changes nothing, and the jump really moved off
+        // the formatter's own `EB 3C 90` (the OEM name is `MSWIN4.1`
+        // on both sides, so the jump — not the OEM — is the
+        // discriminator). The dumped image is `fsck.fat` clean; the
+        // tool resolves through `PATH` and the test skips when absent.
+        let (backing, mut fat) = formatted();
+        fat.flush().expect("the pre-write flush runs");
+        let before = sector(&backing, 0);
+        let before_fsinfo = sector(&backing, 1);
+        let before_second = sector(&backing, 2);
+        install_boot_record(&mut fat).expect("the record writes");
+        let record = crate::boot::records::kolibri_fat32();
+        let after = sector(&backing, 0);
+        assert_eq!(
+            &after[0..11],
+            &record[0..11],
+            "the payload jump and oem name win"
+        );
+        assert_eq!(
+            &after[11..90],
+            &before[11..90],
+            "the graft keeps the whole bpb window, label included"
+        );
+        assert_eq!(
+            &after[90..510],
+            &record[90..510],
+            "the boot code is the payload's"
+        );
+        assert_eq!(
+            &after[510..512],
+            &[0x55, 0xAA],
+            "the signature closes the sector"
+        );
+        assert_eq!(
+            sector(&backing, 1),
+            before_fsinfo,
+            "the write preserves the fsinfo sector"
+        );
+        assert_eq!(
+            sector(&backing, 2),
+            before_second,
+            "the write preserves sector 2"
+        );
+        assert_eq!(
+            &before[0..3],
+            &[0xEB, 0x3C, 0x90],
+            "the formatter's own jump"
+        );
+        assert_eq!(
+            &after[0..3],
+            &[0xEB, 0x58, 0x90],
+            "the payload jump replaces it"
+        );
+        install_boot_record(&mut fat).expect("the second write runs");
+        assert_eq!(sector(&backing, 0), after, "a second write changes nothing");
+        fat.flush().expect("the caller-side flush runs");
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let image = scratch.path().join("kolibri-record.img");
+        std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
+        let output = match std::process::Command::new("fsck.fat")
+            .arg("-n")
+            .arg(&image)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "fsck.fat -n exits 0 after the record write ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
             output.status
         );
     }
