@@ -1,8 +1,9 @@
 //! FAT32 boot records for the FreeDOS and KolibriOS sticks: the two
 //! ms-sys payloads Rufus writes through `write_fat_32_fd_br` and
 //! `write_fat_32_kos_br` (`src/ms-sys/fat32.c`), called from
-//! `src/format.c:1033` (FreeDOS, with `bKeepLabel = 0`) and from
-//! `FUN_140075d80` (KolibriOS).
+//! `src/format.c:1033` (FreeDOS, with `bKeepLabel = 0`) and
+//! `src/format.c:1037` (KolibriOS). `FUN_140075d80` carries the same
+//! KolibriOS record inlined rather than calling ms-sys.
 //!
 //! Provenance, stated exactly so the transcription stays checkable.
 //! Both bodies below were transcribed programmatically from the
@@ -44,13 +45,15 @@
 //! volume, never this one.
 //!
 //! Sector-0-only rule. The FreeDOS reference additionally rewrites
-//! sector 1 with ms-sys's blank FSInfo (`free_count = 0`) and zeroes
-//! sector 2, purely so 1024/2048-byte-sector media see a boot
-//! signature at `0x3FE`/`0x5FE` (that is what ms-sys `is_fat_32_br`
-//! checks). Our volumes use 512-byte sectors, the BIOS loads only
-//! sector 0, and our FSInfo carries the real free-cluster counts — so
-//! [`write`] preserves sectors 1 and 2 instead of clobbering them
-//! (see [`freedos`](super::freedos) for the full reasoning).
+//! sector 1 from its header's FSInfo image and zeroes sector 2,
+//! purely so 1024/2048-byte-sector media see a boot signature at
+//! `0x3FE`/`0x5FE` (that is what ms-sys `is_fat_32_br` checks) — but
+//! it leaves the 8 FSInfo count bytes at absolute `0x3E8..0x3F0`
+//! unwritten, so the formatter's real free-cluster counts survive
+//! there. Our volumes use 512-byte sectors and the BIOS loads only
+//! sector 0 — so [`write`] preserves sectors 1 and 2 instead of
+//! rewriting them (see [`freedos`](super::freedos) for the full
+//! reasoning).
 //!
 //! The FreeDOS FAT16 record is out of scope: this project formats
 //! FAT32 only (see `fs/fat32/geometry.rs`, which refuses FAT16

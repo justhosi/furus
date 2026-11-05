@@ -29,13 +29,13 @@
 //! byte-exact `CONFIG.SYS`/`AUTOEXEC.BAT` contents (`SetDOSLocale`):
 //! pure planning, no writes — placing the files on a stick is a later
 //! slice.
-//! [`freedos`] loads and verifies the 27 embedded FreeDOS payloads
-//! (`ExtractFreeDOS`, `src/dos.c:344-403`): the `COMMAND.COM` /
-//! `KERNEL.SYS` pair for the target root plus the 25 `LOCALE\` files —
-//! pure loading, so the file install flow is a later slice — and
-//! writes the FreeDOS FAT32 boot record through the BPB-preserving
-//! graft, deliberately preserving (not blanking) the FSInfo and
-//! sector 2 (see its module docs). [`records`] holds the two
+//! [`freedos`] installs a complete FreeDOS volume (`ExtractFreeDOS`,
+//! `src/dos.c:344-403`): the `COMMAND.COM` / `KERNEL.SYS` pair at the
+//! target root plus the 25 `LOCALE\` files, the `CONFIG.SYS` /
+//! `AUTOEXEC.BAT` pair [`dos_locale`] plans, and the FreeDOS FAT32
+//! boot record through the BPB-preserving graft, deliberately
+//! preserving (not rewriting) the FSInfo and sector 2 (see its module
+//! docs). [`records`] holds the two
 //! transcribed ms-sys FAT32 boot records (FreeDOS and KolibriOS) plus
 //! the sector-0-only [`write`](records::write) seam: 11-byte head,
 //! 430-byte body, `55 AA` tail, with the `0x0B..0x5A` BPB window left

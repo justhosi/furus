@@ -1,5 +1,29 @@
-//! FreeDOS payloads: the 27 embedded files `ExtractFreeDOS` copies onto
-//! the stick (`src/dos.c:344-403`, resource ids `src/resource.h:34-60`).
+//! FreeDOS install: the 27 embedded payloads, the `CONFIG.SYS` /
+//! `AUTOEXEC.BAT` pair and the FAT32 boot record — a complete FreeDOS
+//! volume from [`install`].
+//!
+//! Reference behaviour (`ExtractFreeDOS`, `src/dos.c:344-403`): the
+//! reference creates `LOCALE\` on the target, writes the first two
+//! resources (`COMMAND.COM`, `KERNEL.SYS`) to the target root with
+//! hidden+system attributes and the other 25 into `LOCALE\` with
+//! normal attributes (`(i<2) ? path : locale_path`, `src/dos.c:344-381`),
+//! then finishes with `SetDOSLocale(path, TRUE)` (`src/dos.c:403`),
+//! which plans the keyboard/codepage/EGA choice and the byte-exact
+//! `CONFIG.SYS` / `AUTOEXEC.BAT` contents (see
+//! [`dos_locale`](super::dos_locale)). The boot record lands where
+//! `WritePBR` puts it (`src/format.c:1006-1040`, the `BT_FREEDOS`
+//! branch at `:1033`). [`install`] follows that order — the payloads
+//! in id order, then the locale files, then the record — and the
+//! record goes through the BPB-preserving graft
+//! ([`records::write`](super::records::write)): the record's entry and
+//! code win, the volume's own `0x0B..0x5A` geometry — volume label
+//! included — survives, and sectors 1 (FSInfo) and 2 are untouched.
+//! The boot record runs last, the same invariant every installer in
+//! this crate keeps: a refusal anywhere earlier (a foreign file in the
+//! way) leaves sector 0 with the formatter's record, never a
+//! half-bootable stick. Nothing here flushes: the caller owns the
+//! flush, the same convention as the [`kolibri`](super::kolibri) and
+//! [`msdos`](super::msdos) installers.
 //!
 //! The set is the FreeDOS kernel (`KERNEL.SYS`), its shell
 //! (`COMMAND.COM`), the `DISPLAY.EXE` / `KEYB.EXE` / `MODE.COM`
@@ -19,16 +43,19 @@
 //! and fails on any drift, so a manifest regeneration must update this
 //! enum in lockstep.
 //!
-//! Install semantics, for the slice that consumes this table
-//! (`ExtractFreeDOS`, `src/dos.c:344-403`): the reference creates
-//! `LOCALE\` on the target, writes the first two resources
-//! (`COMMAND.COM`, `KERNEL.SYS`) to the target root with hidden+system
-//! attributes and the other 25 into `LOCALE\` with normal attributes
-//! (`(i<2) ? path : locale_path`, `src/dos.c:344-381`), then finishes
-//! with `SetDOSLocale(path, TRUE)` (`src/dos.c:403`). Declared gap: our
+//! Layout, matching the reference exactly: [`FreeDosFile::destination`]
+//! sends the first two resources to the target root and the other 25
+//! into `LOCALE\` (`(i<2) ? path : locale_path`, `src/dos.c:377`).
+//! Every write keeps the keep-if-identical policy of
+//! [`install_loader`](super::kolibri::install_loader): a file already
+//! present with byte-identical content counts as kept and nothing is
+//! written; differing bytes refuse naming the file. (The reference
+//! overwrites with `CREATE_ALWAYS`; this crate never overwrites a
+//! foreign DOS file.) Declared gap: our
 //! [`Fat32`](crate::fs::fat32::Fat32) `create_file` carries no attribute
 //! parameter (every entry takes the plain archive attribute), so the
-//! hidden+system marks cannot be reproduced through that API yet.
+//! reference's hidden+system marks on `COMMAND.COM` / `KERNEL.SYS`
+//! cannot be reproduced through that API yet.
 //!
 //! Two naming notes, both verified against the `v4.15` tag. First, id 320
 //! really is `EGA12.CPX` with the extension: that is the spelling in the
@@ -46,7 +73,10 @@
 //! (`MODE.COM`, 16244 bytes, `u_len` 30736; libmagic `UPX compressed,
 //! uncompressed 30736 bytes`) yet the manifest calls it `FreeDOS boot
 //! sector / loader stub`, which is also wrong — and that is exactly why
-//! the boot record is not in this set (see below). The `UPX!` bytes are
+//! the boot record is not in this set: boot-record handling comes from
+//! ms-sys, per `license.h`, so the record lives in
+//! [`records`](super::records) instead, transcribed from the ms-sys
+//! headers. The `UPX!` bytes are
 //! a real UPX header, not a stray string: the stub, the UPX header and
 //! `c_len` together account for the file length — `EGA.CPX` 6464 = 36-byte
 //! stub + header + `c_len` 6312 (residual 152), id 320 8119 = 36 + header +
@@ -58,25 +88,27 @@
 //! the packed bytes verbatim and FreeDOS's own tools decompress them on
 //! the target.
 //!
-//! What this module is not: it only loads and verifies — the file
-//! install flow and the `SetDOSLocale(path, TRUE)` call belong to a
-//! later slice. The FreeDOS boot record is not among these resources
-//! either (boot-record handling comes from ms-sys, per `license.h`)
-//! — it lives in [`records`](super::records) instead, transcribed
-//! from the ms-sys headers, and [`install_boot_record`] writes its
-//! sector-0 image through the BPB-preserving graft.
+//! Honest limits that remain. FAT attributes (hidden+system on
+//! `COMMAND.COM` / `KERNEL.SYS`) cannot be set because
+//! [`Fat32`](crate::fs::fat32::Fat32) `create_file` takes no attribute
+//! parameter. FAT16 media are out of scope: this crate formats FAT32
+//! only. And the record is verified by transcription plus `fsck.fat`,
+//! never by booting — there is no QEMU on this host, so no stick has
+//! booted on hardware.
 //!
 //! One deliberate divergence from the reference, stated plainly.
 //! `write_fat_32_fd_br` (`src/ms-sys/fat32.c:101-125`, called with
-//! `bKeepLabel = 0`) also rewrites sector 1 with ms-sys's *blank*
-//! FSInfo (`free_count = 0`, from `br_fat32fd_0x52.h`'s last 488 bytes
-//! plus `br_fat32fd_0x3f0.h`) and zeroes sector 2 except `55 AA` —
-//! purely so 1024/2048-byte-sector media see a boot signature at
-//! `0x3FE`/`0x5FE` (that is what ms-sys `is_fat_32_br` checks). Our
-//! volumes use 512-byte sectors, the BIOS loads only sector 0, and
-//! our FSInfo carries the real free-cluster counts, so
+//! `bKeepLabel = 0`) also rewrites sector 1 from its header's FSInfo
+//! image and zeroes sector 2 except `55 AA` — purely so
+//! 1024/2048-byte-sector media see a boot signature at `0x3FE`/`0x5FE`
+//! (that is what ms-sys `is_fat_32_br` checks) — but it deliberately
+//! leaves the 8 FSInfo count bytes at absolute `0x3E8..0x3F0`
+//! unwritten (`Cluster information is not overwritten`, says the
+//! ms-sys comment: it writes `0x52..0x3E8` and `0x3F0..0x600`), so the
+//! formatter's real free-cluster counts survive there. Our volumes use
+//! 512-byte sectors, the BIOS loads only sector 0, and
 //! [`install_boot_record`] preserves both sectors instead of
-//! clobbering them. This is a fidelity difference with a reason, not
+//! rewriting them. This is a fidelity difference with a reason, not
 //! an omission. The FreeDOS FAT16 record is out of scope: this project
 //! formats FAT32 only.
 //!
@@ -84,6 +116,7 @@
 
 use std::path::Path;
 
+use super::dos_locale;
 use super::records;
 use crate::error::CoreError;
 use crate::error::Result;
@@ -525,9 +558,247 @@ pub fn install_boot_record(fat: &mut Fat32) -> Result<()> {
     records::write(fat, &records::freedos_fat32())
 }
 
+/// Directory holding the 25 locale payloads (`LOCALE\` of
+/// `ExtractFreeDOS`, `src/dos.c:369-372`): every [`FreeDosFile`] with
+/// [`Destination::Locale`] lands here.
+pub const LOCALE_DIR: &str = "/LOCALE";
+
+/// The locale directory's bare name, for root-listing comparisons.
+pub const LOCALE_NAME: &str = "LOCALE";
+
+/// File name of the DOS configuration at the volume root.
+pub const CONFIG_SYS: &str = "CONFIG.SYS";
+
+/// File name of the DOS startup batch file at the volume root.
+pub const AUTOEXEC_BAT: &str = "AUTOEXEC.BAT";
+
+/// Destination path of `CONFIG.SYS` on the volume: the volume root.
+pub const CONFIG_SYS_PATH: &str = "/CONFIG.SYS";
+
+/// Destination path of `AUTOEXEC.BAT` on the volume: the volume root.
+pub const AUTOEXEC_BAT_PATH: &str = "/AUTOEXEC.BAT";
+
+/// One file [`install`] wrote: its volume name and byte count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrittenFile {
+    name: &'static str,
+    bytes: u64,
+}
+
+impl WrittenFile {
+    /// Volume file name (`COMMAND.COM`, `EGA.CPX`, `CONFIG.SYS`, ...).
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Bytes written.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// What [`install`] did: which files were written (each with its byte
+/// count), which were kept, and whether the boot record went down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    written: Vec<WrittenFile>,
+    kept: Vec<&'static str>,
+    record_written: bool,
+}
+
+impl Installed {
+    /// Files written, in install order, each with its byte count. Kept
+    /// files contribute no entry here.
+    #[must_use]
+    pub fn written(&self) -> &[WrittenFile] {
+        &self.written
+    }
+
+    /// Names of the files that already held byte-identical content and
+    /// were kept without a write, in install order.
+    #[must_use]
+    pub fn kept(&self) -> &[&str] {
+        &self.kept
+    }
+
+    /// Total bytes written (kept files contribute nothing).
+    #[must_use]
+    pub fn bytes_written(&self) -> u64 {
+        self.written.iter().map(WrittenFile::bytes).sum()
+    }
+
+    /// Whether the boot record was grafted onto sector 0. Always true
+    /// on success: the record write is unconditional and runs last, so
+    /// a repeat install rewrites the same bytes rather than skipping
+    /// them.
+    #[must_use]
+    pub fn record_written(&self) -> bool {
+        self.record_written
+    }
+}
+
+/// Create `LOCALE` at the volume root when it is absent.
+///
+/// The [`install_companions`](super::syslinux::install_companions)
+/// idiom: the root listing decides, so an existing directory is left
+/// alone and a second install never recreates it. A root entry of that
+/// name that is a file refuses naming it instead of failing inside
+/// `mkdir` or the later locale writes.
+fn ensure_locale_dir(fat: &mut Fat32) -> Result<()> {
+    let root = fat.list_dir("/")?;
+    match root.iter().find(|entry| {
+        entry.name.eq_ignore_ascii_case(LOCALE_NAME)
+            || entry.short_name.eq_ignore_ascii_case(LOCALE_NAME)
+    }) {
+        Some(entry) if entry.is_dir => Ok(()),
+        Some(_) => Err(CoreError::invalid(format!(
+            "freedos directory '{LOCALE_NAME}' already present at '/' as a file, not a directory: refusing"
+        ))),
+        None => {
+            fat.mkdir(LOCALE_DIR)?;
+            Ok(())
+        }
+    }
+}
+
+/// Place one file at `dest` inside `dir`: keep without a write when an
+/// entry of `name` (case-insensitive name or short name) already holds
+/// byte-identical content, refuse naming the file when it holds
+/// different bytes, else write `bytes` (`create_file` plus a
+/// zero-offset `write_at`).
+///
+/// Shared by the payload loop and the locale files, the same policy as
+/// [`install_loader`](super::kolibri::install_loader): silently
+/// keeping a foreign DOS file would boot it, so a conflict refuses
+/// instead.
+fn place(
+    fat: &mut Fat32,
+    dir: &str,
+    dest: &str,
+    name: &'static str,
+    bytes: &[u8],
+    written: &mut Vec<WrittenFile>,
+    kept: &mut Vec<&'static str>,
+) -> Result<()> {
+    let len = u64::try_from(bytes.len()).map_err(|_| {
+        CoreError::invalid(format!(
+            "freedos file '{name}' is longer than u64: refusing"
+        ))
+    })?;
+    let present = fat.list_dir(dir)?.iter().any(|entry| {
+        entry.name.eq_ignore_ascii_case(name) || entry.short_name.eq_ignore_ascii_case(name)
+    });
+    if present {
+        let back = fat.read_file(dest)?;
+        if back.as_slice() == bytes {
+            kept.push(name);
+            return Ok(());
+        }
+        return Err(CoreError::invalid(format!(
+            "freedos file '{name}' already present at '{dir}' differs from the installer copy: refusing to overwrite it"
+        )));
+    }
+    fat.create_file(dest, len)?;
+    fat.write_at(dest, 0, bytes)?;
+    written.push(WrittenFile { name, bytes: len });
+    Ok(())
+}
+
+/// Install a complete FreeDOS volume: the 27 payloads in id order (the
+/// two [`Destination::Root`] files at `/COMMAND.COM` and `/KERNEL.SYS`,
+/// the 25 [`Destination::Locale`] files under `/LOCALE`), then the
+/// locale files [`dos_locale::plan`] renders for
+/// [`DosFlavor::FreeDos`](dos_locale::DosFlavor) (`/CONFIG.SYS` when
+/// the plan carries one, `/AUTOEXEC.BAT` always), then the boot record
+/// through [`records::write`](super::records::write).
+///
+/// The record runs last — the "boot record last" invariant every
+/// installer in this crate follows — so a refusal anywhere earlier
+/// leaves sector 0 with the formatter's record. A failure between
+/// files leaves a partial set behind (the torn-state window, the same
+/// as the [`msdos`](super::msdos) installer), but with no record down
+/// nothing is half-bootable. Does not flush: the caller owns the
+/// flush.
+pub fn install(fat: &mut Fat32, locale: &dos_locale::Locale) -> Result<Installed> {
+    install_from(fat, locale, &|file| file.load())
+}
+
+/// Install a complete FreeDOS volume, resolving the payloads through
+/// `load`.
+///
+/// The single loading path behind [`install`] (which passes
+/// [`FreeDosFile::load`]): callers that resolve payloads differently —
+/// the tests point it at the asset tree without the runtime asset
+/// directory — inject that here instead of duplicating the install,
+/// the same seam as
+/// [`install_payloads_from`](super::syslinux::install_payloads_from).
+pub fn install_from(
+    fat: &mut Fat32,
+    locale: &dos_locale::Locale,
+    load: &dyn Fn(FreeDosFile) -> Result<Vec<u8>>,
+) -> Result<Installed> {
+    ensure_locale_dir(fat)?;
+    let mut written = Vec::new();
+    let mut kept: Vec<&'static str> = Vec::new();
+    for file in FreeDosFile::ALL {
+        let bytes = load(file)?;
+        let name = file.target_name();
+        match file.destination() {
+            Destination::Root => {
+                let dest = format!("/{name}");
+                place(fat, "/", &dest, name, &bytes, &mut written, &mut kept)?;
+            }
+            Destination::Locale => {
+                let dest = format!("{LOCALE_DIR}/{name}");
+                place(
+                    fat,
+                    LOCALE_DIR,
+                    &dest,
+                    name,
+                    &bytes,
+                    &mut written,
+                    &mut kept,
+                )?;
+            }
+        }
+    }
+    let plan = dos_locale::plan(dos_locale::DosFlavor::FreeDos, locale);
+    if let Some(config) = plan.config_sys() {
+        place(
+            fat,
+            "/",
+            CONFIG_SYS_PATH,
+            CONFIG_SYS,
+            config,
+            &mut written,
+            &mut kept,
+        )?;
+    }
+    place(
+        fat,
+        "/",
+        AUTOEXEC_BAT_PATH,
+        AUTOEXEC_BAT,
+        plan.autoexec_bat(),
+        &mut written,
+        &mut kept,
+    )?;
+    records::write(fat, &records::freedos_fat32())?;
+    Ok(Installed {
+        written,
+        kept,
+        record_written: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boot::dos_locale::DosFlavor;
+    use crate::boot::dos_locale::Locale;
+    use crate::boot::dos_locale::plan;
     use crate::fs::Volume;
     use crate::fs::fat32::format::FormatOptions;
     use crate::hash::Algo;
@@ -987,5 +1258,482 @@ mod tests {
             "fsck.fat -n exits 0 after the record write ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
             output.status
         );
+    }
+
+    /// Install through [`install_from`](super::install_from) with the
+    /// payloads read straight from the asset tree: the production
+    /// [`install`](super::install) resolves through the runtime asset
+    /// directory, which no test may depend on, so the tests inject
+    /// this loader instead (the same seam as
+    /// `syslinux::install_payloads_from`).
+    fn install_assets(fat: &mut Fat32, locale: &Locale) -> Result<Installed> {
+        let dir = resources_dir();
+        install_from(fat, locale, &|file| file.load_from(&dir))
+    }
+
+    /// Volume path of a payload: the root pair at `/`, the other 25
+    /// under `/LOCALE`.
+    fn payload_dest(file: FreeDosFile) -> String {
+        match file.destination() {
+            Destination::Root => format!("/{}", file.target_name()),
+            Destination::Locale => format!("/LOCALE/{}", file.target_name()),
+        }
+    }
+
+    /// The 25 locale payload names in id order, the exact `/LOCALE`
+    /// listing a fresh install produces.
+    fn locale_names() -> Vec<&'static str> {
+        FreeDosFile::ALL
+            .iter()
+            .filter(|file| file.destination() == Destination::Locale)
+            .map(|file| file.target_name())
+            .collect()
+    }
+
+    /// Dump the image under test and require `fsck.fat -n` (read-only)
+    /// to exit 0. The tool resolves through `PATH`; when it is absent
+    /// the test skips. The caller flushes first: nothing in this module
+    /// flushes, so the image dumps only what the caller published.
+    fn assert_fsck_clean(backing: &SharedVolume, name: &str) {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let image = scratch.path().join(name);
+        std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
+        let output = match std::process::Command::new("fsck.fat")
+            .arg("-n")
+            .arg(&image)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "fsck.fat -n exits 0 after the freedos install ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    #[test]
+    fn install_us_builds_the_full_volume() {
+        // End to end with the US locale (the 437/US special case, so no
+        // CONFIG.SYS): the root holds the pair, the echo-only
+        // AUTOEXEC.BAT and LOCALE; LOCALE holds exactly the 25 locale
+        // payload names; every payload reads back byte-identical to its
+        // asset; AUTOEXEC.BAT equals the plan bytes; the boot record
+        // lands through the graft with sectors 1-2 untouched; and the
+        // image is fsck clean.
+        let locale = Locale::us();
+        let planned = plan(DosFlavor::FreeDos, &locale);
+        assert!(
+            planned.config_sys().is_none(),
+            "the US plan carries no CONFIG.SYS"
+        );
+        let (backing, mut fat) = formatted();
+        fat.flush().expect("the pre-install flush runs");
+        let before = sector(&backing, 0);
+        let before_fsinfo = sector(&backing, 1);
+        let before_second = sector(&backing, 2);
+        let done = install_assets(&mut fat, &locale).expect("the install runs");
+        assert!(done.kept().is_empty(), "a fresh install keeps nothing");
+        assert!(done.record_written(), "the record went down");
+        // The report: the 27 payloads in id order, then AUTOEXEC.BAT —
+        // no CONFIG.SYS, because the plan carries none.
+        let mut want: Vec<&str> = FreeDosFile::ALL
+            .iter()
+            .map(|file| file.target_name())
+            .collect();
+        want.push(AUTOEXEC_BAT);
+        let written: Vec<&str> = done.written().iter().map(|file| file.name()).collect();
+        assert_eq!(
+            written, want,
+            "every payload plus AUTOEXEC.BAT wrote in order"
+        );
+        for (file, entry) in FreeDosFile::ALL.iter().zip(done.written().iter()) {
+            assert_eq!(
+                entry.bytes(),
+                file.size(),
+                "the report counts the {} bytes",
+                file.target_name()
+            );
+        }
+        let autoexec = done.written().last().expect("AUTOEXEC.BAT wrote");
+        assert_eq!(
+            autoexec.name(),
+            AUTOEXEC_BAT,
+            "the last write is AUTOEXEC.BAT"
+        );
+        assert_eq!(
+            autoexec.bytes(),
+            planned.autoexec_bat().len() as u64,
+            "the report counts the AUTOEXEC.BAT bytes"
+        );
+        let total: u64 = FreeDosFile::ALL
+            .iter()
+            .map(|file| file.size())
+            .sum::<u64>()
+            .checked_add(planned.autoexec_bat().len() as u64)
+            .expect("the byte total fits u64");
+        assert_eq!(
+            done.bytes_written(),
+            total,
+            "the total counts every written byte"
+        );
+        // The root holds the pair, the startup file and the locale
+        // directory — and no CONFIG.SYS.
+        let listed = fat.list_dir("/").expect("the root lists");
+        let mut shorts: Vec<&str> = listed
+            .iter()
+            .map(|entry| entry.short_name.as_str())
+            .collect();
+        shorts.sort_unstable();
+        assert_eq!(
+            shorts,
+            ["AUTOEXEC.BAT", "COMMAND.COM", "KERNEL.SYS", "LOCALE"],
+            "the root holds the pair, the startup file and LOCALE"
+        );
+        assert!(
+            fat.read_file("/CONFIG.SYS").is_err(),
+            "no CONFIG.SYS was created"
+        );
+        // LOCALE holds exactly the 25 locale payload names.
+        let listed = fat.list_dir("/LOCALE").expect("the locale lists");
+        let names: Vec<&str> = listed
+            .iter()
+            .map(|entry| entry.short_name.as_str())
+            .collect();
+        assert_eq!(names, locale_names(), "LOCALE holds the 25 locale files");
+        // Every payload reads back byte-identical to its asset.
+        for file in FreeDosFile::ALL {
+            let want =
+                std::fs::read(resources_dir().join(file.asset_file())).expect("the asset reads");
+            let back = fat
+                .read_file(&payload_dest(file))
+                .expect("the payload reads back");
+            assert_eq!(
+                back,
+                want,
+                "payload {} is byte-identical to its asset",
+                file.target_name()
+            );
+        }
+        let back = fat
+            .read_file("/AUTOEXEC.BAT")
+            .expect("AUTOEXEC.BAT reads back");
+        assert_eq!(
+            back,
+            planned.autoexec_bat(),
+            "AUTOEXEC.BAT equals the plan bytes"
+        );
+        // The record proof: the FreeDOS head and code land, the BPB
+        // window survives, the signature closes the sector, and sectors
+        // 1 (FSInfo, real counts kept) and 2 are byte-identical to
+        // before the call.
+        let after = sector(&backing, 0);
+        assert_eq!(
+            &after[0..3],
+            &[0xEB, 0x58, 0x90],
+            "the payload jump replaces the formatter's"
+        );
+        assert_eq!(&after[0x52..0x5A], b"FAT32   ", "the type string at 0x52");
+        assert_eq!(
+            &after[510..512],
+            &[0x55, 0xAA],
+            "the signature closes the sector"
+        );
+        assert_eq!(
+            &after[11..90],
+            &before[11..90],
+            "the graft keeps the whole bpb window, label included"
+        );
+        assert_eq!(
+            sector(&backing, 1),
+            before_fsinfo,
+            "the install preserves the fsinfo sector with its real counts"
+        );
+        assert_eq!(
+            sector(&backing, 2),
+            before_second,
+            "the install preserves sector 2"
+        );
+        fat.flush().expect("the caller-side flush runs");
+        assert_fsck_clean(&backing, "freedos-install.img");
+    }
+
+    #[test]
+    fn us_special_case_writes_no_config_sys() {
+        // The 437/US special case (`dos_locale.c:1008-1023`): the plan
+        // carries no CONFIG.SYS and the 93-byte echo-only AUTOEXEC.BAT,
+        // so the install writes no CONFIG.SYS anywhere.
+        let locale = Locale::us();
+        let planned = plan(DosFlavor::FreeDos, &locale);
+        assert!(
+            planned.config_sys().is_none(),
+            "the 437/US plan carries no CONFIG.SYS"
+        );
+        assert_eq!(
+            planned.autoexec_bat().len(),
+            93,
+            "the echo-only AUTOEXEC.BAT is 93 bytes"
+        );
+        let (_backing, mut fat) = formatted();
+        let done = install_assets(&mut fat, &locale).expect("the install runs");
+        let listed = fat.list_dir("/").expect("the root lists");
+        assert!(
+            listed.iter().all(|entry| entry.short_name != "CONFIG.SYS"),
+            "the root has no CONFIG.SYS"
+        );
+        assert!(
+            fat.read_file("/CONFIG.SYS").is_err(),
+            "no CONFIG.SYS was created"
+        );
+        let back = fat
+            .read_file("/AUTOEXEC.BAT")
+            .expect("AUTOEXEC.BAT reads back");
+        assert_eq!(
+            back,
+            planned.autoexec_bat(),
+            "AUTOEXEC.BAT is the 93-byte echo form"
+        );
+        assert_eq!(back.len(), 93, "the echo form stays 93 bytes on disk");
+        assert!(
+            done.written()
+                .iter()
+                .all(|file| file.name() != "CONFIG.SYS"),
+            "the report writes no CONFIG.SYS"
+        );
+        assert!(
+            done.kept().iter().all(|kept| *kept != "CONFIG.SYS"),
+            "the report keeps no CONFIG.SYS"
+        );
+    }
+
+    #[test]
+    fn non_us_locale_writes_byte_exact_dos_files() {
+        // German keyboard with a Latin-1 OEM codepage: exercises the
+        // FreeDOS 850-to-858 upgrade, so CONFIG.SYS and AUTOEXEC.BAT
+        // must equal the plan byte for byte and the startup file must
+        // name the upgraded codepage, the locale EGA file and the
+        // keyboard driver the plan picked.
+        let locale = Locale {
+            keyboard_id: 0x0407,
+            system_language_id: 0x0409,
+            oem_codepage: 850,
+        };
+        let planned = plan(DosFlavor::FreeDos, &locale);
+        assert_eq!(planned.keyboard(), "gr", "German survives");
+        assert_eq!(planned.codepage(), 858, "the 850 upgrade lands");
+        assert_eq!(planned.ega_file(), "ega.cpx", "the EGA file");
+        let config = planned
+            .config_sys()
+            .expect("a non-US plan carries CONFIG.SYS");
+        let (_backing, mut fat) = formatted();
+        let done = install_assets(&mut fat, &locale).expect("the install runs");
+        let back = fat.read_file("/CONFIG.SYS").expect("CONFIG.SYS reads back");
+        assert_eq!(back, config, "CONFIG.SYS is byte-exact");
+        let back = fat
+            .read_file("/AUTOEXEC.BAT")
+            .expect("AUTOEXEC.BAT reads back");
+        assert_eq!(back, planned.autoexec_bat(), "AUTOEXEC.BAT is byte-exact");
+        let text = String::from_utf8(back).expect("AUTOEXEC.BAT is ASCII text");
+        assert!(
+            text.contains("((858) \\locale\\ega.cpx)"),
+            "the prepare line names the upgraded codepage and EGA file: {text}"
+        );
+        assert!(
+            text.contains("keyb gr,,\\locale\\keyboard.sys"),
+            "the keyb line names the keyboard and driver: {text}"
+        );
+        // MODE.COM and the EGA fonts land in LOCALE (payload ids 304
+        // and 309-326 ride Destination::Locale), byte-identical to
+        // their assets.
+        for file in [FreeDosFile::ModeCom, FreeDosFile::Ega] {
+            let want =
+                std::fs::read(resources_dir().join(file.asset_file())).expect("the asset reads");
+            let back = fat
+                .read_file(&payload_dest(file))
+                .expect("the locale file reads back");
+            assert_eq!(
+                back,
+                want,
+                "locale file {} is byte-identical to its asset",
+                file.target_name()
+            );
+        }
+        let listed = fat.list_dir("/").expect("the root lists");
+        assert!(
+            listed.iter().any(|entry| entry.short_name == "CONFIG.SYS"),
+            "a non-US root carries CONFIG.SYS"
+        );
+        assert!(
+            done.written()
+                .iter()
+                .any(|file| file.name() == "CONFIG.SYS"),
+            "the report counts CONFIG.SYS as written"
+        );
+        assert!(
+            done.written()
+                .iter()
+                .any(|file| file.name() == "AUTOEXEC.BAT"),
+            "the report counts AUTOEXEC.BAT as written"
+        );
+    }
+
+    #[test]
+    fn second_install_keeps_everything() {
+        // A second install over identical bytes keeps all 28 files
+        // (the 27 payloads plus AUTOEXEC.BAT; the US plan has no
+        // CONFIG.SYS): nothing writes, nothing refuses.
+        let locale = Locale::us();
+        let (_backing, mut fat) = formatted();
+        let first = install_assets(&mut fat, &locale).expect("the first install runs");
+        assert!(first.kept().is_empty(), "a fresh install keeps nothing");
+        let again = install_assets(&mut fat, &locale).expect("identical bytes are kept");
+        assert!(
+            again.written().is_empty(),
+            "nothing writes twice: {:?}",
+            again.written()
+        );
+        assert_eq!(
+            again.bytes_written(),
+            0,
+            "no byte written means a zero total"
+        );
+        let mut want: Vec<&str> = FreeDosFile::ALL
+            .iter()
+            .map(|file| file.target_name())
+            .collect();
+        want.push(AUTOEXEC_BAT);
+        assert_eq!(
+            again.kept(),
+            want.as_slice(),
+            "the second install keeps all 28 files in order"
+        );
+        assert!(
+            again.record_written(),
+            "the record rewrite still runs (it is unconditional)"
+        );
+        let want = std::fs::read(resources_dir().join(FreeDosFile::CommandCom.asset_file()))
+            .expect("the asset reads");
+        let back = fat
+            .read_file("/COMMAND.COM")
+            .expect("the kept file reads back");
+        assert_eq!(back, want, "kept bytes unchanged");
+    }
+
+    #[test]
+    fn differing_command_com_refuses() {
+        // A foreign `/COMMAND.COM` refuses naming the file and stays
+        // untouched — keeping it would boot a foreign shell.
+        let (_backing, mut fat) = formatted();
+        let foreign = b"foreign-command-bytes".to_vec();
+        fat.create_file("/COMMAND.COM", foreign.len() as u64)
+            .expect("a foreign file lands first");
+        fat.write_at("/COMMAND.COM", 0, &foreign)
+            .expect("the foreign write lands");
+        let error = install_assets(&mut fat, &Locale::us()).expect_err("differing bytes refuse");
+        let text = error.to_string();
+        assert!(text.contains("COMMAND.COM"), "names the file: {text}");
+        assert!(text.contains("differs"), "names the conflict: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        let back = fat.read_file("/COMMAND.COM").expect("the file still reads");
+        assert_eq!(back, foreign, "foreign bytes untouched");
+    }
+
+    #[test]
+    fn differing_locale_ega_refuses() {
+        // A foreign `/LOCALE/EGA.CPX` refuses naming the file and stays
+        // untouched. The earlier payloads land first (id order), so the
+        // refusal proves the sequence position, not just the policy.
+        let (_backing, mut fat) = formatted();
+        fat.mkdir("/LOCALE")
+            .expect("the locale directory lands first");
+        let foreign = b"foreign-ega-bytes".to_vec();
+        fat.create_file("/LOCALE/EGA.CPX", foreign.len() as u64)
+            .expect("a foreign file lands first");
+        fat.write_at("/LOCALE/EGA.CPX", 0, &foreign)
+            .expect("the foreign write lands");
+        let error = install_assets(&mut fat, &Locale::us()).expect_err("differing bytes refuse");
+        let text = error.to_string();
+        assert!(text.contains("EGA.CPX"), "names the file: {text}");
+        assert!(text.contains("differs"), "names the conflict: {text}");
+        assert!(text.contains("/LOCALE"), "names the directory: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        let back = fat
+            .read_file("/LOCALE/EGA.CPX")
+            .expect("the file still reads");
+        assert_eq!(back, foreign, "foreign bytes untouched");
+        let want = std::fs::read(resources_dir().join(FreeDosFile::CommandCom.asset_file()))
+            .expect("the asset reads");
+        let back = fat
+            .read_file("/COMMAND.COM")
+            .expect("the earlier payload reads back");
+        assert_eq!(
+            back, want,
+            "the id-ordered payloads before the conflict landed"
+        );
+    }
+
+    #[test]
+    fn locale_file_refusal_leaves_the_boot_sector() {
+        // Boot-record-last by construction: a refusal late in the
+        // sequence (a differing AUTOEXEC.BAT, the last file before the
+        // record) must leave sector 0 with the formatter's `EB 3C 90`,
+        // not the FreeDOS head.
+        let (backing, mut fat) = formatted();
+        let foreign = b"foreign-autoexec-bytes".to_vec();
+        fat.create_file("/AUTOEXEC.BAT", foreign.len() as u64)
+            .expect("a foreign file lands first");
+        fat.write_at("/AUTOEXEC.BAT", 0, &foreign)
+            .expect("the foreign write lands");
+        fat.flush().expect("the pre-install flush runs");
+        let before = sector(&backing, 0);
+        assert_eq!(
+            &before[0..3],
+            &[0xEB, 0x3C, 0x90],
+            "the formatter's own jump"
+        );
+        let error =
+            install_assets(&mut fat, &Locale::us()).expect_err("a differing AUTOEXEC.BAT refuses");
+        let text = error.to_string();
+        assert!(text.contains("AUTOEXEC.BAT"), "names the file: {text}");
+        assert!(text.contains("differs"), "names the conflict: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        fat.flush().expect("the post-refusal flush runs");
+        assert_eq!(
+            sector(&backing, 0),
+            before,
+            "sector 0 still carries the formatter's record"
+        );
+        let back = fat
+            .read_file("/AUTOEXEC.BAT")
+            .expect("the file still reads");
+        assert_eq!(back, foreign, "foreign bytes untouched");
+    }
+
+    #[test]
+    fn locale_path_as_file_refuses() {
+        // LOCALE as a plain file is not a directory to fill: the
+        // install refuses naming it and writes nothing behind it.
+        let (_backing, mut fat) = formatted();
+        let foreign = b"a file, not a directory".to_vec();
+        fat.create_file("/LOCALE", foreign.len() as u64)
+            .expect("a file lands first");
+        fat.write_at("/LOCALE", 0, &foreign)
+            .expect("the file writes");
+        let error = install_assets(&mut fat, &Locale::us()).expect_err("a file LOCALE refuses");
+        let text = error.to_string();
+        assert!(text.contains("LOCALE"), "names the path: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert!(
+            fat.read_file("/COMMAND.COM").is_err(),
+            "no payload landed behind the refusal"
+        );
+        let back = fat.read_file("/LOCALE").expect("the file still reads");
+        assert_eq!(back, foreign, "foreign bytes untouched");
     }
 }
