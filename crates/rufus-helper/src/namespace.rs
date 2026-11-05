@@ -75,6 +75,8 @@ mod tests {
 
     use super::enter_mount_namespace;
 
+    const THREAD_MOUNTINFO: &str = "/proc/thread-self/mountinfo";
+
     /// The kernel is the only judge of the grant: root (having
     /// `CAP_SYS_ADMIN`) gets the isolation, everyone else gets the
     /// abort. On current kernels this is exactly `unshare(2)`'s rule
@@ -103,6 +105,15 @@ mod tests {
     /// process). Needs real root for `unshare(CLONE_NEWNS)` and
     /// `mount(2)`; this repo's test runs are unprivileged, so it is
     /// skipped on purpose — never faked.
+    ///
+    /// The reads below use `/proc/thread-self/mountinfo` on purpose:
+    /// `unshare(CLONE_NEWNS)` isolates only the calling thread while
+    /// `/proc/self` follows the thread-group leader, so a test body
+    /// running on a harness thread would read the host table through
+    /// the default. The argv pipeline unshares on the main thread and
+    /// may keep the default; the service worker unshares on its own
+    /// thread, so any read it makes must pass the thread-specific
+    /// path.
     #[ignore = "needs root: CAP_SYS_ADMIN for unshare(CLONE_NEWNS) + mount(2)"]
     #[test]
     fn a_mount_made_after_isolation_stays_inside_and_leaves_clean() {
@@ -122,7 +133,8 @@ mod tests {
                 .iter()
                 .any(|entry| entry.fstype == "tmpfs" && entry.mountpoint == target)
         };
-        let before = MountTable::read(None).expect("mountinfo of the isolated namespace");
+        let before = MountTable::read(Some(std::path::Path::new(THREAD_MOUNTINFO)))
+            .expect("mountinfo of the isolated namespace");
         assert!(
             mounted_at(&before),
             "the mount is visible inside the namespace: {:?}",
@@ -132,7 +144,8 @@ mod tests {
         recorder
             .unmount_all()
             .expect("the unmounted tmpfs leaves the table again");
-        let after = MountTable::read(None).expect("mountinfo after the sweep");
+        let after = MountTable::read(Some(std::path::Path::new(THREAD_MOUNTINFO)))
+            .expect("mountinfo after the sweep");
         assert!(
             !mounted_at(&after),
             "the recorder unmounted it: left, {:?}",

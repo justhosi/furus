@@ -122,7 +122,10 @@ impl MountTable {
 
     /// Read and parse a mountinfo file. `None` reads
     /// `/proc/self/mountinfo`; a fixture path parses the same table the
-    /// kernel's own `fs/proc_namespace.c` would print.
+    /// kernel's own `fs/proc_namespace.c` would print. `None` follows
+    /// the thread-group leader's namespace, so a caller that unshared
+    /// from a non-leader thread must pass the thread-specific path
+    /// (such as `/proc/thread-self/mountinfo`) instead.
     pub fn read(path: Option<&Path>) -> Result<Self> {
         let path = path.unwrap_or_else(|| Path::new(MOUNTINFO_PATH));
         let text = fs::read_to_string(path).map_err(|err| CoreError::io(path, err))?;
