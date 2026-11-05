@@ -26,8 +26,10 @@
 //! [`install_boot`] needs a 512-byte-sector disk and writes the MBR
 //! window plus the SBR; [`install_loader`] needs a FAT32 volume and
 //! writes `/grldr`; [`install`] loads both payloads from the runtime
-//! asset directory and delegates. The caller owns the post-MBR gap
-//! sizing just like GRUB2: the SBR must fit the disk past offset 512.
+//! asset directory and delegates. `install_boot` itself only checks
+//! the SBR against the disk end — the pipeline bounds it against the
+//! Mkpart-planned post-MBR gap before calling, so a record can never
+//! reach into the first partition.
 
 use crate::boot::Resource;
 use crate::boot::load;

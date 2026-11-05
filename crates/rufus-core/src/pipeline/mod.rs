@@ -14,7 +14,7 @@
 //! identifiers, so the CLI and the machine cannot drift apart.
 
 pub mod badblocks;
-pub mod bootloader;
+pub(crate) mod bootloader;
 pub(crate) mod decompress;
 pub mod event;
 pub mod mkfs;
