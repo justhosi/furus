@@ -17,7 +17,9 @@
 //! * `write` — validates the plan file (schema version + confirm
 //!   hash) and runs it through the S17 pipeline against the planned
 //!   device, or against the `--device-file` seam in tests; exit 7 only
-//!   for unwired bootloader modes and image kinds with no tree reader.
+//!   for unwired bootloader modes, image kinds with no tree reader,
+//!   and `Copy` plans run over the `--device-file` seam (no partition
+//!   node to mount).
 //!   `write`
 //!   is the one command whose failure goes to stderr in both modes:
 //!   `--json` streams one `Event` object per stdout line, so the
@@ -603,7 +605,9 @@ enum Command {
     /// With --plan the file is checked (schema version + confirm hash)
     /// and then run through the S17 pipeline: wipe, table, partition,
     /// format, write, bootloader, finalize. Mismatches exit 1; unwired
-    /// bootloader modes and image kinds with no tree reader exit 7. `--device-file` runs
+    /// bootloader modes, image kinds with no tree reader, and `Copy`
+    /// plans over `--device-file` (no partition node to mount) exit 7.
+    /// `--device-file` runs
     /// the same plan against a regular file instead of the planned
     /// device (a test seam; the planned device is never opened then).
     /// Failures report on stderr in both modes, so `--json` stdout

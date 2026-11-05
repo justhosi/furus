@@ -32,7 +32,7 @@ it must be ≥ 0x8006 bytes or the magic physically does not fit), runs the
 binary with the same flags, applies the same normalisations, recomputes
 `confirm` with `Plan::confirm()` and compares whole-JSON equality.
 
-## Regeneration (after a deliberate `PLAN_VERSION` bump)
+## Regeneration (after a reviewed plan-content change)
 
 ```sh
 python3 - <<'EOF'
@@ -56,5 +56,8 @@ EOF
 ```
 
 `cargo xtask size --write-baseline` style discipline applies: regenerate by
-hand when the schema changes, and the change must ship with a bumped
-`PLAN_VERSION` (see `rufus-proto` docs on field order and confirm hashes).
+hand when the plan schema changes **or** when a reviewed change to the
+plan's content changes the output (as happened when the bootloader step
+started pairing with the write mode, at the same schema version); a
+schema change must ship with a bumped `PLAN_VERSION` (see `rufus-proto`
+docs on field order and confirm hashes).
