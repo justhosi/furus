@@ -20,12 +20,17 @@
 //! root and writes nothing to sector 0: a KolibriOS stick also needs
 //! the `FUN_140075d80` boot record, which this project holds no
 //! embedded copy of, so a stick from this slice alone will not boot.
+//! [`msdos`] writes caller-supplied `IO.SYS` (contiguous, first),
+//! `MSDOS.SYS` and `COMMAND.COM` with the WinME jump patch applied
+//! where the bytes match, and writes nothing to sector 0: nothing is
+//! bundled, so a plain run carries no MS-DOS files at all.
 //! Wiring these installers into the copy and pipeline paths is a later
 //! slice, and no stick has been booted on hardware.
 
 pub mod grub2;
 pub mod grub4dos;
 pub mod kolibri;
+pub mod msdos;
 pub mod syslinux;
 
 use std::path::Path;
