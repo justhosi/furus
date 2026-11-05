@@ -15,12 +15,17 @@
 //! contiguous `ldlinux.sys` plus sector-map/ADV patch, companions,
 //! config wrapper, obsolete-module substitution); [`grub2`] installs a
 //! GRUB2 BIOS boot record and places a `grubx64.efi` image;
-//! [`grub4dos`] writes the GRUB4DOS MBR window, SBR and root `grldr`.
+//! [`grub4dos`] writes the GRUB4DOS MBR window, SBR and root `grldr`;
+//! [`kolibri`] places the KolibriOS `MTLD_F32` loader at the volume
+//! root and writes nothing to sector 0: a KolibriOS stick also needs
+//! the `FUN_140075d80` boot record, which this project holds no
+//! embedded copy of, so a stick from this slice alone will not boot.
 //! Wiring these installers into the copy and pipeline paths is a later
 //! slice, and no stick has been booted on hardware.
 
 pub mod grub2;
 pub mod grub4dos;
+pub mod kolibri;
 pub mod syslinux;
 
 use std::path::Path;

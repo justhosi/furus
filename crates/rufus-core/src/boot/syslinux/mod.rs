@@ -515,7 +515,7 @@ pub fn read_capped(
     };
     if size > max_bytes {
         return Err(CoreError::invalid(format!(
-            "syslinux read of '{}' is {size} bytes, past the {}: refusing",
+            "read of '{}' is {size} bytes, past the {}: refusing",
             ascii_safe(name),
             describe_cap(max_bytes),
         )));
@@ -580,7 +580,7 @@ pub fn read_capped(
         })?;
         if (out.len() as u64) > max_bytes {
             return Err(CoreError::invalid(format!(
-                "syslinux read of '{}' runs past the {}: refusing",
+                "read of '{}' runs past the {}: refusing",
                 ascii_safe(name),
                 describe_cap(max_bytes),
             )));
