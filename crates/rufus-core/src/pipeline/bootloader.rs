@@ -169,14 +169,15 @@ pub(crate) enum Installed {
     /// `None` mode: nothing written.
     Skipped,
     /// Syslinux family install: family and located directory, stage
-    /// size, companions written, config path, and log lines in
-    /// reference order (located directory, selection, then companion
-    /// cautions).
+    /// size, companions written and kept, config path, and log lines
+    /// in reference order (located directory, selection, companion
+    /// cautions, then kept-existing lines).
     Syslinux {
         family: Family,
         dir: String,
         stage_bytes: u64,
         companions: Vec<String>,
+        kept_companions: Vec<String>,
         config_path: String,
         messages: Vec<String>,
     },
@@ -388,11 +389,15 @@ fn install_syslinux(
     messages.extend(located.messages().iter().cloned());
     messages.extend(selection.messages().iter().cloned());
     messages.extend(placed.cautions.iter().cloned());
+    for name in &placed.kept {
+        messages.push(format!("  Kept existing '{name}'"));
+    }
     Ok(Installed::Syslinux {
         family: selection.family(),
         dir: target,
         stage_bytes: loader.stage_bytes(),
         companions: placed.written,
+        kept_companions: placed.kept,
         config_path: "/syslinux.cfg".to_string(),
         messages,
     })
@@ -659,15 +664,18 @@ pub(crate) fn run(
             dir,
             stage_bytes,
             companions,
+            kept_companions,
             config_path,
             ..
         } => {
+            // Kept files log per file through the install messages
+            // above; the summary counts every companion present.
+            let total = companions.len() + kept_companions.len();
             ctx.reporter.event(Event::Message {
                 level: "info",
                 text: format!(
-                    "installed {} Syslinux into '{dir}' ({} companions, config {config_path}, {stage_bytes} stage bytes)",
+                    "installed {} Syslinux into '{dir}' ({total} companions, config {config_path}, {stage_bytes} stage bytes)",
                     family.version(),
-                    companions.len(),
                 ),
             });
         }
@@ -2165,15 +2173,14 @@ mod end_to_end {
     }
 
     /// The mount stand-in: a real temp directory standing in for the
-    /// kernel mount, with `partition.img` materialising the partition
-    /// window bytes before the copy and writing them back on release.
-    /// No `mount(2)`, no privileges: the copy walk lands in the temp
-    /// directory (discarded for this Syslinux run — the bootloader
-    /// reads its payloads from the ISO tree, not from the mount), and
-    /// the round-tripped window proves the mount/release flow without
-    /// touching the kernel. A kernel mount would expose the live
-    /// filesystem instead; this shim only proves the copy has a real
-    /// writable directory and the window survives the round trip.
+    /// kernel mount. Before the copy, `partition.img` materialises the
+    /// partition window bytes; on release, the temp tree's contents
+    /// merge into the partition window through the real `Fat32` API
+    /// and the volume flushes. That merge is what proves the copy's
+    /// bytes round-trip into the partition window: a kernel mount
+    /// would expose the live filesystem instead, which no unprivileged
+    /// test can do, so the shim stands in for `mount(2)` without
+    /// calling it.
     struct MountShim {
         dir: tempfile::TempDir,
         path: std::path::PathBuf,
@@ -2222,16 +2229,75 @@ mod end_to_end {
                     self.len
                 )));
             }
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&self.path)
-                .map_err(|source| CoreError::io(&self.path, source))?;
-            file.write_all_at(&staged, self.base)
-                .map_err(|source| CoreError::io(&self.path, source))?;
-            file.sync_all()
-                .map_err(|source| CoreError::io(&self.path, source))?;
+            // Merge what the copy walk landed in the temp tree into
+            // the live window, then flush: this is the assertion
+            // surface that proves the copy's bytes reached the image.
+            // (The staged window above only guards the size now — the
+            // copy never touched the window, so there is nothing to
+            // restore from it.)
+            let mut fat = Fat32::open(Box::new(
+                PartFile::open(&self.path, self.base, self.len).expect("the merge window opens"),
+            ))
+            .expect("the merge volume opens");
+            merge_dir(&mut fat, self.dir.path(), "")?;
+            fat.flush()?;
             Ok(())
         }
+    }
+
+    /// Copy one temp-tree level into the FAT32 volume: directories are
+    /// created (when the listing misses them) before descending, files
+    /// are created and written whole, and only the shim's own
+    /// `partition.img` is skipped. Everything the walk produced lands —
+    /// including the companions, which the bootloader step then keeps
+    /// by byte comparison instead of refusing. Anything that is
+    /// neither a file nor a directory refuses — the fixture tree holds
+    /// no symlinks, and silently dropping one would hide a lost entry.
+    fn merge_dir(fat: &mut Fat32, fs_dir: &std::path::Path, fat_dir: &str) -> TestResult<()> {
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(fs_dir)
+            .map_err(|source| CoreError::io(fs_dir, source))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|source| CoreError::io(fs_dir, source))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in &entries {
+            let name = entry.file_name();
+            let name_str = name.to_str().ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "test mount entry '{}' is not UTF-8: refusing",
+                    name.to_string_lossy()
+                ))
+            })?;
+            if name_str == "partition.img" {
+                continue;
+            }
+            let dest = if fat_dir.is_empty() {
+                format!("/{name_str}")
+            } else {
+                format!("{fat_dir}/{name_str}")
+            };
+            let file_type = entry
+                .file_type()
+                .map_err(|source| CoreError::io(entry.path(), source))?;
+            if file_type.is_dir() {
+                match fat.list_dir(&dest) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        fat.mkdir(&dest)?;
+                    }
+                }
+                merge_dir(fat, &entry.path(), &dest)?;
+            } else if file_type.is_file() {
+                let bytes = std::fs::read(entry.path())
+                    .map_err(|source| CoreError::io(entry.path(), source))?;
+                fat.create_file(&dest, bytes.len() as u64)?;
+                fat.write_at(&dest, 0, &bytes)?;
+            } else {
+                return Err(CoreError::invalid(format!(
+                    "test mount entry '{dest}' is neither a file nor a directory: refusing"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Fixture opener over one disk image file: the device is a fresh
@@ -2484,6 +2550,16 @@ mod end_to_end {
             let back = fat.read_file(&path).expect("the companion reads back");
             assert_eq!(back, bytes, "{name} keeps the ISO bytes");
         }
+        // The copy's own output, merged into the image on release:
+        // this reads back out of the partition image, not the temp
+        // dir, so it fails if the merge ever drops the walk's files.
+        let back = fat
+            .read_file("/isolinux/isolinux.cfg")
+            .expect("the copied config reads back");
+        assert_eq!(
+            back, b"DEFAULT linux\n",
+            "the copy output survived the merge into the image"
+        );
         let back = fat
             .read_file("/syslinux.cfg")
             .expect("the wrapper reads back");

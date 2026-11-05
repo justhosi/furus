@@ -194,6 +194,9 @@ pub fn write_config(fat: &mut Fat32, text: &[u8]) -> Result<()> {
 pub struct CompanionInstall {
     /// Companion names written, in [`COMPANIONS`] order.
     pub written: Vec<String>,
+    /// Companion names already present with byte-identical content,
+    /// counted as kept and left unwritten, in [`COMPANIONS`] order.
+    pub kept: Vec<String>,
     /// One [`caution_for`] line per missing name, in [`COMPANIONS`]
     /// order.
     pub cautions: Vec<String>,
@@ -203,11 +206,15 @@ pub struct CompanionInstall {
 /// volume under `target_dir`.
 ///
 /// Each present name reads through [`read`] and lands at
-/// `target_dir/<name>` (`create_file` plus a zero-offset `write_at`),
-/// refusing to overwrite an existing file there. Missing names
-/// contribute their [`caution_for`] line and no file. `target_dir`
-/// itself is created with `mkdir` when it is not `/` and cannot be
-/// listed.
+/// `target_dir/<name>` (`create_file` plus a zero-offset `write_at`).
+/// An existing destination counts as kept — and nothing is written —
+/// when its bytes equal the image's copy: the copy step legitimately
+/// places these files first by walking the whole tree, so an
+/// identical file is the expected state, not a conflict. Differing
+/// bytes refuse naming the file, since silently keeping a foreign
+/// module would boot it. Missing names contribute their
+/// [`caution_for`] line and no file. `target_dir` itself is created
+/// with `mkdir` when it is not `/` and cannot be listed.
 ///
 /// The destination directory is a parameter because the payload
 /// directory varies per ISO (`/isolinux`, `/syslinux`, `/`, ...): the
@@ -233,6 +240,7 @@ pub fn install_companions(
         }
     }
     let mut written = Vec::new();
+    let mut kept = Vec::new();
     let mut cautions = Vec::new();
     for name in COMPANIONS {
         let Some(bytes) = read(source, dir, name)? else {
@@ -248,8 +256,17 @@ pub fn install_companions(
             entry.name.eq_ignore_ascii_case(name) || entry.short_name.eq_ignore_ascii_case(name)
         });
         if already {
+            // Byte-identical means satisfied: the copy step walks the
+            // whole tree, so it placed this file first. Anything else
+            // is a genuine conflict — keeping it would boot a module
+            // the image never shipped, so it refuses instead.
+            let back = fat.read_file(&dest)?;
+            if back == bytes {
+                kept.push(name.to_string());
+                continue;
+            }
             return Err(CoreError::invalid(format!(
-                "syslinux companion '{name}' is already present at '{target_dir}': refusing to overwrite it"
+                "syslinux companion '{name}' already present at '{target_dir}' differs from the image's copy: refusing to overwrite it"
             )));
         }
         let len = u64::try_from(bytes.len()).map_err(|_| {
@@ -261,7 +278,11 @@ pub fn install_companions(
         fat.write_at(&dest, 0, &bytes)?;
         written.push(name.to_string());
     }
-    Ok(CompanionInstall { written, cautions })
+    Ok(CompanionInstall {
+        written,
+        kept,
+        cautions,
+    })
 }
 
 #[cfg(test)]
@@ -652,12 +673,85 @@ mod tests {
             .expect("libutil reads back");
         assert_eq!(back, lib_bytes, "libutil bytes identical");
 
-        // An existing file refuses rather than overwrites.
+        // A second run over identical bytes keeps instead of
+        // refusing: the copy step legitimately places these first.
+        let again = install_companions(&mut fat, &source, &isolinux_dir(), "/isolinux")
+            .expect("identical bytes are kept");
+        assert!(
+            again.written.is_empty(),
+            "nothing writes twice: {:?}",
+            again.written
+        );
+        assert_eq!(
+            again.kept,
+            vec!["menu.c32".to_string(), "libutil.c32".to_string()],
+            "the present pair reports kept"
+        );
+        assert_eq!(again.cautions.len(), 2, "cautions repeat");
+    }
+
+    #[test]
+    fn install_companions_keeps_identical_bytes_untouched() {
+        // Pre-create one companion with exactly the image's bytes,
+        // leave the other absent: the run keeps the first, writes the
+        // second, and changes no byte of the first.
+        let (menu, menu_bytes) = file_entry(b"menu.c32", b"menu-bytes");
+        let (lib, lib_bytes) = file_entry(b"libutil.c32", b"lib-bytes");
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"isolinux")])
+            .with_dir(&[b"isolinux"], vec![menu, lib])
+            .with_file(&[b"isolinux", b"menu.c32"], &menu_bytes)
+            .with_file(&[b"isolinux", b"libutil.c32"], &lib_bytes);
+        let (_backing, mut fat) = formatted();
+        fat.mkdir("/isolinux").expect("the copy makes the dir");
+        fat.create_file("/isolinux/menu.c32", menu_bytes.len() as u64)
+            .expect("the copy lands first");
+        fat.write_at("/isolinux/menu.c32", 0, &menu_bytes)
+            .expect("the copy writes");
+        let done = install_companions(&mut fat, &source, &isolinux_dir(), "/isolinux")
+            .expect("identical bytes are kept");
+        assert_eq!(
+            done.written,
+            vec!["libutil.c32".to_string()],
+            "only the absent file writes"
+        );
+        assert_eq!(
+            done.kept,
+            vec!["menu.c32".to_string()],
+            "the identical file reports kept"
+        );
+        let back = fat
+            .read_file("/isolinux/menu.c32")
+            .expect("kept file reads back");
+        assert_eq!(back, menu_bytes, "kept bytes unchanged");
+    }
+
+    #[test]
+    fn install_companions_refuses_differing_bytes() {
+        // Pre-create one companion with foreign bytes: the run
+        // refuses naming it, writes nothing for it, and leaves the
+        // file untouched — keeping it would boot a foreign module.
+        let (menu, menu_bytes) = file_entry(b"menu.c32", b"menu-bytes");
+        let source = MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"isolinux")])
+            .with_dir(&[b"isolinux"], vec![menu])
+            .with_file(&[b"isolinux", b"menu.c32"], &menu_bytes);
+        let (_backing, mut fat) = formatted();
+        fat.mkdir("/isolinux").expect("the copy makes the dir");
+        fat.create_file("/isolinux/menu.c32", 7)
+            .expect("a foreign file lands first");
+        fat.write_at("/isolinux/menu.c32", 0, b"foreign")
+            .expect("the foreign write lands");
         let error = install_companions(&mut fat, &source, &isolinux_dir(), "/isolinux")
-            .expect_err("an overwrite refuses");
+            .expect_err("differing bytes refuse");
         let text = error.to_string();
         assert!(text.contains("menu.c32"), "names the file: {text}");
+        assert!(text.contains("differs"), "names the conflict: {text}");
         assert!(text.is_ascii(), "stays ASCII: {text}");
+        let back = fat
+            .read_file("/isolinux/menu.c32")
+            .expect("the file still reads");
+        assert_eq!(back, b"foreign", "foreign bytes untouched");
     }
 
     #[test]

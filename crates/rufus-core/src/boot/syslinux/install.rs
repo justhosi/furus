@@ -110,7 +110,11 @@ impl Installed {
 /// neither replace nor remove the first and would leave an
 /// unreferenced cluster run behind. The check reads `list_dir("/")`
 /// and compares the dot-joined short name (`LDLINUX.SYS` — the user
-/// text form, not the raw space-padded 8.3 field).
+/// text form, not the raw space-padded 8.3 field). Companions are
+/// handled differently on purpose: they carry no sector map, so a
+/// byte-identical file is provably the same payload and safe to keep,
+/// while a stage file may hide another volume's sector map and is
+/// never trusted that way.
 ///
 /// The payload lengths validate before any byte moves: a `vbr` shorter
 /// than a sector and a `core` of one sector or less (empty included)
