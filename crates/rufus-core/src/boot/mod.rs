@@ -24,8 +24,14 @@
 //! `MSDOS.SYS` and `COMMAND.COM` with the WinME jump patch applied
 //! where the bytes match, and writes nothing to sector 0: nothing is
 //! bundled, so a plain run carries no MS-DOS files at all.
+//! [`dos_locale`] plans the DOS keyboard/codepage/EGA choice and the
+//! byte-exact `CONFIG.SYS`/`AUTOEXEC.BAT` contents (`SetDOSLocale`):
+//! pure planning, no writes — placing the files on a stick is a later
+//! slice.
 //! Wiring these installers into the copy and pipeline paths is a later
 //! slice, and no stick has been booted on hardware.
+
+pub mod dos_locale;
 
 pub mod grub2;
 pub mod grub4dos;
