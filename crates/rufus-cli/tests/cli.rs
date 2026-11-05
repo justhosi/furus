@@ -116,6 +116,103 @@ fn fixture(path: &std::path::Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// A minimal but valid ISO9660 image with one file (`TOP.TXT`,
+/// `top-txt`) and no bootloader payloads: `plan --iso-mode` copies it
+/// (`Copy` plus `Auto`), and the bootloader step then refuses naming
+/// its missing payloads. The bare [`fixture`] cannot serve here: its
+/// zero version byte makes the tree reader refuse at the `Write` step,
+/// before the bootloader ever runs.
+fn bootless_iso(path: &std::path::Path) -> PathBuf {
+    const SECTOR: usize = 2048;
+    const IMAGE_SECTORS: usize = 32;
+    const ROOT: u32 = 20;
+    const FILE: u32 = 23;
+    const RECORD_FIXED: usize = 33;
+
+    fn encode_record(extent: u32, data_len: u32, flags: u8, identifier: &[u8]) -> Vec<u8> {
+        let pad = if identifier.len().is_multiple_of(2) {
+            1
+        } else {
+            0
+        };
+        let len = RECORD_FIXED + identifier.len() + pad;
+        let mut out = vec![0u8; len];
+        out[0] = len as u8;
+        out[2..6].copy_from_slice(&extent.to_le_bytes());
+        out[6..10].copy_from_slice(&extent.to_be_bytes());
+        out[10..14].copy_from_slice(&data_len.to_le_bytes());
+        out[14..18].copy_from_slice(&data_len.to_be_bytes());
+        out[25] = flags;
+        out[28..30].copy_from_slice(&1u16.to_le_bytes());
+        out[30..32].copy_from_slice(&1u16.to_be_bytes());
+        out[32] = identifier.len() as u8;
+        out[33..33 + identifier.len()].copy_from_slice(identifier);
+        out
+    }
+
+    fn dir_sector(records: &[Vec<u8>]) -> [u8; SECTOR] {
+        let mut sector = [0u8; SECTOR];
+        let mut offset = 0;
+        for record in records {
+            sector[offset..offset + record.len()].copy_from_slice(record);
+            offset += record.len();
+        }
+        sector
+    }
+
+    fn primary_sector() -> [u8; SECTOR] {
+        let mut sector = [0u8; SECTOR];
+        sector[0] = 1;
+        sector[1..6].copy_from_slice(b"CD001");
+        sector[6] = 1;
+        let label = b"LABEL";
+        sector[40..40 + label.len()].copy_from_slice(label);
+        for byte in sector
+            .iter_mut()
+            .skip(40 + label.len())
+            .take(32 - label.len())
+        {
+            *byte = b' ';
+        }
+        sector[80..84].copy_from_slice(&(IMAGE_SECTORS as u32).to_le_bytes());
+        sector[84..88].copy_from_slice(&(IMAGE_SECTORS as u32).to_be_bytes());
+        sector[128..130].copy_from_slice(&2048u16.to_le_bytes());
+        sector[130..132].copy_from_slice(&2048u16.to_be_bytes());
+        sector[881] = 1;
+        let root = encode_record(ROOT, SECTOR as u32, 2, b"\x00");
+        sector[156..156 + root.len()].copy_from_slice(&root);
+        sector
+    }
+
+    fn typed_sector(kind: u8) -> [u8; SECTOR] {
+        let mut sector = [0u8; SECTOR];
+        sector[0] = kind;
+        sector[1..6].copy_from_slice(b"CD001");
+        sector[6] = 1;
+        sector
+    }
+
+    let mut image = vec![0u8; IMAGE_SECTORS * SECTOR];
+    let mut put = |sector: usize, bytes: &[u8]| {
+        let base = sector * SECTOR;
+        image[base..base + bytes.len()].copy_from_slice(bytes);
+    };
+    put(16, &primary_sector());
+    put(17, &typed_sector(0));
+    put(18, &typed_sector(255));
+    put(
+        ROOT as usize,
+        &dir_sector(&[
+            encode_record(ROOT, SECTOR as u32, 2, b"\x00"),
+            encode_record(ROOT, SECTOR as u32, 2, b"\x01"),
+            encode_record(FILE, 7, 0, b"TOP.TXT;1"),
+        ]),
+    );
+    put(FILE as usize, b"top-txt");
+    std::fs::write(path, &image).expect("write bootless iso");
+    path.to_path_buf()
+}
+
 // ---------------------------------------------------------------------------
 // version
 // ---------------------------------------------------------------------------
@@ -187,6 +284,7 @@ fn help_lists_commands_and_documented_flags() {
         "--scheme",
         "--target",
         "--filesystem",
+        "--iso-mode",
         "--label",
         "--cluster",
         "--quick",
@@ -682,9 +780,10 @@ fn plan_device_safety_exits_without_dry_run() {
 // ---------------------------------------------------------------------------
 
 /// The plan JSON at `plan_json` (from `plan --dry-run`), resealed
-/// without its `Bootloader` step: no slice installs one yet, so the
-/// end-to-end plans drop it and re-seal the confirm hash through the
-/// typed `Plan` (never by string surgery).
+/// without its `Bootloader` step: the end-to-end runs below pin the
+/// other steps, so the bootloader step is dropped to keep them
+/// independent of installer behaviour. Re-sealed through the typed
+/// `Plan` (never by string surgery).
 fn runnable_plan(dir: &std::path::Path, plan_json: &str, name: &str) -> PathBuf {
     let mut plan: Plan = serde_json::from_str(plan_json).expect("plan parses");
     plan.steps
@@ -1113,17 +1212,148 @@ fn write_sigint_cancels_with_exit_6() {
     assert_eq!(error["error"], "cancelled");
 }
 
+/// A `plan` invocation with `--iso-mode` appended.
+fn plan_iso_args(image: &std::path::Path, device: &str, dry_run: bool, json: bool) -> Vec<String> {
+    let mut args = plan_args(image, device, dry_run, json);
+    args.push("--iso-mode".to_string());
+    args
+}
+
+fn plan_iso_run(image: &std::path::Path, device: &str, dry_run: bool) -> Run {
+    let args = plan_iso_args(image, device, dry_run, true);
+    run_args(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The `Write` and `Bootloader` modes of one plan JSON object.
+fn planned_modes(plan_json: &str) -> (serde_json::Value, serde_json::Value) {
+    let planned: serde_json::Value = serde_json::from_str(plan_json).expect("plan json");
+    let steps = planned["steps"].as_array().expect("steps array");
+    let write = steps
+        .iter()
+        .find(|step| step["op"] == "write")
+        .expect("a write step");
+    let bootloader = steps
+        .iter()
+        .find(|step| step["op"] == "bootloader")
+        .expect("a bootloader step");
+    (write["mode"].clone(), bootloader["mode"].clone())
+}
+
+#[test]
+fn plan_iso_mode_pairs_copy_with_auto_bootloader() {
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let iso = fixture(&dir.path().join("fixture.iso"));
+    // Without the flag the sniffed ISO goes byte-for-byte with no
+    // installer: `dd` plus `none`, in JSON and in the human rendering.
+    let plain = plan_run(&iso, "/dev/null", true);
+    assert_eq!(plain.code, 0, "{}", plain.stderr);
+    assert_eq!(
+        planned_modes(&plain.stdout),
+        (
+            serde_json::Value::String("dd".to_string()),
+            serde_json::Value::String("none".to_string())
+        ),
+        "a plain iso plans dd plus no bootloader"
+    );
+    let human = run_plan(&iso, "/dev/null", true, false);
+    assert_eq!(human.code, 0, "{}", human.stderr);
+    assert!(
+        human.stdout.contains("write (mode dd)"),
+        "human shows dd: {}",
+        human.stdout
+    );
+    assert!(
+        human.stdout.contains("bootloader (mode none)"),
+        "human shows none: {}",
+        human.stdout
+    );
+    // With the flag the same image walks its tree with an installer.
+    let flagged = plan_iso_run(&iso, "/dev/null", true);
+    assert_eq!(flagged.code, 0, "{}", flagged.stderr);
+    assert_eq!(
+        planned_modes(&flagged.stdout),
+        (
+            serde_json::Value::String("copy".to_string()),
+            serde_json::Value::String("auto".to_string())
+        ),
+        "an iso-mode iso plans copy plus auto bootloader"
+    );
+    let args = plan_iso_args(&iso, "/dev/null", true, false);
+    let human = run_args(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(human.code, 0, "{}", human.stderr);
+    assert!(
+        human.stdout.contains("write (mode copy)"),
+        "human shows copy: {}",
+        human.stdout
+    );
+    assert!(
+        human.stdout.contains("bootloader (mode auto)"),
+        "human shows auto: {}",
+        human.stdout
+    );
+    // A WIM plans copy however it is asked: content wins over the
+    // flag, which changes nothing here.
+    let mut wim = vec![0u8; 4096];
+    wim[..8].copy_from_slice(b"MSWIM\0\0\0");
+    let wim_path = dir.path().join("image.wim");
+    std::fs::write(&wim_path, &wim).expect("write wim");
+    let planned = plan_iso_run(&wim_path, "/dev/null", true);
+    assert_eq!(planned.code, 0, "{}", planned.stderr);
+    assert_eq!(
+        planned_modes(&planned.stdout),
+        (
+            serde_json::Value::String("copy".to_string()),
+            serde_json::Value::String("auto".to_string())
+        ),
+        "a wim plans copy plus auto bootloader"
+    );
+    // Without the flag the same WIM still copies: the kind, not the
+    // flag, decides.
+    let plain_wim = plan_run(&wim_path, "/dev/null", true);
+    assert_eq!(plain_wim.code, 0, "{}", plain_wim.stderr);
+    assert_eq!(
+        planned_modes(&plain_wim.stdout),
+        (
+            serde_json::Value::String("copy".to_string()),
+            serde_json::Value::String("auto".to_string())
+        ),
+        "a plain wim still plans copy plus auto bootloader"
+    );
+}
+
 #[test]
 fn write_bootloader_without_payloads_maps_to_exit_1() {
     // The full plan keeps its `Bootloader` step here (no stripping):
-    // the bare fixture ISO carries no Syslinux payloads, so the step
-    // refuses as invalid input without writing anything.
+    // a valid ISO with no bootloader payloads, planned `Dd` plus
+    // `None`, then flipped to `Auto` through the typed `Plan` and
+    // resealed. The `Dd` write needs no mount, so the run reaches the
+    // bootloader step, which refuses as invalid input naming its
+    // missing payloads. A plain `Dd` plan would carry `None` and pass
+    // through untouched; an `--iso-mode` (`Copy`) plan cannot serve
+    // here (the file seam has no partition node to mount, so the
+    // `Write` step refuses before the bootloader ever runs); the bare
+    // broken-ISO fixture cannot serve either (its tree refuses before
+    // the probes run).
     let dir = tempfile::tempdir().expect("scratch dir");
-    let iso = fixture(&dir.path().join("fixture.iso"));
+    let iso = bootless_iso(&dir.path().join("bootless.iso"));
     let plan_out = plan_run(&iso, "/dev/null", true);
     assert_eq!(plan_out.code, 0, "{}", plan_out.stderr);
+    let mut plan: Plan = serde_json::from_str(&plan_out.stdout).expect("plan parses");
+    let mut saw_bootloader = false;
+    for step in &mut plan.steps {
+        if let Step::Bootloader { mode } = step {
+            *mode = rufus_proto::BootloaderMode::Auto;
+            saw_bootloader = true;
+        }
+    }
+    assert!(saw_bootloader, "the plan carries a bootloader step");
+    plan.confirm = plan.confirm().expect("confirm recomputes");
     let plan_file = dir.path().join("plan.json");
-    std::fs::write(&plan_file, &plan_out.stdout).expect("save plan");
+    std::fs::write(
+        &plan_file,
+        serde_json::to_string(&plan).expect("plan serialises"),
+    )
+    .expect("save plan");
     let seam_path = sparse_seam(&dir.path().join("stick.img"), 64 * 1024 * 1024);
 
     // Code plus kind only — no message-text matching. The run emits

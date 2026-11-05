@@ -54,6 +54,10 @@ pub struct Options {
     /// Quick (metadata-only) format; the surface case is documented in the
     /// `--help` text.
     pub quick_format: bool,
+    /// Copy an ISO/UDF image's file tree instead of writing the image
+    /// byte-for-byte (`--iso-mode`): the recommended mode for bootable
+    /// sticks, whose bootloader step then installs from the tree.
+    pub iso_mode: bool,
     /// Bad-block scan.
     pub bad_blocks: bool,
     /// Read-back verification.
@@ -142,9 +146,35 @@ pub fn device_ref(path: &Path, dry_run: bool, sysfs: &SysfsRoot) -> Result<Devic
 /// extension is only a tiebreaker when the content could not be
 /// identified at all ([`ImageKind::Unknown`]): `iso`/`img`/`raw` names
 /// conventionally mean sector images worth dd-ing, anything else is a
-/// job for a later-slice reader (WIM: wimlib in S21). Provisional for
-/// this schema generation: the executor decides finally.
-fn write_mode(image: &Path, kind: &ImageKind) -> WriteMode {
+/// job for a later-slice reader (WIM: wimlib in S21). The plan's mode
+/// is final: the executor runs whatever mode lands here.
+/// `iso_mode` (the `--iso-mode` flag) flips tree-walkable images to
+/// copy: `Iso`/`Raw` kinds, and `Unknown` kinds with a ddable
+/// extension, become `Copy` so the file tree (and the bootloader step
+/// after it) serves the stick. Compressed and container kinds are
+/// unchanged by the flag — a compressed ISO cannot be walked without
+/// decoding, and the write arm refuses that combination with a clear
+/// message.
+fn write_mode(image: &Path, kind: &ImageKind, iso_mode: bool) -> WriteMode {
+    if iso_mode {
+        match kind {
+            ImageKind::Iso | ImageKind::Raw => return WriteMode::Copy,
+            ImageKind::Unknown => {
+                let ddable = image
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("iso")
+                            || ext.eq_ignore_ascii_case("img")
+                            || ext.eq_ignore_ascii_case("raw")
+                    });
+                if ddable {
+                    return WriteMode::Copy;
+                }
+            }
+            _ => {}
+        }
+    }
     match kind {
         // Content is authoritative for the streamable kinds: sector
         // images raw, archives through the pipeline's host-tool
@@ -186,7 +216,14 @@ fn write_mode(image: &Path, kind: &ImageKind) -> WriteMode {
 }
 
 /// The ordered provisional steps for one image/device combination.
+///
+/// The bootloader step follows the write mode: a `Dd` write already
+/// laid the image's own boot code, so the plan emits
+/// [`BootloaderMode::None`]; a `Copy` write needs the installer, so it
+/// emits [`BootloaderMode::Auto`].
 pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
+    let write = write_mode(image, kind, options.iso_mode);
+    let needs_installer = write == WriteMode::Copy;
     vec![
         Step::Wipe,
         Step::Mklabel {
@@ -201,11 +238,13 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
             cluster_bytes: options.cluster_bytes,
             quick: options.quick_format,
         },
-        Step::Write {
-            mode: write_mode(image, kind),
-        },
+        Step::Write { mode: write },
         Step::Bootloader {
-            mode: BootloaderMode::Auto,
+            mode: if needs_installer {
+                BootloaderMode::Auto
+            } else {
+                BootloaderMode::None
+            },
         },
         Step::Finalize,
     ]
@@ -257,7 +296,12 @@ pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Resu
 mod tests {
     use std::path::Path;
 
+    use rufus_proto::BootloaderMode;
+    use rufus_proto::Filesystem;
     use rufus_proto::ImageKind;
+    use rufus_proto::Scheme;
+    use rufus_proto::Step;
+    use rufus_proto::Target;
     use rufus_proto::WriteMode;
 
     use super::write_mode;
@@ -283,11 +327,91 @@ mod tests {
             ("image.bin", ImageKind::Unknown, WriteMode::Copy),
             ("image", ImageKind::Unknown, WriteMode::Copy),
         ] {
-            let got = write_mode(Path::new(name), &kind);
+            let got = write_mode(Path::new(name), &kind, false);
             assert_eq!(
                 got, want,
                 "'{name}' sniffed as {kind:?} must transfer with {want:?}"
             );
         }
+    }
+
+    #[test]
+    fn write_mode_iso_flag_flips_walkable_images_to_copy() {
+        // With the flag set, tree-walkable images copy whatever the
+        // sniff said; compressed and container kinds do not move.
+        for (name, kind, want) in [
+            ("image.iso", ImageKind::Iso, WriteMode::Copy),
+            ("image.bin", ImageKind::Raw, WriteMode::Copy),
+            ("image.img", ImageKind::Unknown, WriteMode::Copy),
+            ("image.bin", ImageKind::Unknown, WriteMode::Copy),
+            ("archive.gz", ImageKind::Gzip, WriteMode::Dd),
+            ("image.iso", ImageKind::Wim, WriteMode::Copy),
+            ("disk.vhd", ImageKind::Vhd, WriteMode::Copy),
+        ] {
+            let got = write_mode(Path::new(name), &kind, true);
+            assert_eq!(
+                got, want,
+                "'{name}' sniffed as {kind:?} with --iso-mode must transfer with {want:?}"
+            );
+        }
+    }
+
+    use super::Options;
+    use super::steps;
+
+    fn test_options(iso_mode: bool) -> Options {
+        Options {
+            scheme: Scheme::Mbr,
+            target: Target::Dual,
+            filesystem: Filesystem::Fat32,
+            label: None,
+            cluster_bytes: None,
+            quick_format: true,
+            bad_blocks: false,
+            verify: false,
+            persistence: false,
+            show_all: false,
+            confirmed_serial: None,
+            iso_mode,
+        }
+    }
+
+    /// The `Write` and `Bootloader` modes of one planned step list.
+    fn planned_modes(image: &str, kind: &ImageKind, iso_mode: bool) -> (WriteMode, BootloaderMode) {
+        let mut write = None;
+        let mut bootloader = None;
+        for step in steps(Path::new(image), kind, &test_options(iso_mode)) {
+            match step {
+                Step::Write { mode } => write = Some(mode),
+                Step::Bootloader { mode } => bootloader = Some(mode),
+                _ => {}
+            }
+        }
+        (
+            write.expect("the plan carries a write step"),
+            bootloader.expect("the plan carries a bootloader step"),
+        )
+    }
+
+    #[test]
+    fn steps_pairs_bootloader_with_write_mode() {
+        // A dd write already laid the image's boot code: no installer.
+        assert_eq!(
+            planned_modes("image.iso", &ImageKind::Iso, false),
+            (WriteMode::Dd, BootloaderMode::None),
+            "a plain iso plans dd plus no bootloader"
+        );
+        // An iso-mode write needs the installer from the tree.
+        assert_eq!(
+            planned_modes("image.iso", &ImageKind::Iso, true),
+            (WriteMode::Copy, BootloaderMode::Auto),
+            "an iso-mode iso plans copy plus auto bootloader"
+        );
+        // Copy stays paired however it was reached.
+        assert_eq!(
+            planned_modes("image.iso", &ImageKind::Wim, false),
+            (WriteMode::Copy, BootloaderMode::Auto),
+            "a wim plans copy plus auto bootloader"
+        );
     }
 }

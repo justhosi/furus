@@ -27,11 +27,6 @@
 //! fallback — `boot.img`, `core.img` and the UEFI image come only
 //! from the image tree — while GRUB4DOS carries its record and loader
 //! as embedded resources 450/451.
-//!
-//! Interim: `plan::steps()` still emits `Bootloader { mode: Auto }`
-//! for every plan, so a `Dd` plan fails here with the FAT32 boot-sector
-//! refusal until part 3 makes `Dd` plans emit `None` (`None` itself
-//! already passes through untouched).
 
 use std::path::Path;
 
@@ -271,6 +266,8 @@ pub(crate) fn install_tree(
         _ => check_mode(mode)?,
     }
     if *mode == BootloaderMode::Auto {
+        // First match wins; one log line per probe, then the winning
+        // branch's own messages (or the single refusal below).
         let mut probes: Vec<String> = Vec::new();
         probes.push("auto: probing syslinux".to_string());
         if let Some(located) = syslinux::locate(source)? {
@@ -278,14 +275,12 @@ pub(crate) fn install_tree(
             prepend_log(&mut installed, probes);
             return Ok(installed);
         }
-        probes.push("auto: no syslinux payloads found, probing grub2".to_string());
         probes.push("auto: probing grub2".to_string());
         if let Some(payloads) = grub2::payloads(source)? {
             let mut installed = install_grub2(source, fat, disk, &payloads, table, cancelled)?;
             prepend_log(&mut installed, probes);
             return Ok(installed);
         }
-        probes.push("auto: no grub2 payloads found, probing grub4dos".to_string());
         probes.push("auto: probing grub4dos".to_string());
         if syslinux::read(source, &[], "grldr")?.is_some() {
             let mut installed = install_grub4dos(fat, disk, table, cancelled, load)?;
@@ -1842,15 +1837,11 @@ mod tests {
             "the first probe is logged"
         );
         assert_eq!(
-            messages[1], "auto: no syslinux payloads found, probing grub2",
-            "the miss is logged"
-        );
-        assert_eq!(
-            messages[2], "auto: probing grub2",
+            messages[1], "auto: probing grub2",
             "the second probe is logged"
         );
         assert_eq!(
-            messages[3], "found grub2 bios payloads at '/boot/grub/i386-pc'",
+            messages[2], "found grub2 bios payloads at '/boot/grub/i386-pc'",
             "the winner identifies itself"
         );
     }
@@ -1915,6 +1906,605 @@ mod tests {
             output.status.success(),
             "fsck.fat -n exits 0 after the install ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
             output.status
+        );
+    }
+}
+
+#[cfg(test)]
+mod end_to_end {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::FileExt as _;
+
+    use crate::boot::Resource;
+    use crate::boot::load_from;
+    use crate::boot::syslinux;
+    use crate::error::CoreError;
+    use crate::error::Result as TestResult;
+    use crate::fs::Volume;
+    use crate::fs::fat32::Fat32;
+    use crate::iso::FLAG_DIRECTORY;
+    use crate::iso::SECTOR_BYTES;
+    use crate::part::TableKind;
+    use crate::part::plan::single_data_window;
+    use crate::pipeline::target::Target;
+    use rufus_proto::DeviceRef;
+    use rufus_proto::Filesystem;
+    use rufus_proto::ImageKind;
+    use rufus_proto::ImageRef;
+    use rufus_proto::Options;
+    use rufus_proto::PLAN_VERSION;
+    use rufus_proto::Plan;
+
+    /// 128 MiB stick image for the run.
+    const DISK_BYTES: u64 = 128 * 1024 * 1024;
+
+    /// Build the fixture ISO: primary + boot + terminator descriptors,
+    /// a root holding `ISOLINUX/`, and six payload files under it, from
+    /// the shared `copy::fixture` sector builders.
+    fn syslinux_iso() -> Vec<u8> {
+        use crate::copy::source::fixture::*;
+        const ROOT: u32 = 20;
+        const DIR: u32 = 21;
+        const BIN: u32 = 22;
+        const CFG: u32 = 23;
+        const C32: u32 = 24;
+        const MENU: u32 = 25;
+        const VESA: u32 = 26;
+        const LIB: u32 = 27;
+        let banner = b"ISOLINUX 6.04 20140611 test-image".to_vec();
+        // Lowercase identifiers throughout: like the directory
+        // above, the reader resolves file opens exactly, so only
+        // lowercase names round-trip through locate and read.
+        let files: Vec<(&[u8], u32, Vec<u8>)> = vec![
+            (b"isolinux.bin;1", BIN, banner),
+            (b"isolinux.cfg;1", CFG, b"DEFAULT linux\n".to_vec()),
+            (b"ldlinux.c32;1", C32, b"ldlinux-c32-stub".to_vec()),
+            (b"menu.c32;1", MENU, b"menu-stub".to_vec()),
+            (b"vesamenu.c32;1", VESA, b"vesamenu-stub".to_vec()),
+            (b"libutil.c32;1", LIB, b"libutil-stub".to_vec()),
+        ];
+        let mut image = vec![0u8; 32 * SECTOR_BYTES];
+        let mut put = |sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(16, &primary_sector("TESTVOL", ROOT, SECTOR_BYTES as u32));
+        put(17, &boot_sector());
+        put(18, &terminator_sector());
+        let root = vec![
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            // Lowercase on purpose: the engine resolves payload
+            // directory components exactly (only file names fold
+            // case), so an upper-case directory is never located.
+            encode_record(DIR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"isolinux"),
+        ];
+        let mut dir = vec![
+            encode_record(DIR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+        ];
+        for (identifier, sector, bytes) in &files {
+            dir.push(encode_record(*sector, bytes.len() as u32, 0, identifier));
+        }
+        put(ROOT, &dir_sector(&root));
+        put(DIR, &dir_sector(&dir));
+        for (_, sector, bytes) in &files {
+            put(*sector, bytes);
+        }
+        image
+    }
+
+    /// A whole-disk [`Target`] over one open file with a declared
+    /// extent: the tempdir-backed disk image the run drives. Opens a
+    /// fresh handle per `device()` call (like the file-seam opener),
+    /// so every handle sees the same bytes. Sparse-backed: the file is
+    /// sized with `set_len`, and wipe/Mkfs pay only their real writes.
+    #[derive(Debug)]
+    struct FileTarget {
+        file: std::fs::File,
+        path: std::path::PathBuf,
+        len: u64,
+    }
+
+    impl FileTarget {
+        fn open(path: &std::path::Path, len: u64) -> TestResult<Self> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|source| CoreError::io(path, source))?;
+            Ok(Self {
+                file,
+                path: path.to_path_buf(),
+                len,
+            })
+        }
+    }
+
+    impl Target for FileTarget {
+        fn size(&self) -> u64 {
+            self.len
+        }
+
+        fn sector_size(&self) -> u32 {
+            512
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> TestResult<()> {
+            if offset
+                .checked_add(buf.len() as u64)
+                .is_some_and(|end| end > self.len)
+            {
+                return Err(CoreError::invalid(format!(
+                    "test read of {} bytes at offset {offset} runs past the {} byte disk",
+                    buf.len(),
+                    self.len
+                )));
+            }
+            self.file
+                .read_exact_at(buf, offset)
+                .map_err(|source| CoreError::io(&self.path, source))
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> TestResult<()> {
+            self.write_all_at_cancellable(offset, buf, usize::MAX, &|| false)?;
+            Ok(())
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> TestResult<u64> {
+            if chunk == 0 {
+                return Err(CoreError::invalid("write chunk size must be non-zero"));
+            }
+            if offset
+                .checked_add(buf.len() as u64)
+                .is_some_and(|end| end > self.len)
+            {
+                return Err(CoreError::invalid(format!(
+                    "test write of {} bytes at offset {offset} runs past the {} byte disk",
+                    buf.len(),
+                    self.len
+                )));
+            }
+            let mut done = 0usize;
+            while done < buf.len() {
+                if cancelled() {
+                    return Ok(done as u64);
+                }
+                let piece = (buf.len() - done).min(chunk);
+                self.file
+                    .write_all_at(&buf[done..done + piece], offset + done as u64)
+                    .map_err(|source| CoreError::io(&self.path, source))?;
+                done += piece;
+            }
+            Ok(done as u64)
+        }
+
+        fn flush(&self) -> TestResult<()> {
+            self.file
+                .sync_all()
+                .map_err(|source| CoreError::io(&self.path, source))
+        }
+    }
+
+    /// A [`Volume`] window over the disk file at `[base, base + len)`:
+    /// the data partition the native formatters write, planned with the
+    /// same [`single_data_window`] call the pipeline stamps with, so the
+    /// formatted window is the stamped partition by construction.
+    #[derive(Debug)]
+    struct PartFile {
+        file: std::fs::File,
+        base: u64,
+        len: u64,
+    }
+
+    impl PartFile {
+        fn open(path: &std::path::Path, base: u64, len: u64) -> TestResult<Self> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|source| CoreError::io(path, source))?;
+            Ok(Self { file, base, len })
+        }
+    }
+
+    impl Volume for PartFile {
+        fn total_bytes(&self) -> u64 {
+            self.len
+        }
+
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> TestResult<()> {
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| CoreError::invalid("test partition read overflows".to_string()))?;
+            if end > self.len {
+                return Err(CoreError::invalid(format!(
+                    "test partition read of {} bytes at offset {offset} runs past the {} byte window at base {}",
+                    buf.len(),
+                    self.len,
+                    self.base
+                )));
+            }
+            self.file
+                .read_exact_at(buf, self.base + offset)
+                .map_err(|source| CoreError::io("<partition window>", source))
+        }
+
+        fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> TestResult<()> {
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or_else(|| CoreError::invalid("test partition write overflows".to_string()))?;
+            if end > self.len {
+                return Err(CoreError::invalid(format!(
+                    "test partition write of {} bytes at offset {offset} runs past the {} byte window at base {}",
+                    buf.len(),
+                    self.len,
+                    self.base
+                )));
+            }
+            self.file
+                .write_all_at(buf, self.base + offset)
+                .map_err(|source| CoreError::io("<partition window>", source))
+        }
+
+        fn flush(&mut self) -> TestResult<()> {
+            self.file
+                .sync_all()
+                .map_err(|source| CoreError::io("<partition window>", source))
+        }
+
+        fn sector_size(&self) -> u32 {
+            512
+        }
+    }
+
+    /// The mount stand-in: a real temp directory standing in for the
+    /// kernel mount, with `partition.img` materialising the partition
+    /// window bytes before the copy and writing them back on release.
+    /// No `mount(2)`, no privileges: the copy walk lands in the temp
+    /// directory (discarded for this Syslinux run — the bootloader
+    /// reads its payloads from the ISO tree, not from the mount), and
+    /// the round-tripped window proves the mount/release flow without
+    /// touching the kernel. A kernel mount would expose the live
+    /// filesystem instead; this shim only proves the copy has a real
+    /// writable directory and the window survives the round trip.
+    struct MountShim {
+        dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        base: u64,
+        len: u64,
+    }
+
+    impl MountShim {
+        fn mount(path: &std::path::Path, base: u64, len: u64) -> TestResult<Self> {
+            let dir = tempfile::tempdir().expect("the mount dir allocates");
+            let file = OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|source| CoreError::io(path, source))?;
+            let mut window = vec![0u8; usize::try_from(len).expect("the window fits usize")];
+            file.read_exact_at(&mut window, base)
+                .map_err(|source| CoreError::io(path, source))?;
+            std::fs::write(dir.path().join("partition.img"), &window).expect("the window stages");
+            Ok(Self {
+                dir,
+                path: path.to_path_buf(),
+                base,
+                len,
+            })
+        }
+    }
+
+    impl crate::pipeline::opener::MountedPartition for MountShim {
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+
+        fn free_bytes(&self) -> TestResult<u64> {
+            // Fixture scale only: plenty for a 60 KiB ISO tree. A
+            // kernel mount would report statvfs here.
+            Ok(1 << 40)
+        }
+
+        fn release(&mut self) -> TestResult<()> {
+            let staged = std::fs::read(self.dir.path().join("partition.img"))
+                .expect("the staged window reads back");
+            let staged_len = u64::try_from(staged.len()).expect("the stage fits u64");
+            if staged_len != self.len {
+                return Err(CoreError::invalid(format!(
+                    "test mount staged {staged_len} bytes for a {} byte window: refusing",
+                    self.len
+                )));
+            }
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .map_err(|source| CoreError::io(&self.path, source))?;
+            file.write_all_at(&staged, self.base)
+                .map_err(|source| CoreError::io(&self.path, source))?;
+            file.sync_all()
+                .map_err(|source| CoreError::io(&self.path, source))?;
+            Ok(())
+        }
+    }
+
+    /// Fixture opener over one disk image file: the device is a fresh
+    /// [`FileTarget`] per call, the partition a [`PartFile`] window at
+    /// the Mkpart-planned offset, the mount the [`MountShim`] stand-in.
+    #[derive(Debug, Clone)]
+    struct EndToEndOpener {
+        path: std::path::PathBuf,
+        disk_len: u64,
+        base: u64,
+        len: u64,
+    }
+
+    impl crate::pipeline::opener::Opener for EndToEndOpener {
+        fn device(&self) -> TestResult<Box<dyn crate::pipeline::target::Target>> {
+            Ok(Box::new(FileTarget::open(&self.path, self.disk_len)?))
+        }
+
+        fn partition(&self) -> TestResult<Box<dyn Volume>> {
+            Ok(Box::new(PartFile::open(&self.path, self.base, self.len)?))
+        }
+
+        fn partition_path(&self) -> TestResult<std::path::PathBuf> {
+            Err(CoreError::invalid(
+                "test opener has no partition node".to_string(),
+            ))
+        }
+
+        fn mount_partition(
+            &self,
+            _filesystem: &Filesystem,
+        ) -> TestResult<Box<dyn crate::pipeline::opener::MountedPartition>> {
+            Ok(Box::new(MountShim::mount(&self.path, self.base, self.len)?))
+        }
+    }
+
+    /// A recording reporter: every event in run order.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        events: Vec<crate::pipeline::event::Event>,
+    }
+
+    impl crate::pipeline::event::Reporter for Recorder {
+        fn event(&mut self, event: crate::pipeline::event::Event) {
+            self.events.push(event);
+        }
+    }
+
+    /// `assets/resources/` next to the workspace root, for the pinned
+    /// core size below.
+    fn resources_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/resources"
+        ))
+    }
+
+    /// Seed `<exe_dir>/../share/rufus-linux/assets` from the manifest
+    /// tree so the production `load()` path resolves with no
+    /// environment variables. This is the resolver's own third
+    /// candidate (`Env::assets_dir` order); `load()` verifies exact
+    /// size and SHA-256 on every load, so the seed cannot plant wrong
+    /// bytes silently. Writes only under `target/` (gitignored),
+    /// idempotent across reruns.
+    fn seed_exe_assets() {
+        let exe = std::env::current_exe().expect("the test exe resolves");
+        let dir = exe
+            .parent()
+            .expect("the exe has a dir")
+            .join("../share/rufus-linux/assets");
+        std::fs::create_dir_all(&dir).expect("the asset dir creates");
+        for name in ["RCDATA_402.bin", "RCDATA_403.bin"] {
+            let bytes = std::fs::read(resources_dir().join(name)).expect("the pinned asset reads");
+            std::fs::write(dir.join(name), &bytes).expect("the asset seeds");
+        }
+    }
+
+    #[test]
+    fn full_plan_installs_syslinux_end_to_end() {
+        // Seed the resolver first: the run below exercises the real
+        // production `load()` path, which needs the asset directory.
+        seed_exe_assets();
+        // A real ISO file (the image tree opens from a path) and a
+        // 128 MiB sparse disk image file, both under one scratch dir.
+        // No `mount(2)`, no privileges: the opener below serves the
+        // file, and the mount shim stands in with a temp directory.
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let iso_path = scratch.path().join("syslinux.iso");
+        std::fs::write(&iso_path, syslinux_iso()).expect("the iso writes");
+        let disk_path = scratch.path().join("disk.img");
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&disk_path)
+            .expect("the disk creates")
+            .set_len(DISK_BYTES)
+            .expect("the disk sizes");
+        let (base, len) =
+            single_data_window(TableKind::Mbr, 512, DISK_BYTES).expect("the data window plans");
+        let opener = EndToEndOpener {
+            path: disk_path.clone(),
+            disk_len: DISK_BYTES,
+            base,
+            len,
+        };
+        let plan = Plan {
+            version: PLAN_VERSION,
+            created_by: "bootloader-e2e".to_string(),
+            device: DeviceRef {
+                path: "/dev/test".to_string(),
+                block_device: false,
+                size_bytes: None,
+                serial: None,
+                model: None,
+                sysfs: None,
+            },
+            image: ImageRef {
+                path: iso_path.display().to_string(),
+                size_bytes: 32 * SECTOR_BYTES as u64,
+                sha256: String::new(),
+                kind: ImageKind::Iso,
+            },
+            options: Options {
+                scheme: rufus_proto::Scheme::Mbr,
+                target: rufus_proto::Target::Dual,
+                filesystem: Filesystem::Fat32,
+                label: None,
+                cluster_bytes: None,
+                quick_format: true,
+                bad_blocks: false,
+                verify: false,
+                persistence: false,
+                show_all: false,
+                confirmed_serial: None,
+            },
+            steps: vec![
+                rufus_proto::Step::Wipe,
+                rufus_proto::Step::Mklabel {
+                    scheme: rufus_proto::Scheme::Mbr,
+                },
+                rufus_proto::Step::Mkpart {
+                    scheme: rufus_proto::Scheme::Mbr,
+                },
+                rufus_proto::Step::Mkfs {
+                    filesystem: Filesystem::Fat32,
+                    label: None,
+                    cluster_bytes: None,
+                    quick: true,
+                },
+                rufus_proto::Step::Write {
+                    mode: rufus_proto::WriteMode::Copy,
+                },
+                rufus_proto::Step::Bootloader {
+                    mode: rufus_proto::BootloaderMode::Auto,
+                },
+                rufus_proto::Step::Finalize,
+            ],
+            confirm: String::new(),
+        };
+        let options = crate::pipeline::RunOptions {
+            verify: false,
+            badblocks: false,
+            retries: 3,
+            retry_delay: std::time::Duration::ZERO,
+            reset_usb: false,
+        };
+        let mut reporter = Recorder::default();
+        let report = crate::pipeline::run(&plan, &opener, &options, &mut reporter, &|| false)
+            .expect("the full plan runs");
+        // All seven steps ran, in order, with no refusal anywhere.
+        let names: Vec<&str> = report.steps.iter().map(|step| step.step).collect();
+        assert_eq!(
+            names,
+            [
+                "wipe",
+                "mklabel",
+                "mkpart",
+                "mkfs",
+                "write",
+                "bootloader",
+                "finalize"
+            ],
+            "every step runs in order"
+        );
+        for event in &reporter.events {
+            if let crate::pipeline::event::Event::Message { text, .. } = event {
+                assert!(!text.contains("not implemented"), "no step refused: {text}");
+            }
+        }
+        // The stamped MBR entry points at the same window the opener
+        // serves: the table and the test agree on the offset.
+        let disk = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&disk_path)
+            .expect("the disk reopens");
+        let mut entry = [0u8; 16];
+        disk.read_exact_at(&mut entry, 446)
+            .expect("the mbr entry reads");
+        let start = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+        assert_eq!(
+            u64::from(start) * 512,
+            base,
+            "the table entry names the data window"
+        );
+        // The partition window is fsck clean.
+        let mut window = vec![0u8; len as usize];
+        disk.read_exact_at(&mut window, base)
+            .expect("the window reads");
+        let picture = scratch.path().join("part.img");
+        std::fs::write(&picture, &window).expect("the window dumps");
+        let output = match std::process::Command::new("fsck.fat")
+            .arg("-n")
+            .arg(&picture)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
+                return;
+            }
+        };
+        assert!(
+            output.status.success(),
+            "fsck.fat -n exits 0 on the installed partition ({})",
+            output.status
+        );
+        // Files and boot sector through a fresh handle over the same
+        // window: the stage, the companions with the ISO's bytes, the
+        // wrapper, and the grafted record.
+        let view = PartFile::open(&disk_path, base, len).expect("the view reopens");
+        let mut fat = Fat32::open(Box::new(view)).expect("the volume opens");
+        let core = load_from(&resources_dir(), Resource::Syslinux604Core)
+            .expect("the core loads")
+            .bytes()
+            .to_vec();
+        let stage = fat.read_file("/ldlinux.sys").expect("the stage reads");
+        assert_eq!(
+            stage.len(),
+            core.len() + 1024,
+            "the stage is core plus adv in 69145 bytes"
+        );
+        for (name, bytes) in [
+            ("ldlinux.c32", b"ldlinux-c32-stub".as_slice()),
+            ("menu.c32", b"menu-stub".as_slice()),
+            ("vesamenu.c32", b"vesamenu-stub".as_slice()),
+            ("libutil.c32", b"libutil-stub".as_slice()),
+        ] {
+            let path = format!("/isolinux/{name}");
+            let back = fat.read_file(&path).expect("the companion reads back");
+            assert_eq!(back, bytes, "{name} keeps the ISO bytes");
+        }
+        let back = fat
+            .read_file("/syslinux.cfg")
+            .expect("the wrapper reads back");
+        assert_eq!(
+            back,
+            syslinux::config_text(b"/isolinux/isolinux.cfg").expect("the wrapper builds"),
+            "the wrapper chains to the located config"
+        );
+        let view = PartFile::open(&disk_path, base, len).expect("the view reopens");
+        let mut sector = [0u8; 512];
+        view.read_exact_at(0, &mut sector).expect("sector 0 reads");
+        assert_eq!(&sector[0..3], &[0xEB, 0x58, 0x90], "the payload jump lands");
+        assert_eq!(
+            &sector[3..11],
+            b"SYSLINUX",
+            "the payload OEM marks the volume"
+        );
+        assert_eq!(
+            2 + u16::from(sector[1]),
+            0x5A,
+            "the jump targets the code at 0x5A"
         );
     }
 }

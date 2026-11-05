@@ -17,8 +17,7 @@
 //! * `write` — validates the plan file (schema version + confirm
 //!   hash) and runs it through the S17 pipeline against the planned
 //!   device, or against the `--device-file` seam in tests; exit 7 only
-//!   for the steps no slice implements yet (bootloader; the copy
-//!   engine is implemented, its plan and write-path wiring is not).
+//!   for unwired bootloader modes and image kinds with no tree reader.
 //!   `write`
 //!   is the one command whose failure goes to stderr in both modes:
 //!   `--json` streams one `Event` object per stdout line, so the
@@ -62,9 +61,8 @@ mod plan;
 // Exit codes and failure reporting
 // ---------------------------------------------------------------------------
 
-/// Exit codes (PLAN §9-S03 table, plus `NotImplemented` for the plan
-/// steps no slice implements yet — bootloader, and copy wiring (the
-/// copy engine itself is implemented)). `UnsupportedImage`
+/// Exit codes (PLAN §9-S03 table, plus `NotImplemented` for unwired
+/// bootloader modes and image kinds with no tree reader). `UnsupportedImage`
 /// has no producer yet (images the executor cannot serve arrive with a
 /// later slice); the contract above is authoritative for callers, hence
 /// the `dead_code` allowance.
@@ -565,6 +563,11 @@ enum Command {
             default_value = "fat32"
         )]
         filesystem: rufus_proto::Filesystem,
+        /// Copy an ISO/UDF image's file tree instead of writing the
+        /// image byte-for-byte (the recommended mode for bootable
+        /// sticks).
+        #[arg(long = "iso-mode")]
+        iso_mode: bool,
         /// Volume label (default: executor derives it from the image).
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
@@ -599,8 +602,8 @@ enum Command {
     ///
     /// With --plan the file is checked (schema version + confirm hash)
     /// and then run through the S17 pipeline: wipe, table, partition,
-    /// format, write, finalize. Mismatches exit 1; steps no slice
-    /// implements yet (bootloader, and copy wiring) exit 7. `--device-file` runs
+    /// format, write, bootloader, finalize. Mismatches exit 1; unwired
+    /// bootloader modes and image kinds with no tree reader exit 7. `--device-file` runs
     /// the same plan against a regular file instead of the planned
     /// device (a test seam; the planned device is never opened then).
     /// Failures report on stderr in both modes, so `--json` stdout
@@ -1626,6 +1629,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
             scheme,
             target,
             filesystem,
+            iso_mode,
             label,
             cluster,
             quick,
@@ -1677,6 +1681,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
                     scheme: scheme.clone(),
                     target: target.clone(),
                     filesystem: filesystem.clone(),
+                    iso_mode: *iso_mode,
                     label: label.clone(),
                     cluster_bytes,
                     quick_format: *quick,

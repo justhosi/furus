@@ -53,11 +53,11 @@
     },
     {
       "op": "bootloader",
-      "mode": "auto"
+      "mode": "none"
     },
     {
       "op": "finalize"
     }
   ],
-  "confirm": "sha256:a018a861d6cc1a951d07c8b85ecc8674e673978b72e9a9753103ddc0aade702b"
+  "confirm": "sha256:d53feca473b3623f012571d18657700b2bf7552139e044fbf3d94b5987d1085c"
 }

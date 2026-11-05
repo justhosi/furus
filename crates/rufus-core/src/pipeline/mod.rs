@@ -3,12 +3,14 @@
 //! contract.
 //!
 //! The machine walks `plan.steps` in order through [`run`], emitting
-//! [`Event`]s to a [`Reporter`] and timing every step. All seven steps
-//! run: wipe, mklabel, mkpart, mkfs and finalize, both write paths
+//! [`Event`]s to a [`Reporter`] and timing every step. Every step is
+//! wired: wipe, mklabel, mkpart, mkfs and finalize, both write paths
 //! (the [`Dd`](rufus_proto::WriteMode::Dd) stream and the
 //! [`Copy`](rufus_proto::WriteMode::Copy) file-tree copy), and the
-//! bootloader step ([`bootloader`] installs Syslinux on FAT32; other
-//! modes and filesystems refuse naming themselves).
+//! bootloader step ([`bootloader`] installs Syslinux, GRUB2 BIOS or
+//! GRUB4DOS on FAT32 plus UEFI GRUB placement; other modes and
+//! filesystems refuse naming themselves). Later features (persistence
+//! and the rest) stay unwired.
 //!
 //! [`step_name`] is the one shared snake_case vocabulary for step
 //! identifiers, so the CLI and the machine cannot drift apart.
@@ -123,7 +125,8 @@ pub fn step_name(step: &Step) -> &'static str {
 
 /// Run one step through the run context: wipe, label, partition,
 /// filesystem, write and bootloader stages live in their own modules
-/// (the bootloader arm runs [`bootloader::run`], Syslinux on FAT32).
+/// (the bootloader arm runs [`bootloader::run`], Syslinux, GRUB2 BIOS
+/// or GRUB4DOS on FAT32).
 /// The match is exhaustive, so a new
 /// [`Step`] variant fails to compile here (and in [`step_name`]) until
 /// it is handled.
