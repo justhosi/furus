@@ -125,8 +125,8 @@ pub fn step_name(step: &Step) -> &'static str {
 
 /// Run one step through the run context: wipe, label, partition,
 /// filesystem, write and bootloader stages live in their own modules
-/// (the bootloader arm runs [`bootloader::run`], Syslinux, GRUB2 BIOS
-/// or GRUB4DOS on FAT32).
+/// (the bootloader arm runs [`bootloader::run`]: Syslinux, GRUB2 BIOS
+/// or GRUB4DOS on FAT32, the UEFI:NTFS shim on NTFS or exFAT).
 /// The match is exhaustive, so a new
 /// [`Step`] variant fails to compile here (and in [`step_name`]) until
 /// it is handled.

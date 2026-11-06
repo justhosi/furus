@@ -575,7 +575,7 @@ enum Command {
         /// Bootloader installer for the copy step (default: auto, paired
         /// with the write mode; uefi-ntfs selects the two-partition
         /// UEFI:NTFS layout and forces copy mode, refused without
-        /// --filesystem ntfs).
+        /// --filesystem ntfs or exfat).
         #[arg(long, value_enum, default_value_t = plan::BootloaderOpt::Auto)]
         bootloader: plan::BootloaderOpt,
         /// Volume label (default: executor derives it from the image).

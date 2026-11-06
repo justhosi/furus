@@ -388,6 +388,44 @@ fn partition_window(partition: &PlannedPartition, sector_size: u32) -> Result<(u
     Ok((offset, len))
 }
 
+/// The byte window `(offset, len)` of the planned partition with
+/// `role` for `kind` on a `size_bytes` disk with `sector_size`-byte
+/// sectors: the shared overflow-checked lookup behind [`data_window`]
+/// (`"data"`) and [`esp_window`] (`"esp"`), so the two spell the
+/// request-plus-plan-plus-lookup arithmetic once. Planned through the
+/// same [`request`] plus [`plan`] the stamper runs, so the window is
+/// the partition the table describes by construction — never a
+/// positional literal. A plan with no such role (unreachable through
+/// [`plan`] today) refuses naming the layout and the role instead of
+/// indexing blindly.
+fn role_window(
+    kind: LayoutKind,
+    table: TableKind,
+    sector_size: u32,
+    size_bytes: u64,
+    role: &str,
+) -> Result<(u64, u64)> {
+    let request = request(
+        kind,
+        table,
+        sector_size,
+        size_bytes,
+        DataType::MicrosoftBasicData,
+    )?;
+    let planned = plan(&request)?;
+    let partition = planned
+        .partitions
+        .iter()
+        .find(|partition| partition.role == role)
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "the {} layout planned no {role} partition",
+                kind.label()
+            ))
+        })?;
+    partition_window(partition, sector_size)
+}
+
 /// The byte window `(offset, len)` of the `Single` layout's data
 /// partition for `table` on a `size_bytes` disk with `sector_size`-byte
 /// sectors: what the platform opener formats and verifies. Planned
@@ -428,25 +466,27 @@ pub fn data_window(
     sector_size: u32,
     size_bytes: u64,
 ) -> Result<(u64, u64)> {
-    let request = request(
-        kind,
-        table,
-        sector_size,
-        size_bytes,
-        DataType::MicrosoftBasicData,
-    )?;
-    let planned = plan(&request)?;
-    let partition = planned
-        .partitions
-        .iter()
-        .find(|partition| partition.role == "data")
-        .ok_or_else(|| {
-            CoreError::invalid(format!(
-                "the {} layout planned no data partition",
-                kind.label()
-            ))
-        })?;
-    partition_window(partition, sector_size)
+    role_window(kind, table, sector_size, size_bytes, "data")
+}
+
+/// The byte window `(offset, len)` of `kind`'s `esp` partition for
+/// `table` on a `size_bytes` disk with `sector_size`-byte sectors:
+/// the window the UEFI:NTFS shim image fills. The sibling of
+/// [`data_window`] over the same shared lookup — the partition whose
+/// `role` is `"esp"` wins, never a positional literal — so the window
+/// is the partition the table describes by construction. Only the
+/// layouts that stamp an ESP have one (`UefiNtfs` today, 1 MiB at the
+/// 1 MiB grid; `WindowsToGo` 100 MiB); every other layout refuses
+/// naming the layout instead of indexing blindly. The geometry does
+/// not depend on the data partition's type, so the lookup plans with
+/// the same fixed type [`data_window`] uses.
+pub fn esp_window(
+    kind: LayoutKind,
+    table: TableKind,
+    sector_size: u32,
+    size_bytes: u64,
+) -> Result<(u64, u64)> {
+    role_window(kind, table, sector_size, size_bytes, "esp")
 }
 
 /// The 1-based table position of `kind`'s `data` partition for `table`
@@ -1427,6 +1467,49 @@ mod tests {
                 1,
                 "{table:?} data is first"
             );
+        }
+    }
+
+    #[test]
+    fn esp_window_matches_the_planned_esp_role() {
+        // The layouts that stamp an ESP resolve through the same role
+        // the planner stamped: `UefiNtfs` is exactly 1 MiB at the 1 MiB
+        // grid on both tables and both sector sizes, `WindowsToGo`
+        // exactly 100 MiB.
+        for (table, sector_size) in [
+            (TableKind::Mbr, 512),
+            (TableKind::Gpt, 512),
+            (TableKind::Mbr, 4096),
+            (TableKind::Gpt, 4096),
+        ] {
+            let size_bytes = 512 * MIB_BYTES;
+            let (offset, len) = esp_window(LayoutKind::UefiNtfs, table, sector_size, size_bytes)
+                .expect("the esp window plans");
+            assert_eq!(offset, MIB_BYTES, "{table:?}/{sector_size} offset");
+            assert_eq!(len, MIB_BYTES, "{table:?}/{sector_size} length");
+        }
+        let size_bytes = 512 * MIB_BYTES;
+        let (offset, len) = esp_window(LayoutKind::WindowsToGo, TableKind::Gpt, 512, size_bytes)
+            .expect("the windows-to-go esp plans");
+        assert_eq!(offset, MIB_BYTES, "the esp still starts on the grid");
+        assert_eq!(len, 100 * MIB_BYTES, "the esp window is exactly 100 MiB");
+    }
+
+    #[test]
+    fn esp_window_refuses_layouts_without_an_esp() {
+        // `Single` and `Persistence` stamp no ESP: the lookup refuses
+        // naming the layout, never a positional guess. The disk is
+        // 512 MiB so the persistence fit gate passes and the refusal
+        // comes from the role lookup itself.
+        for kind in [LayoutKind::Single, LayoutKind::Persistence] {
+            for table in [TableKind::Mbr, TableKind::Gpt] {
+                let error =
+                    esp_window(kind, table, 512, 512 * MIB_BYTES).expect_err("no esp refuses");
+                let text = error.to_string();
+                assert!(text.contains(kind.label()), "names the layout: {text}");
+                assert!(text.contains("esp"), "names the role: {text}");
+                assert!(text.is_ascii(), "stays ASCII: {text}");
+            }
         }
     }
 

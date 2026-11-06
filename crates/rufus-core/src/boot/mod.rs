@@ -1,4 +1,4 @@
-//! Bootloader installation: the six embedded payloads plus one
+//! Bootloader installation: the seven embedded payloads plus one
 //! installer per family, and the 27 embedded FreeDOS payloads, all in
 //! this module.
 //!
@@ -8,15 +8,17 @@
 //! that does not match all of them. [`load`] is the production entry
 //! point (it resolves through [`asset_path`](crate::paths::asset_path));
 //! [`load_from`] is the testable core over an explicit directory. The
-//! six resources are the Syslinux 4.07 VBR/core (ids 400/401), the
-//! Syslinux 6.04 VBR/core (402/403) and the Grub4DOS MBR/core
-//! (450/451).
+//! seven resources are the Syslinux 4.07 VBR/core (ids 400/401), the
+//! Syslinux 6.04 VBR/core (402/403), the Grub4DOS MBR/core
+//! (450/451) and the UEFI:NTFS shim image (502).
 //!
 //! [`syslinux`] installs either Syslinux family (family decision,
 //! contiguous `ldlinux.sys` plus sector-map/ADV patch, companions,
 //! config wrapper, obsolete-module substitution); [`grub2`] installs a
 //! GRUB2 BIOS boot record and places a `grubx64.efi` image;
 //! [`grub4dos`] writes the GRUB4DOS MBR window, SBR and root `grldr`;
+//! [`uefi_ntfs`] writes the embedded 1 MiB UEFI:NTFS shim image
+//! verbatim at the ESP partition's offset (never formatted by us);
 //! [`kolibri`] places the KolibriOS `MTLD_F32` loader at the volume
 //! root and writes the `FUN_140075d80` boot record through the
 //! BPB-preserving graft: the volume label survives instead of becoming
@@ -55,6 +57,7 @@ pub mod kolibri;
 pub mod msdos;
 pub mod records;
 pub mod syslinux;
+pub mod uefi_ntfs;
 
 use std::path::Path;
 
@@ -67,9 +70,10 @@ use crate::paths::asset_path;
 /// One embedded bootloader payload, pinned against `assets/manifest.json`.
 ///
 /// The numeric ids are the manifest resource ids (400-403 Syslinux,
-/// 450-451 Grub4DOS); the sizes and digests are the manifest `bytes` and
-/// `sha256` values, so any manifest regeneration must update this enum
-/// in lockstep (the load test below guards the drift).
+/// 450-451 Grub4DOS, 502 UEFI:NTFS); the sizes and digests are the
+/// manifest `bytes` and `sha256` values, so any manifest regeneration
+/// must update this enum in lockstep (the load test below guards the
+/// drift).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Resource {
     /// Syslinux 4.07 VBR (`ldlinux.bss`), manifest id 400.
@@ -84,19 +88,24 @@ pub enum Resource {
     Grub4DosMbr,
     /// Grub4DOS core (`grldr`), manifest id 451.
     Grub4DosCore,
+    /// UEFI:NTFS shim image (`uefi-ntfs.img`), manifest id 502: a 1 MiB
+    /// FAT12 container holding the NTFS EFI driver, written verbatim at
+    /// the ESP offset (see [`uefi_ntfs`](self::uefi_ntfs)).
+    UefiNtfsImage,
 }
 
 impl Resource {
     /// Every variant, so the tests below load each payload and no new
     /// variant can skip that coverage silently (a new variant must be
     /// added here to keep the file-name test exhaustive).
-    pub const ALL: [Resource; 6] = [
+    pub const ALL: [Resource; 7] = [
         Resource::Syslinux407Vbr,
         Resource::Syslinux407Core,
         Resource::Syslinux604Vbr,
         Resource::Syslinux604Core,
         Resource::Grub4DosMbr,
         Resource::Grub4DosCore,
+        Resource::UefiNtfsImage,
     ];
 
     /// Manifest resource id.
@@ -109,6 +118,7 @@ impl Resource {
             Self::Syslinux604Core => 403,
             Self::Grub4DosMbr => 450,
             Self::Grub4DosCore => 451,
+            Self::UefiNtfsImage => 502,
         }
     }
 
@@ -122,6 +132,7 @@ impl Resource {
             Self::Syslinux604Core => "RCDATA_403.bin",
             Self::Grub4DosMbr => "RCDATA_450.bin",
             Self::Grub4DosCore => "RCDATA_451.bin",
+            Self::UefiNtfsImage => "RCDATA_502.bin",
         }
     }
 
@@ -135,6 +146,7 @@ impl Resource {
             Self::Syslinux604Core => 68121,
             Self::Grub4DosMbr => 8192,
             Self::Grub4DosCore => 42742,
+            Self::UefiNtfsImage => 1_048_576,
         }
     }
 
@@ -158,6 +170,9 @@ impl Resource {
             Self::Grub4DosCore => {
                 "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809"
             }
+            Self::UefiNtfsImage => {
+                "72683fa1250eeea772d3399277b434d4e55ba8dd0dc926e52d817e701fc2eb9e"
+            }
         }
     }
 
@@ -171,6 +186,7 @@ impl Resource {
             Self::Syslinux604Core => "Syslinux 6.04 core",
             Self::Grub4DosMbr => "Grub4DOS MBR",
             Self::Grub4DosCore => "Grub4DOS core",
+            Self::UefiNtfsImage => "UEFI:NTFS image",
         }
     }
 }
@@ -198,7 +214,7 @@ impl Payload {
         self.bytes.len()
     }
 
-    /// Whether the payload holds no bytes (never true for the six pinned
+    /// Whether the payload holds no bytes (never true for the seven pinned
     /// resources — every size is non-zero — but the [`len`](Self::len)
     /// companion keeps the API unsurprising).
     #[must_use]
@@ -306,7 +322,7 @@ mod tests {
     fn every_resource_loads_with_pinned_size_and_digest() {
         // The anti-drift guard: the file names, sizes and digests above
         // come from `assets/manifest.json`, so a manifest regeneration
-        // that changes any of the six payloads fails here until the
+        // that changes any of the seven payloads fails here until the
         // enum is updated in lockstep.
         for resource in Resource::ALL {
             let payload = load_from(&resources_dir(), resource).expect("the pinned payload loads");
@@ -347,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn file_names_are_exactly_the_six_pinned_names() {
+    fn file_names_are_exactly_the_seven_pinned_names() {
         // One assertion over every variant, so a future variant that is
         // added to `ALL` without a real payload file cannot slip past
         // the load test above (it would fail there on a missing file).
@@ -361,20 +377,21 @@ mod tests {
                 "RCDATA_403.bin",
                 "RCDATA_450.bin",
                 "RCDATA_451.bin",
+                "RCDATA_502.bin",
             ],
-            "the six pinned file names"
+            "the seven pinned file names"
         );
     }
 
     #[test]
-    fn resource_ids_are_the_six_manifest_ids() {
+    fn resource_ids_are_the_seven_manifest_ids() {
         // Sibling to the file-name guard: the numeric ids ride the same
         // manifest entries, so they pin in lockstep too.
         let ids: Vec<u16> = Resource::ALL.iter().map(|r| r.id()).collect();
         assert_eq!(
             ids,
-            [400, 401, 402, 403, 450, 451],
-            "the six manifest resource ids"
+            [400, 401, 402, 403, 450, 451, 502],
+            "the seven manifest resource ids"
         );
     }
 

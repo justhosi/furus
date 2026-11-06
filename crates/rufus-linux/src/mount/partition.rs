@@ -4,9 +4,10 @@
 //! single-level directory under [`std::env::temp_dir`], hands back a
 //! [`Mounted`] guard that owns the mount, and answers the copy
 //! pre-flight through `statvfs`. The kernel filesystem names are pinned
-//! here: `Fat32` mounts as `"vfat"`, `Exfat` as `"exfat"`; every other
+//! here: `Fat32` mounts as `"vfat"`, `Exfat` as `"exfat"`, `Ntfs` as
+//! `"ntfs3"` (the in-kernel read-write driver); every other
 //! [`Filesystem`] refuses before anything is created or mounted (copy
-//! onto NTFS/ext/UDF is not wired).
+//! onto ext/UDF is not wired).
 //!
 //! The guard is generic over [`MountOps`] so tests can drive it with a
 //! fake backend: the mount call happens exactly once per guard, and the
@@ -48,27 +49,27 @@ const MAX_MOUNT_DIR_ATTEMPTS: u32 = 16;
 static MOUNT_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The kernel filesystem type to mount for `filesystem`: `Fat32` is
-/// `"vfat"` on Linux, `Exfat` is `"exfat"`. Every other variant refuses
-/// with an ASCII message naming the filesystem: copy onto NTFS/ext/UDF
-/// is not wired, so mounting one would only waste a mount point.
+/// `"vfat"` on Linux, `Exfat` is `"exfat"`, `Ntfs` is `"ntfs3"` (the
+/// in-kernel read-write driver the UEFI:NTFS data partition needs).
+/// Every other variant refuses with an ASCII message naming the
+/// filesystem: copy onto ext/UDF is not wired, so mounting one would
+/// only waste a mount point.
 fn fstype_of(filesystem: &Filesystem) -> Result<&'static str> {
     match filesystem {
         Filesystem::Fat32 => Ok("vfat"),
         Filesystem::Exfat => Ok("exfat"),
-        Filesystem::Ntfs => Err(CoreError::invalid(
-            "copy onto ntfs is not wired: the data partition mount refuses ntfs (fat32 and exfat only)".to_string(),
-        )),
+        Filesystem::Ntfs => Ok("ntfs3"),
         Filesystem::Ext2 => Err(CoreError::invalid(
-            "copy onto ext2 is not wired: the data partition mount refuses ext2 (fat32 and exfat only)".to_string(),
+            "copy onto ext2 is not wired: the data partition mount refuses ext2 (fat32, exfat and ntfs only)".to_string(),
         )),
         Filesystem::Ext3 => Err(CoreError::invalid(
-            "copy onto ext3 is not wired: the data partition mount refuses ext3 (fat32 and exfat only)".to_string(),
+            "copy onto ext3 is not wired: the data partition mount refuses ext3 (fat32, exfat and ntfs only)".to_string(),
         )),
         Filesystem::Ext4 => Err(CoreError::invalid(
-            "copy onto ext4 is not wired: the data partition mount refuses ext4 (fat32 and exfat only)".to_string(),
+            "copy onto ext4 is not wired: the data partition mount refuses ext4 (fat32, exfat and ntfs only)".to_string(),
         )),
         Filesystem::Udf => Err(CoreError::invalid(
-            "copy onto udf is not wired: the data partition mount refuses udf (fat32 and exfat only)".to_string(),
+            "copy onto udf is not wired: the data partition mount refuses udf (fat32, exfat and ntfs only)".to_string(),
         )),
     }
 }
@@ -474,6 +475,33 @@ mod tests {
     }
 
     #[test]
+    fn fake_mount_passes_ntfs3_through() {
+        // `Ntfs` mounts as `ntfs3`: the seam sees the fstype the
+        // mapping pins, exactly once.
+        let temp = tempfile::tempdir().expect("scratch fits");
+        let fake = FakeOps::new();
+        let dir = scratch_dir(&temp, "mnt");
+        let source = Path::new("/dev/rufus-test-part");
+        let mut guard =
+            Mounted::mount_with_ops(source, &dir, "ntfs3", fake.clone(), fake_free_bytes)
+                .expect("fake mount lands");
+        assert_eq!(
+            fake.mounts(),
+            [FakeCall::Mount {
+                source: source.display().to_string(),
+                target: dir.display().to_string(),
+                fstype: Some("ntfs3".to_string()),
+            }]
+        );
+        guard.release().expect("release lands");
+        assert_eq!(
+            fake.mounts().len(),
+            1,
+            "the mount call happens exactly once"
+        );
+    }
+
+    #[test]
     fn drop_without_release_still_unmounts() {
         let temp = tempfile::tempdir().expect("scratch fits");
         let fake = FakeOps::new();
@@ -576,19 +604,24 @@ mod tests {
     }
 
     #[test]
-    fn fstype_mapping_refuses_everything_but_fat32_and_exfat() {
+    fn fstype_mapping_maps_fat32_exfat_and_ntfs() {
         assert_eq!(fstype_of(&Filesystem::Fat32).expect("fat32 maps"), "vfat");
         assert_eq!(fstype_of(&Filesystem::Exfat).expect("exfat maps"), "exfat");
-        for filesystem in [Filesystem::Ntfs, Filesystem::Ext4, Filesystem::Udf] {
+        assert_eq!(
+            fstype_of(&Filesystem::Ntfs).expect("ntfs maps"),
+            "ntfs3",
+            "ntfs mounts through the in-kernel read-write driver"
+        );
+        for filesystem in [Filesystem::Ext4, Filesystem::Udf] {
             let error = fstype_of(&filesystem).expect_err("unwired filesystems refuse");
             let text = error.to_string();
             let name = match filesystem {
-                Filesystem::Ntfs => "ntfs",
                 Filesystem::Ext4 => "ext4",
                 Filesystem::Udf => "udf",
                 _ => "unreachable",
             };
             assert!(text.contains(name), "{text}");
+            assert!(text.contains("ntfs"), "the refusal lists ntfs: {text}");
             assert!(text.is_ascii(), "{text}");
         }
         // The remaining tool-based variants refuse the same way.
@@ -603,10 +636,9 @@ mod tests {
         // The refusal happens before any directory is created or any
         // mount is attempted, so these run unprivileged: `LiveOps`
         // never sees the call.
-        for filesystem in [Filesystem::Ntfs, Filesystem::Ext4, Filesystem::Udf] {
+        for filesystem in [Filesystem::Ext4, Filesystem::Udf] {
             let error = mount(Path::new("/dev/rufus-test-part"), &filesystem).expect_err("refuses");
             let name = match filesystem {
-                Filesystem::Ntfs => "ntfs",
                 Filesystem::Ext4 => "ext4",
                 Filesystem::Udf => "udf",
                 _ => "unreachable",

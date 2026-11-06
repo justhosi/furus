@@ -499,15 +499,17 @@ fn check_steps(plan: &Plan) -> Result<(), Reject> {
         let number = index + 1;
         match step {
             Step::Mkpart { layout, .. }
-                if *layout == Layout::UefiNtfs && plan.options.filesystem != Filesystem::Ntfs =>
+                if *layout == Layout::UefiNtfs
+                    && plan.options.filesystem != Filesystem::Ntfs
+                    && plan.options.filesystem != Filesystem::Exfat =>
             {
-                // The shim boots an NTFS data partition the image tree
-                // populates: any other filesystem is refused with the
-                // planner's own wording, so a hand-built plan cannot
-                // slip past the CLI gate.
+                // The shim boots an NTFS or exFAT data partition the
+                // image tree populates: any other filesystem is refused
+                // with the planner's own wording, so a hand-built plan
+                // cannot slip past the CLI gate.
                 return Err(reject(
                     "invalid_step",
-                    "UEFI:NTFS needs an NTFS data partition; choose --filesystem ntfs",
+                    "UEFI:NTFS needs an NTFS or exFAT data partition; choose --filesystem ntfs or exfat",
                 ));
             }
             Step::Mklabel { scheme } | Step::Mkpart { scheme, .. } => {
@@ -1340,9 +1342,9 @@ mod tests {
     }
 
     #[test]
-    fn uefi_ntfs_layout_without_ntfs_is_refused() {
-        // The shim boots an NTFS data partition: a hand-built plan
-        // pairing the two-partition layout with the default FAT32
+    fn uefi_ntfs_layout_without_ntfs_or_exfat_is_refused() {
+        // The shim boots an NTFS or exFAT data partition: a hand-built
+        // plan pairing the two-partition layout with the default FAT32
         // filesystem is refused with the planner's own wording.
         let fixture = Fixture::new();
         let (mut plan, env, _device) = fixture.good(true);
@@ -1354,22 +1356,24 @@ mod tests {
         assert_eq!(refused.code, "invalid_step");
         assert_eq!(
             refused.message,
-            "UEFI:NTFS needs an NTFS data partition; choose --filesystem ntfs"
+            "UEFI:NTFS needs an NTFS or exFAT data partition; choose --filesystem ntfs or exfat"
         );
     }
 
     #[test]
-    fn uefi_ntfs_layout_with_ntfs_is_accepted() {
-        // The same layout over the NTFS filesystem it boots passes:
-        // the rule only fires on the mismatched pairing.
-        let fixture = Fixture::new();
-        let (mut plan, env, _device) = fixture.good(true);
-        if let Step::Mkpart { layout, .. } = &mut plan.steps[2] {
-            *layout = rufus_proto::Layout::UefiNtfs;
+    fn uefi_ntfs_layout_with_ntfs_or_exfat_is_accepted() {
+        // The same layout over either filesystem it boots passes: the
+        // rule only fires on a mismatched pairing.
+        for filesystem in [Filesystem::Ntfs, Filesystem::Exfat] {
+            let fixture = Fixture::new();
+            let (mut plan, env, _device) = fixture.good(true);
+            if let Step::Mkpart { layout, .. } = &mut plan.steps[2] {
+                *layout = rufus_proto::Layout::UefiNtfs;
+            }
+            plan.options.filesystem = filesystem.clone();
+            plan = signed(plan);
+            validate(&plan, &env).expect("the pairing passes");
         }
-        plan.options.filesystem = Filesystem::Ntfs;
-        plan = signed(plan);
-        validate(&plan, &env).expect("the ntfs pairing passes");
     }
 
     #[test]

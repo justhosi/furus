@@ -1,14 +1,16 @@
 //! The bootloader step: Syslinux, GRUB2 and GRUB4DOS installation
-//! from the image tree, plus UEFI GRUB placement.
+//! from the image tree, UEFI GRUB placement, and the UEFI:NTFS shim.
 //!
-//! What is wired today (FAT32 volumes only): explicit `Syslinux` mode
-//! installs one Syslinux family; explicit `Grub2` installs the BIOS
-//! record and places a UEFI image when the tree carries one; explicit
-//! `Grub4dos` writes the embedded MBR/SBR and the root loader; `Auto`
-//! takes the first match of syslinux, grub2, grub4dos, logging each
-//! probe. `UefiNtfs` stays not implemented: it names S20's UEFI:NTFS
-//! partition, not the UEFI GRUB file this step places. `Freedos`
-//! refuses the same way.
+//! What is wired today: explicit `Syslinux` mode installs one Syslinux
+//! family; explicit `Grub2` installs the BIOS record and places a UEFI
+//! image when the tree carries one; explicit `Grub4dos` writes the
+//! embedded MBR/SBR and the root loader (all three read the image tree
+//! and need a FAT32 volume); `Auto` takes the first match of syslinux,
+//! grub2, grub4dos, logging each probe. Explicit `UefiNtfs` is
+//! disk-only instead: it writes the embedded 1 MiB shim image at the
+//! ESP offset of the two-partition layout for NTFS or exFAT plans — no
+//! image tree, no FAT32 volume (the copy step already placed the ISO
+//! files on the data partition). `Freedos` stays not implemented.
 //!
 //! The obsolete-module replacement ([`Obsolete`](crate::boot::syslinux::Obsolete))
 //! is deliberately not applied here: no newer module bytes are
@@ -41,6 +43,7 @@ use crate::boot::grub2;
 use crate::boot::grub4dos;
 use crate::boot::syslinux;
 use crate::boot::syslinux::Family;
+use crate::boot::uefi_ntfs;
 use crate::copy::IsoSource;
 use crate::copy::Source as TreeSource;
 use crate::copy::UdfSource;
@@ -51,6 +54,7 @@ use crate::fs::Volume;
 use crate::fs::fat32::Fat32;
 use crate::iso::IsoReader;
 use crate::part::TableKind;
+use crate::part::plan::LayoutKind;
 use crate::pipeline::event::Event;
 use crate::pipeline::steps::RunContext;
 use crate::pipeline::target::Target;
@@ -127,7 +131,9 @@ impl Volume for DiskView<'_> {
 /// Refuse every [`BootloaderMode`] with no wired installer, naming
 /// the mode: one table shared by [`install_tree`] and [`run`], so an
 /// unwired mode never reaches the image or the device through either
-/// entry point. (`UefiNtfs` names S20's UEFI:NTFS partition, not the
+/// entry point. `UefiNtfs` passes here — its disk-only arm lives in
+/// [`run`], not [`install_tree`], which refuses it through its own
+/// explicit arm. (The mode names S20's UEFI:NTFS partition, not the
 /// UEFI GRUB file the GRUB arms place.)
 fn check_mode(mode: &BootloaderMode) -> Result<()> {
     match mode {
@@ -135,10 +141,8 @@ fn check_mode(mode: &BootloaderMode) -> Result<()> {
         | BootloaderMode::Syslinux
         | BootloaderMode::Auto
         | BootloaderMode::Grub2
-        | BootloaderMode::Grub4dos => Ok(()),
-        BootloaderMode::UefiNtfs => Err(CoreError::NotImplemented {
-            what: "uefi_ntfs bootloader installation (wired in a later slice)",
-        }),
+        | BootloaderMode::Grub4dos
+        | BootloaderMode::UefiNtfs => Ok(()),
         BootloaderMode::Freedos => Err(CoreError::NotImplemented {
             what: "freedos bootloader installation (wired in a later slice)",
         }),
@@ -198,6 +202,15 @@ pub(crate) enum Installed {
         embedded_grldr: bool,
         messages: Vec<String>,
     },
+    /// UEFI:NTFS install: shim image byte count, the ESP offset it
+    /// landed at, and log lines (the reference `Writing UEFI:NTFS
+    /// data...` line). Only the disk-only [`run`] path builds this —
+    /// [`install_tree`] refuses the mode through its own arm.
+    UefiNtfs {
+        bytes: u64,
+        offset: u64,
+        messages: Vec<String>,
+    },
 }
 
 impl Installed {
@@ -208,7 +221,8 @@ impl Installed {
             Installed::Skipped => &[],
             Installed::Syslinux { messages, .. }
             | Installed::Grub2 { messages, .. }
-            | Installed::Grub4dos { messages, .. } => messages,
+            | Installed::Grub4dos { messages, .. }
+            | Installed::UefiNtfs { messages, .. } => messages,
         }
     }
 }
@@ -224,7 +238,8 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
         Installed::Skipped => {}
         Installed::Syslinux { messages, .. }
         | Installed::Grub2 { messages, .. }
-        | Installed::Grub4dos { messages, .. } => {
+        | Installed::Grub4dos { messages, .. }
+        | Installed::UefiNtfs { messages, .. } => {
             messages.splice(..0, probes);
         }
     }
@@ -247,8 +262,11 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
 /// verbatim. `Syslinux` runs the Syslinux branch; `Grub2` the GRUB2
 /// BIOS branch plus UEFI placement; `Grub4dos` the embedded MBR/SBR
 /// plus the root loader; `Auto` takes the first match of syslinux,
-/// grub2, grub4dos. Every other mode refuses as not implemented,
-/// naming itself.
+/// grub2, grub4dos. `UefiNtfs` refuses here as invalid rather than not
+/// implemented: the installer exists but is disk-only (no tree, no
+/// FAT32 volume — see [`install_uefi_ntfs`]), so [`run`] wires it
+/// directly and a tree install can never serve it. Every other mode
+/// refuses as not implemented, naming itself.
 ///
 /// `table` is the recorded partition-table kind the BIOS arms bound
 /// their post-MBR gap through (see [`gap_end`]); the Syslinux-only
@@ -310,6 +328,13 @@ pub(crate) fn install_tree(
             install_grub2(source, fat, disk, &payloads, table, cancelled)
         }
         BootloaderMode::Grub4dos => install_grub4dos(fat, disk, table, cancelled, load),
+        // Disk-only by design (see `install_uefi_ntfs`): the shim
+        // lands on the whole disk at the ESP offset with no tree and
+        // no FAT32 volume, so the tree core refuses it and `run`
+        // wires it directly.
+        BootloaderMode::UefiNtfs => Err(CoreError::invalid(
+            "uefi-ntfs installs the embedded image onto the whole disk at the ESP offset, not through the filesystem tree: refusing a tree install".to_string(),
+        )),
         // `None` returned above; unwired modes refused in
         // `check_mode`. This names the mode rather than assuming the
         // match is exhaustive forever.
@@ -550,6 +575,120 @@ fn install_grub4dos(
     })
 }
 
+/// UEFI:NTFS gates plus the ESP window: the filesystem gate mirrors
+/// the reference (`rufus.c:2032-2037`: NTFS or exFAT only, naming the
+/// plan filesystem otherwise); the table gate mirrors [`gap_end`] (no
+/// recorded table, no window); the window comes from
+/// [`esp_window`](crate::part::plan::esp_window) over the `UefiNtfs`
+/// layout the mode implies. Returns `(offset, end)` with `end`
+/// overflow-checked. Shared by [`install_uefi_ntfs`] and
+/// [`run_uefi_ntfs`] so a refused plan fails before any image read —
+/// production's 1 MiB `load` runs only after these gates pass.
+fn uefi_ntfs_window(
+    disk: &dyn Volume,
+    table: Option<TableKind>,
+    filesystem: &Filesystem,
+) -> Result<(u64, u64)> {
+    match filesystem {
+        Filesystem::Ntfs | Filesystem::Exfat => {}
+        _ => {
+            return Err(CoreError::invalid(format!(
+                "uefi-ntfs installation needs an NTFS or exFAT data partition, the plan carries {}: refusing",
+                filesystem_name(filesystem)
+            )));
+        }
+    }
+    let table = table.ok_or_else(|| {
+        CoreError::invalid(
+            "uefi-ntfs install needs a recorded partition table to locate the ESP window: refusing"
+                .to_string(),
+        )
+    })?;
+    let (offset, len) = crate::part::plan::esp_window(
+        LayoutKind::UefiNtfs,
+        table,
+        disk.sector_size(),
+        disk.total_bytes(),
+    )?;
+    let end = offset.checked_add(len).ok_or_else(|| {
+        CoreError::invalid(format!(
+            "uefi-ntfs ESP window at offset {offset} plus {len} bytes overflows u64: refusing"
+        ))
+    })?;
+    Ok((offset, end))
+}
+
+/// UEFI:NTFS arm: the shim `image` onto the whole disk at the ESP
+/// offset, for `Ntfs`/`Exfat` plans only.
+///
+/// Disk-only, unlike every other arm: no image tree is opened and no
+/// `Fat32` volume is touched — the copy step already placed the ISO
+/// files on the data partition, and the shim lands in partition 1.
+/// The gates and the window come from [`uefi_ntfs_window`], and the
+/// write goes through
+/// [`uefi_ntfs::install`](crate::boot::uefi_ntfs::install) —
+/// pre-write bound check, whole image, nothing else. No flush here:
+/// the caller owns it, like every other arm's disk side.
+///
+/// Production passes the embedded bytes (loaded through
+/// [`crate::boot::load`]); tests pass explicit bytes, which is what
+/// makes the oversized-image refusal testable without faking the
+/// asset tree.
+fn install_uefi_ntfs(
+    disk: &mut dyn Volume,
+    table: Option<TableKind>,
+    filesystem: &Filesystem,
+    image: &[u8],
+) -> Result<Installed> {
+    let (offset, end) = uefi_ntfs_window(disk, table, filesystem)?;
+    let installed = uefi_ntfs::install(disk, image, offset, end)?;
+    Ok(Installed::UefiNtfs {
+        bytes: installed.bytes(),
+        offset: installed.offset(),
+        messages: vec!["Writing UEFI:NTFS data...".to_string()],
+    })
+}
+
+/// The UEFI:NTFS completion line: the image byte count and the ESP
+/// offset, shared by [`run_uefi_ntfs`] and the tree-run summary match
+/// so both agree.
+fn uefi_ntfs_summary(bytes: u64, offset: u64) -> String {
+    format!("wrote UEFI:NTFS image ({bytes} bytes at offset {offset})")
+}
+
+/// Run the UEFI:NTFS arm: gate the plan and resolve the ESP window
+/// first (a refused plan does no 1 MiB image read), then load the
+/// embedded shim, install it through [`install_uefi_ntfs`], flush the
+/// disk, and report the reference line plus the completion line.
+fn run_uefi_ntfs(ctx: &mut RunContext<'_>, filesystem: &Filesystem) -> Result<()> {
+    let cancelled = ctx.cancelled;
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let table = ctx.table;
+    let mut disk = DiskView::new(ctx.device()?);
+    uefi_ntfs_window(&disk, table, filesystem)?;
+    let image = crate::boot::load(Resource::UefiNtfsImage)?;
+    let installed = install_uefi_ntfs(&mut disk, table, filesystem, image.bytes())?;
+    disk.flush()?;
+    for message in installed.messages() {
+        ctx.reporter.event(Event::Message {
+            level: "info",
+            text: message.clone(),
+        });
+    }
+    let Installed::UefiNtfs { bytes, offset, .. } = installed else {
+        return Err(CoreError::invalid(
+            "uefi-ntfs install reported no UEFI:NTFS facts: refusing".to_string(),
+        ));
+    };
+    ctx.reporter.event(Event::Message {
+        level: "info",
+        text: uefi_ntfs_summary(bytes, offset),
+    });
+    Ok(())
+}
+
 /// Filesystem name in plan vocabulary (`fat32`, `exfat`, ...).
 fn filesystem_name(filesystem: &Filesystem) -> &'static str {
     match filesystem {
@@ -567,17 +706,20 @@ fn filesystem_name(filesystem: &Filesystem) -> &'static str {
 /// the freshly formatted data partition (and, for the BIOS arms, the
 /// whole disk behind it).
 ///
-/// `None` reports one info line and writes nothing. Unwired modes
-/// refuse up front through the shared [`check_mode`] table (they never
-/// reach the image or the device), then non-FAT32 filesystems refuse
-/// naming the plan filesystem, then the image tree opens exactly like
-/// `write::run_copy` does. The partition and the whole-disk target
-/// open next; a cancellation check follows before the first write (no
-/// partial-cleanup machinery is needed — the directory tree can be
-/// reformatted, so a torn step reports and the next run starts
-/// clean), then the install, one flush of the partition, and the run
-/// message. The disk-side stores flush inside their own install
-/// calls.
+/// `None` reports one info line and writes nothing. `UefiNtfs` takes
+/// the disk-only path ([`run_uefi_ntfs`]) before anything else below:
+/// no unwired-mode check needed beyond the shared table, no
+/// filesystem gate against FAT32, no image tree, no `Fat32` volume.
+/// Unwired modes refuse up front through the shared [`check_mode`]
+/// table (they never reach the image or the device), then
+/// non-FAT32 filesystems refuse naming the plan filesystem, then the
+/// image tree opens exactly like `write::run_copy` does. The partition
+/// and the whole-disk target open next; a cancellation check follows
+/// before the first write (no partial-cleanup machinery is needed —
+/// the directory tree can be reformatted, so a torn step reports and
+/// the next run starts clean), then the install, one flush of the
+/// partition, and the run message. The disk-side stores flush inside
+/// their own install calls.
 pub(crate) fn run(
     ctx: &mut RunContext<'_>,
     mode: &BootloaderMode,
@@ -590,6 +732,14 @@ pub(crate) fn run(
             text: "bootloader: none requested, leaving the image boot code untouched".to_string(),
         });
         return Ok(());
+    }
+    if *mode == BootloaderMode::UefiNtfs {
+        // Disk-only arm, before the FAT32 gate and the image-tree
+        // setup below: the copy step already placed the ISO files on
+        // the data partition, and the shim lands in partition 1, so
+        // neither the tree nor the FAT32 volume is opened here. Every
+        // other mode keeps today's path byte-for-byte.
+        return run_uefi_ntfs(ctx, filesystem);
     }
     // Unwired installers never reach the image or the device: same
     // table as `install_tree` (see `check_mode`).
@@ -709,6 +859,15 @@ pub(crate) fn run(
             ctx.reporter.event(Event::Message {
                 level: "info",
                 text: format!("installed grub4dos boot record ({sbr_bytes} sbr bytes, {grldr})"),
+            });
+        }
+        Installed::UefiNtfs { bytes, offset, .. } => {
+            // The tree core never builds this variant (its UefiNtfs
+            // arm refuses); the disk-only path reports the same line
+            // through `uefi_ntfs_summary`, kept here so both agree.
+            ctx.reporter.event(Event::Message {
+                level: "info",
+                text: uefi_ntfs_summary(*bytes, *offset),
             });
         }
     }
@@ -1190,22 +1349,239 @@ mod tests {
 
     #[test]
     fn unimplemented_modes_name_themselves() {
+        // `Freedos` is the last mode without a wired installer: it
+        // refuses as not implemented, naming itself and the gap.
+        // (`UefiNtfs` used to refuse here too; its disk-only arm now
+        // lives in `run`, and the tree core refuses it as invalid —
+        // see the next test.)
         let source = syslinux_604_tree();
-        for (mode, name) in [
-            (BootloaderMode::UefiNtfs, "uefi_ntfs"),
-            (BootloaderMode::Freedos, "freedos"),
-        ] {
-            let (_backing, mut fat) = formatted();
-            let error =
-                tree_install(&source, &mut fat, &mode).expect_err("an unwired mode refuses");
+        let (_backing, mut fat) = formatted();
+        let error =
+            tree_install(&source, &mut fat, &BootloaderMode::Freedos).expect_err("freedos refuses");
+        assert!(
+            matches!(error, CoreError::NotImplemented { .. }),
+            "a mode refusal is NotImplemented: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("freedos"), "names the mode: {text}");
+        assert!(text.contains("later slice"), "names the gap: {text}");
+    }
+
+    #[test]
+    fn install_tree_refuses_uefi_ntfs_as_disk_only() {
+        // The shim lands on the whole disk with no tree and no FAT32
+        // volume, so the tree core refuses it — as invalid, not not
+        // implemented (the installer exists, in `run`), naming the
+        // whole-disk path.
+        let source = syslinux_604_tree();
+        let (_backing, mut fat) = formatted();
+        let error = tree_install(&source, &mut fat, &BootloaderMode::UefiNtfs)
+            .expect_err("a tree uefi-ntfs refuses");
+        assert!(
+            !matches!(error, CoreError::NotImplemented { .. }),
+            "a wired mode is never NotImplemented: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("uefi-ntfs"), "names the mode: {text}");
+        assert!(text.contains("whole disk"), "names the path: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+    }
+
+    /// 64 MiB whole-disk double for the UEFI:NTFS arm: big enough for
+    /// the planner to lay the 1 MiB ESP window on, small enough to
+    /// snapshot in RAM.
+    const UEFI_DISK_BYTES: u64 = 64 * 1024 * 1024;
+
+    /// A whole-disk double prefilled with a recognisable pattern, plus
+    /// the pattern for the untouched comparisons.
+    fn prefilled_uefi_disk() -> (VecTarget, Vec<u8>) {
+        let target = VecTarget::new(UEFI_DISK_BYTES, 512).expect("the disk allocates");
+        let before: Vec<u8> = (0..UEFI_DISK_BYTES as usize)
+            .map(|index| ((index * 11 + 7) % 251) as u8)
+            .collect();
+        target.write_all_at(0, &before).expect("the prefill lands");
+        (target, before)
+    }
+
+    /// The pinned shim bytes through the asset-tree loader (what
+    /// production's [`crate::boot::load`] resolves to, without the
+    /// runtime asset directory).
+    fn uefi_image_bytes() -> Vec<u8> {
+        asset_loader(Resource::UefiNtfsImage)
+            .expect("the shim loads")
+            .bytes()
+            .to_vec()
+    }
+
+    /// Run the disk-only arm over `target` with explicit `image`
+    /// bytes: the helper-level seam every UEFI test below shares (a
+    /// [`DiskView`] bridges the target into the [`Volume`] the arm
+    /// speaks).
+    fn uefi_install(
+        target: &mut VecTarget,
+        table: Option<TableKind>,
+        filesystem: &Filesystem,
+        image: &[u8],
+    ) -> Result<Installed> {
+        let mut disk = DiskView::new(target);
+        install_uefi_ntfs(&mut disk, table, filesystem, image)
+    }
+
+    #[test]
+    fn uefi_ntfs_installs_the_image_at_the_esp_window() {
+        // The pinned 1 MiB lands whole at the 1 MiB ESP offset the
+        // planner stamps for the `UefiNtfs` layout; the head and the
+        // whole data window keep the prefill.
+        let (mut target, before) = prefilled_uefi_disk();
+        let image = uefi_image_bytes();
+        let installed = uefi_install(&mut target, Some(TableKind::Mbr), &Filesystem::Ntfs, &image)
+            .expect("the install runs");
+        let Installed::UefiNtfs {
+            bytes,
+            offset,
+            messages,
+        } = installed
+        else {
+            panic!("a uefi-ntfs install reports the UefiNtfs variant");
+        };
+        assert_eq!(bytes, uefi_ntfs::IMAGE_BYTES, "the whole image counts");
+        assert_eq!(offset, 1024 * 1024, "the planner's ESP offset");
+        assert_eq!(
+            messages,
+            ["Writing UEFI:NTFS data...".to_string()],
+            "the reference line reports"
+        );
+        assert!(
+            messages.iter().all(|line| line.is_ascii()),
+            "every message stays ASCII"
+        );
+        let after = target.bytes().expect("the disk reads back");
+        assert_eq!(
+            &after[offset as usize..(offset + bytes) as usize],
+            &image[..],
+            "the image lands whole at the ESP offset"
+        );
+        assert_eq!(
+            &after[..offset as usize],
+            &before[..offset as usize],
+            "not one byte before the window moved"
+        );
+        let (data_offset, data_len) = crate::part::plan::data_window(
+            LayoutKind::UefiNtfs,
+            TableKind::Mbr,
+            512,
+            UEFI_DISK_BYTES,
+        )
+        .expect("the data window plans");
+        assert_eq!(
+            &after[data_offset as usize..(data_offset + data_len) as usize],
+            &before[data_offset as usize..(data_offset + data_len) as usize],
+            "the data window's bytes are untouched"
+        );
+    }
+
+    #[test]
+    fn uefi_ntfs_takes_ntfs_and_exfat_and_refuses_the_rest() {
+        // The reference's filesystem rule (`rufus.c:2032-2037`): NTFS
+        // and exFAT run, every other plan filesystem refuses naming
+        // itself, before any write.
+        for filesystem in [Filesystem::Ntfs, Filesystem::Exfat] {
+            let (mut target, _before) = prefilled_uefi_disk();
+            let image = uefi_image_bytes();
+            let installed = uefi_install(&mut target, Some(TableKind::Mbr), &filesystem, &image)
+                .expect("ntfs and exfat run");
             assert!(
-                matches!(error, CoreError::NotImplemented { .. }),
-                "a mode refusal is NotImplemented: {error:?}"
+                matches!(installed, Installed::UefiNtfs { .. }),
+                "{filesystem:?} reports the UefiNtfs variant"
             );
-            let text = error.to_string();
-            assert!(text.contains(name), "names the mode: {text}");
-            assert!(text.contains("later slice"), "names the gap: {text}");
         }
+        for filesystem in [
+            Filesystem::Fat32,
+            Filesystem::Ext2,
+            Filesystem::Ext3,
+            Filesystem::Ext4,
+            Filesystem::Udf,
+        ] {
+            let (mut target, before) = prefilled_uefi_disk();
+            let image = uefi_image_bytes();
+            let error = uefi_install(&mut target, Some(TableKind::Mbr), &filesystem, &image)
+                .expect_err("other filesystems refuse");
+            let text = error.to_string();
+            assert!(
+                text.contains(filesystem_name(&filesystem)),
+                "names the filesystem: {text}"
+            );
+            assert!(text.contains("NTFS or exFAT"), "names the rule: {text}");
+            assert!(text.is_ascii(), "stays ASCII: {text}");
+            assert_eq!(
+                target.bytes().expect("the disk reads back"),
+                before,
+                "no byte moved in 67108864 bytes of disk"
+            );
+        }
+    }
+
+    #[test]
+    fn uefi_ntfs_without_a_recorded_table_refuses() {
+        // No table, no window: the `gap_end`-style honesty gate fires
+        // before any write.
+        let (mut target, before) = prefilled_uefi_disk();
+        let image = uefi_image_bytes();
+        let error = uefi_install(&mut target, None, &Filesystem::Ntfs, &image)
+            .expect_err("a table-less uefi-ntfs refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("recorded partition table"),
+            "names the missing bound: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(
+            target.bytes().expect("the disk reads back"),
+            before,
+            "no byte moved in 67108864 bytes of disk"
+        );
+    }
+
+    #[test]
+    fn uefi_ntfs_oversized_image_refuses_before_any_write() {
+        // One byte past the ESP window: the pre-write bound check
+        // fires naming the offset, the length and the limit, with the
+        // device byte-identical.
+        let (offset, len) = crate::part::plan::esp_window(
+            LayoutKind::UefiNtfs,
+            TableKind::Mbr,
+            512,
+            UEFI_DISK_BYTES,
+        )
+        .expect("the window plans");
+        let oversized = vec![0xA5u8; (len + 1) as usize];
+        let (mut target, before) = prefilled_uefi_disk();
+        let error = uefi_install(
+            &mut target,
+            Some(TableKind::Mbr),
+            &Filesystem::Ntfs,
+            &oversized,
+        )
+        .expect_err("an overrunning image refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains(&offset.to_string()),
+            "names the offset: {text}"
+        );
+        assert!(
+            text.contains(&(len + 1).to_string()),
+            "names the length: {text}"
+        );
+        assert!(
+            text.contains(&(offset + len).to_string()),
+            "names the limit: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(
+            target.bytes().expect("the disk reads back"),
+            before,
+            "no byte moved in 67108864 bytes of disk"
+        );
     }
 
     /// An [`Opener`](crate::pipeline::opener::Opener) that counts
@@ -1218,6 +1594,33 @@ mod tests {
     impl crate::pipeline::opener::Opener for CountingOpener {
         fn device(&self) -> TestResult<Box<dyn crate::pipeline::target::Target>> {
             Err(CoreError::invalid("test opener has no device".to_string()))
+        }
+
+        fn partition(&self) -> TestResult<Box<dyn Volume>> {
+            self.partitions.set(self.partitions.get() + 1);
+            Err(CoreError::invalid(
+                "test opener has no partition".to_string(),
+            ))
+        }
+
+        fn partition_path(&self) -> TestResult<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no node".to_string()))
+        }
+    }
+
+    /// A test [`Opener`](crate::pipeline::opener::Opener) serving one
+    /// shared [`VecTarget`](crate::pipeline::target::VecTarget) as the
+    /// whole disk while counting `partition()` calls: the UEFI run
+    /// path must never open the data partition.
+    #[derive(Debug, Clone)]
+    struct DiskOpener {
+        target: VecTarget,
+        partitions: Rc<Cell<usize>>,
+    }
+
+    impl crate::pipeline::opener::Opener for DiskOpener {
+        fn device(&self) -> TestResult<Box<dyn crate::pipeline::target::Target>> {
+            Ok(Box::new(self.target.clone()))
         }
 
         fn partition(&self) -> TestResult<Box<dyn Volume>> {
@@ -1245,16 +1648,18 @@ mod tests {
         }
     }
 
-    /// A [`RunContext`](crate::pipeline::steps::RunContext) over the
-    /// counting opener, for the `run` tests below.
-    fn run_context<'a>(
-        opener: &'a CountingOpener,
+    /// A [`RunContext`](crate::pipeline::steps::RunContext) over any
+    /// test opener with an explicit recorded table, for the `run`
+    /// tests below.
+    fn run_context_table<'a>(
+        opener: &'a dyn crate::pipeline::opener::Opener,
         reporter: &'a mut Recorder,
+        table: Option<TableKind>,
     ) -> crate::pipeline::steps::RunContext<'a> {
         crate::pipeline::steps::RunContext {
             opener,
             target: None,
-            table: None,
+            table,
             partitioned: false,
             logger: crate::log::Logger::new(crate::log::Level::Info),
             reporter,
@@ -1268,6 +1673,21 @@ mod tests {
             },
         }
     }
+
+    /// [`run_context_table`] with no recorded table, over the counting
+    /// opener.
+    fn run_context<'a>(
+        opener: &'a CountingOpener,
+        reporter: &'a mut Recorder,
+    ) -> crate::pipeline::steps::RunContext<'a> {
+        run_context_table(opener, reporter, None)
+    }
+
+    /// The one shared asset seeder lives in [`super::end_to_end`]:
+    /// every UEFI test below calls it there, so parallel threads stage
+    /// through unique temp names plus an atomic `rename` and never race
+    /// on the final asset bytes.
+    use super::end_to_end::seed_exe_assets;
 
     fn image_ref(path: &str, kind: rufus_proto::ImageKind) -> rufus_proto::ImageRef {
         rufus_proto::ImageRef {
@@ -1341,6 +1761,139 @@ mod tests {
             "a mode refusal is NotImplemented: {error:?}"
         );
         assert_eq!(partitions.get(), 0, "the partition never opens");
+    }
+
+    #[test]
+    fn run_uefi_ntfs_writes_the_image_and_reports_both_lines() {
+        // Through the real `run` path with a bogus image path (proving
+        // no image tree opens) on an NTFS plan: the image lands at the
+        // 1 MiB ESP offset, the head and the data window keep the
+        // prefill, the data partition never opens, the disk flushes
+        // once, and both log lines report.
+        seed_exe_assets();
+        let (target, before) = prefilled_uefi_disk();
+        let partitions = Rc::new(Cell::new(0usize));
+        let opener = DiskOpener {
+            target: target.clone(),
+            partitions: Rc::clone(&partitions),
+        };
+        let mut reporter = Recorder::default();
+        let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Mbr));
+        run(
+            &mut ctx,
+            &BootloaderMode::UefiNtfs,
+            &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
+            &rufus_proto::Filesystem::Ntfs,
+        )
+        .expect("the run lands");
+        assert_eq!(partitions.get(), 0, "the data partition never opens");
+        let texts: Vec<&str> = reporter
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                crate::pipeline::event::Event::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"Writing UEFI:NTFS data..."),
+            "the reference line reports: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"wrote UEFI:NTFS image (1048576 bytes at offset 1048576)"),
+            "the completion line names bytes and offset: {texts:?}"
+        );
+        let after = target.bytes().expect("the disk reads back");
+        let image = uefi_image_bytes();
+        assert_eq!(
+            &after[1024 * 1024..2 * 1024 * 1024],
+            &image[..],
+            "the image lands whole at the ESP offset"
+        );
+        assert_eq!(
+            &after[..1024 * 1024],
+            &before[..1024 * 1024],
+            "the head keeps the prefill"
+        );
+        let (data_offset, data_len) = crate::part::plan::data_window(
+            LayoutKind::UefiNtfs,
+            TableKind::Mbr,
+            512,
+            UEFI_DISK_BYTES,
+        )
+        .expect("the data window plans");
+        assert_eq!(
+            &after[data_offset as usize..(data_offset + data_len) as usize],
+            &before[data_offset as usize..(data_offset + data_len) as usize],
+            "the data window's bytes are untouched"
+        );
+        assert_eq!(target.flushes(), 1, "the run flushes the disk once");
+    }
+
+    #[test]
+    fn run_uefi_ntfs_refuses_fat32_before_any_write() {
+        // A FAT32 plan refuses naming the filesystem, with the device
+        // byte-identical and the partition never opened.
+        seed_exe_assets();
+        let (target, before) = prefilled_uefi_disk();
+        let partitions = Rc::new(Cell::new(0usize));
+        let opener = DiskOpener {
+            target: target.clone(),
+            partitions: Rc::clone(&partitions),
+        };
+        let mut reporter = Recorder::default();
+        let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Mbr));
+        let error = run(
+            &mut ctx,
+            &BootloaderMode::UefiNtfs,
+            &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
+            &rufus_proto::Filesystem::Fat32,
+        )
+        .expect_err("a fat32 plan refuses");
+        let text = error.to_string();
+        assert!(text.contains("fat32"), "names the filesystem: {text}");
+        assert!(text.contains("NTFS or exFAT"), "names the rule: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(partitions.get(), 0, "the data partition never opens");
+        assert_eq!(
+            target.bytes().expect("the disk reads back"),
+            before,
+            "no byte moved in 67108864 bytes of disk"
+        );
+    }
+
+    #[test]
+    fn run_uefi_ntfs_without_a_table_refuses() {
+        // No recorded table, no window: the run refuses before any
+        // write, with the device byte-identical.
+        seed_exe_assets();
+        let (target, before) = prefilled_uefi_disk();
+        let partitions = Rc::new(Cell::new(0usize));
+        let opener = DiskOpener {
+            target: target.clone(),
+            partitions: Rc::clone(&partitions),
+        };
+        let mut reporter = Recorder::default();
+        let mut ctx = run_context_table(&opener, &mut reporter, None);
+        let error = run(
+            &mut ctx,
+            &BootloaderMode::UefiNtfs,
+            &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
+            &rufus_proto::Filesystem::Ntfs,
+        )
+        .expect_err("a table-less run refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("recorded partition table"),
+            "names the missing bound: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(partitions.get(), 0, "the data partition never opens");
+        assert_eq!(
+            target.bytes().expect("the disk reads back"),
+            before,
+            "no byte moved in 67108864 bytes of disk"
+        );
     }
 
     /// A GRUB2 payload tree: `/boot/grub/i386-pc/boot.img` (600
@@ -1919,7 +2472,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod end_to_end {
+pub(crate) mod end_to_end {
     use std::fs::OpenOptions;
     use std::os::unix::fs::FileExt as _;
 
@@ -2361,17 +2914,31 @@ mod end_to_end {
     /// candidate (`Env::assets_dir` order); `load()` verifies exact
     /// size and SHA-256 on every load, so the seed cannot plant wrong
     /// bytes silently. Writes only under `target/` (gitignored),
-    /// idempotent across reruns.
-    fn seed_exe_assets() {
+    /// idempotent across reruns. The single seeder every lib test
+    /// shares (unit and end-to-end alike): each payload stages to a
+    /// unique temp name in the same directory and is `rename`d into
+    /// place, and `rename` onto one filesystem is atomic — parallel
+    /// test threads never observe a truncated asset, which a direct
+    /// `write` of the final name allowed.
+    pub(crate) fn seed_exe_assets() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static SEED_TICK: AtomicU64 = AtomicU64::new(0);
         let exe = std::env::current_exe().expect("the test exe resolves");
         let dir = exe
             .parent()
             .expect("the exe has a dir")
             .join("../share/rufus-linux/assets");
         std::fs::create_dir_all(&dir).expect("the asset dir creates");
-        for name in ["RCDATA_402.bin", "RCDATA_403.bin"] {
+        for name in ["RCDATA_402.bin", "RCDATA_403.bin", "RCDATA_502.bin"] {
             let bytes = std::fs::read(resources_dir().join(name)).expect("the pinned asset reads");
-            std::fs::write(dir.join(name), &bytes).expect("the asset seeds");
+            let staged = dir.join(format!(
+                ".{name}.seed-{}-{}.tmp",
+                std::process::id(),
+                SEED_TICK.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&staged, &bytes).expect("the asset stages");
+            std::fs::rename(&staged, dir.join(name)).expect("the asset lands");
         }
     }
 

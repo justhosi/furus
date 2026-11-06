@@ -45,8 +45,8 @@ use crate::image::Inspected;
 /// already laid the image's own boot code, so no installer; a `Copy`
 /// write needs one); any explicit mode is emitted verbatim.
 /// `UefiNtfs` additionally selects the two-partition UEFI:NTFS layout
-/// and forces `Copy` (the shim boots an NTFS data partition the image
-/// tree populates); every other mode stays on the single layout.
+/// and forces `Copy` (the shim boots an NTFS or exFAT data partition
+/// the image tree populates); every other mode stays on the single layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum BootloaderOpt {
     /// Pair with the write mode (`Dd` → none, `Copy` → auto).
@@ -57,7 +57,7 @@ pub enum BootloaderOpt {
     Grub2,
     /// GRUB4DOS.
     Grub4dos,
-    /// UEFI:NTFS helper partition (NTFS data partition, copy mode).
+    /// UEFI:NTFS helper partition (NTFS or exFAT data partition, copy mode).
     UefiNtfs,
     /// FreeDOS.
     Freedos,
@@ -111,8 +111,8 @@ pub struct Options {
     /// Bootloader selector (`--bootloader`): `auto` pairs with the
     /// write mode, an explicit mode is emitted verbatim, and
     /// `uefi-ntfs` additionally selects the UEFI:NTFS layout and
-    /// forces copy mode (refused without an NTFS filesystem in
-    /// [`build`]).
+    /// forces copy mode (refused without an NTFS or exFAT filesystem
+    /// in [`build`]).
     pub bootloader: BootloaderOpt,
     /// Bad-block scan.
     pub bad_blocks: bool,
@@ -278,7 +278,7 @@ fn write_mode(image: &Path, kind: &ImageKind, iso_mode: bool) -> WriteMode {
 /// [`BootloaderMode::None`]; a `Copy` write needs the installer, so it
 /// emits [`BootloaderMode::Auto`]. An explicit selector is emitted
 /// verbatim instead, except that `UefiNtfs` forces [`WriteMode::Copy`]
-/// (the shim boots a populated NTFS data partition). The mkpart step
+/// (the shim boots a populated NTFS or exFAT data partition). The mkpart step
 /// carries the selector's layout (`UefiNtfs` for `uefi-ntfs`, `Single`
 /// otherwise).
 pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
@@ -333,15 +333,21 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
 /// happen in S05/S06. The confirm hash is recomputed here and a
 /// serialisation failure (practically impossible for this JSON-native
 /// schema) is surfaced as an I/O-class [`Fail`], fail closed (PLAN §2).
-/// A `uefi-ntfs` bootloader without an NTFS data filesystem is refused
-/// here, before any step is built: the shim boots an NTFS partition the
-/// image tree populates, so any other filesystem is a usage error.
+/// A `uefi-ntfs` bootloader without an NTFS or exFAT data filesystem
+/// is refused here, before any step is built: the shim boots an NTFS
+/// or exFAT partition the image tree populates, so any other
+/// filesystem is a usage error.
 pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Result<Plan, Fail> {
-    if options.bootloader == BootloaderOpt::UefiNtfs && options.filesystem != Filesystem::Ntfs {
+    if options.bootloader == BootloaderOpt::UefiNtfs
+        && options.filesystem != Filesystem::Ntfs
+        && options.filesystem != Filesystem::Exfat
+    {
         return Err(Fail {
             exit: crate::Exit::Usage,
             kind: "usage",
-            message: "UEFI:NTFS needs an NTFS data partition; choose --filesystem ntfs".to_owned(),
+            message:
+                "UEFI:NTFS needs an NTFS or exFAT data partition; choose --filesystem ntfs or exfat"
+                    .to_owned(),
         });
     }
     let steps = steps(Path::new(&inspected.path), &inspected.kind, options);
@@ -593,9 +599,10 @@ mod tests {
     }
 
     #[test]
-    fn build_refuses_uefi_ntfs_without_ntfs() {
-        // The shim boots an NTFS data partition: any other filesystem
-        // is a usage refusal, before any hash is sealed.
+    fn build_refuses_uefi_ntfs_without_ntfs_or_exfat() {
+        // The shim boots an NTFS or exFAT data partition: any other
+        // filesystem is a usage refusal with the exact message, before
+        // any hash is sealed.
         let device = DeviceRef {
             path: "/dev/null".to_string(),
             block_device: false,
@@ -614,36 +621,34 @@ mod tests {
         options.bootloader = BootloaderOpt::UefiNtfs;
         options.filesystem = Filesystem::Fat32;
         let refused = build(device.clone(), inspected, &options).expect_err("fat32 refuses");
-        assert!(
-            refused.message.contains("UEFI:NTFS"),
-            "the refusal names the shim: {}",
-            refused.message
+        assert_eq!(
+            refused.message,
+            "UEFI:NTFS needs an NTFS or exFAT data partition; choose --filesystem ntfs or exfat",
+            "the refusal carries the exact message"
         );
-        assert!(
-            refused.message.contains("--filesystem ntfs"),
-            "the refusal names the fix: {}",
-            refused.message
-        );
-        // The NTFS sibling seals fine and stamps the uefi-ntfs layout.
-        let inspected = crate::image::Inspected {
-            path: "image.iso".to_string(),
-            size_bytes: 32_780,
-            sha256: "0".repeat(64),
-            kind: ImageKind::Iso,
-        };
-        options.filesystem = Filesystem::Ntfs;
-        let plan = match build(device, inspected, &options) {
-            Ok(plan) => plan,
-            Err(fail) => panic!("ntfs seals: {}", fail.message),
-        };
-        let layout = plan
-            .steps
-            .iter()
-            .find_map(|step| match step {
-                Step::Mkpart { layout, .. } => Some(layout.clone()),
-                _ => None,
-            })
-            .expect("the plan carries an mkpart step");
-        assert_eq!(layout, Layout::UefiNtfs);
+        // The NTFS and exFAT siblings seal fine and stamp the
+        // uefi-ntfs layout.
+        for filesystem in [Filesystem::Ntfs, Filesystem::Exfat] {
+            let inspected = crate::image::Inspected {
+                path: "image.iso".to_string(),
+                size_bytes: 32_780,
+                sha256: "0".repeat(64),
+                kind: ImageKind::Iso,
+            };
+            options.filesystem = filesystem.clone();
+            let plan = match build(device.clone(), inspected, &options) {
+                Ok(plan) => plan,
+                Err(fail) => panic!("{filesystem:?} seals: {}", fail.message),
+            };
+            let layout = plan
+                .steps
+                .iter()
+                .find_map(|step| match step {
+                    Step::Mkpart { layout, .. } => Some(layout.clone()),
+                    _ => None,
+                })
+                .expect("the plan carries an mkpart step");
+            assert_eq!(layout, Layout::UefiNtfs);
+        }
     }
 }
