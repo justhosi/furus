@@ -102,8 +102,7 @@ write side is the most complete part:
   the pipeline — wipe, table, partition, format, write (a byte-for-byte
   `Dd` or a file-tree `Copy`), bootloader, finalize — with per-event
   JSON (`--json`) or a throttled progress line, Ctrl-C cancellation
-  (exit 6), and typed refusals (exit 7 only for what no slice wires
-  yet: the UEFI:NTFS and FreeDOS bootloader modes, the image kinds with
+  (exit 6), and typed refusals (exit 7 only for the image kinds with
   no tree reader — WIM, VHD, VHDX, FFU, qcow2, PE — and a `Copy` plan
   run over the `--device-file` seam, which has no partition node to
   mount). `--device-file` runs the same plan
@@ -125,22 +124,37 @@ write side is the most complete part:
   recommended mode for bootable sticks); a `Copy` write walks the
   ISO9660 or UDF tree onto the mounted data partition through a mount
   seam (`Opener::mount_partition`, guarded by `rufus-linux`'s `Mounted`
-  helper with vfat/exfat, `NOSUID|NODEV` and a detach fallback). The
+  helper with vfat/exfat/ntfs3, `NOSUID|NODEV` and a detach fallback). The
   walk is cancellable, pre-flights free space, enforces the FAT32
   file-size limit, and throttles its progress through the pipeline's
-  shared 100 ms cadence.
-* Bootloader installation (S19) is wired as the `bootloader` pipeline
-  step. The plan pairs `Bootloader`: `None` with a `Dd` write (the
-  image already carries its own loader) and `Auto` with a `Copy` write;
-  `Auto` probes Syslinux, then GRUB2, then GRUB4DOS in the image's own
-  tree. Syslinux installs from the image's payloads (family choice
-  4.07/6.04, a VBR graft, a contiguous stage file with sector map and
-  ADV, companions kept when the copy already placed identical bytes,
-  and a `syslinux.cfg` wrapper); GRUB2 BIOS writes its record into the
-  MBR with `core.img` bounded by the post-MBR gap and places a UEFI
-  GRUB payload at `/EFI/boot/bootx64.efi` when absent; GRUB4DOS writes
-  its MBR/SBR plus `/grldr`. The UEFI:NTFS and FreeDOS modes remain
-  unwired (exit 7).
+  shared 100 ms cadence. The `Raw` UDF path (a pure-UDF image carries no
+  `CD001`, so it detects as `Raw`) is wired but has no test: nothing in
+  the tree opens a real UDF image.
+* Bootloader installation (S19/S20) is wired as the `bootloader`
+  pipeline step. `rufus plan --bootloader <mode>` selects the installer
+  explicitly (`auto`, `syslinux`, `grub2`, `grub4dos`, `uefi-ntfs`,
+  `freedos`, `kolibri`, `msdos` or `none`); `auto` keeps the write-mode
+  pairing (a `Dd` write already laid the image's own boot code, so
+  `none`; a `Copy` write needs one, so `auto`), and every other mode is
+  emitted verbatim. `auto` probes Syslinux, then GRUB2, then GRUB4DOS
+  in the image's own tree: Syslinux installs from the image's payloads
+  (family choice 4.07/6.04, a VBR graft, a contiguous stage file with
+  sector map and ADV, companions kept when the copy already placed
+  identical bytes, and a `syslinux.cfg` wrapper); GRUB2 BIOS writes its
+  record into the MBR with `core.img` bounded by the post-MBR gap and
+  places a UEFI GRUB payload at `/EFI/boot/bootx64.efi` when absent;
+  GRUB4DOS writes its MBR/SBR plus `/grldr`. `uefi-ntfs` forces `Copy`
+  and the two-partition `uefi_ntfs` layout, writing the embedded 1 MiB
+  shim image at the ESP offset, and needs an NTFS or exFAT data
+  partition. `freedos` and `kolibri` need a FAT32 data partition:
+  FreeDOS installs the embedded payloads (kernel, shell, `DISPLAY`,
+  `KEYB`, `MODE`, the keyboard-layout libraries and the EGA codepage
+  fonts) plus a `CONFIG.SYS`/`AUTOEXEC.BAT` pair and the transcribed
+  ms-sys FAT32 boot record; KolibriOS places the `MTLD_F32` loader and
+  its record. `msdos` needs FAT32 plus `--msdos-dir` naming the user's
+  `IO.SYS`, `MSDOS.SYS` and `COMMAND.COM`, and plans no write step (the
+  files must be the first entries of the fresh volume). No stick has
+  been booted on hardware or in QEMU here.
 * The GUI is still a stub: it prints version/help and otherwise reports
   "GUI arrives in S24".
 

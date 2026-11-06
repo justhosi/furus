@@ -17,9 +17,10 @@ licences below use SPDX identifiers.
 | Component | SPDX | Role |
 |---|---|---|
 | Rufus itself (code, dialogs, icons, glyphs, `rufus.loc`, `rufus.com`, setup wrapper) | `GPL-3.0-or-later` | The upstream program we reuse as data. |
-| FreeDOS (FreeCOM, CONFIG.SYS template, KEYB, boot stub, keyboard layouts, DOS utilities) | `GPL-2.0-or-later` | DOS boot payloads written to the target. |
+| FreeDOS (`COMMAND.COM`, `KERNEL.SYS`, `DISPLAY`, `KEYB`, `MODE`, keyboard layouts, EGA codepage fonts) | `GPL-2.0-or-later` | DOS boot payloads written to the target. |
 | Syslinux 4.07 / 6.04 | `GPL-2.0-or-later` | Bootloader payloads written to the target. |
 | GRUB4DOS | `GPL-2.0-or-later` | Legacy boot helper payload. |
+| ms-sys (`br_fat32fd_0x52.h`, `br_fat32kos_0x52.h`, `br_fat32_0x0.h`) | `GPL-2.0-or-later` | FreeDOS and KolibriOS FAT32 boot records transcribed into `crates/rufus-core/src/boot/records.rs`. |
 | GRUB2 | `GPL-3.0-or-later` | Bootloader payload read from the image's own `/boot/grub` tree in S19 (not part of these 86 embedded resources). |
 | UEFI:NTFS (`uefi-ntfs.img`) | `GPL-3.0-or-later` | NTFS UEFI driver payload written to the target. |
 | wimlib (not embedded; linked per A5) | `LGPL-3.0-or-later` | C library for WIM/ESD apply. |
@@ -65,16 +66,32 @@ GPLv3 umbrella; if we draw our own glyphs, these payloads are not distributed.
 
 ### FreeDOS — RCDATA `300–326` (27 payloads)
 
-What: DOS boot set used by Rufus's FreeDOS target: FreeCOM (300),
-`CONFIG.SYS` template (301), a DOS utility (302), the KEYB keyboard driver
-(303), a boot-sector/loader stub (304), the 4-part keyboard layout library
-(305–308, Jiri Malak / Henrique Peron) and 18 UPX-packed DOS.COM utilities
-(309–326). Licence: **`GPL-2.0-or-later`** (FreeDOS family per decision A6).
-GPL-2.0-or-later is compatible with our GPLv3-or-later use. Uncertainty: the
-exact per-resource names for 300–308 and especially the utilities 309–326 are
-content-based inferences from strings/headers, not verified upstream
-filenames — **re-verify in S20** (which ports `dos_locale` and owns the FreeDOS
-/exFAT extraction path).
+What: DOS boot set used by Rufus's FreeDOS target, re-verified in S20 against
+the `v4.15` tag (`res_name[]`, `src/dos.c:346-351`): `COMMAND.COM` (300),
+`KERNEL.SYS` (301), `DISPLAY.EXE` (302), `KEYB.EXE` (303), `MODE.COM` (304),
+the 4-part keyboard layout library (305–308, Jiri Malak / Henrique Peron) and
+18 EGA codepage fonts (309–326, `EGA.CPX` .. `EGA18.CPX`). Licence:
+**`GPL-2.0-or-later`** (FreeDOS family per decision A6), compatible with our
+GPLv3-or-later use. S20 corrected the manifest's earlier content-based
+guesses: ids 309–326 are UPX-compressed EGA codepage fonts, not "utilities",
+and id 304 is `MODE.COM`, not a boot stub. The boot record itself is not in
+this set: it comes from ms-sys (see the next section), transcribed into
+`crates/rufus-core/src/boot/records.rs`.
+
+### ms-sys FAT32 boot records — transcribed (not extracted)
+
+What: the FreeDOS and KolibriOS FAT32 boot records in
+`crates/rufus-core/src/boot/records.rs`, transcribed programmatically from the
+readable upstream ms-sys headers (nothing was retyped or carved out of the
+unpacked exe): the FreeDOS body is the first 430 bytes of
+`src/ms-sys/inc/br_fat32fd_0x52.h`, the KolibriOS body the 430 bytes of
+`src/ms-sys/inc/br_fat32kos_0x52.h`, and the 11-byte head is
+`src/ms-sys/inc/br_fat32_0x0.h`. The FreeDOS code is the ANI (substring gmbh)
+bootstrap named in that header's comment, adapted for FreeDOS; the KolibriOS
+code carries the `MTLD_F32` loader name. Licence: **`GPL-2.0-or-later`**
+(ms-sys), compatible with GPLv3 use. The reconstructed sectors were verified
+byte-identical against the records Rufus generates, so the ms-sys source is
+the authoritative transcription source for both records. No uncertainty.
 
 ### Syslinux — RCDATA `400–404` (5 payloads)
 
@@ -119,7 +136,9 @@ native `rufus` CLI (S03). Keep only as behavioural reference.
 What: 1 MiB FAT12 image (`mkfs.fat`, label `RUFUS_BOOT`) holding the
 `uefi-ntfs.efi` NTFS UEFI driver. Licence: **`GPL-3.0-or-later`** (the
 UEFI:NTFS project, per decision A6; same author as Rufus). Compatible. No
-distribution problem: the whole FAT image ships as data under GPLv3.
+distribution problem: the whole FAT image ships as data under GPLv3. S20 wires
+it into the `uefi-ntfs` bootloader mode as `Resource::UefiNtfsImage` (manifest
+id 502), written verbatim at the ESP partition offset.
 
 ### Setup wrapper — RCDATA `503–504` (2 payloads)
 
@@ -160,9 +179,9 @@ A `GPL-3.0-or-later` application (A1) may include **all** of the above:
   `rufus.loc`, `rufus.com`, uefi-ntfs.img, the setup wrapper 503/504) are the
   same licence as the rewrite itself — inclusion is trivially fine, with
   preserved attribution and the GPLv3 source offer.
-* FreeDOS, Syslinux and GRUB4DOS payloads are `GPL-2.0-or-later`. "or-later"
-  allows redistribution under GPL-3.0, and the rewrite is GPLv3-or-later, so
-  combined distribution is licence-clean.
+* FreeDOS, Syslinux, GRUB4DOS and the transcribed ms-sys boot records are
+  `GPL-2.0-or-later`. "or-later" allows redistribution under GPL-3.0, and the
+  rewrite is GPLv3-or-later, so combined distribution is licence-clean.
 * **wimlib (`LGPL-3.0-or-later`, decision A5) is linked** through an FFI
   boundary, not statically absorbed into a proprietary product — and the
   product would not be proprietary in any case (GPLv3, A1). LGPL-3.0's
@@ -180,14 +199,12 @@ licence conflict but an attribution/identification task for S23.
 
 ## Open items tracked from this audit
 
-1. FreeDOS payload names (300–326): content-based inferences — re-verify in
-   **S20**.
-2. Certificate bundle exact contents (701–704): content-based inferences —
+1. Certificate bundle exact contents (701–704): content-based inferences —
    re-verify in **S23**.
-3. `RCDATA_452` authorship (GRUB4DOS message file vs. Rufus-authored
+2. `RCDATA_452` authorship (GRUB4DOS message file vs. Rufus-authored
    screen): verify against upstream `pbatard/rufus`; either answer keeps
    the compatibility conclusion.
-4. uefi-md5sum licence id: confirm from the public project when copying
+3. uefi-md5sum licence id: confirm from the public project when copying
    assets in S01 and rebuilding in **S23**.
-5. Trademark: the public name is not "Rufus" (decision A2; working name
+4. Trademark: the public name is not "Rufus" (decision A2; working name
    `rufus-linux`). Keep "Rufus" out of the distributed product identity.
