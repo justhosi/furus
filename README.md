@@ -128,8 +128,13 @@ write side is the most complete part:
   walk is cancellable, pre-flights free space, enforces the FAT32
   file-size limit, and throttles its progress through the pipeline's
   shared 100 ms cadence. The `Raw` UDF path (a pure-UDF image carries no
-  `CD001`, so it detects as `Raw`) is wired but has no test: nothing in
-  the tree opens a real UDF image.
+  `CD001`, so it detects as `Raw`) is driven end to end by a positive
+  and a negative test: the copy arm lands a UDF tree byte for byte and
+  refuses a volume whose structure is corrupt. The fixture is
+  hand-encoded against our own reader, so it proves the arm consumes
+  what the reader accepts, not that the reader matches a real `mkudffs`
+  volume; a real `mkudffs`-built volume through the copy arm remains a
+  declared follow-up.
 * Bootloader installation (S19/S20) is wired as the `bootloader`
   pipeline step. `rufus plan --bootloader <mode>` selects the installer
   explicitly (`auto`, `syslinux`, `grub2`, `grub4dos`, `uefi-ntfs`,
@@ -143,7 +148,11 @@ write side is the most complete part:
   identical bytes, and a `syslinux.cfg` wrapper); GRUB2 BIOS writes its
   record into the MBR with `core.img` bounded by the post-MBR gap and
   places a UEFI GRUB payload at `/EFI/boot/bootx64.efi` when absent;
-  GRUB4DOS writes its MBR/SBR plus `/grldr`. `uefi-ntfs` forces `Copy`
+  GRUB4DOS writes its MBR/SBR and refuses before writing anything
+  unless a root `/grldr` already exists (the image's own or a
+  caller-supplied one), because resource 451 is GRUB2's `core.img`, not
+  a `grldr` (Rufus downloads the real loader `grub4dos-0.4.6a/grldr`
+  and bundles none). `uefi-ntfs` forces `Copy`
   and the two-partition `uefi_ntfs` layout, writing the embedded 1 MiB
   shim image at the ESP offset, and needs an NTFS or exFAT data
   partition. `freedos` and `kolibri` need a FAT32 data partition:
@@ -153,8 +162,15 @@ write side is the most complete part:
   ms-sys FAT32 boot record; KolibriOS places the `MTLD_F32` loader and
   its record. `msdos` needs FAT32 plus `--msdos-dir` naming the user's
   `IO.SYS`, `MSDOS.SYS` and `COMMAND.COM`, and plans no write step (the
-  files must be the first entries of the fresh volume). No stick has
-  been booted on hardware or in QEMU here.
+  files must be the first entries of the fresh volume). Three loaders
+  now boot in QEMU from full six-step plans (Syslinux 4.07 to its
+  `boot:` prompt, FreeDOS to a `C:\>` prompt, and GRUB2 BIOS to a
+  `grub>` shell running a config that prints `GRUB2-OK`), and the
+  UEFI:NTFS shim boots a real NTFS payload under OVMF
+  (`UEFI-NTFS-OK`). No stick has been booted on hardware, and the
+  GRUB4DOS boot test is `#[ignore]`d behind `RUFUS_TEST_GRLDR` because
+  the payload is not bundled; each suite prints one `skip:` line when
+  qemu, grub-mkimage, mkntfs, OVMF or another tool is absent.
 * The GUI is still a stub: it prints version/help and otherwise reports
   "GUI arrives in S24".
 
@@ -265,7 +281,14 @@ device, run on demand with `sudo -E $(which cargo) test --offline
 -p rufus-core --test <suite> -- --ignored --nocapture`, or inside the
 documented privileged container (an `archlinux` image; the NTFS suite's
 module doc records the `pacman -Sy --noconfirm ntfs-3g ntfsprogs`
-package split).
+package split). Two further suites exercise the mount and boot seams:
+`crates/rufus-linux/tests/mount_seam.rs` mounts FAT32, exFAT and NTFS
+through the real kernel (`#[ignore]`d, root + loop devices, run with
+`-p rufus-linux --test mount_seam`), and
+`crates/rufus-core/tests/uefi_ntfs_boot.rs` boots the UEFI:NTFS shim
+against a real NTFS volume in OVMF (unprivileged; it runs in the normal
+suite and skips with one `skip:` line when qemu, grub-mkimage, mkntfs,
+ntfscp, unshare, ntfs-3g or the OVMF images are absent).
 
 ## Docs
 

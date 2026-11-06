@@ -21,7 +21,7 @@ licences below use SPDX identifiers.
 | Syslinux 4.07 / 6.04 | `GPL-2.0-or-later` | Bootloader payloads written to the target. |
 | GRUB4DOS | `GPL-2.0-or-later` | Legacy boot helper payload. |
 | ms-sys (`br_fat32fd_0x52.h`, `br_fat32kos_0x52.h`, `br_fat32_0x0.h`) | `GPL-2.0-or-later` | FreeDOS and KolibriOS FAT32 boot records transcribed into `crates/rufus-core/src/boot/records.rs`. |
-| GRUB2 | `GPL-3.0-or-later` | Bootloader payload read from the image's own `/boot/grub` tree in S19 (not part of these 86 embedded resources). |
+| GRUB2 | `GPL-3.0-or-later` | Bootloader payload read from the image's own `/boot/grub` tree in S19; the bundled `core.img` fallback is RCDATA 451. |
 | UEFI:NTFS (`uefi-ntfs.img`) | `GPL-3.0-or-later` | NTFS UEFI driver payload written to the target. |
 | wimlib (not embedded; linked per A5) | `LGPL-3.0-or-later` | C library for WIM/ESD apply. |
 | ntfs-3g (`mkntfs`; external tool per A4) | `GPL-2.0-or-later` | Runtime system tool, not shipped in the binary. |
@@ -103,17 +103,29 @@ identity is confirmed by their role in the S19 `syslinux` installer. The install
 patches files on FAT filesystems; Syslinux's own freestanding bits (ldlinux
 binaries) are GPLv2+ data/code reused, not absorbed.
 
-### GRUB4DOS — RCDATA `450–452` (3 payloads)
+### GRUB4DOS MBR, GRUB2 `core.img` and the UEFI-only error screen — RCDATA `450–452` (3 payloads)
 
-What: `grldr.mbr` (450), `grldr` (451) used for legacy boot on UEFI-only
-systems, plus the ANSI-art error screen "ERROR: BIOS/LEGACY BOOT OF
-UEFI-ONLY MEDIA" (452). Licence: **`GPL-2.0-or-later`** (GRUB4DOS per decision
-A6). Uncertainty: 452 might be a Rufus-authored custom message file for
-`grldr` rather than stock GRUB4DOS content (see `manifest.json` notes); either
-way the licence is GPL-2.0+ or GPL-3.0+ and the compatibility conclusion is
-unchanged — **re-verify against pbatard/rufus**. GRUB2 (GPLv3+) is read
-from the image's own `/boot/grub` tree by the S19 bootloader step, not
-this embedded resource set.
+What: `grldr.mbr` (450) is the GRUB4DOS MBR/SBR used for legacy boot of
+UEFI-only media. Resource 451 was first catalogued as GRUB4DOS's
+`grldr` but is in fact GRUB2's embedded `core.img` (the code names it
+`Resource::Grub2CoreImg`); Rufus downloads the real GRUB4DOS loader
+`grub4dos-0.4.6a/grldr` and bundles none, so the GRUB4DOS arm refuses
+unless the volume already carries a root `/grldr`. Resource 452 is the
+ANSI-art "ERROR: BIOS/LEGACY BOOT OF UEFI-ONLY MEDIA" screen.
+
+Licence: **`GPL-2.0-or-later`** for `grldr.mbr` (450, GRUB4DOS per
+decision A6); **`GPL-3.0-or-later`** for 451 (GRUB2) and 452 (Rufus's
+own file, resolved below).
+
+452 is resolved, not third-party GRUB4DOS artwork: upstream
+`src/resource.h:68` defines `IDR_SBR_MSG 452` and `src/rufus.rc:475`
+maps it to RCDATA of `../res/mbr/msg.txt`; the v4.15 file is 1244
+bytes with LF endings, and converting every `\n` to CRLF gives 1265
+bytes with SHA-256
+`8d39acfbb9c662a891ed897659631f17e9b837286bcd2d9976cc319db6977667`,
+byte-identical to `assets/resources/RCDATA_452.bin`. It is Rufus's own
+GPL-3.0-or-later file, and no code in this port consumes it (no
+`Resource` variant).
 
 ### `RCDATA_500` — `rufus.loc` (1 payload)
 
@@ -201,10 +213,7 @@ licence conflict but an attribution/identification task for S23.
 
 1. Certificate bundle exact contents (701–704): content-based inferences —
    re-verify in **S23**.
-2. `RCDATA_452` authorship (GRUB4DOS message file vs. Rufus-authored
-   screen): verify against upstream `pbatard/rufus`; either answer keeps
-   the compatibility conclusion.
-3. uefi-md5sum licence id: confirm from the public project when copying
+2. uefi-md5sum licence id: confirm from the public project when copying
    assets in S01 and rebuilding in **S23**.
-4. Trademark: the public name is not "Rufus" (decision A2; working name
+3. Trademark: the public name is not "Rufus" (decision A2; working name
    `rufus-linux`). Keep "Rufus" out of the distributed product identity.
