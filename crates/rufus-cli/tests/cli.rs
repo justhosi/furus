@@ -1325,15 +1325,43 @@ fn write_sigint_cancels_with_exit_6() {
         .expect("first event arrives")
         .expect("readable first event");
     assert!(first.contains("step_started"), "{first}");
-    let mut waited = 0;
-    while child.try_wait().expect("poll child").is_none() {
-        let _ = Command::new("sh")
-            .args(["-c", &format!("kill -INT {pid}")])
-            .status();
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        waited += 1;
-        assert!(waited < 400, "the run should cancel within 10 s");
-    }
+    // Signal once, then poll for the exit. The flag is sticky and
+    // idempotent, so a repeat is only a guard against a lost signal:
+    // it fires after a 2 s grace with the child still running. Mid-run
+    // cancellation has no wire event (the error object comes last, on
+    // stderr), so the observable reaction is the child's exit. The
+    // deadline is a generous wall-clock bound, not a speed claim.
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(120);
+    let resend_after = std::time::Duration::from_secs(2);
+    let mut signals: u32 = 0;
+    let mut last_signal: Option<std::time::Instant> = None;
+    let exited = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break Some(status);
+        }
+        if started.elapsed() >= deadline {
+            break None;
+        }
+        if last_signal.is_none_or(|at| at.elapsed() >= resend_after) {
+            let sent = Command::new("sh")
+                .args(["-c", &format!("kill -INT {pid}")])
+                .status();
+            if sent.is_ok_and(|status| status.success()) {
+                signals += 1;
+            }
+            last_signal = Some(std::time::Instant::now());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let Some(status) = exited else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "the run should cancel within 120 s: elapsed {:?}, signals sent {signals}, exit status: still running",
+            started.elapsed()
+        );
+    };
     // Drain the event pipe, then reap: the code is the verdict. The
     // pipe holds events only — the failure object went to stderr, so
     // every line here must parse.
@@ -1341,8 +1369,12 @@ fn write_sigint_cancels_with_exit_6() {
     for line in lines.by_ref() {
         events.push(line.expect("readable event"));
     }
-    let status = child.wait().expect("reap child");
-    assert_eq!(status.code(), Some(6), "SIGINT cancels the run");
+    assert_eq!(
+        status.code(),
+        Some(6),
+        "SIGINT cancels the run: elapsed {:?}, signals sent {signals}, exit status {status}",
+        started.elapsed()
+    );
     for line in &events {
         serde_json::from_str::<serde_json::Value>(line).expect("each stdout line parses");
     }
