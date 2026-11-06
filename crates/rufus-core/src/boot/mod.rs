@@ -43,9 +43,10 @@
 //! 430-byte body, `55 AA` tail, with the `0x0B..0x5A` BPB window left
 //! as placeholders for the graft and the grafted record mirrored into
 //! the backup boot sector (sector 6, `src/format.c` two-pass loop).
-//! Wiring these installers into the
-//! copy and pipeline paths is a later
-//! slice, and no stick has been booted on hardware.
+//! Every installer above is wired into the bootloader step (see
+//! [`crate::pipeline`]): Syslinux, GRUB2 BIOS (plus UEFI placement),
+//! GRUB4DOS, the UEFI:NTFS shim, FreeDOS, KolibriOS and MS-DOS — and
+//! no stick has been booted on hardware.
 
 pub mod dos_locale;
 

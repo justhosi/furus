@@ -330,12 +330,16 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
 /// locale files plus the boot record; `Kolibri` the image-tree loader
 /// plus the boot record; `MsDos` the user-supplied files from
 /// `msdos_dir` (no boot record — the formatter's standard record
-/// stands); `Auto` takes the first match of syslinux,
+/// stands — and no image tree: an `msdos` plan carries no write step,
+/// so [`run`] short-circuits past the tree setup); `Auto` takes the
+/// first match of syslinux,
 /// grub2, grub4dos. `UefiNtfs` refuses here as invalid rather than not
 /// implemented: the installer exists but is disk-only (no tree, no
 /// FAT32 volume — see [`install_uefi_ntfs`]), so [`run`] wires it
-/// directly and a tree install can never serve it. Every other mode
-/// refuses as not implemented, naming itself.
+/// directly and a tree install can never serve it. Any future variant
+/// refuses through the shared [`check_mode`] table before reaching
+/// here; the trailing `other` arm stays as fail-closed invalid,
+/// unreachable today.
 ///
 /// `table` is the recorded partition-table kind the BIOS arms bound
 /// their post-MBR gap through (see [`gap_end`]); the Syslinux-only
@@ -393,7 +397,7 @@ pub(crate) fn install_tree(
         BootloaderMode::Syslinux => {
             let Some(located) = syslinux::locate(source)? else {
                 return Err(CoreError::invalid(
-                    "no syslinux payloads found in the image: refusing a syslinux install (grub, grub4dos and uefi auto-detection arrive in a later slice)",
+                    "no syslinux payloads found in the image: refusing a syslinux install",
                 ));
             };
             install_syslinux(source, fat, &located, cancelled, load)
@@ -427,9 +431,10 @@ pub(crate) fn install_tree(
         BootloaderMode::UefiNtfs => Err(CoreError::invalid(
             "uefi-ntfs installs the embedded image onto the whole disk at the ESP offset, not through the filesystem tree: refusing a tree install".to_string(),
         )),
-        // `None` returned above; unwired modes refused in
-        // `check_mode`. This names the mode rather than assuming the
-        // match is exhaustive forever.
+        // `None` returned above; any future unwired variant would
+        // refuse in `check_mode` above, so this arm is unreachable
+        // today. This names the mode rather than assuming the match
+        // is exhaustive forever.
         other => Err(CoreError::invalid(format!(
             "bootloader mode '{other:?}' has no wired installer: refusing"
         ))),
@@ -953,6 +958,59 @@ fn run_uefi_ntfs(ctx: &mut RunContext<'_>, filesystem: &Filesystem) -> Result<()
     Ok(())
 }
 
+/// Run the MS-DOS arm: the user-supplied files from `msdos_dir`
+/// onto the freshly formatted FAT32 data partition, without ever
+/// opening the image tree (an `msdos` plan carries no write step, so
+/// the image is only the still-required CLI detection record — the
+/// installer reads the directory, never the image).
+///
+/// The shared path above already ran the FAT32 gate; the
+/// `msdos_dir` requirement mirrors the arm's own gate, so a refused
+/// plan fails the same way through either entry: a non-FAT32
+/// filesystem names itself first, then a missing directory names
+/// `--msdos-dir`, both before any write. One flush of the partition
+/// follows the install, then the reference lines plus the completion
+/// line.
+fn run_msdos(ctx: &mut RunContext<'_>, msdos_dir: Option<&Path>) -> Result<()> {
+    let cancelled = ctx.cancelled;
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let Some(dir) = msdos_dir else {
+        return Err(CoreError::invalid(
+            "msdos install needs the user-supplied directory (--msdos-dir) holding IO.SYS, MSDOS.SYS and COMMAND.COM: refusing".to_string(),
+        ));
+    };
+    let mut fat = Fat32::open(ctx.opener.partition()?)?;
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let installed = install_msdos(&mut fat, dir, cancelled)?;
+    fat.flush()?;
+    for message in installed.messages() {
+        ctx.reporter.event(Event::Message {
+            level: "info",
+            text: message.clone(),
+        });
+    }
+    let Installed::MsDos {
+        written,
+        kept,
+        bytes,
+        ..
+    } = installed
+    else {
+        return Err(CoreError::invalid(
+            "msdos install reported no MS-DOS facts: refusing".to_string(),
+        ));
+    };
+    ctx.reporter.event(Event::Message {
+        level: "info",
+        text: msdos_summary(written, kept, bytes),
+    });
+    Ok(())
+}
+
 /// Filesystem name in plan vocabulary (`fat32`, `exfat`, ...).
 fn filesystem_name(filesystem: &Filesystem) -> &'static str {
     match filesystem {
@@ -966,16 +1024,25 @@ fn filesystem_name(filesystem: &Filesystem) -> &'static str {
     }
 }
 
-/// Run the bootloader step: one wired arm from the image tree onto
-/// the freshly formatted data partition (and, for the BIOS arms, the
-/// whole disk behind it).
+/// Run the bootloader step: one wired arm onto the freshly
+/// formatted data partition (and, for the BIOS arms, the whole disk
+/// behind it), reading the image tree only where the arm needs it
+/// (the disk-only and user-file arms never open it).
 ///
 /// `None` reports one info line and writes nothing. `UefiNtfs` takes
 /// the disk-only path ([`run_uefi_ntfs`]) before anything else below:
-/// no unwired-mode check needed beyond the shared table, no
+/// the shared [`check_mode`] table passes for every wired mode today
+/// (it stays as the fail-closed gate for future variants), no
 /// filesystem gate against FAT32, no image tree, no `Fat32` volume.
-/// Unwired modes refuse up front through the shared [`check_mode`]
-/// table (they never reach the image or the device), then
+/// `MsDos` short-circuits past the image-tree setup below
+/// ([`run_msdos`]): after the kind and FAT32 gates, the install goes
+/// straight onto the partition under the `msdos_dir` requirement —
+/// the image tree never opens, so the plan's image needs no readable
+/// tree at all (the CLI still requires the `--image` argument as the
+/// detection record). Every mode is wired today, so the run never
+/// produces `NotImplemented` itself; a future variant would refuse
+/// up front through the shared [`check_mode`]
+/// table (never reaching the image or the device), then
 /// non-FAT32 filesystems refuse naming the plan filesystem, then the
 /// image tree opens exactly like `write::run_copy` does. The partition
 /// and the whole-disk target open next; a cancellation check follows
@@ -987,9 +1054,7 @@ fn filesystem_name(filesystem: &Filesystem) -> &'static str {
 ///
 /// `msdos_dir` is the plan's user-supplied MS-DOS directory, read by
 /// the `MsDos` arm only (see [`install_tree`]); every other arm
-/// ignores it, so callers pass `None` there. An `msdos` plan carries
-/// no write step, but `run` still opens the image tree first — the
-/// step shape stays uniform and the gate order stays shared.
+/// ignores it, so callers pass `None` there.
 pub(crate) fn run(
     ctx: &mut RunContext<'_>,
     mode: &BootloaderMode,
@@ -1032,6 +1097,13 @@ pub(crate) fn run(
             "bootloader installation needs a FAT32 volume, the plan carries {}: only FAT32 is wired",
             filesystem_name(filesystem)
         )));
+    }
+    if *mode == BootloaderMode::MsDos {
+        // User-supplied files by design (see `install_msdos`): the
+        // arm never reads the image tree, so it short-circuits here
+        // past the tree setup below — a plan whose image has no tree
+        // still installs. The FAT32 gate above already ran.
+        return run_msdos(ctx, msdos_dir);
     }
     let volume = FileVolume::open(Path::new(&image.path))?;
     let source: Box<dyn TreeSource> = match &image.kind {
@@ -1597,9 +1669,9 @@ mod tests {
     }
 
     #[test]
-    fn bare_tree_refuses_with_the_later_slice_note() {
+    fn bare_tree_refuses_without_pretending_grub_support() {
         // Nothing Syslinux-like anywhere: the explicit mode refuses
-        // naming the gap instead of pretending GRUB support.
+        // naming what is missing instead of pretending GRUB support.
         let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
         let source = source.with_file(&[b"a.txt"], b"x");
         let (_backing, mut fat) = formatted();
@@ -1610,7 +1682,6 @@ mod tests {
             text.contains("no syslinux payloads"),
             "says what is missing: {text}"
         );
-        assert!(text.contains("later slice"), "names the gap: {text}");
         assert!(text.is_ascii(), "stays ASCII: {text}");
     }
 
@@ -2481,6 +2552,8 @@ mod tests {
             "no volume byte moved: the gate fires before any file write"
         );
     }
+
+    /// 64 MiB whole-disk double for the UEFI:NTFS arm: big enough for
     /// the planner to lay the 1 MiB ESP window on, small enough to
     /// snapshot in RAM.
     const UEFI_DISK_BYTES: u64 = 64 * 1024 * 1024;
@@ -3600,6 +3673,9 @@ pub(crate) mod end_to_end {
     use crate::iso::FLAG_DIRECTORY;
     use crate::iso::SECTOR_BYTES;
     use crate::part::TableKind;
+    use crate::part::plan::LayoutKind;
+    use crate::part::plan::data_window;
+    use crate::part::plan::esp_window;
     use crate::part::plan::single_data_window;
     use crate::pipeline::target::Target;
     use rufus_proto::DeviceRef;
@@ -3667,6 +3743,108 @@ pub(crate) mod end_to_end {
             put(*sector, bytes);
         }
         image
+    }
+
+    /// Build the GRUB2 fixture ISO plus its payload bytes: primary +
+    /// boot + terminator descriptors, `boot/grub/i386-pc/` holding
+    /// `boot.img` (600 patterned bytes) and `core.img` (3000 patterned
+    /// bytes). Lowercase identifiers with `;1` versions, like
+    /// [`syslinux_iso`]: the reader resolves directory components
+    /// exactly and strips the file versions.
+    fn grub2_iso() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use crate::copy::source::fixture::*;
+        const ROOT: u32 = 20;
+        const BOOT: u32 = 21;
+        const GRUB: u32 = 22;
+        const PC: u32 = 23;
+        const BOOTIMG: u32 = 24;
+        const COREIMG: u32 = 25;
+        let boot: Vec<u8> = (0..600)
+            .map(|index| ((index * 7 + 3) % 251) as u8)
+            .collect();
+        let core: Vec<u8> = (0..3000)
+            .map(|index| ((index * 13 + 5) % 251) as u8)
+            .collect();
+        let mut image = vec![0u8; 32 * SECTOR_BYTES];
+        let mut put = |sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(16, &primary_sector("TESTVOL", ROOT, SECTOR_BYTES as u32));
+        put(17, &boot_sector());
+        put(18, &terminator_sector());
+        let root = vec![
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(BOOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"boot"),
+        ];
+        let boot_dir = vec![
+            encode_record(BOOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(GRUB, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"grub"),
+        ];
+        let grub_dir = vec![
+            encode_record(GRUB, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(BOOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(PC, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"i386-pc"),
+        ];
+        let pc_dir = vec![
+            encode_record(PC, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(GRUB, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(BOOTIMG, boot.len() as u32, 0, b"boot.img;1"),
+            encode_record(COREIMG, core.len() as u32, 0, b"core.img;1"),
+        ];
+        put(ROOT, &dir_sector(&root));
+        put(BOOT, &dir_sector(&boot_dir));
+        put(GRUB, &dir_sector(&grub_dir));
+        put(PC, &dir_sector(&pc_dir));
+        put(BOOTIMG, &boot);
+        put(COREIMG, &core);
+        (image, boot, core)
+    }
+
+    /// Build the KolibriOS fixture ISO plus its loader bytes: the
+    /// descriptors plus a 1 KiB loader file under the exact reference
+    /// directories (`HD_Load`, then `USB_Boot`). The directory
+    /// components keep their case: the locator resolves them exactly,
+    /// unlike file names.
+    fn kolibri_iso() -> (Vec<u8>, Vec<u8>) {
+        use crate::copy::source::fixture::*;
+        const ROOT: u32 = 20;
+        const HD: u32 = 21;
+        const USB: u32 = 22;
+        const LOADER: u32 = 23;
+        let loader: Vec<u8> = (0..1024)
+            .map(|index| ((index * 7 + 3) % 251) as u8)
+            .collect();
+        let mut image = vec![0u8; 32 * SECTOR_BYTES];
+        let mut put = |sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(16, &primary_sector("TESTVOL", ROOT, SECTOR_BYTES as u32));
+        put(17, &boot_sector());
+        put(18, &terminator_sector());
+        let root = vec![
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(HD, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"HD_Load"),
+        ];
+        let hd_dir = vec![
+            encode_record(HD, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(USB, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"USB_Boot"),
+        ];
+        let usb_dir = vec![
+            encode_record(USB, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(HD, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(LOADER, loader.len() as u32, 0, b"MTLD_F32;1"),
+        ];
+        put(ROOT, &dir_sector(&root));
+        put(HD, &dir_sector(&hd_dir));
+        put(USB, &dir_sector(&usb_dir));
+        put(LOADER, &loader);
+        (image, loader)
     }
 
     /// A whole-disk [`Target`] over one open file with a declared
@@ -4047,6 +4225,10 @@ pub(crate) mod end_to_end {
         let mut names: Vec<String> = vec![
             "RCDATA_402.bin".to_string(),
             "RCDATA_403.bin".to_string(),
+            // The GRUB4DOS arm loads resources 450/451 through the
+            // production path, so its tests seed them here too.
+            "RCDATA_450.bin".to_string(),
+            "RCDATA_451.bin".to_string(),
             "RCDATA_502.bin".to_string(),
         ];
         for id in 300..=326u32 {
@@ -4407,7 +4589,8 @@ pub(crate) mod end_to_end {
         // `None` refuses the run naming `--msdos-dir`, so this test
         // fails. The ISO is only the still-required detection record:
         // the arm never reads the tree (the plan carries no write
-        // step).
+        // step), and `run` never even opens it (see
+        // `msdos_plan_ignores_an_image_with_no_tree`).
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let iso_path = scratch.path().join("dos.iso");
         std::fs::write(&iso_path, syslinux_iso()).expect("the iso writes");
@@ -4497,6 +4680,59 @@ pub(crate) mod end_to_end {
     }
 
     #[test]
+    fn msdos_plan_ignores_an_image_with_no_tree() {
+        // The arm never reads the image tree, and `run` short-circuits
+        // past the tree setup: a plan whose image is not an ISO at all
+        // (patterned bytes, no descriptors) still installs. The kind
+        // stays `Iso` and the CLI still requires the `--image`
+        // argument — only the readability requirement is gone.
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let iso_path = scratch.path().join("dos.iso");
+        let garbage: Vec<u8> = (0..4096)
+            .map(|index| ((index * 11 + 7) % 251) as u8)
+            .collect();
+        std::fs::write(&iso_path, &garbage).expect("the non-image writes");
+        let (disk_path, opener, base, len) = msdos_rig(&scratch);
+        let dos = msdos_user_dir();
+        let mut reporter = Recorder::default();
+        let plan = msdos_plan(&iso_path, Some(dos.path()));
+        let report =
+            crate::pipeline::run(&plan, &opener, &msdos_run_options(), &mut reporter, &|| {
+                false
+            })
+            .expect("a tree-less image still installs msdos");
+        let names: Vec<&str> = report.steps.iter().map(|step| step.step).collect();
+        assert_eq!(
+            names,
+            [
+                "wipe",
+                "mklabel",
+                "mkpart",
+                "mkfs",
+                "bootloader",
+                "finalize"
+            ],
+            "every step runs in order, with no write step"
+        );
+        let view = PartFile::open(&disk_path, base, len).expect("the view reopens");
+        let mut fat = Fat32::open(Box::new(view)).expect("the volume opens");
+        let back = fat.read_file("/IO.SYS").expect("IO.SYS reads back");
+        assert_eq!(
+            back.len(),
+            crate::boot::msdos::IO_SYS_BYTES,
+            "the bios lands without any image tree"
+        );
+        let back = fat
+            .read_file("/COMMAND.COM")
+            .expect("COMMAND.COM reads back");
+        assert_eq!(
+            back.len(),
+            crate::boot::msdos::COMMAND_COM_BYTES,
+            "the shell lands without any image tree"
+        );
+    }
+
+    #[test]
     fn msdos_plan_without_its_directory_refuses_leaving_the_volume_identical() {
         // Same rig, two phases: format first, snapshot the partition
         // window, then run the bootloader step with `msdos_dir: None`
@@ -4553,5 +4789,449 @@ pub(crate) mod end_to_end {
         disk.read_exact_at(&mut after, base)
             .expect("the window reads back");
         assert_eq!(after, before, "no volume byte moved");
+    }
+
+    /// A real `pipeline::run` step plan for the acceptance table:
+    /// wipe, table, partition, format, bootloader, finalize — never a
+    /// transfer step, which no bootloader arm needs (every arm reads
+    /// the image file itself, or nothing at all).
+    fn acceptance_plan(
+        iso: &std::path::Path,
+        image_len: u64,
+        filesystem: Filesystem,
+        layout: rufus_proto::Layout,
+        mode: rufus_proto::BootloaderMode,
+        dos: Option<&std::path::Path>,
+    ) -> Plan {
+        Plan {
+            version: PLAN_VERSION,
+            created_by: "bootloader-acceptance".to_string(),
+            device: DeviceRef {
+                path: "/dev/test".to_string(),
+                block_device: false,
+                size_bytes: None,
+                serial: None,
+                model: None,
+                sysfs: None,
+            },
+            image: ImageRef {
+                path: iso.display().to_string(),
+                size_bytes: image_len,
+                sha256: String::new(),
+                kind: ImageKind::Iso,
+            },
+            options: Options {
+                scheme: rufus_proto::Scheme::Mbr,
+                target: rufus_proto::Target::Dual,
+                filesystem: filesystem.clone(),
+                label: None,
+                cluster_bytes: None,
+                quick_format: true,
+                bad_blocks: false,
+                verify: false,
+                persistence: false,
+                show_all: false,
+                confirmed_serial: None,
+                msdos_dir: dos.map(|dir| dir.display().to_string()),
+            },
+            steps: vec![
+                rufus_proto::Step::Wipe,
+                rufus_proto::Step::Mklabel {
+                    scheme: rufus_proto::Scheme::Mbr,
+                },
+                rufus_proto::Step::Mkpart {
+                    scheme: rufus_proto::Scheme::Mbr,
+                    layout,
+                },
+                rufus_proto::Step::Mkfs {
+                    filesystem: filesystem.clone(),
+                    label: None,
+                    cluster_bytes: None,
+                    quick: true,
+                },
+                rufus_proto::Step::Bootloader { mode },
+                rufus_proto::Step::Finalize,
+            ],
+            confirm: String::new(),
+        }
+    }
+
+    /// One mode of the acceptance table on its own fresh file-backed
+    /// disk, so modes cannot mask each other. The `UefiNtfs` and
+    /// `None` modes run in two phases (set up, snapshot the data
+    /// window, then the bootloader step) so the test pins that the
+    /// arm itself leaves the data window alone; every other mode runs
+    /// the whole six-step plan at once.
+    fn acceptance_one(mode: rufus_proto::BootloaderMode) {
+        use rufus_proto::BootloaderMode as Mode;
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        // Fixtures up front (a few hundred KiB total): the syslinux
+        // image serves every arm that ignores the tree, the GRUB2 and
+        // Kolibri images carry their payloads, and the MS-DOS image is
+        // patterned garbage proving no tree is ever opened.
+        let syslinux = syslinux_iso();
+        let (grub2_image, grub2_boot, grub2_core) = grub2_iso();
+        let (kolibri_image, kolibri_loader) = kolibri_iso();
+        let garbage: Vec<u8> = (0..4096)
+            .map(|index| ((index * 11 + 7) % 251) as u8)
+            .collect();
+        let (iso_bytes, image_len): (&[u8], u64) = match mode {
+            Mode::Grub2 => (&grub2_image, 32 * SECTOR_BYTES as u64),
+            Mode::Kolibri => (&kolibri_image, 32 * SECTOR_BYTES as u64),
+            Mode::MsDos => (&garbage, garbage.len() as u64),
+            _ => (&syslinux, 32 * SECTOR_BYTES as u64),
+        };
+        let iso_path = scratch.path().join("acceptance.iso");
+        std::fs::write(&iso_path, iso_bytes).expect("the iso writes");
+        let dos = (mode == Mode::MsDos).then(msdos_user_dir);
+        // The UEFI:NTFS data partition lives in the two-partition
+        // window; every other mode formats the single data window.
+        let uefi = mode == Mode::UefiNtfs;
+        let disk_path = scratch.path().join("disk.img");
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&disk_path)
+            .expect("the disk creates")
+            .set_len(DISK_BYTES)
+            .expect("the disk sizes");
+        let (base, len) = if uefi {
+            data_window(LayoutKind::UefiNtfs, TableKind::Mbr, 512, DISK_BYTES)
+                .expect("the uefi data window plans")
+        } else {
+            single_data_window(TableKind::Mbr, 512, DISK_BYTES).expect("the data window plans")
+        };
+        let opener = EndToEndOpener {
+            path: disk_path.clone(),
+            disk_len: DISK_BYTES,
+            base,
+            len,
+        };
+        let filesystem = if uefi {
+            Filesystem::Exfat
+        } else {
+            Filesystem::Fat32
+        };
+        let layout = if uefi {
+            rufus_proto::Layout::UefiNtfs
+        } else {
+            rufus_proto::Layout::Single
+        };
+        let plan = acceptance_plan(
+            &iso_path,
+            image_len,
+            filesystem,
+            layout,
+            mode.clone(),
+            dos.as_ref().map(|dir| dir.path()),
+        );
+        // Step names in run order, asserted after every run below.
+        let step_names = |report: &crate::pipeline::RunReport| {
+            report
+                .steps
+                .iter()
+                .map(|step| step.step)
+                .collect::<Vec<_>>()
+        };
+        // Sector 0 of the data window through a fresh handle: the
+        // record fingerprints below all read it this way, which is
+        // what proves the run flushed.
+        let boot_sector = || {
+            let disk = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&disk_path)
+                .expect("the disk reopens");
+            let mut sector = [0u8; 512];
+            disk.read_exact_at(&mut sector, base)
+                .expect("sector 0 reads");
+            sector
+        };
+        // The data window through a fresh volume handle (flush proof
+        // for the file fingerprints).
+        let open_volume = || {
+            let view = PartFile::open(&disk_path, base, len).expect("the view reopens");
+            Fat32::open(Box::new(view)).expect("the volume opens")
+        };
+        if uefi || mode == Mode::None {
+            // Two phases: format first, snapshot the window, then the
+            // bootloader step alone. A single plan could not isolate
+            // the arm's own writes from the formatter's.
+            let mut setup = plan.clone();
+            setup.steps.truncate(4);
+            let mut reporter = Recorder::default();
+            crate::pipeline::run(
+                &setup,
+                &opener,
+                &msdos_run_options(),
+                &mut reporter,
+                &|| false,
+            )
+            .expect("wipe through mkfs runs");
+            let disk = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&disk_path)
+                .expect("the disk reopens");
+            let mut before = vec![0u8; len as usize];
+            disk.read_exact_at(&mut before, base)
+                .expect("the window snapshots");
+            let mut phase = plan.clone();
+            phase.steps = if uefi {
+                // `Mklabel` re-records the table: every `run` starts
+                // context-free, so the second phase must stamp it again
+                // before the arm resolves its ESP window.
+                vec![
+                    rufus_proto::Step::Mklabel {
+                        scheme: rufus_proto::Scheme::Mbr,
+                    },
+                    rufus_proto::Step::Bootloader {
+                        mode: Mode::UefiNtfs,
+                    },
+                    rufus_proto::Step::Finalize,
+                ]
+            } else {
+                vec![rufus_proto::Step::Bootloader { mode: Mode::None }]
+            };
+            let mut reporter = Recorder::default();
+            let report = crate::pipeline::run(
+                &phase,
+                &opener,
+                &msdos_run_options(),
+                &mut reporter,
+                &|| false,
+            )
+            .expect("the bootloader phase runs");
+            if uefi {
+                assert_eq!(
+                    step_names(&report),
+                    ["mklabel", "bootloader", "finalize"],
+                    "the uefi phase runs in order"
+                );
+                let (offset, esp_len) =
+                    esp_window(LayoutKind::UefiNtfs, TableKind::Mbr, 512, DISK_BYTES)
+                        .expect("the esp window plans");
+                assert_eq!(
+                    esp_len,
+                    crate::boot::uefi_ntfs::IMAGE_BYTES,
+                    "the esp window holds the whole shim"
+                );
+                let shim = load_from(&resources_dir(), Resource::UefiNtfsImage)
+                    .expect("the shim loads")
+                    .bytes()
+                    .to_vec();
+                let mut window = vec![0u8; esp_len as usize];
+                disk.read_exact_at(&mut window, offset)
+                    .expect("the esp window reads");
+                assert_eq!(window, shim, "the shim lands whole at the esp offset");
+            } else {
+                assert_eq!(
+                    step_names(&report),
+                    ["bootloader"],
+                    "the none phase runs its one step"
+                );
+            }
+            let mut after = vec![0u8; len as usize];
+            disk.read_exact_at(&mut after, base)
+                .expect("the window reads back");
+            assert_eq!(
+                after, before,
+                "the {mode:?} arm leaves the data window alone"
+            );
+            return;
+        }
+        let mut reporter = Recorder::default();
+        let report =
+            crate::pipeline::run(&plan, &opener, &msdos_run_options(), &mut reporter, &|| {
+                false
+            })
+            .expect("the acceptance plan runs");
+        assert_eq!(
+            step_names(&report),
+            [
+                "wipe",
+                "mklabel",
+                "mkpart",
+                "mkfs",
+                "bootloader",
+                "finalize"
+            ],
+            "every step runs in order, with no write step"
+        );
+        match mode {
+            Mode::Syslinux => {
+                // The stage lands and the payload record grafts:
+                // companions and the wrapper are the arm tests'
+                // province (`syslinux_604_installs_stage_companions_and_config`).
+                let mut fat = open_volume();
+                let stage = fat.read_file("/LDLINUX.SYS").expect("the stage reads back");
+                assert!(!stage.is_empty(), "the stage lands");
+                let sector = boot_sector();
+                assert_eq!(&sector[0..3], &[0xEB, 0x58, 0x90], "the payload jump lands");
+                assert_eq!(
+                    &sector[3..11],
+                    b"SYSLINUX",
+                    "the payload oem marks the volume"
+                );
+                assert_eq!(
+                    2 + u16::from(sector[1]),
+                    0x5A,
+                    "the jump targets the code at 0x5A"
+                );
+            }
+            Mode::Grub2 => {
+                // The BIOS record plus the whole core image on the
+                // disk itself (sectors 0 and 1, not the partition
+                // window); the UEFI placement has no payload in this
+                // image, so nothing is placed (see
+                // `grub2_installs_bios_and_places_uefi` for the placed
+                // case).
+                let disk = std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&disk_path)
+                    .expect("the disk reopens");
+                let mut sector = [0u8; 512];
+                disk.read_exact_at(&mut sector, 0).expect("sector 0 reads");
+                assert_eq!(&sector[..0x5c], &grub2_boot[..0x5c], "record head verbatim");
+                assert_eq!(
+                    &sector[0x5c..0x64],
+                    &1u64.to_le_bytes(),
+                    "the kernel field names sector 1"
+                );
+                assert_eq!(&sector[510..512], &[0x55, 0xAA], "the boot mark closes");
+                let mut core_back = vec![0u8; grub2_core.len()];
+                disk.read_exact_at(&mut core_back, 512)
+                    .expect("the core reads");
+                assert_eq!(core_back, grub2_core, "the core lands whole at sector 1");
+            }
+            Mode::Grub4dos => {
+                // The embedded loader plus MBR/SBR; the keep-existing
+                // path is the arm tests' province
+                // (`grub4dos_keeps_an_existing_grldr`).
+                let expected = load_from(&resources_dir(), Resource::Grub4DosCore)
+                    .expect("the loader loads")
+                    .bytes()
+                    .to_vec();
+                let mut fat = open_volume();
+                let back = fat.read_file("/GRLDR").expect("the loader reads back");
+                assert_eq!(back, expected, "resource 451 lands byte-identical");
+                let mbr = load_from(&resources_dir(), Resource::Grub4DosMbr)
+                    .expect("the mbr loads")
+                    .bytes()
+                    .to_vec();
+                let disk = std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&disk_path)
+                    .expect("the disk reopens");
+                let mut sector = [0u8; 512];
+                disk.read_exact_at(&mut sector, 0).expect("sector 0 reads");
+                assert_eq!(&sector[..423], &mbr[..423], "the mbr window lands");
+                assert_eq!(&sector[510..512], &[0x55, 0xAA], "the boot mark closes");
+                let sbr = &mbr[512..];
+                let mut sbr_back = vec![0u8; sbr.len()];
+                disk.read_exact_at(&mut sbr_back, 512)
+                    .expect("the sbr reads");
+                assert_eq!(sbr_back, sbr, "the sbr lands whole at sector 1");
+            }
+            Mode::Freedos => {
+                // The pair, the 25 locale files and the rendered
+                // `AUTOEXEC.BAT`: 28 files, plus the record (the locale
+                // plan lines are the arm tests' province,
+                // `install_us_builds_the_full_volume`).
+                let mut fat = open_volume();
+                for name in ["/COMMAND.COM", "/KERNEL.SYS", "/AUTOEXEC.BAT"] {
+                    let back = fat.read_file(name).expect("the file reads back");
+                    assert!(!back.is_empty(), "{name} lands");
+                }
+                let listed = fat.list_dir("/LOCALE").expect("the locale lists");
+                assert_eq!(listed.len(), 25, "LOCALE holds the 25 locale files");
+                let entries = fat.list_dir("/").expect("the root lists");
+                let mut root: Vec<&str> = entries
+                    .iter()
+                    .map(|entry| entry.short_name.as_str())
+                    .collect();
+                root.sort_unstable();
+                assert_eq!(
+                    root,
+                    vec!["AUTOEXEC.BAT", "COMMAND.COM", "KERNEL.SYS", "LOCALE"],
+                    "the root holds the pair plus AUTOEXEC.BAT beside LOCALE"
+                );
+                let sector = boot_sector();
+                assert_eq!(&sector[0..3], &[0xEB, 0x58, 0x90], "the payload jump lands");
+                assert_eq!(&sector[510..512], &[0x55, 0xAA], "the boot mark closes");
+            }
+            Mode::Kolibri => {
+                // The image-tree loader byte-identical at the root,
+                // plus the record (the keep path is the arm tests'
+                // province).
+                let mut fat = open_volume();
+                let back = fat.read_file("/MTLD_F32").expect("the loader reads back");
+                assert_eq!(back, kolibri_loader, "the loader is byte-identical");
+                let sector = boot_sector();
+                assert_eq!(&sector[0..3], &[0xEB, 0x58, 0x90], "the payload jump lands");
+                assert_eq!(&sector[510..512], &[0x55, 0xAA], "the boot mark closes");
+            }
+            Mode::MsDos => {
+                // The three user files with `IO.SYS` first and both
+                // patches applied (the keep and miss paths are the arm
+                // tests' province).
+                let mut fat = open_volume();
+                let listed = fat.list_dir("/").expect("the root lists");
+                let shorts: Vec<&str> = listed
+                    .iter()
+                    .map(|entry| entry.short_name.as_str())
+                    .collect();
+                assert_eq!(
+                    shorts,
+                    vec!["IO.SYS", "MSDOS.SYS", "COMMAND.COM"],
+                    "IO.SYS lands first"
+                );
+                let back = fat.read_file("/IO.SYS").expect("IO.SYS reads back");
+                assert_eq!(
+                    back[crate::boot::msdos::IO_SYS_PATCH_OFFSET],
+                    0xEB,
+                    "the bios patch byte lands"
+                );
+                let back = fat
+                    .read_file("/COMMAND.COM")
+                    .expect("COMMAND.COM reads back");
+                assert_eq!(
+                    back[crate::boot::msdos::COMMAND_COM_PATCH_OFFSET],
+                    0xEB,
+                    "the shell patch byte lands"
+                );
+            }
+            Mode::UefiNtfs | Mode::Auto | Mode::None => {
+                panic!("the two-phase arms above return early; auto is never accepted here");
+            }
+        }
+    }
+
+    /// Acceptance across every wired bootloader mode: each mode runs a
+    /// real `pipeline::run` step plan on its own fresh file-backed
+    /// disk and leaves its fingerprint behind. The `UefiNtfs` and
+    /// `None` arms run in two phases so the data-window comparison
+    /// isolates the arm from the formatter; the exFAT data partition
+    /// for `UefiNtfs` formats natively (NTFS would need the host
+    /// tool). Every fingerprint reads through a fresh handle, which
+    /// is what proves each run flushed.
+    #[test]
+    fn every_wired_mode_installs_its_fingerprint_end_to_end() {
+        // One asset seeding for the arms that load production
+        // payloads (FreeDOS, GRUB4DOS, UEFI:NTFS); the rest read the
+        // image tree or the user directory only.
+        seed_exe_assets();
+        use rufus_proto::BootloaderMode as Mode;
+        for mode in [
+            Mode::Syslinux,
+            Mode::Grub2,
+            Mode::Grub4dos,
+            Mode::UefiNtfs,
+            Mode::Freedos,
+            Mode::Kolibri,
+            Mode::MsDos,
+            Mode::None,
+        ] {
+            acceptance_one(mode);
+        }
     }
 }

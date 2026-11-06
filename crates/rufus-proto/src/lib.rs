@@ -398,7 +398,10 @@ pub enum BootloaderMode {
     /// MS-DOS from user-supplied system files: MS-DOS cannot be
     /// bundled for licensing reasons, so the three files (`IO.SYS`,
     /// `MSDOS.SYS`, `COMMAND.COM`) come from the plan's `msdos_dir`,
-    /// never from an embedded payload.
+    /// never from an embedded payload. The installer reads no image
+    /// tree — an `msdos` plan carries no write step, and `run`
+    /// short-circuits past the tree setup — so the plan image needs
+    /// no readable tree.
     #[serde(rename = "msdos")]
     MsDos,
     /// No bootloader (plain data media).

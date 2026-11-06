@@ -17,9 +17,9 @@
 //! * `write` — validates the plan file (schema version + confirm
 //!   hash) and runs it through the S17 pipeline against the planned
 //!   device, or against the `--device-file` seam in tests; exit 7 only
-//!   for unwired bootloader modes, image kinds with no tree reader,
-//!   and `Copy` plans run over the `--device-file` seam (no partition
-//!   node to mount).
+//!   for image kinds with no tree reader (wim, vhd, vhdx, ffu, qcow2,
+//!   pe) and `Copy` plans run over the `--device-file` seam (no
+//!   partition node to mount).
 //!   `write`
 //!   is the one command whose failure goes to stderr in both modes:
 //!   `--json` streams one `Event` object per stdout line, so the
@@ -65,8 +65,9 @@ mod plan;
 // Exit codes and failure reporting
 // ---------------------------------------------------------------------------
 
-/// Exit codes (PLAN §9-S03 table, plus `NotImplemented` for unwired
-/// bootloader modes and image kinds with no tree reader). `UnsupportedImage`
+/// Exit codes (PLAN §9-S03 table, plus `NotImplemented` for image
+/// kinds with no tree reader and mounts no seam provides).
+/// `UnsupportedImage`
 /// has no producer yet (images the executor cannot serve arrive with a
 /// later slice); the contract above is authoritative for callers, hence
 /// the `dead_code` allowance.
@@ -87,7 +88,8 @@ pub enum Exit {
     UnsupportedImage = 5,
     /// User cancelled a long operation.
     Cancelled = 6,
-    /// Subcommand exists but ships with a later slice.
+    /// A planned step or mount the run cannot serve yet (image kinds
+    /// with no tree reader, mounts with no node).
     NotImplemented = 7,
 }
 
@@ -625,9 +627,9 @@ enum Command {
     ///
     /// With --plan the file is checked (schema version + confirm hash)
     /// and then run through the S17 pipeline: wipe, table, partition,
-    /// format, write, bootloader, finalize. Mismatches exit 1; unwired
-    /// bootloader modes, image kinds with no tree reader, and `Copy`
-    /// plans over `--device-file` (no partition node to mount) exit 7.
+    /// format, write, bootloader, finalize. Mismatches exit 1; image
+    /// kinds with no tree reader, and `Copy` plans over `--device-file`
+    /// (no partition node to mount), exit 7.
     /// `--device-file` runs
     /// the same plan against a regular file instead of the planned
     /// device (a test seam; the planned device is never opened then).
@@ -1885,7 +1887,7 @@ mod tests {
     #[test]
     fn from_core_maps_unimplemented_to_exit_7() {
         let fail = Fail::from_core(CoreError::NotImplemented {
-            what: "bootloader installation (not wired yet)",
+            what: "copy of a wim image (the wim reader arrives in a later slice)",
         });
         assert_eq!(fail.exit, Exit::NotImplemented);
         assert_eq!(fail.exit.code(), 7);

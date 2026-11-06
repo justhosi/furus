@@ -522,6 +522,21 @@ fn check_steps(plan: &Plan) -> Result<(), Reject> {
             "--msdos-dir only applies to --bootloader msdos",
         ));
     }
+    // An `msdos` plan carries no transfer step by construction: the
+    // installer must place `IO.SYS` as the first root entry of the
+    // fresh volume, so a hand-built plan smuggling one in would leave
+    // it not first. Refused before the per-step walk.
+    if msdos_plan
+        && plan
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::Write { .. }))
+    {
+        return Err(reject(
+            "invalid_step",
+            "an msdos plan must not carry a write step (IO.SYS must be the first root entry) - rebuild the plan",
+        ));
+    }
     for (index, step) in plan.steps.iter().enumerate() {
         let number = index + 1;
         match step {
@@ -1449,6 +1464,11 @@ mod tests {
             }
             if mode == BootloaderMode::MsDos {
                 plan.options.msdos_dir = Some("/tmp/dos".to_string());
+                // A real `msdos` plan carries no transfer step, so the
+                // fixture's `Write` goes: the filesystem pairing stays
+                // the only thing under test.
+                plan.steps
+                    .retain(|step| !matches!(step, Step::Write { .. }));
             }
             plan.options.filesystem = Filesystem::Ntfs;
             plan = signed(plan);
@@ -1474,6 +1494,10 @@ mod tests {
             }
             if mode == BootloaderMode::MsDos {
                 plan.options.msdos_dir = Some("/tmp/dos".to_string());
+                // A real `msdos` plan carries no transfer step (see the
+                // write-step rule below), so the fixture's `Write` goes.
+                plan.steps
+                    .retain(|step| !matches!(step, Step::Write { .. }));
             }
             plan = signed(plan);
             validate(&plan, &env).expect("the pairing passes");
@@ -1509,8 +1533,44 @@ mod tests {
             *slot = BootloaderMode::MsDos;
         }
         plan.options.msdos_dir = Some("/tmp/dos".to_string());
+        // A real `msdos` plan carries no transfer step (see the
+        // write-step rule below), so the fixture's `Write` goes.
+        plan.steps
+            .retain(|step| !matches!(step, Step::Write { .. }));
         plan = signed(plan);
         validate(&plan, &env).expect("a directory passes");
+    }
+
+    #[test]
+    fn msdos_plan_with_a_write_step_is_refused() {
+        // The installer must place `IO.SYS` as the first root entry of
+        // the fresh volume: a hand-built `msdos` plan smuggling a
+        // transfer step in is refused naming the rule, and dropping
+        // the step (what the planner emits) passes.
+        let fixture = Fixture::new();
+        let (mut plan, env, _device) = fixture.good(true);
+        if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+            *slot = BootloaderMode::MsDos;
+        }
+        plan.options.msdos_dir = Some("/tmp/dos".to_string());
+        plan = signed(plan);
+        let refused = validate(&plan, &env).expect_err("a write step refuses");
+        assert_eq!(refused.code, "invalid_step");
+        assert_eq!(
+            refused.message,
+            "an msdos plan must not carry a write step (IO.SYS must be the first root entry) - rebuild the plan"
+        );
+        assert!(refused.message.is_ascii(), "the refusal stays ASCII");
+        let fixture = Fixture::new();
+        let (mut plan, env, _device) = fixture.good(true);
+        if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+            *slot = BootloaderMode::MsDos;
+        }
+        plan.options.msdos_dir = Some("/tmp/dos".to_string());
+        plan.steps
+            .retain(|step| !matches!(step, Step::Write { .. }));
+        plan = signed(plan);
+        validate(&plan, &env).expect("a write-less msdos plan passes");
     }
 
     #[test]

@@ -7,9 +7,10 @@
 //! wired: wipe, mklabel, mkpart, mkfs and finalize, both write paths
 //! (the [`Dd`](rufus_proto::WriteMode::Dd) stream and the
 //! [`Copy`](rufus_proto::WriteMode::Copy) file-tree copy), and the
-//! bootloader step ([`bootloader`] installs Syslinux, GRUB2 BIOS or
-//! GRUB4DOS on FAT32 plus UEFI GRUB placement; other modes and
-//! filesystems refuse naming themselves). Later features (persistence
+//! bootloader step ([`bootloader`] installs Syslinux, GRUB2 BIOS,
+//! GRUB4DOS, FreeDOS, KolibriOS or MS-DOS on a FAT32 data partition,
+//! or the UEFI:NTFS shim for an NTFS or exFAT one; `Auto` probes the
+//! tree-backed families in that order). Later features (persistence
 //! and the rest) stay unwired.
 //!
 //! [`step_name`] is the one shared snake_case vocabulary for step
@@ -148,7 +149,8 @@ fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result
             // the `MsDos` arm only; every other arm ignores it (`None`
             // elsewhere). An `msdos` plan carries no write step, so the
             // image reference here is the still-required detection
-            // record, never a transfer source.
+            // record — the arm never opens it, so it needs no
+            // readable tree.
             let msdos_dir = plan.options.msdos_dir.as_deref().map(std::path::Path::new);
             bootloader::run(ctx, mode, &plan.image, &plan.options.filesystem, msdos_dir)
         }
@@ -4447,7 +4449,7 @@ mod tests {
             &mut reporter,
             &|| false,
         )
-        .expect_err("bootloader is not implemented yet");
+        .expect_err("the bootloader step refuses without its image");
         let finished: Vec<&str> = reporter
             .events()
             .iter()
