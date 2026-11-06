@@ -914,9 +914,14 @@ fn release_after_failure(
 /// detects as `Raw`) opens through [`UdfReader`] plus [`UdfSource`],
 /// refusing — naming the kind and carrying the UDF reader's message
 /// — when it is neither an ISO9660 nor a UDF tree. The `Raw` UDF
-/// path has no test (nothing in the tree opens a real UDF image
-/// through this arm); the neither-ISO-nor-UDF failure branch is
-/// tested. Every other kind refused earlier in
+/// path is tested end to end on a synthetic UDF 2.01 volume built
+/// in-tree (`copy_walks_a_udf_tree_onto_the_mount`), and the
+/// neither-ISO-nor-UDF failure branch is tested too (a zeroed image,
+/// and a UDF volume with a corrupt NSR sector). Still untested: UDF
+/// volumes written by real tools (`mkudffs` or a Windows writer, see
+/// the reader's own sample notes), the 2048-byte block size, multi-
+/// extent or long-named entries, and the reserve-sequence fallback;
+/// the copy tests only ever see the hand-encoded fixture. Every other kind refused earlier in
 /// [`refuse_unsupported_kind`], before the image file was even
 /// opened.
 ///
@@ -1443,6 +1448,7 @@ mod tests {
     use crate::pipeline::steps::RunContext;
     use crate::pipeline::target::Target;
     use crate::pipeline::target::VecTarget;
+    use crate::udf::stamp_tag;
 
     use rufus_proto::Filesystem;
     use rufus_proto::ImageKind;
@@ -2112,6 +2118,294 @@ mod tests {
             assert!(text.is_ascii(), "{text}");
         }
         assert_eq!(opener.mounts(), 0, "a malformed image never mounts");
+    }
+
+    /// Block size of the synthetic UDF volume. The anchor probe tries
+    /// 2048 first; this volume is too short to hold the anchor at block
+    /// 256 in 2048-byte units, so the probe falls through to 512 (the
+    /// reader's own synthetic tests take the same path).
+    const UDF_BLOCK: u32 = 512;
+    /// Absolute block of the anchor volume descriptor pointer.
+    const UDF_ANCHOR: u32 = 256;
+    /// Absolute block where the main descriptor sequence starts (8 blocks).
+    const UDF_MAIN: u32 = 96;
+    /// Absolute block where partition 0 starts (900 blocks long).
+    const UDF_PART: u32 = 257;
+    /// Partition-relative block of the file set descriptor.
+    const UDF_FSD: u32 = 8;
+    /// Partition-relative block of the root directory file entry.
+    const UDF_ROOT: u32 = 10;
+    /// Blocks the synthetic volume occupies: the partition plus a tail.
+    const UDF_BLOCKS: u32 = UDF_PART + 16;
+
+    /// Stamp the ECMA-167 tag (`id`, CRC over `crc_len` bytes after the
+    /// tag, claimed `location`) onto a whole block.
+    fn udf_tagged(mut block: Vec<u8>, id: u16, crc_len: usize, location: u32) -> Vec<u8> {
+        stamp_tag(&mut block, id, crc_len as u16, location);
+        block
+    }
+
+    /// Write one whole block at absolute block `at` of `image`.
+    fn udf_put(image: &mut [u8], at: u32, block: &[u8]) {
+        let base = at as usize * UDF_BLOCK as usize;
+        image[base..base + block.len()].copy_from_slice(block);
+    }
+
+    /// A file entry (tag 266, extended) with `data` embedded in the
+    /// entry block itself: `ftype` 5 is a regular file, 4 a directory.
+    /// The entry claims partition-relative block `rel`.
+    fn udf_entry(rel: u32, ftype: u8, data: &[u8]) -> Vec<u8> {
+        let mut block = vec![0u8; UDF_BLOCK as usize];
+        block[27] = ftype;
+        // Permission word (offset 44), mapped by `permissions_to_mode`:
+        // 0x1CA5 reads 0o755 (the reader's own pinned word), 0x1884
+        // reads 0o644. A zero word would copy as mode 0, unreadable.
+        let perm: u32 = if ftype == 4 { 0x1CA5 } else { 0x1884 };
+        block[44..48].copy_from_slice(&perm.to_le_bytes());
+        // ICB flags: allocation type 3, data embedded in the entry.
+        block[34..36].copy_from_slice(&3u16.to_le_bytes());
+        block[56..64].copy_from_slice(&(data.len() as u64).to_le_bytes());
+        block[212..216].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        block[216..216 + data.len()].copy_from_slice(data);
+        udf_tagged(block, 266, UDF_BLOCK as usize - 16, rel)
+    }
+
+    /// One file identifier descriptor (tag 257) padded to 4 bytes:
+    /// characteristics (`0x02` directory, `0x0A` parent), the ICB
+    /// (one block at `lbn`), the compressed name, and the block
+    /// `location` the record sits in.
+    fn udf_fid(characteristics: u8, lbn: u32, name: &[u8], location: u32) -> Vec<u8> {
+        let body = 38 + name.len();
+        let total = body + (4 - body % 4) % 4;
+        let mut record = vec![0u8; total];
+        record[16..18].copy_from_slice(&1u16.to_le_bytes());
+        record[18] = characteristics;
+        record[19] = name.len() as u8;
+        record[20..24].copy_from_slice(&UDF_BLOCK.to_le_bytes());
+        record[24..28].copy_from_slice(&lbn.to_le_bytes());
+        record[38..38 + name.len()].copy_from_slice(name);
+        udf_tagged(record, 257, total - 16, location)
+    }
+
+    /// OSTA compressed Unicode for `text` (compression id 8, one byte
+    /// per character): the form every fixture name takes.
+    fn udf_name(text: &str) -> Vec<u8> {
+        let mut out = vec![8u8];
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+
+    /// A synthetic UDF 2.01 volume holding the same tree as the ISO
+    /// fixture: `TOP.TXT` (`top-txt`), `A/NESTED.TXT` (`nested`) and an
+    /// empty `B/`. Layout (512-byte blocks, partition 0 at block 257):
+    /// recognition at byte 32768 (`BEA01`, `nsr`, `TEA01`), anchor at
+    /// block 256 with the main sequence at block 96, the primary,
+    /// logical volume (file set at relative block 8), partition,
+    /// unallocated, implementation-use and terminator descriptors at
+    /// 96..101, then the file set (8), the root entry (10), `TOP.TXT`
+    /// (11), `A` (12), `B` (13) and `NESTED.TXT` (14). Every file and
+    /// directory keeps its data inside its own entry block, so no
+    /// extent maps are needed. `nsr` is `NSR03` for a valid volume.
+    ///
+    /// The offsets are the ones the reader's own synthetic volume pins
+    /// (`udf/reader.rs`), which is the only source for them here: the
+    /// fixture proves the copy arm consumes what the reader accepts,
+    /// not that the reader matches a real `mkudffs` image byte for byte.
+    fn udf_tree_bytes(nsr: &[u8; 5]) -> Vec<u8> {
+        let mut image = vec![0u8; UDF_BLOCKS as usize * UDF_BLOCK as usize];
+        for (index, id) in [*b"BEA01", *nsr, *b"TEA01"].iter().enumerate() {
+            let base = 32768 + index * 2048;
+            image[base + 1..base + 6].copy_from_slice(id);
+            image[base + 6] = 0x01;
+        }
+        // Anchor: a main extent of 8 blocks at block 96, no reserve.
+        let mut anchor = vec![0u8; UDF_BLOCK as usize];
+        anchor[16..20].copy_from_slice(&(8 * UDF_BLOCK).to_le_bytes());
+        anchor[20..24].copy_from_slice(&UDF_MAIN.to_le_bytes());
+        udf_put(
+            &mut image,
+            UDF_ANCHOR,
+            &udf_tagged(anchor, 2, UDF_BLOCK as usize - 16, UDF_ANCHOR),
+        );
+        // Primary volume descriptor (tag 1).
+        let primary = vec![0u8; UDF_BLOCK as usize];
+        udf_put(
+            &mut image,
+            UDF_MAIN,
+            &udf_tagged(primary, 1, UDF_BLOCK as usize - 16, UDF_MAIN),
+        );
+        // Logical volume descriptor (tag 6): label `LABEL`, block size,
+        // `*OSTA UDF Compliant` domain at revision 2.01, the file set's
+        // long address and one type-1 partition map to partition 0.
+        let mut logical = vec![0u8; UDF_BLOCK as usize];
+        logical[84] = 8;
+        logical[85..90].copy_from_slice(b"LABEL");
+        logical[84 + 127] = 6;
+        logical[212..216].copy_from_slice(&UDF_BLOCK.to_le_bytes());
+        logical[217..236].copy_from_slice(b"*OSTA UDF Compliant");
+        logical[240..242].copy_from_slice(&0x0201u16.to_le_bytes());
+        logical[248..252].copy_from_slice(&UDF_BLOCK.to_le_bytes());
+        logical[252..256].copy_from_slice(&UDF_FSD.to_le_bytes());
+        logical[264..268].copy_from_slice(&6u32.to_le_bytes());
+        logical[268..272].copy_from_slice(&1u32.to_le_bytes());
+        logical[440..446].copy_from_slice(&[1, 6, 1, 0, 0, 0]);
+        udf_put(
+            &mut image,
+            UDF_MAIN + 1,
+            &udf_tagged(logical, 6, 446 - 16, UDF_MAIN + 1),
+        );
+        // Partition descriptor (tag 5): partition 0 at block 257, 900
+        // blocks, contents identifier `+NSR03`.
+        let mut partition = vec![0u8; UDF_BLOCK as usize];
+        partition[25..31].copy_from_slice(b"+NSR03");
+        partition[188..192].copy_from_slice(&UDF_PART.to_le_bytes());
+        partition[192..196].copy_from_slice(&900u32.to_le_bytes());
+        udf_put(
+            &mut image,
+            UDF_MAIN + 2,
+            &udf_tagged(partition, 5, UDF_BLOCK as usize - 16, UDF_MAIN + 2),
+        );
+        // Unallocated space (7), implementation use (4) and the
+        // terminator (8): skipped by the reader, required by the
+        // measured six-descriptor shape.
+        for (lbn, id) in [(UDF_MAIN + 3, 7u16), (UDF_MAIN + 4, 4), (UDF_MAIN + 5, 8)] {
+            let block = vec![0u8; UDF_BLOCK as usize];
+            udf_put(
+                &mut image,
+                lbn,
+                &udf_tagged(block, id, UDF_BLOCK as usize - 16, lbn),
+            );
+        }
+        // File set descriptor (tag 256) at partition-relative block 8:
+        // the root ICB (one block, relative 10, partition 0).
+        let mut fsd = vec![0u8; UDF_BLOCK as usize];
+        fsd[400..404].copy_from_slice(&UDF_BLOCK.to_le_bytes());
+        fsd[404..408].copy_from_slice(&UDF_ROOT.to_le_bytes());
+        udf_put(
+            &mut image,
+            UDF_PART + UDF_FSD,
+            &udf_tagged(fsd, 256, UDF_BLOCK as usize - 16, UDF_FSD),
+        );
+        // Root directory: the parent, TOP.TXT, A and B.
+        let mut root = udf_fid(0x0A, UDF_ROOT, &[], UDF_ROOT);
+        root.extend(udf_fid(0x00, 11, &udf_name("TOP.TXT"), UDF_ROOT));
+        root.extend(udf_fid(0x02, 12, &udf_name("A"), UDF_ROOT));
+        root.extend(udf_fid(0x02, 13, &udf_name("B"), UDF_ROOT));
+        udf_put(
+            &mut image,
+            UDF_PART + UDF_ROOT,
+            &udf_entry(UDF_ROOT, 4, &root),
+        );
+        // A holds NESTED.TXT; B stays empty (its parent entry only).
+        let mut a = udf_fid(0x0A, 12, &[], 12);
+        a.extend(udf_fid(0x00, 14, &udf_name("NESTED.TXT"), 12));
+        udf_put(&mut image, UDF_PART + 12, &udf_entry(12, 4, &a));
+        let b = udf_fid(0x0A, 13, &[], 13);
+        udf_put(&mut image, UDF_PART + 13, &udf_entry(13, 4, &b));
+        udf_put(&mut image, UDF_PART + 11, &udf_entry(11, 5, b"top-txt"));
+        udf_put(&mut image, UDF_PART + 14, &udf_entry(14, 5, b"nested"));
+        image
+    }
+
+    #[test]
+    fn copy_walks_a_udf_tree_onto_the_mount() {
+        // The synthetic UDF volume (no `CD001`, so `detect` says `Raw`)
+        // runs through `write::run` with a `Raw` kind: the UDF arm
+        // opens it, and the same tree the ISO test pins lands byte for
+        // byte under the mount, with the same concrete counts.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let bytes = udf_tree_bytes(b"NSR03");
+        let path = scratch.path().join("tree.udf");
+        std::fs::write(&path, &bytes).expect("udf fixture writes");
+        let size = bytes.len() as u64;
+        let volume = FileVolume::open(&path).expect("udf fixture opens");
+        assert_eq!(
+            crate::image::detect(&volume).expect("detect reads the header"),
+            ImageKind::Raw,
+            "the fixture classifies as raw, so the UDF arm is the one under test"
+        );
+        let opener = CopyOpener::new(1024 * 1024);
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        {
+            let mut ctx = copy_context(&opener, &mut reporter, &never);
+            let image = copy_image(&path, size, ImageKind::Raw);
+            run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect("the udf tree copies");
+        }
+        let dest = opener.scratch.path();
+        assert_eq!(
+            std::fs::read(dest.join("TOP.TXT")).expect("top reads back"),
+            b"top-txt"
+        );
+        assert!(dest.join("A").is_dir(), "A is a directory on the mount");
+        assert_eq!(
+            std::fs::read(dest.join("A").join("NESTED.TXT")).expect("nested reads back"),
+            b"nested"
+        );
+        assert!(dest.join("B").is_dir(), "B is an empty directory");
+        assert_eq!(
+            std::fs::read_dir(dest.join("B")).expect("B lists").count(),
+            0
+        );
+        let found = infos(&reporter);
+        assert!(
+            found
+                .iter()
+                .any(|text| text.contains("tree.udf") && text.contains("(raw)")),
+            "the opening line names the image path and kind: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|text| text == &"copied 2 files in 2 directories (13 bytes), 0 renamed"),
+            "the completion line reports the concrete result: {found:?}"
+        );
+        assert!(
+            found.iter().all(|text| text.is_ascii()),
+            "messages stay ASCII: {found:?}"
+        );
+        assert!(
+            reporter
+                .events()
+                .iter()
+                .any(|event| matches!(event, Event::Progress { step: "write", .. })),
+            "a copy reports progress: {:?}",
+            reporter.events()
+        );
+        assert_eq!(opener.mounts(), 1);
+        assert_eq!(opener.releases(), 1, "the mount is released");
+    }
+
+    #[test]
+    fn copy_refuses_a_udf_volume_with_a_mismatched_structure() {
+        // Same layout with the recognition sector's NSR identifier
+        // corrupted: still `Raw` (no `CD001`), but the UDF reader
+        // refuses it, so the arm names UDF and carries the reader's
+        // refusal (the identifier it found). Nothing mounts.
+        let scratch = tempfile::tempdir().expect("scratch fits");
+        let bytes = udf_tree_bytes(b"XXX01");
+        let path = scratch.path().join("broken.udf");
+        std::fs::write(&path, &bytes).expect("udf fixture writes");
+        let size = bytes.len() as u64;
+        let opener = CopyOpener::new(u64::MAX);
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        {
+            let mut ctx = copy_context(&opener, &mut reporter, &never);
+            let image = copy_image(&path, size, ImageKind::Raw);
+            let error = run(&mut ctx, &WriteMode::Copy, &image, &Filesystem::Fat32)
+                .expect_err("a UDF volume with a bad NSR refuses");
+            assert!(
+                matches!(error, CoreError::InvalidInput { .. }),
+                "the refusal names its shape: {error:?}"
+            );
+            let text = error.to_string();
+            assert!(text.contains("UDF open failed"), "{text}");
+            assert!(text.contains("XXX01"), "{text}");
+            assert!(text.is_ascii(), "{text}");
+        }
+        assert_eq!(opener.mounts(), 0, "a malformed UDF image never mounts");
     }
 
     /// A single-file ISO holding `size` patterned bytes under
