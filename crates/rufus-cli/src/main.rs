@@ -41,6 +41,7 @@ use clap::Parser;
 use clap::Subcommand;
 use rufus_core::error::CoreError;
 use rufus_core::hash::Algo;
+use rufus_core::part::plan::LayoutKind;
 use rufus_core::partition::TableKind;
 use rufus_core::pipeline::Event;
 use rufus_core::safety::SafetyVerdict;
@@ -49,6 +50,7 @@ use rufus_linux::MountTable;
 use rufus_linux::SwapEntry;
 use rufus_linux::SysfsRoot;
 use rufus_linux::mounts::read_swaps;
+use rufus_proto::Layout;
 use rufus_proto::PLAN_VERSION;
 use rufus_proto::Plan;
 use rufus_proto::Scheme;
@@ -570,6 +572,12 @@ enum Command {
         /// sticks).
         #[arg(long = "iso-mode")]
         iso_mode: bool,
+        /// Bootloader installer for the copy step (default: auto, paired
+        /// with the write mode; uefi-ntfs selects the two-partition
+        /// UEFI:NTFS layout and forces copy mode, refused without
+        /// --filesystem ntfs).
+        #[arg(long, value_enum, default_value_t = plan::BootloaderOpt::Auto)]
+        bootloader: plan::BootloaderOpt,
         /// Volume label (default: executor derives it from the image).
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
@@ -1204,18 +1212,18 @@ fn cmd_write(
         });
     }
     // The plan verifies; run it through the S17 pipeline.
-    // The opener's partition window is derived from the plan steps,
-    // not from `options.scheme`: `Mklabel`/`Mkpart` are what `Mkpart`
-    // stamps, so a plan whose options disagree with its steps still
-    // formats the stamped partition (see `opener_table_kind`).
-    let table = opener_table_kind(&parsed)?;
+    // The opener's partition window and node spelling are derived from
+    // the plan steps, not from `options.scheme`: `Mklabel`/`Mkpart` are
+    // what `Mkpart` stamps, so a plan whose options disagree with its
+    // steps still formats the stamped partition (see `opener_table_kind`).
+    let (table, layout) = opener_table_kind(&parsed)?;
     let cancel = rufus_linux::Cancel::new();
     cancel.install().map_err(Fail::from_core)?;
     if let Some(file) = paths.device_file.as_deref() {
         // Test seam: the plan's device path is never opened in this
         // mode, so a graded device cannot be written by accident — only
         // the seam file is touched.
-        let opener = rufus_linux::FileOpener::open(file, table).map_err(Fail::from_core)?;
+        let opener = rufus_linux::FileOpener::open(file, table, layout).map_err(Fail::from_core)?;
         run_plan(&parsed, &opener, &cancel, json, reset_usb)
     } else {
         let sysfs = paths.sysfs();
@@ -1225,42 +1233,75 @@ fn cmd_write(
             message: core.to_string(),
         })?;
         let device = find_device(&devices, Path::new(&parsed.device.path))?;
-        let opener = rufus_linux::DeviceOpener::new(&device, table, sysfs);
+        let opener = rufus_linux::DeviceOpener::new(&device, table, layout, sysfs)
+            .map_err(Fail::from_core)?;
         run_plan(&parsed, &opener, &cancel, json, reset_usb)
     }
 }
 
-/// The [`TableKind`] the opener plans its partition window for: read
-/// off the plan's `Mklabel`/`Mkpart` steps — the authority for what
+/// The (`TableKind`, `LayoutKind`) pair the opener plans its partition
+/// window and node spelling for: read off the plan's `Mklabel`/`Mkpart`
+/// steps — the authority for what
 /// [`Mkpart`](rufus_proto::Step::Mkpart) stamps — never off
 /// `options.scheme`, which is the planner's intent, not the stamped
-/// table. A plan whose options disagree with its steps still runs
-/// against the stamped partition; a plan whose steps disagree with
-/// each other refuses here, before touching the device, with the same
-/// exit class the in-run refusal would map to.
-fn opener_table_kind(plan: &Plan) -> Result<TableKind, Fail> {
+/// table. The layout rides on the `Mkpart` step alone (`Mklabel` only
+/// records the table); a plan whose options disagree with its steps
+/// still runs against the stamped partition, while a plan whose steps
+/// disagree with each other refuses here, before touching the device,
+/// with the same exit class the in-run refusal would map to.
+fn opener_table_kind(plan: &Plan) -> Result<(TableKind, LayoutKind), Fail> {
     let mut label: Option<Scheme> = None;
     let mut part: Option<Scheme> = None;
+    let mut layout: Option<Layout> = None;
     for step in &plan.steps {
         match step {
             Step::Mklabel { scheme } => label = Some(scheme.clone()),
-            Step::Mkpart { scheme } => part = Some(scheme.clone()),
+            Step::Mkpart {
+                scheme,
+                layout: step_layout,
+            } => {
+                part = Some(scheme.clone());
+                if let Some(seen) = &layout {
+                    if seen != step_layout {
+                        return Err(Fail {
+                            exit: Exit::Usage,
+                            kind: "invalid_plan",
+                            message: format!(
+                                "plan steps disagree: mkpart asks for '{}' but also for '{}': refusing before touching the device",
+                                human_layout(seen),
+                                human_layout(step_layout),
+                            ),
+                        });
+                    }
+                } else {
+                    layout = Some(step_layout.clone());
+                }
+            }
             _ => {}
         }
     }
-    match (label, part) {
-        (Some(label), Some(part)) if label != part => Err(Fail {
-            exit: Exit::Usage,
-            kind: "invalid_plan",
-            message: format!(
-                "plan steps disagree: mklabel asks for '{}' but mkpart asks for '{}': refusing before touching the device",
-                human_scheme(&label),
-                human_scheme(&part),
-            ),
-        }),
-        (Some(scheme), _) | (None, Some(scheme)) => Ok(table_kind(&scheme)),
-        (None, None) => Ok(table_kind(&plan.options.scheme)),
-    }
+    let table = match (label, part) {
+        (Some(label), Some(part)) if label != part => {
+            return Err(Fail {
+                exit: Exit::Usage,
+                kind: "invalid_plan",
+                message: format!(
+                    "plan steps disagree: mklabel asks for '{}' but mkpart asks for '{}': refusing before touching the device",
+                    human_scheme(&label),
+                    human_scheme(&part),
+                ),
+            });
+        }
+        (Some(scheme), _) | (None, Some(scheme)) => table_kind(&scheme),
+        (None, None) => table_kind(&plan.options.scheme),
+    };
+    // Every planned run stamps an `Mkpart` step; a hand-built plan
+    // without one keeps the single layout, the planner's default.
+    let layout = match layout {
+        Some(step_layout) => layout_kind(&step_layout),
+        None => LayoutKind::Single,
+    };
+    Ok((table, layout))
 }
 
 /// The [`TableKind`] a plan [`Scheme`] asks for: the same mapping the
@@ -1270,6 +1311,18 @@ fn table_kind(scheme: &Scheme) -> TableKind {
     match scheme {
         Scheme::Mbr => TableKind::Mbr,
         Scheme::Gpt => TableKind::Gpt,
+    }
+}
+
+/// The [`LayoutKind`] a plan [`Layout`] asks for: the same mapping the
+/// pipeline's `Mkpart` runs with, so the opener's partition window and
+/// node spelling cover the layout the steps stamp.
+fn layout_kind(layout: &Layout) -> LayoutKind {
+    match layout {
+        Layout::Single => LayoutKind::Single,
+        Layout::UefiNtfs => LayoutKind::UefiNtfs,
+        Layout::WindowsToGo => LayoutKind::WindowsToGo,
+        Layout::Persistence => LayoutKind::Persistence,
     }
 }
 
@@ -1523,6 +1576,16 @@ fn human_scheme(scheme: &rufus_proto::Scheme) -> &'static str {
     }
 }
 
+/// Human-friendly layout tag (matches the plan JSON values).
+fn human_layout(layout: &rufus_proto::Layout) -> &'static str {
+    match layout {
+        rufus_proto::Layout::Single => "single",
+        rufus_proto::Layout::UefiNtfs => "uefi_ntfs",
+        rufus_proto::Layout::WindowsToGo => "windows_to_go",
+        rufus_proto::Layout::Persistence => "persistence",
+    }
+}
+
 fn human_target(target: &Target) -> &'static str {
     match target {
         Target::Bios => "bios",
@@ -1549,7 +1612,11 @@ fn describe_step(step: &Step) -> String {
     match step {
         Step::Wipe => "wipe (clear first/last MiB, rescan)".to_string(),
         Step::Mklabel { scheme } => format!("mklabel (scheme {})", human_scheme(scheme)),
-        Step::Mkpart { scheme } => format!("mkpart (scheme {})", human_scheme(scheme)),
+        Step::Mkpart { scheme, layout } => format!(
+            "mkpart (scheme {} layout {})",
+            human_scheme(scheme),
+            human_layout(layout)
+        ),
         Step::Mkfs {
             filesystem,
             label,
@@ -1634,6 +1701,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
             target,
             filesystem,
             iso_mode,
+            bootloader,
             label,
             cluster,
             quick,
@@ -1686,6 +1754,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
                     target: target.clone(),
                     filesystem: filesystem.clone(),
                     iso_mode: *iso_mode,
+                    bootloader: *bootloader,
                     label: label.clone(),
                     cluster_bytes,
                     quick_format: *quick,
@@ -1876,5 +1945,124 @@ mod tests {
         // The reference policy (`0x140010a40`) rides along unchanged.
         assert_eq!(options.retries, 3);
         assert_eq!(options.retry_delay, std::time::Duration::from_secs(5));
+    }
+
+    /// A minimal plan carrying `steps`: the opener derivation only reads
+    /// steps and `options.scheme`, so device/image facts stay empty.
+    fn derivation_plan(steps: Vec<Step>) -> Plan {
+        Plan {
+            version: PLAN_VERSION,
+            created_by: "test".to_string(),
+            device: rufus_proto::DeviceRef {
+                path: "/dev/null".to_string(),
+                block_device: false,
+                size_bytes: None,
+                serial: None,
+                model: None,
+                sysfs: None,
+            },
+            image: rufus_proto::ImageRef {
+                path: "image.iso".to_string(),
+                size_bytes: 32_780,
+                sha256: "0".repeat(64),
+                kind: rufus_proto::ImageKind::Iso,
+            },
+            options: rufus_proto::Options {
+                scheme: Scheme::Mbr,
+                target: Target::Dual,
+                filesystem: rufus_proto::Filesystem::Fat32,
+                label: None,
+                cluster_bytes: None,
+                quick_format: false,
+                bad_blocks: false,
+                verify: false,
+                persistence: false,
+                show_all: false,
+                confirmed_serial: None,
+            },
+            steps,
+            confirm: String::new(),
+        }
+    }
+
+    /// The opener derivation follows the steps, not the options: the
+    /// layout rides on the `Mkpart` step, defaulting to single when no
+    /// `Mkpart` step is present.
+    #[test]
+    fn opener_derivation_reads_table_and_layout_off_the_steps() {
+        let plan = derivation_plan(vec![
+            Step::Mklabel {
+                scheme: Scheme::Mbr,
+            },
+            Step::Mkpart {
+                scheme: Scheme::Mbr,
+                layout: Layout::UefiNtfs,
+            },
+        ]);
+        let (table, layout) = match opener_table_kind(&plan) {
+            Ok(pair) => pair,
+            Err(fail) => panic!("agreeing steps derive: {}", fail.message),
+        };
+        assert_eq!(table, TableKind::Mbr);
+        assert_eq!(layout, LayoutKind::UefiNtfs);
+
+        // No mkpart step at all: the table falls back to the options
+        // scheme and the layout to the single default.
+        let plan = derivation_plan(vec![Step::Wipe]);
+        let (table, layout) = match opener_table_kind(&plan) {
+            Ok(pair) => pair,
+            Err(fail) => panic!("fallbacks hold: {}", fail.message),
+        };
+        assert_eq!(table, TableKind::Mbr);
+        assert_eq!(layout, LayoutKind::Single);
+    }
+
+    /// Two `Mkpart` steps with different layouts refuse before touching
+    /// the device, naming both layouts like the scheme refusal names
+    /// both schemes.
+    #[test]
+    fn opener_derivation_refuses_mkpart_layout_disagreement() {
+        let plan = derivation_plan(vec![
+            Step::Mkpart {
+                scheme: Scheme::Mbr,
+                layout: Layout::Single,
+            },
+            Step::Mkpart {
+                scheme: Scheme::Mbr,
+                layout: Layout::UefiNtfs,
+            },
+        ]);
+        let refused = match opener_table_kind(&plan) {
+            Ok(_) => panic!("disagreeing layouts must refuse"),
+            Err(fail) => fail,
+        };
+        assert_eq!(refused.exit, Exit::Usage);
+        assert_eq!(refused.kind, "invalid_plan");
+        assert!(
+            refused.message.contains("single"),
+            "names the first layout: {}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("uefi_ntfs"),
+            "names the second layout: {}",
+            refused.message
+        );
+    }
+
+    /// The human mkpart line prints scheme and layout in their JSON
+    /// spellings.
+    #[test]
+    fn describe_step_prints_mkpart_scheme_and_layout() {
+        let line = describe_step(&Step::Mkpart {
+            scheme: Scheme::Gpt,
+            layout: Layout::UefiNtfs,
+        });
+        assert_eq!(line, "mkpart (scheme gpt layout uefi_ntfs)");
+        let line = describe_step(&Step::Mkpart {
+            scheme: Scheme::Mbr,
+            layout: Layout::Single,
+        });
+        assert_eq!(line, "mkpart (scheme mbr layout single)");
     }
 }

@@ -134,7 +134,7 @@ fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result
     match step {
         Step::Wipe => wipe::run(ctx),
         Step::Mklabel { scheme } => mklabel::run(ctx, scheme),
-        Step::Mkpart { scheme } => mkpart::run(ctx, scheme),
+        Step::Mkpart { scheme, layout } => mkpart::run(ctx, scheme, layout),
         Step::Mkfs {
             filesystem,
             label,
@@ -253,6 +253,7 @@ mod tests {
     use rufus_proto::Filesystem;
     use rufus_proto::ImageKind;
     use rufus_proto::ImageRef;
+    use rufus_proto::Layout;
     use rufus_proto::Options;
     use rufus_proto::Scheme;
     use rufus_proto::WriteMode;
@@ -1483,6 +1484,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
             ]),
             &opener,
@@ -1520,6 +1522,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Gpt,
+                    layout: rufus_proto::Layout::Single,
                 },
             ]),
             &opener,
@@ -1551,6 +1554,65 @@ mod tests {
     }
 
     #[test]
+    fn mkpart_stamps_uefi_ntfs_with_data_second() {
+        // The two-partition layout the `uefi-ntfs` plan selects: the
+        // ESP first, the data partition after it. The stamper and the
+        // opener share the one layout-aware constructor, so the
+        // formatted window is the second entry by construction — never
+        // a literal position in either half.
+        let opener = TestOpener::new(LAYOUT_LEN);
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan(vec![
+                Step::Mklabel {
+                    scheme: Scheme::Mbr,
+                },
+                Step::Mkpart {
+                    scheme: Scheme::Mbr,
+                    layout: Layout::UefiNtfs,
+                },
+            ]),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("mklabel and mkpart run the uefi-ntfs layout");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert_eq!(bytes[510], 0x55);
+        assert_eq!(bytes[511], 0xAA);
+        // Slot 0 is the FAT ESP, slot 1 the NTFS data partition, the
+        // rest stays empty.
+        assert_eq!(bytes[450], 0x0c, "the esp entry is FAT32 LBA");
+        assert_eq!(bytes[466], 0x07, "the data entry is NTFS");
+        for entry in [478, 494] {
+            assert_eq!(bytes[entry + 4], 0x00, "slot at {entry} stays empty");
+        }
+        let esp_start = u32::from_le_bytes([bytes[454], bytes[455], bytes[456], bytes[457]]);
+        let esp_count = u32::from_le_bytes([bytes[458], bytes[459], bytes[460], bytes[461]]);
+        assert_eq!(esp_start, 2048, "the esp starts on the 1 MiB grid");
+        assert_eq!(esp_count, 2048, "the esp window is exactly 1 MiB");
+        let data_start = u32::from_le_bytes([bytes[470], bytes[471], bytes[472], bytes[473]]);
+        assert_eq!(data_start, 4096, "the data partition follows the esp");
+        // The planner's own window for the layout names the same bytes
+        // the table stamped: the second entry, not the first.
+        let (offset, len) = crate::part::plan::data_window(
+            crate::part::plan::LayoutKind::UefiNtfs,
+            crate::part::TableKind::Mbr,
+            512,
+            LAYOUT_LEN,
+        )
+        .expect("the uefi-ntfs data window plans");
+        assert_eq!(offset, u64::from(data_start) * 512);
+        assert_eq!(
+            len,
+            LAYOUT_LEN - offset,
+            "the data window runs to the last LBA"
+        );
+        assert_eq!(opener.target.rereads(), 1);
+    }
+
+    #[test]
     fn mkpart_refuses_a_scheme_that_disagrees_with_mklabel() {
         let opener = TestOpener::new(LAYOUT_LEN);
         let mut reporter = VecReporter::new();
@@ -1561,6 +1623,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Gpt,
+                    layout: rufus_proto::Layout::Single,
                 },
             ]),
             &opener,
@@ -1585,6 +1648,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
             ]),
             &opener,
@@ -1607,6 +1671,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
                 Step::Mkfs {
                     filesystem: Filesystem::Fat32,
@@ -1669,6 +1734,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
             ]
         };
@@ -1739,6 +1805,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
                 Step::Mkfs {
                     filesystem: Filesystem::Fat32,
@@ -1856,6 +1923,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
             ]),
             &opener,
@@ -2002,6 +2070,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
                 Step::Mkfs {
                     filesystem: Filesystem::Fat32,
@@ -2141,6 +2210,7 @@ mod tests {
             (
                 Step::Mkpart {
                     scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
                 "mkpart",
             ),

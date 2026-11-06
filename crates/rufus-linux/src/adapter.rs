@@ -28,11 +28,14 @@
 //!
 //! Agreement with [`Mkpart`](rufus_core::pipeline::mkpart): the
 //! partition window is not recomputed here — both sides feed the same
-//! `(table, sector size, byte size)` triple, read off the same opened
+//! `(layout, table, sector size, byte size)` tuple, read off the same opened
 //! handle, into the same
-//! [`single_data_window`](rufus_core::part::plan::single_data_window)
+//! [`data_window`](rufus_core::part::plan::data_window)
 //! planner call, so the formatted window is the stamped partition by
-//! construction.
+//! construction. The partition node spelling follows the same tuple
+//! through
+//! [`data_partition_number`](rufus_core::part::plan::data_partition_number),
+//! so the node names the data partition however the layout orders it.
 
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
@@ -46,7 +49,9 @@ use rufus_core::error::CoreError;
 use rufus_core::error::Result;
 use rufus_core::fs::Volume;
 use rufus_core::part::TableKind;
-use rufus_core::part::plan::single_data_window;
+use rufus_core::part::plan::LayoutKind;
+use rufus_core::part::plan::data_partition_number;
+use rufus_core::part::plan::data_window;
 use rufus_core::pipeline::MountedPartition;
 use rufus_core::pipeline::Opener;
 use rufus_core::pipeline::Target;
@@ -286,6 +291,10 @@ struct Shared {
     /// The table [`Mkpart`](rufus_core::pipeline::mkpart) stamps, so
     /// the window planner runs with the same kind.
     table: TableKind,
+    /// The layout [`Mkpart`](rufus_core::pipeline::mkpart) stamps, so
+    /// the window planner and the node spelling run with the same
+    /// shape: the data partition is wherever the layout puts it.
+    layout: LayoutKind,
     backend: Backend,
     state: Mutex<Option<Arc<BlockDevice>>>,
     opens: AtomicUsize,
@@ -333,11 +342,15 @@ impl Shared {
 
     /// The data-partition window over the shared handle. Geometry comes
     /// off the live handle through the same planner call `Mkpart`
-    /// stamps with — one triple, one function, no second computation.
+    /// stamps with — one tuple, one function, no second computation.
     fn partition_volume(&self) -> Result<Box<dyn Volume>> {
         let handle = self.handle()?;
-        let (offset, len) =
-            single_data_window(self.table, handle.logical_sector_size(), handle.size())?;
+        let (offset, len) = data_window(
+            self.layout,
+            self.table,
+            handle.logical_sector_size(),
+            handle.size(),
+        )?;
         let sector = handle.logical_sector_size();
         Ok(Box::new(SinkVolume::new(handle, offset, len, sector)?))
     }
@@ -354,26 +367,42 @@ pub struct DeviceOpener(Arc<Shared>);
 
 impl DeviceOpener {
     /// Record `device` (discovered, e.g. by enumeration) for the table
-    /// `table`: nothing opens yet. The partition node spelling comes
-    /// from the sysfs partition list when it names index 1, else the
-    /// plain-digit rule — the same rule `S04` lists with.
-    pub fn new(device: &Device, table: TableKind, sysfs: SysfsRoot) -> Self {
+    /// `table` and the layout `layout`: nothing opens yet. The
+    /// partition node spelling comes from the sysfs partition list
+    /// when it names the data partition's planner-derived index, else
+    /// the plain-digit rule — the same rule `S04` lists with. The
+    /// index is the layout's `data` role position (second for
+    /// `UefiNtfs`, third for `WindowsToGo`), never a literal: a
+    /// geometry the planner rejects fails construction here, on every
+    /// layout, so no caller can name a node (`partition_path`) or
+    /// mount one (`mount_partition`) before the derivation succeeds.
+    /// The later window call then plans the same derivation again
+    /// over the live handle.
+    pub fn new(
+        device: &Device,
+        table: TableKind,
+        layout: LayoutKind,
+        sysfs: SysfsRoot,
+    ) -> Result<Self> {
+        let part_index =
+            data_partition_number(layout, table, device.sector_size, device.size_bytes)?;
         let backend = Backend::Device {
             path: PathBuf::from(&device.dev_path),
             disk_name: device.name.clone(),
-            part_name: partition_name(device, 1),
+            part_name: partition_name(device, part_index),
             size: device.size_bytes,
             logical: device.sector_size,
             physical: device.physical_sector_size,
             sysfs,
             usb: device.usb,
         };
-        Self(Arc::new(Shared {
+        Ok(Self(Arc::new(Shared {
             table,
+            layout,
             backend,
             state: Mutex::new(None),
             opens: AtomicUsize::new(0),
-        }))
+        })))
     }
 }
 
@@ -499,7 +528,7 @@ impl FileOpener {
     /// to exit 1 (`InvalidInput`); only a link swapped in after this
     /// check still fails later at the `O_NOFOLLOW` open as I/O, which
     /// is the fail-closed remainder of the same race.
-    pub fn open(path: &Path, table: TableKind) -> Result<Self> {
+    pub fn open(path: &Path, table: TableKind, layout: LayoutKind) -> Result<Self> {
         match std::fs::symlink_metadata(path) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
@@ -522,6 +551,7 @@ impl FileOpener {
         }
         let shared = Arc::new(Shared {
             table,
+            layout,
             backend: Backend::File {
                 path: path.to_path_buf(),
             },
@@ -816,7 +846,8 @@ mod tests {
             .expect("seam file creates")
             .set_len(64 * 1024 * 1024)
             .expect("seam file sizes");
-        let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
+        let opener =
+            FileOpener::open(&path, TableKind::Mbr, LayoutKind::Single).expect("seam opens");
         // Device and partition views share the one open: no second
         // exclusive claim, one counted open.
         let device = opener.device().expect("device opens");
@@ -880,8 +911,10 @@ mod tests {
         let opener = DeviceOpener::new(
             &device,
             TableKind::Mbr,
+            LayoutKind::Single,
             SysfsRoot::new(dir.path().join("sys")),
-        );
+        )
+        .expect("a plannable geometry opens");
         // The partition is a window over the same open handle: one
         // counted open for both views, never a second exclusive claim.
         let device_target = opener.device().expect("device opens");
@@ -899,15 +932,176 @@ mod tests {
     }
 
     #[test]
+    fn uefi_ntfs_opener_serves_the_second_partition_window() {
+        // A `UefiNtfs` opener resolves its volume to the layout's data
+        // window — the second partition, past the 1 MiB ESP — through
+        // the same planner the stamper runs, never a literal position.
+        // On a 64 MiB MBR disk that window starts at 2 MiB and runs to
+        // the last sector.
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("stick.img");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("seam file creates")
+            .set_len(64 * 1024 * 1024)
+            .expect("seam file sizes");
+        let opener =
+            FileOpener::open(&path, TableKind::Mbr, LayoutKind::UefiNtfs).expect("seam opens");
+        let device = opener.device().expect("device opens");
+        let mut partition = opener.partition().expect("partition views");
+        assert_eq!(opener.0.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(device.size(), 64 * 1024 * 1024);
+        assert_eq!(partition.total_bytes(), 62 * 1024 * 1024);
+        partition
+            .write_all_at(0, &[5u8; 32])
+            .expect("partition write lands");
+        let mut buf = [0u8; 32];
+        device
+            .read_at(2 * 1024 * 1024, &mut buf)
+            .expect("device sees the partition write at the second window");
+        assert_eq!(buf, [5u8; 32]);
+        // One byte before the data window (the ESP's last byte) is
+        // untouched, proving the volume starts past the first partition.
+        device
+            .read_at(2 * 1024 * 1024 - 32, &mut buf)
+            .expect("the esp tail reads");
+        assert_eq!(buf, [0u8; 32]);
+    }
+
+    #[test]
+    fn uefi_ntfs_opener_names_the_second_partition_node() {
+        use crate::model::Partition;
+        use crate::model::Transport;
+
+        // The node spelling follows the layout's `data` role position
+        // — second for `UefiNtfs`, first for `Single` — never a
+        // literal: both openers share the one device, only the layout
+        // differs.
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let sysfs = dir.path().join("sys");
+        // The kernel side: both partition nodes exist under the disk,
+        // so the wait answers on its first check.
+        for node in ["sdb1", "sdb2"] {
+            std::fs::create_dir_all(sysfs.join("class/block/sdb").join(node))
+                .expect("node dir creates");
+        }
+        let device = Device {
+            sysfs: sysfs.join("class/block/sdb").display().to_string(),
+            name: "sdb".to_string(),
+            dev_path: "/dev/sdb".to_string(),
+            size_bytes: 64 * 1024 * 1024,
+            sector_size: 512,
+            physical_sector_size: 512,
+            removable: true,
+            read_only: false,
+            usb: true,
+            vendor: None,
+            model: None,
+            serial: None,
+            transport: Transport::Unknown,
+            partition_table: None,
+            vid_pid: None,
+            port_path: None,
+            partitions: vec![
+                Partition {
+                    name: "sdb1".to_string(),
+                    number: Some(1),
+                    size_bytes: 1024 * 1024,
+                    fstype: None,
+                },
+                Partition {
+                    name: "sdb2".to_string(),
+                    number: Some(2),
+                    size_bytes: 62 * 1024 * 1024,
+                    fstype: None,
+                },
+            ],
+        };
+        let uefi = DeviceOpener::new(
+            &device,
+            TableKind::Mbr,
+            LayoutKind::UefiNtfs,
+            SysfsRoot::new(sysfs.clone()),
+        )
+        .expect("a plannable geometry opens");
+        assert_eq!(
+            uefi.partition_path().expect("the second node waits"),
+            PathBuf::from("/dev/sdb2")
+        );
+        let single = DeviceOpener::new(
+            &device,
+            TableKind::Mbr,
+            LayoutKind::Single,
+            SysfsRoot::new(sysfs),
+        )
+        .expect("a plannable geometry opens");
+        assert_eq!(
+            single.partition_path().expect("the first node waits"),
+            PathBuf::from("/dev/sdb1")
+        );
+    }
+
+    #[test]
+    fn device_opener_refuses_a_geometry_the_planner_rejects() {
+        use crate::model::Transport;
+
+        // `WindowsToGo` has no MBR spelling (the reserved partition
+        // has no MBR type byte), so the planner rejects the tuple and
+        // construction fails here — never a fallback to partition 1,
+        // which names the ESP slot on multi-partition layouts. No
+        // caller can name or mount a node before the derivation
+        // succeeds.
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let device = Device {
+            sysfs: dir.path().join("sys/class/block/sdb").display().to_string(),
+            name: "sdb".to_string(),
+            dev_path: "/dev/sdb".to_string(),
+            size_bytes: 64 * 1024 * 1024,
+            sector_size: 512,
+            physical_sector_size: 512,
+            removable: true,
+            read_only: false,
+            usb: true,
+            vendor: None,
+            model: None,
+            serial: None,
+            transport: Transport::Unknown,
+            partition_table: None,
+            vid_pid: None,
+            port_path: None,
+            partitions: Vec::new(),
+        };
+        let error = DeviceOpener::new(
+            &device,
+            TableKind::Mbr,
+            LayoutKind::WindowsToGo,
+            SysfsRoot::new(dir.path().join("sys")),
+        )
+        .expect_err("an unplannable geometry refuses construction");
+        let message = error.to_string();
+        assert!(!message.is_empty(), "the refusal says something");
+        assert!(message.is_ascii(), "the refusal stays ASCII: {message}");
+        assert!(
+            message.contains("windows-to-go"),
+            "the refusal names the layout: {message}"
+        );
+    }
+
+    #[test]
     fn file_seam_creates_refuses_and_has_no_node() {
         let dir = tempfile::tempdir().expect("scratch dir");
         // Absent: created empty (length 0 — the pipeline will refuse an
         // image that does not fit, which is the honest answer).
         let fresh = dir.path().join("fresh.img");
-        let opener = FileOpener::open(&fresh, TableKind::Mbr).expect("seam creates");
+        let opener =
+            FileOpener::open(&fresh, TableKind::Mbr, LayoutKind::Single).expect("seam creates");
         assert_eq!(opener.device().expect("device opens").size(), 0);
         // A directory is not a regular file.
-        let error = FileOpener::open(dir.path(), TableKind::Mbr).expect_err("a dir refuses");
+        let error = FileOpener::open(dir.path(), TableKind::Mbr, LayoutKind::Single)
+            .expect_err("a dir refuses");
         assert!(error.to_string().contains("directory"), "{error:?}");
         // No partition node behind a file.
         let error = opener.partition_path().expect_err("the seam has no node");
@@ -935,7 +1129,8 @@ mod tests {
         file.write_all(&[0xA5u8; 4096]).expect("tail writes");
         file.set_len(8 * 1024 * 1024).expect("sparse file sizes");
         drop(file);
-        let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
+        let opener =
+            FileOpener::open(&path, TableKind::Mbr, LayoutKind::Single).expect("seam opens");
         // A filesystem without hole queries answers `None`: accept
         // that explicitly (nothing to pin then) instead of assuming
         // tmpfs/ext4/overlayfs semantics everywhere.
@@ -962,7 +1157,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("scratch dir");
         let path = dir.path().join("dense.img");
         std::fs::write(&path, vec![0x5Au8; 1024 * 1024]).expect("dense file writes");
-        let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
+        let opener =
+            FileOpener::open(&path, TableKind::Mbr, LayoutKind::Single).expect("seam opens");
         // A filesystem without hole queries answers `None`: accept
         // that explicitly (nothing to pin then) instead of assuming
         // tmpfs/ext4/overlayfs semantics everywhere.
@@ -979,7 +1175,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("scratch dir");
         let path = dir.path().join("empty.img");
         std::fs::write(&path, []).expect("empty file writes");
-        let opener = FileOpener::open(&path, TableKind::Mbr).expect("seam opens");
+        let opener =
+            FileOpener::open(&path, TableKind::Mbr, LayoutKind::Single).expect("seam opens");
         // A filesystem without hole queries answers `None`: accept
         // that explicitly (nothing to pin then) instead of assuming
         // tmpfs/ext4/overlayfs semantics everywhere.
@@ -1020,8 +1217,10 @@ mod tests {
         let opener = DeviceOpener::new(
             &device,
             TableKind::Mbr,
+            LayoutKind::Single,
             SysfsRoot::new(dir.path().join("sys")),
-        );
+        )
+        .expect("a plannable geometry opens");
         assert!(!opener.reset_device().expect("no error"));
     }
 
@@ -1036,7 +1235,8 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).expect("link creates");
         // A link to a regular file refuses as a link, never as the
         // file: usage error (exit 1 at the CLI), not I/O.
-        let error = FileOpener::open(&link, TableKind::Mbr).expect_err("a link refuses");
+        let error = FileOpener::open(&link, TableKind::Mbr, LayoutKind::Single)
+            .expect_err("a link refuses");
         assert!(
             matches!(error, CoreError::InvalidInput { .. }),
             "a symlink is misuse, not device failure: {error:?}"
@@ -1046,7 +1246,8 @@ mod tests {
         // the link itself, never its absent target).
         let dangling = dir.path().join("dangling.img");
         std::os::unix::fs::symlink(dir.path().join("absent.img"), &dangling).expect("link creates");
-        let error = FileOpener::open(&dangling, TableKind::Mbr).expect_err("dangling refuses");
+        let error = FileOpener::open(&dangling, TableKind::Mbr, LayoutKind::Single)
+            .expect_err("dangling refuses");
         assert!(error.to_string().contains("symlink"), "{error:?}");
     }
 }

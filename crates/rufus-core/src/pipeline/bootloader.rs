@@ -2441,6 +2441,7 @@ mod end_to_end {
                 },
                 rufus_proto::Step::Mkpart {
                     scheme: rufus_proto::Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
                 },
                 rufus_proto::Step::Mkfs {
                     filesystem: Filesystem::Fat32,

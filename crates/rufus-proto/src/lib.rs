@@ -31,7 +31,10 @@
 //!   helper can tell "user ticked show-all" apart from "user typed the
 //!   serial". A v1 plan must not be blessed by a v2 reader: its
 //!   confirm hash describes the v1 byte layout, so the version check
-//!   refuses it outright.
+//!   refuses it outright. v3 appended [`Step::Mkpart::layout`] — the
+//!   partition layout the data window derives from — so a v2 plan
+//!   (whose mkpart step carries no layout) is refused outright for
+//!   the same reason.
 //! * `confirm` is the SHA-256 over the canonical JSON bytes of the plan
 //!   with `confirm` set to `""` (see [`Plan::confirm`]). serde_json writes
 //!   struct fields in declaration order, so the byte layout *is* the
@@ -73,12 +76,12 @@ pub mod events;
 
 pub use events::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, LogLine, Outcome, Progress};
 
-/// Schema version of [`Plan`]. v2 appended [`Options::confirmed_serial`]
-/// (the typed serial confirmation of a non-removable target) and refuses
-/// v1 plans, fail closed — see the schema history in the crate
+/// Schema version of [`Plan`]. v3 appended `Step::Mkpart::layout`
+/// (the partition layout the data window derives from) and refuses
+/// v1/v2 plans, fail closed — see the schema history in the crate
 /// documentation. A plan carrying a higher or older version must be
 /// refused by the helper.
-pub const PLAN_VERSION: u32 = 2;
+pub const PLAN_VERSION: u32 = 3;
 
 /// A write plan: device, image, options, ordered steps and a confirm hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +302,9 @@ pub enum Step {
     Mkpart {
         /// Table the partition lives in.
         scheme: Scheme,
+        /// Layout the partition belongs to (the data partition's
+        /// position and window derive from it).
+        layout: Layout,
     },
     /// Format the data partition.
     Mkfs {
@@ -323,6 +329,27 @@ pub enum Step {
     },
     /// Final checks + partition rescan + flush; done.
     Finalize,
+}
+
+/// Partition layout of a plan: which of the planner's table shapes
+/// [`Step::Mkpart`] stamps. Wire-level mirror of the core planner's
+/// `LayoutKind` (this crate has no dependencies, so the enum is
+/// duplicated and core maps it exactly as `Scheme` maps to
+/// `TableKind`): the data partition's position and byte window derive
+/// from it, so the stamper, the opener and the node spelling cannot
+/// drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layout {
+    /// One data partition over the whole usable span.
+    Single,
+    /// A small FAT `UEFI_NTFS` partition followed by the data
+    /// partition (the UEFI:NTFS boot shim for NTFS media).
+    UefiNtfs,
+    /// ESP + Microsoft Reserved + Windows data (portable Windows).
+    WindowsToGo,
+    /// Linux data first, then the ext4 persistence tail.
+    Persistence,
 }
 
 /// How an image reaches the device.
@@ -389,9 +416,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // S06 bumps the schema to v2: `Options.confirmed_serial` is appended
-// (PLAN §6 rule 4's typed serial confirmation). Bumping the version must
-// be a deliberate commit that also regenerates every golden file (see
-// the crate documentation about field order and confirm hashes).
+// (PLAN §6 rule 4's typed serial confirmation). S20 bumps it to v3:
+// `Step::Mkpart::layout` is appended (the partition layout the data
+// window derives from). Bumping the version must be a deliberate
+// commit that also regenerates every golden file (see the crate
+// documentation about field order and confirm hashes).
 const _: () = assert!(PLAN_VERSION >= 1, "PLAN_VERSION must stay positive");
 
 #[cfg(test)]
@@ -438,6 +467,7 @@ mod tests {
                 },
                 Step::Mkpart {
                     scheme: Scheme::Gpt,
+                    layout: Layout::Single,
                 },
                 Step::Mkfs {
                     filesystem: Filesystem::Fat32,
@@ -458,8 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_two_until_deliberately_bumped() {
-        assert_eq!(PLAN_VERSION, 2);
+    fn schema_version_is_three_until_deliberately_bumped() {
+        assert_eq!(PLAN_VERSION, 3);
         let mut plan = sample();
         plan.confirm = plan.confirm().expect("sample serialises to canonical JSON");
         assert_eq!(plan.version, PLAN_VERSION);
@@ -506,7 +536,7 @@ mod tests {
 
         // 2. Values and tags (order-insensitive via Value).
         let obj: serde_json::Value = serde_json::from_str(&text).expect("value");
-        assert_eq!(obj["version"], 2);
+        assert_eq!(obj["version"], 3);
         assert_eq!(obj["confirm"], plan.confirm);
         assert_eq!(
             obj["options"]["confirmed_serial"], "ABC123",
@@ -516,6 +546,12 @@ mod tests {
         assert_eq!(steps[0]["op"], "wipe");
         assert_eq!(steps[1]["op"], "mklabel");
         assert_eq!(steps[1]["scheme"], "gpt");
+        // v3 appended `layout` to the mkpart step; pin it after
+        // `scheme` so a reordering cannot slip through a hash-only
+        // equality (the hash would change too, but this names the field).
+        assert_eq!(steps[2]["op"], "mkpart");
+        assert_eq!(steps[2]["scheme"], "gpt");
+        assert_eq!(steps[2]["layout"], "single");
         assert_eq!(steps[3]["op"], "mkfs");
         assert_eq!(steps[3]["filesystem"], "fat32");
         assert_eq!(steps[4]["op"], "write");
@@ -559,7 +595,7 @@ mod tests {
             assert_ne!(fresh, base.confirm, "{label} did not change the hash");
         };
 
-        check("version", &|p| p.version = 3);
+        check("version", &|p| p.version = 4);
         check("created_by", &|p| p.created_by = "x".into());
         check("device.path", &|p| p.device.path = "/dev/sdc".into());
         check("device.block_device", &|p| p.device.block_device = false);
@@ -580,6 +616,13 @@ mod tests {
         check("step payload", &|p| {
             if let Step::Write { mode } = &mut p.steps[4] {
                 *mode = WriteMode::Copy;
+            }
+        });
+        // v3: swapping the mkpart layout must change the hash, or a
+        // tampered plan could move the data window and still verify.
+        check("step layout", &|p| {
+            if let Step::Mkpart { layout, .. } = &mut p.steps[2] {
+                *layout = Layout::UefiNtfs;
             }
         });
     }
@@ -622,6 +665,19 @@ mod tests {
         // refuse (fail closed) — a deliberate schema property.
         let future_variant = r#"{"op":"future_op"}"#;
         assert!(serde_json::from_str::<Step>(future_variant).is_err());
+    }
+
+    #[test]
+    fn layout_tags_match_the_documented_shapes() {
+        for (layout, tag) in [
+            (Layout::Single, "single"),
+            (Layout::UefiNtfs, "uefi_ntfs"),
+            (Layout::WindowsToGo, "windows_to_go"),
+            (Layout::Persistence, "persistence"),
+        ] {
+            let wire = serde_json::to_string(&layout).expect("layout serialises");
+            assert_eq!(wire, format!(r#""{tag}""#));
+        }
     }
 
     #[test]

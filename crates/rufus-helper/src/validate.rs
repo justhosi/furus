@@ -50,7 +50,9 @@ use rufus_linux::SysfsRoot;
 use rufus_linux::mounts::read_swaps;
 use rufus_linux::sysfs::Filter;
 use rufus_linux::sysfs::enumerate as enumerate_devices;
+use rufus_proto::Filesystem;
 use rufus_proto::ImageKind;
+use rufus_proto::Layout;
 use rufus_proto::PLAN_VERSION;
 use rufus_proto::Plan;
 use rufus_proto::Scheme;
@@ -496,7 +498,19 @@ fn check_steps(plan: &Plan) -> Result<(), Reject> {
     for (index, step) in plan.steps.iter().enumerate() {
         let number = index + 1;
         match step {
-            Step::Mklabel { scheme } | Step::Mkpart { scheme } => {
+            Step::Mkpart { layout, .. }
+                if *layout == Layout::UefiNtfs && plan.options.filesystem != Filesystem::Ntfs =>
+            {
+                // The shim boots an NTFS data partition the image tree
+                // populates: any other filesystem is refused with the
+                // planner's own wording, so a hand-built plan cannot
+                // slip past the CLI gate.
+                return Err(reject(
+                    "invalid_step",
+                    "UEFI:NTFS needs an NTFS data partition; choose --filesystem ntfs",
+                ));
+            }
+            Step::Mklabel { scheme } | Step::Mkpart { scheme, .. } => {
                 if *scheme != plan.options.scheme {
                     return Err(reject(
                         "invalid_step",
@@ -858,6 +872,7 @@ mod tests {
                     },
                     Step::Mkpart {
                         scheme: Scheme::Mbr,
+                        layout: rufus_proto::Layout::Single,
                     },
                     Step::Mkfs {
                         filesystem: Filesystem::Fat32,
@@ -1317,11 +1332,44 @@ mod tests {
     fn mkpart_scheme_mismatch_is_refused() {
         let fixture = Fixture::new();
         let (mut plan, env, _device) = fixture.good(true);
-        if let Step::Mkpart { scheme } = &mut plan.steps[2] {
+        if let Step::Mkpart { scheme, .. } = &mut plan.steps[2] {
             *scheme = Scheme::Gpt;
         }
         plan = signed(plan);
         assert_eq!(refused_code(validate(&plan, &env)), "invalid_step");
+    }
+
+    #[test]
+    fn uefi_ntfs_layout_without_ntfs_is_refused() {
+        // The shim boots an NTFS data partition: a hand-built plan
+        // pairing the two-partition layout with the default FAT32
+        // filesystem is refused with the planner's own wording.
+        let fixture = Fixture::new();
+        let (mut plan, env, _device) = fixture.good(true);
+        if let Step::Mkpart { layout, .. } = &mut plan.steps[2] {
+            *layout = rufus_proto::Layout::UefiNtfs;
+        }
+        plan = signed(plan);
+        let refused = validate(&plan, &env).expect_err("fat32 data refuses");
+        assert_eq!(refused.code, "invalid_step");
+        assert_eq!(
+            refused.message,
+            "UEFI:NTFS needs an NTFS data partition; choose --filesystem ntfs"
+        );
+    }
+
+    #[test]
+    fn uefi_ntfs_layout_with_ntfs_is_accepted() {
+        // The same layout over the NTFS filesystem it boots passes:
+        // the rule only fires on the mismatched pairing.
+        let fixture = Fixture::new();
+        let (mut plan, env, _device) = fixture.good(true);
+        if let Step::Mkpart { layout, .. } = &mut plan.steps[2] {
+            *layout = rufus_proto::Layout::UefiNtfs;
+        }
+        plan.options.filesystem = Filesystem::Ntfs;
+        plan = signed(plan);
+        validate(&plan, &env).expect("the ntfs pairing passes");
     }
 
     #[test]

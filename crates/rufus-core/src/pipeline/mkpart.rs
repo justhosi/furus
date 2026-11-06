@@ -1,9 +1,9 @@
-//! The mkpart step: stamp the recorded table with its first partition.
+//! The mkpart step: stamp the recorded table with its partitions.
 //!
 //! The step refuses a scheme that disagrees with the table
 //! [`Mklabel`](super::mklabel) recorded (naming both); a missing
 //! recording is not a refusal — `Mklabel` is validation-only, and the
-//! stamp carries its own scheme. Geometry comes from the target: sector
+//! stamp carries its own scheme and layout. Geometry comes from the target: sector
 //! size straight off it, `last_lba` as `floor(size / sector_size) - 1`
 //! (the trailing partial sector is unused by construction — e.g. a
 //! 64 MiB + 1234 byte target plans over full sectors only; a target
@@ -17,6 +17,7 @@
 //! the partition counts as existing for
 //! [`Mkfs`](rufus_proto::Step::Mkfs).
 
+use rufus_proto::Layout;
 use rufus_proto::Scheme;
 
 use crate::error::CoreError;
@@ -25,13 +26,15 @@ use crate::part::plan;
 use crate::part::plan::PlanRequest;
 use crate::pipeline::event::Event;
 use crate::pipeline::steps::RunContext;
+use crate::pipeline::steps::layout_kind_of;
 use crate::pipeline::steps::table_kind_of;
 use crate::pipeline::steps::table_name;
 
-/// Stamp the table: plan a `Single` layout for the step's scheme,
+/// Stamp the table: plan the step's layout for the step's scheme,
 /// render it against the real geometry and write every sector.
-pub(crate) fn run(ctx: &mut RunContext<'_>, scheme: &Scheme) -> Result<()> {
+pub(crate) fn run(ctx: &mut RunContext<'_>, scheme: &Scheme, layout: &Layout) -> Result<()> {
     let kind = table_kind_of(scheme);
+    let layout_kind = layout_kind_of(layout);
     match ctx.table {
         Some(recorded) if recorded == kind => {}
         Some(recorded) => {
@@ -46,9 +49,15 @@ pub(crate) fn run(ctx: &mut RunContext<'_>, scheme: &Scheme) -> Result<()> {
     let size = ctx.device()?.size();
     let sector_size = ctx.device()?.sector_size();
     // The request the platform opener re-derives for its partition
-    // window (see `single_data_window`): one constructor, so the
+    // window (see `data_window`): one constructor, so the
     // stamped table and the formatted window cannot disagree.
-    let request: PlanRequest = plan::single_request(kind, sector_size, size)?;
+    let request: PlanRequest = plan::request(
+        layout_kind,
+        kind,
+        sector_size,
+        size,
+        plan::DataType::MicrosoftBasicData,
+    )?;
     let table_plan = plan::plan(&request)?;
     let rendered = plan::render(&table_plan, sector_size, request.last_lba)?;
     let total = rendered.byte_len();

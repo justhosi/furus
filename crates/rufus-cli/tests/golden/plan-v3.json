@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "created_by": "<created_by>",
   "device": {
     "path": "/dev/null",
@@ -38,7 +38,8 @@
     },
     {
       "op": "mkpart",
-      "scheme": "mbr"
+      "scheme": "mbr",
+      "layout": "single"
     },
     {
       "op": "mkfs",
@@ -59,5 +60,5 @@
       "op": "finalize"
     }
   ],
-  "confirm": "sha256:d53feca473b3623f012571d18657700b2bf7552139e044fbf3d94b5987d1085c"
+  "confirm": "sha256:fb560db60bd3d97087eba82b12d39c306b887561174767eaa053b4a3566aee43"
 }

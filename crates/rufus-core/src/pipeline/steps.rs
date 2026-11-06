@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use rufus_proto::Layout;
 use rufus_proto::Scheme;
 
 use super::RunOptions;
@@ -23,6 +24,7 @@ use crate::error::Result;
 use crate::log::Level;
 use crate::log::Logger;
 use crate::part::TableKind;
+use crate::part::plan::LayoutKind;
 use crate::pipeline::event::Event;
 use crate::pipeline::event::Reporter;
 use crate::pipeline::opener::Opener;
@@ -107,6 +109,18 @@ pub(crate) fn table_kind_of(scheme: &Scheme) -> TableKind {
     match scheme {
         Scheme::Mbr => TableKind::Mbr,
         Scheme::Gpt => TableKind::Gpt,
+    }
+}
+
+/// The [`LayoutKind`] a plan [`Layout`] asks for: the same mapping the
+/// opener's partition window and node spelling run with, so the
+/// stamped table, the formatted window and the node agree.
+pub(crate) fn layout_kind_of(layout: &Layout) -> LayoutKind {
+    match layout {
+        Layout::Single => LayoutKind::Single,
+        Layout::UefiNtfs => LayoutKind::UefiNtfs,
+        Layout::WindowsToGo => LayoutKind::WindowsToGo,
+        Layout::Persistence => LayoutKind::Persistence,
     }
 }
 

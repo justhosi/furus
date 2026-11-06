@@ -98,6 +98,7 @@ use rufus_proto::DeviceRef;
 use rufus_proto::Filesystem;
 use rufus_proto::ImageKind;
 use rufus_proto::ImageRef;
+use rufus_proto::Layout;
 use rufus_proto::Options;
 use rufus_proto::PLAN_VERSION;
 use rufus_proto::Plan;
@@ -391,6 +392,7 @@ fn plan_for(
             },
             Step::Mkpart {
                 scheme: Scheme::Mbr,
+                layout: Layout::Single,
             },
             Step::Mkfs {
                 filesystem: Filesystem::Fat32,

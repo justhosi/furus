@@ -29,7 +29,9 @@ use std::path::Path;
 use rufus_linux::SysfsRoot;
 use rufus_proto::BootloaderMode;
 use rufus_proto::DeviceRef;
+use rufus_proto::Filesystem;
 use rufus_proto::ImageKind;
+use rufus_proto::Layout;
 use rufus_proto::PLAN_VERSION;
 use rufus_proto::Plan;
 use rufus_proto::Step;
@@ -37,6 +39,54 @@ use rufus_proto::WriteMode;
 
 use crate::Fail;
 use crate::image::Inspected;
+
+/// The `--bootloader` selector: which installer the plan's bootloader
+/// step carries. `Auto` keeps the write-mode pairing (a `Dd` write
+/// already laid the image's own boot code, so no installer; a `Copy`
+/// write needs one); any explicit mode is emitted verbatim.
+/// `UefiNtfs` additionally selects the two-partition UEFI:NTFS layout
+/// and forces `Copy` (the shim boots an NTFS data partition the image
+/// tree populates); every other mode stays on the single layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BootloaderOpt {
+    /// Pair with the write mode (`Dd` → none, `Copy` → auto).
+    Auto,
+    /// Syslinux 4.x/6.x.
+    Syslinux,
+    /// GNU GRUB 2.
+    Grub2,
+    /// GRUB4DOS.
+    Grub4dos,
+    /// UEFI:NTFS helper partition (NTFS data partition, copy mode).
+    UefiNtfs,
+    /// FreeDOS.
+    Freedos,
+    /// No bootloader (plain data media).
+    None,
+}
+
+impl BootloaderOpt {
+    /// The bootloader mode the plan's bootloader step carries.
+    fn mode(self) -> BootloaderMode {
+        match self {
+            BootloaderOpt::Auto => BootloaderMode::Auto,
+            BootloaderOpt::Syslinux => BootloaderMode::Syslinux,
+            BootloaderOpt::Grub2 => BootloaderMode::Grub2,
+            BootloaderOpt::Grub4dos => BootloaderMode::Grub4dos,
+            BootloaderOpt::UefiNtfs => BootloaderMode::UefiNtfs,
+            BootloaderOpt::Freedos => BootloaderMode::Freedos,
+            BootloaderOpt::None => BootloaderMode::None,
+        }
+    }
+
+    /// The partition layout the plan's mkpart step stamps.
+    fn layout(self) -> Layout {
+        match self {
+            BootloaderOpt::UefiNtfs => Layout::UefiNtfs,
+            _ => Layout::Single,
+        }
+    }
+}
 
 /// Options as parsed from the `plan` subcommand flags.
 #[derive(Debug)]
@@ -58,6 +108,12 @@ pub struct Options {
     /// byte-for-byte (`--iso-mode`): the recommended mode for bootable
     /// sticks, whose bootloader step then installs from the tree.
     pub iso_mode: bool,
+    /// Bootloader selector (`--bootloader`): `auto` pairs with the
+    /// write mode, an explicit mode is emitted verbatim, and
+    /// `uefi-ntfs` additionally selects the UEFI:NTFS layout and
+    /// forces copy mode (refused without an NTFS filesystem in
+    /// [`build`]).
+    pub bootloader: BootloaderOpt,
     /// Bad-block scan.
     pub bad_blocks: bool,
     /// Read-back verification.
@@ -217,13 +273,37 @@ fn write_mode(image: &Path, kind: &ImageKind, iso_mode: bool) -> WriteMode {
 
 /// The ordered provisional steps for one image/device combination.
 ///
-/// The bootloader step follows the write mode: a `Dd` write already
-/// laid the image's own boot code, so the plan emits
+/// With `Auto` the bootloader step follows the write mode: a `Dd`
+/// write already laid the image's own boot code, so the plan emits
 /// [`BootloaderMode::None`]; a `Copy` write needs the installer, so it
-/// emits [`BootloaderMode::Auto`].
+/// emits [`BootloaderMode::Auto`]. An explicit selector is emitted
+/// verbatim instead, except that `UefiNtfs` forces [`WriteMode::Copy`]
+/// (the shim boots a populated NTFS data partition). The mkpart step
+/// carries the selector's layout (`UefiNtfs` for `uefi-ntfs`, `Single`
+/// otherwise).
 pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
-    let write = write_mode(image, kind, options.iso_mode);
-    let needs_installer = write == WriteMode::Copy;
+    let (write, bootloader) = match options.bootloader {
+        BootloaderOpt::Auto => {
+            let write = write_mode(image, kind, options.iso_mode);
+            let needs_installer = write == WriteMode::Copy;
+            (
+                write,
+                if needs_installer {
+                    BootloaderMode::Auto
+                } else {
+                    BootloaderMode::None
+                },
+            )
+        }
+        selected => {
+            let write = if selected == BootloaderOpt::UefiNtfs {
+                WriteMode::Copy
+            } else {
+                write_mode(image, kind, options.iso_mode)
+            };
+            (write, selected.mode())
+        }
+    };
     vec![
         Step::Wipe,
         Step::Mklabel {
@@ -231,6 +311,7 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
         },
         Step::Mkpart {
             scheme: options.scheme.clone(),
+            layout: options.bootloader.layout(),
         },
         Step::Mkfs {
             filesystem: options.filesystem.clone(),
@@ -239,13 +320,7 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
             quick: options.quick_format,
         },
         Step::Write { mode: write },
-        Step::Bootloader {
-            mode: if needs_installer {
-                BootloaderMode::Auto
-            } else {
-                BootloaderMode::None
-            },
-        },
+        Step::Bootloader { mode: bootloader },
         Step::Finalize,
     ]
 }
@@ -258,7 +333,17 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
 /// happen in S05/S06. The confirm hash is recomputed here and a
 /// serialisation failure (practically impossible for this JSON-native
 /// schema) is surfaced as an I/O-class [`Fail`], fail closed (PLAN §2).
+/// A `uefi-ntfs` bootloader without an NTFS data filesystem is refused
+/// here, before any step is built: the shim boots an NTFS partition the
+/// image tree populates, so any other filesystem is a usage error.
 pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Result<Plan, Fail> {
+    if options.bootloader == BootloaderOpt::UefiNtfs && options.filesystem != Filesystem::Ntfs {
+        return Err(Fail {
+            exit: crate::Exit::Usage,
+            kind: "usage",
+            message: "UEFI:NTFS needs an NTFS data partition; choose --filesystem ntfs".to_owned(),
+        });
+    }
     let steps = steps(Path::new(&inspected.path), &inspected.kind, options);
     let mut plan = Plan {
         version: PLAN_VERSION,
@@ -297,8 +382,10 @@ mod tests {
     use std::path::Path;
 
     use rufus_proto::BootloaderMode;
+    use rufus_proto::DeviceRef;
     use rufus_proto::Filesystem;
     use rufus_proto::ImageKind;
+    use rufus_proto::Layout;
     use rufus_proto::Scheme;
     use rufus_proto::Step;
     use rufus_proto::Target;
@@ -356,7 +443,9 @@ mod tests {
         }
     }
 
+    use super::BootloaderOpt;
     use super::Options;
+    use super::build;
     use super::steps;
 
     fn test_options(iso_mode: bool) -> Options {
@@ -373,6 +462,7 @@ mod tests {
             show_all: false,
             confirmed_serial: None,
             iso_mode,
+            bootloader: BootloaderOpt::Auto,
         }
     }
 
@@ -413,5 +503,147 @@ mod tests {
             (WriteMode::Copy, BootloaderMode::Auto),
             "a wim plans copy plus auto bootloader"
         );
+    }
+
+    /// The `Layout` of one planned step list.
+    fn planned_layout(image: &str, kind: &ImageKind, bootloader: BootloaderOpt) -> Layout {
+        let mut options = test_options(false);
+        options.bootloader = bootloader;
+        for step in steps(Path::new(image), kind, &options) {
+            if let Step::Mkpart { layout, .. } = step {
+                return layout;
+            }
+        }
+        panic!("the plan carries an mkpart step");
+    }
+
+    #[test]
+    fn explicit_bootloader_modes_are_emitted_verbatim_on_single() {
+        // Any explicit selector but `uefi-ntfs` is emitted as-is and
+        // stays on the single layout; the write mode still follows the
+        // image (a dd image stays dd).
+        for (selected, want) in [
+            (BootloaderOpt::Syslinux, BootloaderMode::Syslinux),
+            (BootloaderOpt::Grub2, BootloaderMode::Grub2),
+            (BootloaderOpt::Grub4dos, BootloaderMode::Grub4dos),
+            (BootloaderOpt::Freedos, BootloaderMode::Freedos),
+            (BootloaderOpt::None, BootloaderMode::None),
+        ] {
+            let mut options = test_options(false);
+            options.bootloader = selected;
+            let mut write = None;
+            let mut bootloader = None;
+            for step in steps(Path::new("image.iso"), &ImageKind::Iso, &options) {
+                match step {
+                    Step::Write { mode } => write = Some(mode),
+                    Step::Bootloader { mode } => bootloader = Some(mode),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                bootloader.expect("the plan carries a bootloader step"),
+                want,
+                "{selected:?} is emitted verbatim"
+            );
+            assert_eq!(
+                write.expect("the plan carries a write step"),
+                WriteMode::Dd,
+                "{selected:?} keeps the image write mode"
+            );
+            assert_eq!(
+                planned_layout("image.iso", &ImageKind::Iso, selected),
+                Layout::Single,
+                "{selected:?} stays on the single layout"
+            );
+        }
+    }
+
+    #[test]
+    fn uefi_ntfs_selects_two_partition_layout_and_forces_copy() {
+        // The shim boots a populated NTFS data partition: even a dd
+        // image is forced to copy, and the mkpart step stamps the
+        // two-partition layout.
+        let mut options = test_options(false);
+        options.bootloader = BootloaderOpt::UefiNtfs;
+        options.filesystem = Filesystem::Ntfs;
+        let mut write = None;
+        let mut bootloader = None;
+        for step in steps(Path::new("image.iso"), &ImageKind::Iso, &options) {
+            match step {
+                Step::Write { mode } => write = Some(mode),
+                Step::Bootloader { mode } => bootloader = Some(mode),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            write.expect("the plan carries a write step"),
+            WriteMode::Copy,
+            "uefi-ntfs forces copy even for a dd image"
+        );
+        assert_eq!(
+            bootloader.expect("the plan carries a bootloader step"),
+            BootloaderMode::UefiNtfs,
+            "uefi-ntfs is emitted verbatim"
+        );
+        assert_eq!(
+            planned_layout("image.iso", &ImageKind::Iso, BootloaderOpt::UefiNtfs),
+            Layout::UefiNtfs,
+            "uefi-ntfs stamps the two-partition layout"
+        );
+    }
+
+    #[test]
+    fn build_refuses_uefi_ntfs_without_ntfs() {
+        // The shim boots an NTFS data partition: any other filesystem
+        // is a usage refusal, before any hash is sealed.
+        let device = DeviceRef {
+            path: "/dev/null".to_string(),
+            block_device: false,
+            size_bytes: None,
+            serial: None,
+            model: None,
+            sysfs: None,
+        };
+        let inspected = crate::image::Inspected {
+            path: "image.iso".to_string(),
+            size_bytes: 32_780,
+            sha256: "0".repeat(64),
+            kind: ImageKind::Iso,
+        };
+        let mut options = test_options(false);
+        options.bootloader = BootloaderOpt::UefiNtfs;
+        options.filesystem = Filesystem::Fat32;
+        let refused = build(device.clone(), inspected, &options).expect_err("fat32 refuses");
+        assert!(
+            refused.message.contains("UEFI:NTFS"),
+            "the refusal names the shim: {}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("--filesystem ntfs"),
+            "the refusal names the fix: {}",
+            refused.message
+        );
+        // The NTFS sibling seals fine and stamps the uefi-ntfs layout.
+        let inspected = crate::image::Inspected {
+            path: "image.iso".to_string(),
+            size_bytes: 32_780,
+            sha256: "0".repeat(64),
+            kind: ImageKind::Iso,
+        };
+        options.filesystem = Filesystem::Ntfs;
+        let plan = match build(device, inspected, &options) {
+            Ok(plan) => plan,
+            Err(fail) => panic!("ntfs seals: {}", fail.message),
+        };
+        let layout = plan
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Mkpart { layout, .. } => Some(layout.clone()),
+                _ => None,
+            })
+            .expect("the plan carries an mkpart step");
+        assert_eq!(layout, Layout::UefiNtfs);
     }
 }

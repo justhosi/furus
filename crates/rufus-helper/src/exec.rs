@@ -354,6 +354,7 @@ mod tests {
             (
                 Step::Mkpart {
                     scheme: Scheme::Gpt,
+                    layout: rufus_proto::Layout::Single,
                 },
                 "mkpart",
             ),

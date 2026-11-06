@@ -294,18 +294,25 @@ impl Rendered {
 // Planning
 // ---------------------------------------------------------------------------
 
-/// Build the `Single`-layout request [`Mkpart`](crate::pipeline::mkpart)
-/// stamps: one Microsoft Basic Data partition over the whole usable
-/// disk. Shared by the stamper and the platform opener's window math,
-/// so the two cannot disagree on inputs — both feed the same table,
-/// sector size and byte size into the same [`plan`].
-///
-/// `size_bytes` is the whole-disk extent; `last_lba` derives as
+/// Build any layout's request over a byte-sized disk: the one
+/// constructor [`single_request`], [`Mkpart`](crate::pipeline::mkpart)
+/// and the layout-aware window helpers share, so the stamped table
+/// and the formatted window cannot disagree on inputs. `size_bytes`
+/// is the whole-disk extent; `last_lba` derives as
 /// `floor(size / sector) - 1`, leaving a trailing partial sector unused
 /// by construction. A zero sector size or a disk smaller than one
-/// sector refuses, naming the numbers (the stamper's wording, kept so
-/// both sides report the same refusal).
-pub fn single_request(table: TableKind, sector_size: u32, size_bytes: u64) -> Result<PlanRequest> {
+/// sector refuses, naming the numbers.
+///
+/// `data_type` is the `data` partition's type; layouts that pin their
+/// own types (`WindowsToGo`, `Persistence`) ignore it for the pinned
+/// partitions (see [`plan`]).
+pub fn request(
+    kind: LayoutKind,
+    table: TableKind,
+    sector_size: u32,
+    size_bytes: u64,
+    data_type: DataType,
+) -> Result<PlanRequest> {
     let sectors = size_bytes
         .checked_div(u64::from(sector_size))
         .ok_or_else(|| {
@@ -319,35 +326,43 @@ pub fn single_request(table: TableKind, sector_size: u32, size_bytes: u64) -> Re
         )));
     }
     Ok(PlanRequest {
-        kind: LayoutKind::Single,
+        kind,
         table,
         sector_size,
         last_lba: sectors - 1,
-        data_type: DataType::MicrosoftBasicData,
+        data_type,
         esp_bytes: 0,
         persistence_bytes: 0,
     })
 }
 
-/// The byte window `(offset, len)` of the `Single` layout's data
-/// partition for `table` on a `size_bytes` disk with `sector_size`-byte
-/// sectors: what the platform opener formats and verifies. Planned
-/// through the same [`single_request`] plus [`plan`] the stamper runs,
-/// so the window is the partition the table describes by construction —
-/// not a second computation that could drift. The first (`data`)
-/// partition wins; an empty plan (unreachable through [`plan`] today)
-/// refuses instead of indexing blindly.
-pub fn single_data_window(
-    table: TableKind,
-    sector_size: u32,
-    size_bytes: u64,
-) -> Result<(u64, u64)> {
-    let request = single_request(table, sector_size, size_bytes)?;
-    let planned = plan(&request)?;
-    let partition = planned
-        .partitions
-        .first()
-        .ok_or_else(|| CoreError::invalid("the single layout planned no partitions".to_string()))?;
+/// Build the `Single`-layout request [`Mkpart`](crate::pipeline::mkpart)
+/// stamps: one Microsoft Basic Data partition over the whole usable
+/// disk. A wrapper over [`request`]: the stamper and the platform
+/// opener's window math share the one constructor, so the two cannot
+/// disagree on inputs — both feed the same table, sector size and
+/// byte size into the same [`plan`].
+///
+/// `size_bytes` is the whole-disk extent; `last_lba` derives as
+/// `floor(size / sector) - 1`, leaving a trailing partial sector unused
+/// by construction. A zero sector size or a disk smaller than one
+/// sector refuses, naming the numbers (the stamper's wording, kept so
+/// both sides report the same refusal).
+pub fn single_request(table: TableKind, sector_size: u32, size_bytes: u64) -> Result<PlanRequest> {
+    request(
+        LayoutKind::Single,
+        table,
+        sector_size,
+        size_bytes,
+        DataType::MicrosoftBasicData,
+    )
+}
+
+/// The byte window `(offset, len)` of one planned partition's span:
+/// the shared overflow-checked LBA-to-bytes math behind
+/// [`single_data_window`] and [`data_window`], so the two spell the
+/// arithmetic once.
+fn partition_window(partition: &PlannedPartition, sector_size: u32) -> Result<(u64, u64)> {
     let sector = u64::from(sector_size);
     let offset = partition.start_lba.checked_mul(sector).ok_or_else(|| {
         CoreError::invalid(format!(
@@ -371,6 +386,108 @@ pub fn single_data_window(
         ))
     })?;
     Ok((offset, len))
+}
+
+/// The byte window `(offset, len)` of the `Single` layout's data
+/// partition for `table` on a `size_bytes` disk with `sector_size`-byte
+/// sectors: what the platform opener formats and verifies. Planned
+/// through the same [`single_request`] plus [`plan`] the stamper runs,
+/// so the window is the partition the table describes by construction —
+/// not a second computation that could drift. The first (`data`)
+/// partition wins; an empty plan (unreachable through [`plan`] today)
+/// refuses instead of indexing blindly.
+pub fn single_data_window(
+    table: TableKind,
+    sector_size: u32,
+    size_bytes: u64,
+) -> Result<(u64, u64)> {
+    let request = single_request(table, sector_size, size_bytes)?;
+    let planned = plan(&request)?;
+    let partition = planned
+        .partitions
+        .first()
+        .ok_or_else(|| CoreError::invalid("the single layout planned no partitions".to_string()))?;
+    partition_window(partition, sector_size)
+}
+
+/// The byte window `(offset, len)` of `kind`'s `data` partition for
+/// `table` on a `size_bytes` disk with `sector_size`-byte sectors:
+/// the layout-aware form of [`single_data_window`] the platform
+/// opener formats and verifies. Planned through the same [`request`]
+/// plus [`plan`] the stamper runs, so the window is the partition the
+/// table describes by construction. The partition whose `role` is
+/// `"data"` wins — never a positional literal — so layouts whose data
+/// sits elsewhere keep working: `WindowsToGo` (data third, after ESP
+/// and MSR) and `Persistence` (data first, before the tail) resolve
+/// through the same role the planner stamped. A plan with no `data`
+/// role (unreachable through [`plan`] today) refuses instead of
+/// indexing blindly.
+pub fn data_window(
+    kind: LayoutKind,
+    table: TableKind,
+    sector_size: u32,
+    size_bytes: u64,
+) -> Result<(u64, u64)> {
+    let request = request(
+        kind,
+        table,
+        sector_size,
+        size_bytes,
+        DataType::MicrosoftBasicData,
+    )?;
+    let planned = plan(&request)?;
+    let partition = planned
+        .partitions
+        .iter()
+        .find(|partition| partition.role == "data")
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "the {} layout planned no data partition",
+                kind.label()
+            ))
+        })?;
+    partition_window(partition, sector_size)
+}
+
+/// The 1-based table position of `kind`'s `data` partition for `table`
+/// on a `size_bytes` disk with `sector_size`-byte sectors: what the
+/// platform opener names the partition node with (say `/dev/sdb2`).
+/// Derived from the planner's own role order — the index of the
+/// `role == "data"` entry — so `UefiNtfs` (data second),
+/// `WindowsToGo` (data third) and `Persistence` (data first) cannot
+/// drift from the stamped table the way a literal position would. A
+/// plan with no `data` role (unreachable through [`plan`] today)
+/// refuses instead of naming a wrong node.
+pub fn data_partition_number(
+    kind: LayoutKind,
+    table: TableKind,
+    sector_size: u32,
+    size_bytes: u64,
+) -> Result<u32> {
+    let request = request(
+        kind,
+        table,
+        sector_size,
+        size_bytes,
+        DataType::MicrosoftBasicData,
+    )?;
+    let planned = plan(&request)?;
+    let position = planned
+        .partitions
+        .iter()
+        .position(|partition| partition.role == "data")
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "the {} layout planned no data partition",
+                kind.label()
+            ))
+        })?;
+    u32::try_from(position + 1).map_err(|_| {
+        CoreError::invalid(format!(
+            "the {} layout planned more partitions than a table position holds",
+            kind.label()
+        ))
+    })
 }
 
 /// Plan a whole-disk layout: [`PlanRequest`] in, checked geometry plus
@@ -1246,6 +1363,71 @@ mod tests {
         let last_lba = 2048 * 320;
         let req_plan = plan_for(LayoutKind::Persistence, TableKind::Mbr, 512, last_lba);
         assert_eq!(req_plan.partitions.last().expect("two").last_lba, last_lba);
+    }
+
+    // ------------------------------------------------------------------
+    // Data windows and partition numbers
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn data_window_matches_the_planned_data_role() {
+        // Every layout on both tables: the window is the `data` role's
+        // span in bytes, and the number is its 1-based table position —
+        // both read off the planner, never a literal.
+        for (kind, number) in [
+            (LayoutKind::Single, 1u32),
+            (LayoutKind::UefiNtfs, 2u32),
+            (LayoutKind::WindowsToGo, 3u32),
+            (LayoutKind::Persistence, 1u32),
+        ] {
+            for table in [TableKind::Mbr, TableKind::Gpt] {
+                if kind == LayoutKind::WindowsToGo && table == TableKind::Mbr {
+                    continue; // the MSR has no MBR type byte
+                }
+                let last_lba = 2048 * 512;
+                let size_bytes = (last_lba + 1) * 512;
+                let req_plan = plan_for(kind, table, 512, last_lba);
+                let data = req_plan
+                    .partitions
+                    .iter()
+                    .find(|partition| partition.role == "data")
+                    .expect("every layout plans a data partition");
+                let (offset, len) =
+                    data_window(kind, table, 512, size_bytes).expect("the data window plans");
+                assert_eq!(offset, data.start_lba * 512, "{kind:?}/{table:?} offset");
+                assert_eq!(
+                    len,
+                    (data.last_lba - data.start_lba + 1) * 512,
+                    "{kind:?}/{table:?} length"
+                );
+                assert_eq!(
+                    data_partition_number(kind, table, 512, size_bytes).expect("the number plans"),
+                    number,
+                    "{kind:?}/{table:?} position"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn data_window_agrees_with_single_data_window() {
+        // The layout-aware window collapses to the legacy one on the
+        // `Single` layout, on both tables.
+        for table in [TableKind::Mbr, TableKind::Gpt] {
+            let size_bytes = 64 * MIB_BYTES;
+            assert_eq!(
+                data_window(LayoutKind::Single, table, 512, size_bytes)
+                    .expect("layout-aware plans"),
+                single_data_window(table, 512, size_bytes).expect("legacy plans"),
+                "{table:?} windows agree"
+            );
+            assert_eq!(
+                data_partition_number(LayoutKind::Single, table, 512, size_bytes)
+                    .expect("the number plans"),
+                1,
+                "{table:?} data is first"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

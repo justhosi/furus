@@ -1723,6 +1723,7 @@ mod tests {
                     },
                     Step::Mkpart {
                         scheme: Scheme::Mbr,
+                        layout: rufus_proto::Layout::Single,
                     },
                     Step::Mkfs {
                         filesystem: Filesystem::Fat32,
