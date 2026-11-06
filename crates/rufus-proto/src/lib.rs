@@ -34,7 +34,9 @@
 //!   refuses it outright. v3 appended [`Step::Mkpart::layout`] — the
 //!   partition layout the data window derives from — so a v2 plan
 //!   (whose mkpart step carries no layout) is refused outright for
-//!   the same reason.
+//!   the same reason. v4 added the `kolibri` [`BootloaderMode`]
+//!   variant — so a v3 plan is refused outright for the same reason
+//!   (unknown enum variants refuse instead of guessing).
 //! * `confirm` is the SHA-256 over the canonical JSON bytes of the plan
 //!   with `confirm` set to `""` (see [`Plan::confirm`]). serde_json writes
 //!   struct fields in declaration order, so the byte layout *is* the
@@ -76,12 +78,12 @@ pub mod events;
 
 pub use events::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, LogLine, Outcome, Progress};
 
-/// Schema version of [`Plan`]. v3 appended `Step::Mkpart::layout`
-/// (the partition layout the data window derives from) and refuses
-/// v1/v2 plans, fail closed — see the schema history in the crate
-/// documentation. A plan carrying a higher or older version must be
-/// refused by the helper.
-pub const PLAN_VERSION: u32 = 3;
+/// Schema version of [`Plan`]. v4 added the `kolibri`
+/// [`BootloaderMode`] variant and refuses v1/v2/v3 plans, fail
+/// closed — see the schema history in the crate documentation. A
+/// plan carrying a higher or older version must be refused by the
+/// helper.
+pub const PLAN_VERSION: u32 = 4;
 
 /// A write plan: device, image, options, ordered steps and a confirm hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +381,8 @@ pub enum BootloaderMode {
     UefiNtfs,
     /// FreeDOS.
     Freedos,
+    /// KolibriOS.
+    Kolibri,
     /// No bootloader (plain data media).
     None,
 }
@@ -418,9 +422,10 @@ fn hex(bytes: &[u8]) -> String {
 // S06 bumps the schema to v2: `Options.confirmed_serial` is appended
 // (PLAN §6 rule 4's typed serial confirmation). S20 bumps it to v3:
 // `Step::Mkpart::layout` is appended (the partition layout the data
-// window derives from). Bumping the version must be a deliberate
-// commit that also regenerates every golden file (see the crate
-// documentation about field order and confirm hashes).
+// window derives from). S20 part 10 bumps it to v4: the `kolibri`
+// `BootloaderMode` variant is added. Bumping the version must be a
+// deliberate commit that also regenerates every golden file (see the
+// crate documentation about field order and confirm hashes).
 const _: () = assert!(PLAN_VERSION >= 1, "PLAN_VERSION must stay positive");
 
 #[cfg(test)]
@@ -488,8 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_three_until_deliberately_bumped() {
-        assert_eq!(PLAN_VERSION, 3);
+    fn schema_version_is_four_until_deliberately_bumped() {
+        assert_eq!(PLAN_VERSION, 4);
         let mut plan = sample();
         plan.confirm = plan.confirm().expect("sample serialises to canonical JSON");
         assert_eq!(plan.version, PLAN_VERSION);
@@ -536,7 +541,7 @@ mod tests {
 
         // 2. Values and tags (order-insensitive via Value).
         let obj: serde_json::Value = serde_json::from_str(&text).expect("value");
-        assert_eq!(obj["version"], 3);
+        assert_eq!(obj["version"], 4);
         assert_eq!(obj["confirm"], plan.confirm);
         assert_eq!(
             obj["options"]["confirmed_serial"], "ABC123",
@@ -595,7 +600,7 @@ mod tests {
             assert_ne!(fresh, base.confirm, "{label} did not change the hash");
         };
 
-        check("version", &|p| p.version = 4);
+        check("version", &|p| p.version = 5);
         check("created_by", &|p| p.created_by = "x".into());
         check("device.path", &|p| p.device.path = "/dev/sdc".into());
         check("device.block_device", &|p| p.device.block_device = false);
@@ -665,6 +670,28 @@ mod tests {
         // refuse (fail closed) — a deliberate schema property.
         let future_variant = r#"{"op":"future_op"}"#;
         assert!(serde_json::from_str::<Step>(future_variant).is_err());
+    }
+
+    #[test]
+    fn bootloader_mode_tags_match_the_documented_modes() {
+        for (mode, tag) in [
+            (BootloaderMode::Auto, "auto"),
+            (BootloaderMode::Syslinux, "syslinux"),
+            (BootloaderMode::Grub2, "grub2"),
+            (BootloaderMode::Grub4dos, "grub4dos"),
+            (BootloaderMode::UefiNtfs, "uefi_ntfs"),
+            (BootloaderMode::Freedos, "freedos"),
+            (BootloaderMode::Kolibri, "kolibri"),
+            (BootloaderMode::None, "none"),
+        ] {
+            let wire = serde_json::to_string(&mode).expect("mode serialises");
+            assert_eq!(wire, format!(r#""{tag}""#), "the {tag} tag is pinned");
+        }
+        // The `kolibri` tag is the v4 addition: it must deserialize
+        // back to the new variant, so a v3 reader's refusal is the
+        // fail-closed behaviour the version check wants.
+        let mode: BootloaderMode = serde_json::from_str(r#""kolibri""#).expect("kolibri parses");
+        assert_eq!(mode, BootloaderMode::Kolibri);
     }
 
     #[test]

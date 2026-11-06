@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "created_by": "<created_by>",
   "device": {
     "path": "/dev/null",
@@ -60,5 +60,5 @@
       "op": "finalize"
     }
   ],
-  "confirm": "sha256:fb560db60bd3d97087eba82b12d39c306b887561174767eaa053b4a3566aee43"
+  "confirm": "sha256:d59ff59ad5282903163437c5106143de35f59fbf358b5ead668f5430e7418aa3"
 }

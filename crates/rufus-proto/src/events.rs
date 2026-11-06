@@ -514,9 +514,9 @@ mod tests {
         );
         let obj: serde_json::Value = serde_json::from_str(&text).expect("plan is a JSON object");
         // The plan schema version and the stream schema version stay
-        // distinct (plan schema at 3 since the mkpart layout bump,
+        // distinct (plan schema at 4 since the kolibri mode bump,
         // stream at 1).
-        assert_eq!(obj["version"], 3);
+        assert_eq!(obj["version"], 4);
         assert_eq!(EVENT_STREAM_VERSION, 1);
         // No new top-level field may appear in the plan JSON.
         let mut keys: Vec<&str> = obj

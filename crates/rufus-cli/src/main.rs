@@ -573,9 +573,10 @@ enum Command {
         #[arg(long = "iso-mode")]
         iso_mode: bool,
         /// Bootloader installer for the copy step (default: auto, paired
-        /// with the write mode; uefi-ntfs selects the two-partition
-        /// UEFI:NTFS layout and forces copy mode, refused without
-        /// --filesystem ntfs or exfat).
+        /// with the write mode: auto|syslinux|grub2|grub4dos|uefi-ntfs|freedos|kolibri|none;
+        /// uefi-ntfs selects the two-partition UEFI:NTFS layout and
+        /// forces copy mode, refused without --filesystem ntfs or
+        /// exfat; freedos and kolibri need --filesystem fat32).
         #[arg(long, value_enum, default_value_t = plan::BootloaderOpt::Auto)]
         bootloader: plan::BootloaderOpt,
         /// Volume label (default: executor derives it from the image).
@@ -1648,6 +1649,7 @@ fn describe_step(step: &Step) -> String {
                 rufus_proto::BootloaderMode::Grub4dos => "grub4dos",
                 rufus_proto::BootloaderMode::UefiNtfs => "uefi_ntfs",
                 rufus_proto::BootloaderMode::Freedos => "freedos",
+                rufus_proto::BootloaderMode::Kolibri => "kolibri",
                 rufus_proto::BootloaderMode::None => "none",
             }
         ),

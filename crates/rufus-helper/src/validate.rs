@@ -50,6 +50,7 @@ use rufus_linux::SysfsRoot;
 use rufus_linux::mounts::read_swaps;
 use rufus_linux::sysfs::Filter;
 use rufus_linux::sysfs::enumerate as enumerate_devices;
+use rufus_proto::BootloaderMode;
 use rufus_proto::Filesystem;
 use rufus_proto::ImageKind;
 use rufus_proto::Layout;
@@ -570,6 +571,20 @@ fn check_steps(plan: &Plan) -> Result<(), Reject> {
                         ),
                     ));
                 }
+            }
+            Step::Bootloader { mode }
+                if (*mode == BootloaderMode::Freedos || *mode == BootloaderMode::Kolibri)
+                    && plan.options.filesystem != Filesystem::Fat32 =>
+            {
+                // Both installers write a FAT32 volume: any other
+                // filesystem is refused with the planner's own wording,
+                // so a hand-built plan cannot slip past the CLI gate.
+                let message = if *mode == BootloaderMode::Freedos {
+                    "FreeDOS needs a FAT32 data partition; choose --filesystem fat32"
+                } else {
+                    "KolibriOS needs a FAT32 data partition; choose --filesystem fat32"
+                };
+                return Err(reject("invalid_step", message));
             }
             Step::Bootloader { .. } | Step::Wipe | Step::Finalize => {}
         }
@@ -1371,6 +1386,49 @@ mod tests {
                 *layout = rufus_proto::Layout::UefiNtfs;
             }
             plan.options.filesystem = filesystem.clone();
+            plan = signed(plan);
+            validate(&plan, &env).expect("the pairing passes");
+        }
+    }
+
+    #[test]
+    fn freedos_and_kolibri_bootloaders_need_fat32() {
+        // Both installers write a FAT32 volume: a hand-built plan
+        // pairing either mode with NTFS is refused with the planner's
+        // own wording.
+        for (mode, message) in [
+            (
+                BootloaderMode::Freedos,
+                "FreeDOS needs a FAT32 data partition; choose --filesystem fat32",
+            ),
+            (
+                BootloaderMode::Kolibri,
+                "KolibriOS needs a FAT32 data partition; choose --filesystem fat32",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let (mut plan, env, _device) = fixture.good(true);
+            if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+                *slot = mode.clone();
+            }
+            plan.options.filesystem = Filesystem::Ntfs;
+            plan = signed(plan);
+            let refused = validate(&plan, &env).expect_err("ntfs data refuses");
+            assert_eq!(refused.code, "invalid_step");
+            assert_eq!(refused.message, message);
+        }
+    }
+
+    #[test]
+    fn freedos_and_kolibri_bootloaders_accepted_on_fat32() {
+        // Either mode over the FAT32 filesystem it writes passes: the
+        // rule only fires on a mismatched pairing.
+        for mode in [BootloaderMode::Freedos, BootloaderMode::Kolibri] {
+            let fixture = Fixture::new();
+            let (mut plan, env, _device) = fixture.good(true);
+            if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+                *slot = mode;
+            }
             plan = signed(plan);
             validate(&plan, &env).expect("the pairing passes");
         }

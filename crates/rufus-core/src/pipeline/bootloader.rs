@@ -1,16 +1,24 @@
-//! The bootloader step: Syslinux, GRUB2 and GRUB4DOS installation
-//! from the image tree, UEFI GRUB placement, and the UEFI:NTFS shim.
+//! The bootloader step: Syslinux, GRUB2, GRUB4DOS, FreeDOS and
+//! KolibriOS installation from the image tree, UEFI GRUB placement,
+//! and the UEFI:NTFS shim.
 //!
 //! What is wired today: explicit `Syslinux` mode installs one Syslinux
 //! family; explicit `Grub2` installs the BIOS record and places a UEFI
 //! image when the tree carries one; explicit `Grub4dos` writes the
 //! embedded MBR/SBR and the root loader (all three read the image tree
-//! and need a FAT32 volume); `Auto` takes the first match of syslinux,
-//! grub2, grub4dos, logging each probe. Explicit `UefiNtfs` is
-//! disk-only instead: it writes the embedded 1 MiB shim image at the
-//! ESP offset of the two-partition layout for NTFS or exFAT plans — no
-//! image tree, no FAT32 volume (the copy step already placed the ISO
-//! files on the data partition). `Freedos` stays not implemented.
+//! and need a FAT32 volume); explicit `Freedos` installs the embedded
+//! FreeDOS payloads plus the locale files and the FreeDOS record (it
+//! does not read the image tree — the write step already copied it —
+//! and needs a FAT32 volume); explicit `Kolibri` locates the
+//! `HD_Load/USB_Boot/MTLD_F32` loader in the image tree, places it at
+//! the volume root and writes the KolibriOS record (it does read the
+//! image tree — the loader comes from the image — and needs a FAT32
+//! volume); `Auto` takes the first match of syslinux, grub2, grub4dos,
+//! logging each probe. Explicit `UefiNtfs` is disk-only instead: it
+//! writes the embedded 1 MiB shim image at the ESP offset of the
+//! two-partition layout for NTFS or exFAT plans — no image tree, no
+//! FAT32 volume (the copy step already placed the ISO files on the
+//! data partition).
 //!
 //! The obsolete-module replacement ([`Obsolete`](crate::boot::syslinux::Obsolete))
 //! is deliberately not applied here: no newer module bytes are
@@ -28,7 +36,11 @@
 //! Payload provenance is honest per arm: GRUB2 ships no embedded
 //! fallback — `boot.img`, `core.img` and the UEFI image come only
 //! from the image tree — while GRUB4DOS carries its record and loader
-//! as embedded resources 450/451.
+//! as embedded resources 450/451. FreeDOS carries its 27 payloads as
+//! embedded resources 300-326 (the locale `CONFIG.SYS`/`AUTOEXEC.BAT`
+//! pair is rendered, not embedded); KolibriOS carries only its boot
+//! record as a transcription — the `MTLD_F32` loader comes from the
+//! image tree.
 
 use std::path::Path;
 
@@ -39,8 +51,11 @@ use rufus_proto::ImageRef;
 
 use crate::boot::Payload;
 use crate::boot::Resource;
+use crate::boot::dos_locale;
+use crate::boot::freedos;
 use crate::boot::grub2;
 use crate::boot::grub4dos;
+use crate::boot::kolibri;
 use crate::boot::syslinux;
 use crate::boot::syslinux::Family;
 use crate::boot::uefi_ntfs;
@@ -134,7 +149,9 @@ impl Volume for DiskView<'_> {
 /// entry point. `UefiNtfs` passes here — its disk-only arm lives in
 /// [`run`], not [`install_tree`], which refuses it through its own
 /// explicit arm. (The mode names S20's UEFI:NTFS partition, not the
-/// UEFI GRUB file the GRUB arms place.)
+/// UEFI GRUB file the GRUB arms place.) Every mode is wired today, so
+/// this always passes; it stays as the shared gate so a future variant
+/// fails closed in both entry points.
 fn check_mode(mode: &BootloaderMode) -> Result<()> {
     match mode {
         BootloaderMode::None
@@ -142,10 +159,9 @@ fn check_mode(mode: &BootloaderMode) -> Result<()> {
         | BootloaderMode::Auto
         | BootloaderMode::Grub2
         | BootloaderMode::Grub4dos
-        | BootloaderMode::UefiNtfs => Ok(()),
-        BootloaderMode::Freedos => Err(CoreError::NotImplemented {
-            what: "freedos bootloader installation (wired in a later slice)",
-        }),
+        | BootloaderMode::UefiNtfs
+        | BootloaderMode::Freedos
+        | BootloaderMode::Kolibri => Ok(()),
     }
 }
 
@@ -202,6 +218,25 @@ pub(crate) enum Installed {
         embedded_grldr: bool,
         messages: Vec<String>,
     },
+    /// FreeDOS install: files written and kept counts, bytes written,
+    /// and log lines (the locale plan lines, then kept-existing
+    /// lines). The boot record always lands on success, so the run
+    /// summary names it without a separate flag.
+    Freedos {
+        files_written: usize,
+        files_kept: usize,
+        bytes: u64,
+        messages: Vec<String>,
+    },
+    /// KolibriOS install: loader byte count, whether the loader was
+    /// kept (`true`) or written (`false`), and log lines (loader
+    /// discovery, then loader placement or skip, then the boot
+    /// record).
+    Kolibri {
+        bytes: u64,
+        kept: bool,
+        messages: Vec<String>,
+    },
     /// UEFI:NTFS install: shim image byte count, the ESP offset it
     /// landed at, and log lines (the reference `Writing UEFI:NTFS
     /// data...` line). Only the disk-only [`run`] path builds this —
@@ -222,6 +257,8 @@ impl Installed {
             Installed::Syslinux { messages, .. }
             | Installed::Grub2 { messages, .. }
             | Installed::Grub4dos { messages, .. }
+            | Installed::Freedos { messages, .. }
+            | Installed::Kolibri { messages, .. }
             | Installed::UefiNtfs { messages, .. } => messages,
         }
     }
@@ -239,6 +276,8 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
         Installed::Syslinux { messages, .. }
         | Installed::Grub2 { messages, .. }
         | Installed::Grub4dos { messages, .. }
+        | Installed::Freedos { messages, .. }
+        | Installed::Kolibri { messages, .. }
         | Installed::UefiNtfs { messages, .. } => {
             messages.splice(..0, probes);
         }
@@ -261,7 +300,9 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
 /// correct mode for a `Dd` plan, whose image boot code already landed
 /// verbatim. `Syslinux` runs the Syslinux branch; `Grub2` the GRUB2
 /// BIOS branch plus UEFI placement; `Grub4dos` the embedded MBR/SBR
-/// plus the root loader; `Auto` takes the first match of syslinux,
+/// plus the root loader; `Freedos` the FreeDOS payloads plus the
+/// locale files plus the boot record; `Kolibri` the image-tree loader
+/// plus the boot record; `Auto` takes the first match of syslinux,
 /// grub2, grub4dos. `UefiNtfs` refuses here as invalid rather than not
 /// implemented: the installer exists but is disk-only (no tree, no
 /// FAT32 volume — see [`install_uefi_ntfs`]), so [`run`] wires it
@@ -328,6 +369,8 @@ pub(crate) fn install_tree(
             install_grub2(source, fat, disk, &payloads, table, cancelled)
         }
         BootloaderMode::Grub4dos => install_grub4dos(fat, disk, table, cancelled, load),
+        BootloaderMode::Freedos => install_freedos(fat, cancelled),
+        BootloaderMode::Kolibri => install_kolibri(source, fat, cancelled),
         // Disk-only by design (see `install_uefi_ntfs`): the shim
         // lands on the whole disk at the ESP offset with no tree and
         // no FAT32 volume, so the tree core refuses it and `run`
@@ -575,6 +618,89 @@ fn install_grub4dos(
     })
 }
 
+/// FreeDOS branch: the embedded payloads, the locale files and the
+/// boot record, through [`freedos::install`](crate::boot::freedos::install).
+///
+/// Does not read the image tree: the write step already copied it, and
+/// the payloads are embedded (resources 300-326) plus the rendered
+/// locale pair — so `source` is unused here, unlike the KolibriOS arm
+/// whose loader comes from the image.
+///
+/// The locale is always [`Locale::us`](dos_locale::Locale::us()): the
+/// reference takes the Windows UI language (`GetKeyboardLayoutNameA`
+/// plus `GetOEMCP`), which this port has no equivalent for yet, so
+/// US/437 is the honest default; the [`Locale`](dos_locale::Locale)
+/// input exists precisely so a later UI can thread it through.
+fn install_freedos(fat: &mut Fat32, cancelled: &dyn Fn() -> bool) -> Result<Installed> {
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let locale = dos_locale::Locale::us();
+    let planned = dos_locale::plan(dos_locale::DosFlavor::FreeDos, &locale);
+    let installed = freedos::install(fat, &locale)?;
+    let mut messages: Vec<String> = Vec::new();
+    messages.extend(planned.messages().iter().cloned());
+    for name in installed.kept() {
+        messages.push(format!("  Kept existing '{name}'"));
+    }
+    let files_written = installed.written().len();
+    let files_kept = installed.kept().len();
+    let bytes = installed.bytes_written();
+    Ok(Installed::Freedos {
+        files_written,
+        files_kept,
+        bytes,
+        messages,
+    })
+}
+
+/// KolibriOS branch: the `MTLD_F32` loader from the image tree at the
+/// volume root, then the KolibriOS boot record.
+///
+/// Reads the image tree — the loader comes from the image — unlike the
+/// FreeDOS arm whose payloads are embedded. A tree without the exact
+/// `HD_Load/USB_Boot/MTLD_F32` path refuses naming it, with the device
+/// byte-identical: the copy step may already have placed the file, but
+/// without the image copy there is nothing honest to write. The record
+/// runs last, so a loader refusal leaves sector 0 untouched.
+fn install_kolibri(
+    source: &dyn TreeSource,
+    fat: &mut Fat32,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Installed> {
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let Some(located) = kolibri::locate(source)? else {
+        return Err(CoreError::invalid(
+            "no kolibri loader found in the image: looked for HD_Load/USB_Boot/MTLD_F32; refusing",
+        ));
+    };
+    let mut messages = vec![format!("found kolibri loader at '{}'", located.path())];
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let placed = kolibri::install_loader(fat, located.bytes())?;
+    if placed.kept() {
+        messages.push("kolibri loader already present at '/MTLD_F32', keeping it".to_string());
+    } else {
+        messages.push(format!(
+            "placed kolibri loader at '/MTLD_F32' ({} bytes)",
+            placed.bytes(),
+        ));
+    }
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    kolibri::install_boot_record(fat)?;
+    messages.push("installed kolibri boot record".to_string());
+    Ok(Installed::Kolibri {
+        bytes: placed.bytes(),
+        kept: placed.kept(),
+        messages,
+    })
+}
+
 /// UEFI:NTFS gates plus the ESP window: the filesystem gate mirrors
 /// the reference (`rufus.c:2032-2037`: NTFS or exFAT only, naming the
 /// plan filesystem otherwise); the table gate mirrors [`gap_end`] (no
@@ -654,6 +780,27 @@ fn install_uefi_ntfs(
 /// so both agree.
 fn uefi_ntfs_summary(bytes: u64, offset: u64) -> String {
     format!("wrote UEFI:NTFS image ({bytes} bytes at offset {offset})")
+}
+
+/// The FreeDOS completion line: files written and kept counts,
+/// bytes written and the record, shared by the tree-run summary match
+/// so both agree.
+fn freedos_summary(files_written: usize, files_kept: usize, bytes: u64) -> String {
+    format!(
+        "installed freedos ({files_written} files written, {files_kept} kept, {bytes} bytes, boot record written)"
+    )
+}
+
+/// The KolibriOS completion line: the loader byte count, its volume
+/// path and whether it was kept or written, plus the boot record,
+/// shared by the tree-run summary match so both agree.
+fn kolibri_summary(bytes: u64, kept: bool) -> String {
+    let loader = if kept {
+        "existing /MTLD_F32 kept"
+    } else {
+        "loader written"
+    };
+    format!("installed kolibri boot record ({bytes} loader bytes at '/MTLD_F32', {loader})")
 }
 
 /// Run the UEFI:NTFS arm: gate the plan and resolve the ESP window
@@ -859,6 +1006,23 @@ pub(crate) fn run(
             ctx.reporter.event(Event::Message {
                 level: "info",
                 text: format!("installed grub4dos boot record ({sbr_bytes} sbr bytes, {grldr})"),
+            });
+        }
+        Installed::Freedos {
+            files_written,
+            files_kept,
+            bytes,
+            ..
+        } => {
+            ctx.reporter.event(Event::Message {
+                level: "info",
+                text: freedos_summary(*files_written, *files_kept, *bytes),
+            });
+        }
+        Installed::Kolibri { bytes, kept, .. } => {
+            ctx.reporter.event(Event::Message {
+                level: "info",
+                text: kolibri_summary(*bytes, *kept),
             });
         }
         Installed::UefiNtfs { bytes, offset, .. } => {
@@ -1348,23 +1512,24 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_modes_name_themselves() {
-        // `Freedos` is the last mode without a wired installer: it
-        // refuses as not implemented, naming itself and the gap.
-        // (`UefiNtfs` used to refuse here too; its disk-only arm now
-        // lives in `run`, and the tree core refuses it as invalid —
-        // see the next test.)
-        let source = syslinux_604_tree();
-        let (_backing, mut fat) = formatted();
-        let error =
-            tree_install(&source, &mut fat, &BootloaderMode::Freedos).expect_err("freedos refuses");
-        assert!(
-            matches!(error, CoreError::NotImplemented { .. }),
-            "a mode refusal is NotImplemented: {error:?}"
-        );
-        let text = error.to_string();
-        assert!(text.contains("freedos"), "names the mode: {text}");
-        assert!(text.contains("later slice"), "names the gap: {text}");
+    fn every_mode_passes_the_shared_gate() {
+        // All modes are wired today: the shared table passes each one,
+        // so a future variant fails closed here until it is named.
+        // (`UefiNtfs` passes here too; its disk-only arm lives in
+        // `run`, and the tree core refuses it as invalid — see the
+        // next test.)
+        for mode in [
+            BootloaderMode::Auto,
+            BootloaderMode::Syslinux,
+            BootloaderMode::Grub2,
+            BootloaderMode::Grub4dos,
+            BootloaderMode::UefiNtfs,
+            BootloaderMode::Freedos,
+            BootloaderMode::Kolibri,
+            BootloaderMode::None,
+        ] {
+            check_mode(&mode).expect("a wired mode passes the gate");
+        }
     }
 
     #[test]
@@ -1385,6 +1550,242 @@ mod tests {
         assert!(text.contains("uefi-ntfs"), "names the mode: {text}");
         assert!(text.contains("whole disk"), "names the path: {text}");
         assert!(text.is_ascii(), "stays ASCII: {text}");
+    }
+
+    #[test]
+    fn freedos_installs_payloads_locale_and_record() {
+        // A fresh FAT32 image through the `Freedos` arm: the
+        // `COMMAND.COM`/`KERNEL.SYS` pair, the `LOCALE` directory with
+        // its 25 files, `AUTOEXEC.BAT` and the FreeDOS record. The
+        // source tree is bare on purpose: the arm never reads it (the
+        // write step already copied it), so a tree without any DOS
+        // files still installs.
+        use crate::boot::dos_locale::DosFlavor;
+        use crate::boot::dos_locale::Locale;
+        seed_exe_assets();
+        let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
+        let source = source.with_file(&[b"a.txt"], b"x");
+        let (backing, mut fat) = formatted();
+        let installed = tree_install(&source, &mut fat, &BootloaderMode::Freedos)
+            .expect("the freedos install runs");
+        let Installed::Freedos {
+            files_written,
+            files_kept,
+            bytes,
+            messages,
+        } = installed
+        else {
+            panic!("a freedos install reports the Freedos variant");
+        };
+        // The US locale plans no `CONFIG.SYS`: 27 payloads plus the
+        // echo-only `AUTOEXEC.BAT` write, nothing kept.
+        assert_eq!(files_written, 28, "27 payloads plus AUTOEXEC.BAT");
+        assert_eq!(files_kept, 0, "a fresh install keeps nothing");
+        assert!(bytes > 0, "bytes count the written files");
+        assert_eq!(
+            messages[0], "Will use DOS keyboard 'us' [US-English]",
+            "the locale keyboard line leads"
+        );
+        assert_eq!(
+            messages[1], "Will use codepage 437 [US-English]",
+            "the locale codepage line follows"
+        );
+        assert!(
+            messages.iter().all(|line| line.is_ascii()),
+            "every message stays ASCII"
+        );
+        let back = fat
+            .read_file("/COMMAND.COM")
+            .expect("COMMAND.COM reads back");
+        assert!(!back.is_empty(), "COMMAND.COM landed");
+        let back = fat.read_file("/KERNEL.SYS").expect("KERNEL.SYS reads back");
+        assert!(!back.is_empty(), "KERNEL.SYS landed");
+        let listed = fat.list_dir("/LOCALE").expect("the locale lists");
+        assert_eq!(listed.len(), 25, "LOCALE holds the 25 locale files");
+        let planned = crate::boot::dos_locale::plan(DosFlavor::FreeDos, &Locale::us());
+        let back = fat
+            .read_file("/AUTOEXEC.BAT")
+            .expect("AUTOEXEC.BAT reads back");
+        assert_eq!(
+            back,
+            planned.autoexec_bat(),
+            "AUTOEXEC.BAT equals the locale plan bytes"
+        );
+        let sector = backing.boot_sector();
+        assert_eq!(&sector[0..3], &[0xEB, 0x58, 0x90], "the payload jump lands");
+        assert_eq!(&sector[510..512], &[0x55, 0xAA], "the boot mark closes");
+        // The run summary names counts, bytes and the record.
+        let summary = freedos_summary(files_written, files_kept, bytes);
+        assert!(summary.contains("28"), "names the files: {summary}");
+        assert!(
+            summary.contains(&bytes.to_string()),
+            "names the bytes: {summary}"
+        );
+        assert!(
+            summary.contains("boot record"),
+            "names the record: {summary}"
+        );
+        assert!(summary.is_ascii(), "stays ASCII: {summary}");
+    }
+
+    /// Synthetic KolibriOS loader bytes (1 KiB of distinct bytes): a
+    /// stand-in with a realistic shape, not a KolibriOS payload.
+    fn kolibri_loader_bytes() -> Vec<u8> {
+        (0..1024)
+            .map(|index| ((index * 7 + 3) % 251) as u8)
+            .collect()
+    }
+
+    /// A source tree holding the exact `HD_Load/USB_Boot/MTLD_F32`
+    /// path with `loader` bytes.
+    fn kolibri_tree(loader: &[u8]) -> MemSource {
+        MemSource::new()
+            .with_dir(&[], vec![dir_entry(b"HD_Load")])
+            .with_dir(&[b"HD_Load"], vec![dir_entry(b"USB_Boot")])
+            .with_dir(
+                &[b"HD_Load", b"USB_Boot"],
+                vec![file_entry(b"MTLD_F32", loader)],
+            )
+            .with_file(&[b"HD_Load", b"USB_Boot", b"MTLD_F32"], loader)
+    }
+
+    #[test]
+    fn kolibri_installs_loader_and_record() {
+        // A synthetic tree carrying `/HD_Load/USB_Boot/MTLD_F32`: the
+        // arm places `/MTLD_F32` byte-identical and writes the Kolibri
+        // record, reporting discovery, placement and the record.
+        let loader = kolibri_loader_bytes();
+        let source = kolibri_tree(&loader);
+        let (backing, mut fat) = formatted();
+        let installed = tree_install(&source, &mut fat, &BootloaderMode::Kolibri)
+            .expect("the kolibri install runs");
+        let Installed::Kolibri {
+            bytes,
+            kept,
+            messages,
+        } = installed
+        else {
+            panic!("a kolibri install reports the Kolibri variant");
+        };
+        assert_eq!(bytes, loader.len() as u64, "the loader bytes count");
+        assert!(!kept, "a fresh write is not kept");
+        assert_eq!(
+            messages[0], "found kolibri loader at '/HD_Load/USB_Boot/MTLD_F32'",
+            "discovery first"
+        );
+        assert!(
+            messages[1].contains("placed kolibri loader at '/MTLD_F32'"),
+            "placement next: {messages:?}"
+        );
+        assert!(
+            messages[1].contains(&bytes.to_string()),
+            "placement names the bytes: {messages:?}"
+        );
+        assert_eq!(
+            messages[2], "installed kolibri boot record",
+            "the record last"
+        );
+        assert!(
+            messages.iter().all(|line| line.is_ascii()),
+            "every message stays ASCII"
+        );
+        let back = fat.read_file("/MTLD_F32").expect("the loader reads back");
+        assert_eq!(back, loader, "the loader is byte-identical");
+        let sector = backing.boot_sector();
+        assert_eq!(&sector[0..3], &[0xEB, 0x58, 0x90], "the payload jump lands");
+        assert_eq!(&sector[510..512], &[0x55, 0xAA], "the boot mark closes");
+        // The run summary names bytes, the path and the record.
+        let summary = kolibri_summary(bytes, kept);
+        assert!(
+            summary.contains(&bytes.to_string()),
+            "names the bytes: {summary}"
+        );
+        assert!(summary.contains("/MTLD_F32"), "names the path: {summary}");
+        assert!(
+            summary.contains("boot record"),
+            "names the record: {summary}"
+        );
+        assert!(summary.is_ascii(), "stays ASCII: {summary}");
+    }
+
+    #[test]
+    fn kolibri_keeps_an_identical_loader() {
+        // A second install over identical bytes keeps them: the copy
+        // step legitimately places the file first, so nothing writes —
+        // but the record still lands and the skip is reported.
+        let loader = kolibri_loader_bytes();
+        let source = kolibri_tree(&loader);
+        let (_backing, mut fat) = formatted();
+        let first = tree_install(&source, &mut fat, &BootloaderMode::Kolibri)
+            .expect("the first install runs");
+        assert!(
+            matches!(first, Installed::Kolibri { kept: false, .. }),
+            "a fresh write is not kept"
+        );
+        let again = tree_install(&source, &mut fat, &BootloaderMode::Kolibri)
+            .expect("identical bytes are kept");
+        let Installed::Kolibri {
+            bytes,
+            kept,
+            messages,
+        } = again
+        else {
+            panic!("a kept install reports the Kolibri variant");
+        };
+        assert!(kept, "the second install reports kept");
+        assert_eq!(
+            bytes,
+            loader.len() as u64,
+            "the kept report counts the bytes"
+        );
+        assert!(
+            messages.iter().any(|line| line.contains("keeping it")),
+            "the skip is reported: {messages:?}"
+        );
+        let back = fat
+            .read_file("/MTLD_F32")
+            .expect("the kept file reads back");
+        assert_eq!(back, loader, "kept bytes unchanged");
+    }
+
+    #[test]
+    fn kolibri_without_a_loader_refuses_leaving_everything_identical() {
+        // A tree without the loader path refuses naming it, with the
+        // volume and the disk byte-identical (the record runs last, so
+        // a loader refusal leaves sector 0 untouched).
+        let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
+        let source = source.with_file(&[b"a.txt"], b"x");
+        let (backing, mut fat) = formatted();
+        let before = backing.bytes.borrow().clone();
+        let mut target = VecTarget::new(512, 512).expect("one sector fits");
+        let disk_before = target.bytes().expect("the disk reads back");
+        let mut disk = DiskView::new(&mut target);
+        let error = install_tree(
+            &source,
+            &mut fat,
+            &mut disk,
+            &BootloaderMode::Kolibri,
+            None,
+            &|| false,
+            &asset_loader,
+        )
+        .expect_err("a loader-less kolibri refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("HD_Load/USB_Boot/MTLD_F32"),
+            "names the path: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(
+            backing.bytes.borrow().as_slice(),
+            before.as_slice(),
+            "no volume byte moved in 67108864 bytes of image"
+        );
+        assert_eq!(
+            target.bytes().expect("the disk reads back"),
+            disk_before,
+            "no disk byte moved"
+        );
     }
 
     /// 64 MiB whole-disk double for the UEFI:NTFS arm: big enough for
@@ -1742,25 +2143,31 @@ mod tests {
     }
 
     #[test]
-    fn run_unimplemented_mode_never_reaches_the_image() {
-        let partitions = Rc::new(Cell::new(0usize));
-        let opener = CountingOpener {
-            partitions: Rc::clone(&partitions),
-        };
-        let mut reporter = Recorder::default();
-        let mut ctx = run_context(&opener, &mut reporter);
-        let error = run(
-            &mut ctx,
-            &BootloaderMode::Freedos,
-            &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
-            &rufus_proto::Filesystem::Fat32,
-        )
-        .expect_err("freedos is not wired");
-        assert!(
-            matches!(error, CoreError::NotImplemented { .. }),
-            "a mode refusal is NotImplemented: {error:?}"
-        );
-        assert_eq!(partitions.get(), 0, "the partition never opens");
+    fn run_wired_modes_reach_the_image() {
+        // `Freedos` and `Kolibri` are wired: with a bogus image path
+        // the run gets past the shared gate to the image open (an I/O
+        // refusal naming the path), never `NotImplemented` — and the
+        // partition still never opens.
+        for mode in [BootloaderMode::Freedos, BootloaderMode::Kolibri] {
+            let partitions = Rc::new(Cell::new(0usize));
+            let opener = CountingOpener {
+                partitions: Rc::clone(&partitions),
+            };
+            let mut reporter = Recorder::default();
+            let mut ctx = run_context(&opener, &mut reporter);
+            let error = run(
+                &mut ctx,
+                &mode,
+                &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
+                &rufus_proto::Filesystem::Fat32,
+            )
+            .expect_err("a missing image refuses");
+            assert!(
+                !matches!(error, CoreError::NotImplemented { .. }),
+                "a wired mode is never NotImplemented: {error:?}"
+            );
+            assert_eq!(partitions.get(), 0, "the partition never opens");
+        }
     }
 
     #[test]
@@ -2930,7 +3337,17 @@ pub(crate) mod end_to_end {
             .expect("the exe has a dir")
             .join("../share/rufus-linux/assets");
         std::fs::create_dir_all(&dir).expect("the asset dir creates");
-        for name in ["RCDATA_402.bin", "RCDATA_403.bin", "RCDATA_502.bin"] {
+        let mut names: Vec<String> = vec![
+            "RCDATA_402.bin".to_string(),
+            "RCDATA_403.bin".to_string(),
+            "RCDATA_502.bin".to_string(),
+        ];
+        for id in 300..=326u32 {
+            // The FreeDOS arm loads resources 300-326 through the
+            // production path, so its tests seed them here too.
+            names.push(format!("RCDATA_{id}.bin"));
+        }
+        for name in &names {
             let bytes = std::fs::read(resources_dir().join(name)).expect("the pinned asset reads");
             let staged = dir.join(format!(
                 ".{name}.seed-{}-{}.tmp",

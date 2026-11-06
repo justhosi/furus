@@ -61,6 +61,8 @@ pub enum BootloaderOpt {
     UefiNtfs,
     /// FreeDOS.
     Freedos,
+    /// KolibriOS.
+    Kolibri,
     /// No bootloader (plain data media).
     None,
 }
@@ -75,6 +77,7 @@ impl BootloaderOpt {
             BootloaderOpt::Grub4dos => BootloaderMode::Grub4dos,
             BootloaderOpt::UefiNtfs => BootloaderMode::UefiNtfs,
             BootloaderOpt::Freedos => BootloaderMode::Freedos,
+            BootloaderOpt::Kolibri => BootloaderMode::Kolibri,
             BootloaderOpt::None => BootloaderMode::None,
         }
     }
@@ -112,7 +115,8 @@ pub struct Options {
     /// write mode, an explicit mode is emitted verbatim, and
     /// `uefi-ntfs` additionally selects the UEFI:NTFS layout and
     /// forces copy mode (refused without an NTFS or exFAT filesystem
-    /// in [`build`]).
+    /// in [`build`]; `freedos` and `kolibri` are refused without a
+    /// FAT32 filesystem there).
     pub bootloader: BootloaderOpt,
     /// Bad-block scan.
     pub bad_blocks: bool,
@@ -336,7 +340,10 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
 /// A `uefi-ntfs` bootloader without an NTFS or exFAT data filesystem
 /// is refused here, before any step is built: the shim boots an NTFS
 /// or exFAT partition the image tree populates, so any other
-/// filesystem is a usage error.
+/// filesystem is a usage error. A `freedos` or `kolibri` bootloader
+/// without a FAT32 data filesystem is refused the same way: both
+/// installers write a FAT32 volume, so any other filesystem is a
+/// usage error naming the mode and the filesystem.
 pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Result<Plan, Fail> {
     if options.bootloader == BootloaderOpt::UefiNtfs
         && options.filesystem != Filesystem::Ntfs
@@ -348,6 +355,20 @@ pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Resu
             message:
                 "UEFI:NTFS needs an NTFS or exFAT data partition; choose --filesystem ntfs or exfat"
                     .to_owned(),
+        });
+    }
+    if options.bootloader == BootloaderOpt::Freedos && options.filesystem != Filesystem::Fat32 {
+        return Err(Fail {
+            exit: crate::Exit::Usage,
+            kind: "usage",
+            message: "FreeDOS needs a FAT32 data partition; choose --filesystem fat32".to_owned(),
+        });
+    }
+    if options.bootloader == BootloaderOpt::Kolibri && options.filesystem != Filesystem::Fat32 {
+        return Err(Fail {
+            exit: crate::Exit::Usage,
+            kind: "usage",
+            message: "KolibriOS needs a FAT32 data partition; choose --filesystem fat32".to_owned(),
         });
     }
     let steps = steps(Path::new(&inspected.path), &inspected.kind, options);
@@ -533,6 +554,7 @@ mod tests {
             (BootloaderOpt::Grub2, BootloaderMode::Grub2),
             (BootloaderOpt::Grub4dos, BootloaderMode::Grub4dos),
             (BootloaderOpt::Freedos, BootloaderMode::Freedos),
+            (BootloaderOpt::Kolibri, BootloaderMode::Kolibri),
             (BootloaderOpt::None, BootloaderMode::None),
         ] {
             let mut options = test_options(false);
@@ -649,6 +671,118 @@ mod tests {
                 })
                 .expect("the plan carries an mkpart step");
             assert_eq!(layout, Layout::UefiNtfs);
+        }
+    }
+
+    #[test]
+    fn build_refuses_freedos_without_fat32() {
+        // The FreeDOS installer writes a FAT32 volume: any other
+        // filesystem is a usage refusal with the exact message, before
+        // any hash is sealed, so a plan cannot be built that is
+        // guaranteed to stop at the last step.
+        let device = DeviceRef {
+            path: "/dev/null".to_string(),
+            block_device: false,
+            size_bytes: None,
+            serial: None,
+            model: None,
+            sysfs: None,
+        };
+        let mut options = test_options(false);
+        options.bootloader = BootloaderOpt::Freedos;
+        for (filesystem, accepted) in [
+            (Filesystem::Fat32, true),
+            (Filesystem::Exfat, false),
+            (Filesystem::Ntfs, false),
+            (Filesystem::Ext4, false),
+        ] {
+            let inspected = crate::image::Inspected {
+                path: "image.iso".to_string(),
+                size_bytes: 32_780,
+                sha256: "0".repeat(64),
+                kind: ImageKind::Iso,
+            };
+            options.filesystem = filesystem.clone();
+            if accepted {
+                let plan = match build(device.clone(), inspected, &options) {
+                    Ok(plan) => plan,
+                    Err(fail) => panic!("{filesystem:?} seals: {}", fail.message),
+                };
+                let mode = plan
+                    .steps
+                    .iter()
+                    .find_map(|step| match step {
+                        Step::Bootloader { mode } => Some(mode.clone()),
+                        _ => None,
+                    })
+                    .expect("the plan carries a bootloader step");
+                assert_eq!(mode, BootloaderMode::Freedos);
+            } else {
+                let refused =
+                    build(device.clone(), inspected, &options).expect_err("non-fat32 refuses");
+                assert_eq!(
+                    refused.message,
+                    "FreeDOS needs a FAT32 data partition; choose --filesystem fat32",
+                    "the refusal carries the exact message"
+                );
+                assert!(refused.message.is_ascii(), "the refusal stays ASCII");
+            }
+        }
+    }
+
+    #[test]
+    fn build_refuses_kolibri_without_fat32() {
+        // The KolibriOS installer writes a FAT32 volume: any other
+        // filesystem is a usage refusal with the exact message, before
+        // any hash is sealed, so a plan cannot be built that is
+        // guaranteed to stop at the last step.
+        let device = DeviceRef {
+            path: "/dev/null".to_string(),
+            block_device: false,
+            size_bytes: None,
+            serial: None,
+            model: None,
+            sysfs: None,
+        };
+        let mut options = test_options(false);
+        options.bootloader = BootloaderOpt::Kolibri;
+        for (filesystem, accepted) in [
+            (Filesystem::Fat32, true),
+            (Filesystem::Exfat, false),
+            (Filesystem::Ntfs, false),
+            (Filesystem::Ext4, false),
+        ] {
+            let inspected = crate::image::Inspected {
+                path: "image.iso".to_string(),
+                size_bytes: 32_780,
+                sha256: "0".repeat(64),
+                kind: ImageKind::Iso,
+            };
+            options.filesystem = filesystem.clone();
+            if accepted {
+                let plan = match build(device.clone(), inspected, &options) {
+                    Ok(plan) => plan,
+                    Err(fail) => panic!("{filesystem:?} seals: {}", fail.message),
+                };
+                let mode = plan
+                    .steps
+                    .iter()
+                    .find_map(|step| match step {
+                        Step::Bootloader { mode } => Some(mode.clone()),
+                        _ => None,
+                    })
+                    .expect("the plan carries a bootloader step");
+                assert_eq!(mode, BootloaderMode::Kolibri);
+            } else {
+                let refused =
+                    build(device.clone(), inspected, &options).expect_err("non-fat32 refuses");
+                assert_eq!(
+                    refused.message,
+                    "KolibriOS needs a FAT32 data partition; choose --filesystem fat32",
+                    "the refusal carries the exact message"
+                );
+                assert!(refused.message.is_ascii(), "the refusal stays ASCII");
+            }
         }
     }
 }
