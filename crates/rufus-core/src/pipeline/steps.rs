@@ -44,9 +44,11 @@ pub(crate) struct RunContext<'a> {
     /// The table [`Mklabel`](rufus_proto::Step::Mklabel) recorded, if
     /// any.
     pub(crate) table: Option<TableKind>,
-    /// True once [`Mkpart`](rufus_proto::Step::Mkpart) stamped a table:
-    /// [`Mkfs`](rufus_proto::Step::Mkfs) refuses without it.
-    pub(crate) partitioned: bool,
+    /// Set once [`Mkpart`](rufus_proto::Step::Mkpart) stamped a table:
+    /// the table and layout it stamped. [`Mkfs`](rufus_proto::Step::Mkfs)
+    /// refuses while it is `None`, and reads the data window back from
+    /// the same pair so the formatted partition is the one stamped.
+    pub(crate) partitioned: Option<(TableKind, LayoutKind)>,
     /// The run's logger, kept for the whole run (path-based formatters
     /// borrow it; see [`mirror_log`]).
     pub(crate) logger: Arc<Logger>,

@@ -14,10 +14,15 @@
 //!
 //! The first sector of asset `RCDATA_450.bin` is byte-identical to
 //! `mbr_grub_0x0` for `0..423`, carries zeros in `423..510` and
-//! `55 AA` at 510; asset bytes `512..8192` are the SBR. Resource 451
-//! (`RCDATA_451.bin`, manifest name `grldr`) is the loader Rufus
-//! copies to the volume root (`?:\\grldr`, `src/format.c:1464,
-//! 1940-1945`; log `Installing: %s (Grub4DOS loader) %s`).
+//! `55 AA` at 510; asset bytes `512..8192` are the SBR.
+//!
+//! The loader is not bundled. Upstream Rufus downloads
+//! `grub4dos-0.4.6a/grldr` and copies it to the volume root
+//! (`?:\\grldr`, `src/format.c:1464, 1940-1945`; log `Installing: %s
+//! (Grub4DOS loader) %s`). Resource 451 (`RCDATA_451.bin`) is GRUB2's
+//! embedded `core.img`, not a GRUB4DOS loader, so it is never written
+//! as `/grldr`. This module therefore takes the loader bytes from its
+//! caller and never reads a loader from the assets.
 //!
 //! Upstream Rufus never writes `menu.lst` (a grep of `src/` finds no
 //! `menu.lst` anywhere), so this installer deliberately writes none
@@ -25,14 +30,11 @@
 //!
 //! [`install_boot`] needs a 512-byte-sector disk and writes the MBR
 //! window plus the SBR; [`install_loader`] needs a FAT32 volume and
-//! writes `/grldr`; [`install`] loads both payloads from the runtime
-//! asset directory and delegates. `install_boot` itself only checks
+//! writes the caller's `grldr` bytes to `/grldr`. `install_boot` itself only checks
 //! the SBR against the disk end — the pipeline bounds it against the
 //! Mkpart-planned post-MBR gap before calling, so a record can never
 //! reach into the first partition.
 
-use crate::boot::Resource;
-use crate::boot::load;
 use crate::error::CoreError;
 use crate::error::Result;
 use crate::fs::Volume;
@@ -169,7 +171,7 @@ impl LoaderInstalled {
 }
 
 /// Install the GRUB4DOS loader onto `fat` from explicit `grldr` bytes
-/// (resource 451).
+/// (the caller's real `grldr`, downloaded by Rufus; never resource 451).
 ///
 /// Refuses an empty image, refuses an existing root `GRLDR` (the root
 /// listing compared on the dot-joined short name, like
@@ -198,52 +200,10 @@ pub fn install_loader(fat: &mut Fat32, grldr: &[u8]) -> Result<LoaderInstalled> 
     Ok(LoaderInstalled { bytes: grldr.len() })
 }
 
-/// What [`install`] wrote: the boot record and the loader reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Installed {
-    boot: BootInstalled,
-    loader: LoaderInstalled,
-}
-
-impl Installed {
-    /// The boot-record report from [`install_boot`].
-    #[must_use]
-    pub fn boot(&self) -> BootInstalled {
-        self.boot
-    }
-
-    /// The loader report from [`install_loader`].
-    #[must_use]
-    pub fn loader(&self) -> LoaderInstalled {
-        self.loader
-    }
-}
-
-/// Install GRUB4DOS onto `disk` (MBR window plus SBR) and `fat` (the
-/// root loader).
-///
-/// Loads resource 450 (`grldr.mbr`) and 451 (`grldr`) through
-/// [`load`] — which needs the runtime asset directory — and delegates
-/// to [`install_loader`] and [`install_boot`], which carry the
-/// ordering contracts. The loader lands first for exactly the torn
-/// rule [`install_boot`] states: a failure leaves at most an inert
-/// `/grldr`, never boot code without its payload. That is the reverse
-/// of Rufus's call order, the same way [`install_boot`]'s own
-/// sector-last order already reverses Rufus's MBR-first writes.
-/// Tests use those two directly with bytes from
-/// [`load_from`](crate::boot::load_from) instead (the same seam slice
-/// 3's installer tests use).
-pub fn install(disk: &mut dyn Volume, fat: &mut Fat32) -> Result<Installed> {
-    let mbr = load(Resource::Grub4DosMbr)?;
-    let grldr = load(Resource::Grub4DosCore)?;
-    let loader = install_loader(fat, grldr.bytes())?;
-    let boot = install_boot(disk, mbr.bytes())?;
-    Ok(Installed { boot, loader })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boot::Resource;
     use crate::boot::load_from;
     use crate::fs::VecVolume;
     use crate::fs::fat32::format::FormatOptions;
@@ -412,13 +372,21 @@ mod tests {
         (backing, fat)
     }
 
+    /// Stand-in `grldr` bytes for the loader tests: no real GRUB4DOS
+    /// loader is bundled, so the tests use a patterned blob of a
+    /// fixed length and check only the file plumbing.
+    fn stand_in_grldr() -> Vec<u8> {
+        (0..4096)
+            .map(|index| ((index * 3 + 1) % 251) as u8)
+            .collect()
+    }
+
     #[test]
     fn install_loader_round_trips_and_refuses_a_second_write() {
         let (backing, mut fat) = formatted();
-        let grldr = payload_bytes(Resource::Grub4DosCore);
-        assert_eq!(grldr.len(), 42742, "resource 451 keeps its 42742 bytes");
+        let grldr = stand_in_grldr();
         let done = install_loader(&mut fat, &grldr).expect("the first write lands");
-        assert_eq!(done.bytes(), 42742, "the report counts 42742 bytes");
+        assert_eq!(done.bytes(), 4096, "the report counts the caller's bytes");
         let back = fat.read_file("/grldr").expect("the loader reads back");
         assert_eq!(back, grldr, "the loader is byte-identical");
         let listed = fat.list_dir("/").expect("the root lists");

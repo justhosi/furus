@@ -93,6 +93,10 @@ pub struct BootSectorInput<'a> {
     /// refused: it is the blank marker of unformatted media, and two
     /// freshly formatted sticks must stay distinguishable.
     pub volume_id: u32,
+    /// The partition's first sector, in units of the volume's sector
+    /// size; `0` for a superfloppy (a volume with no partition table).
+    /// The BPB's hidden-sectors field carries it verbatim.
+    pub hidden_sectors: u32,
     /// Optional volume label; the field carries [`NO_NAME_LABEL`]
     /// when absent.
     pub label: Option<&'a str>,
@@ -161,8 +165,11 @@ pub(crate) fn label_field(label: Option<&str>) -> Result<[u8; 11]> {
 /// * `root entries` (17), `total sectors 16` (19) and `FAT size 16`
 ///   (22) are FAT12/16-era fields: zero on FAT32, the authoritative
 ///   32-bit versions live at 32 and 36;
-/// * `hidden sectors` (28) is 0: this formatter addresses whole
-///   targets; a partition offset is the table writers' (S08) business;
+/// * `hidden sectors` (28) is the partition's first sector in units
+///   of the volume's sector size, as the caller supplies it. The
+///   DOS-family boot loaders (FreeDOS, GRUB4DOS) derive their own read
+///   base from this field, so a partitioned volume must carry its
+///   start LBA here; a superfloppy writes 0;
 /// * `ext flags` (40) is 0 — both FATs are equally rootable and no
 ///   mirroring is forced; `fs version` (42) is 0 (FAT32 revision 1.0);
 /// * the drive number (64) is `0x80`, byte 65 is the NT-flag
@@ -203,7 +210,7 @@ pub fn boot_sector(input: &BootSectorInput<'_>) -> Result<[u8; 512]> {
     put_u16(&mut sector, 22, 0)?; // FAT size 16: dead on FAT32
     put_u16(&mut sector, 24, SECTORS_PER_TRACK)?;
     put_u16(&mut sector, 26, HEADS)?;
-    put_u32(&mut sector, 28, 0)?; // hidden sectors
+    put_u32(&mut sector, 28, input.hidden_sectors)?; // hidden sectors
     put_u32(&mut sector, 32, geometry.total_sectors)?;
     put_u32(&mut sector, 36, geometry.fat_sectors)?;
     put_u16(&mut sector, 40, 0)?; // ext flags: no forced FAT mirroring
@@ -518,11 +525,13 @@ mod tests {
     }
 
     /// A boot input both test modules start from: the sample geometry,
-    /// serial `0x1A2B_3C4D`, label `Rufus`, Rufus's own OEM name.
+    /// serial `0x1A2B_3C4D`, a partition at LBA 2048 (the 1 MiB grid of
+    /// a 512-byte-sector disk), label `Rufus`, Rufus's own OEM name.
     fn sample_input() -> BootSectorInput<'static> {
         BootSectorInput {
             geometry: sample_geometry(),
             volume_id: 0x1A2B_3C4D,
+            hidden_sectors: 2048,
             label: Some("Rufus"),
             oem: DEFAULT_OEM,
         }
@@ -544,7 +553,9 @@ mod tests {
         ("fat size 16", 22, &[0, 0]),
         ("sectors per track", 24, &[63, 0x00]),
         ("heads", 26, &[255, 0x00]),
-        ("hidden", 28, &[0, 0, 0, 0]),
+        // 2048 LE: the sample sits at the partition's LBA 2048 (the
+        // field was pinned at 0 before partitions carried their start)
+        ("hidden", 28, &[0x00, 0x08, 0x00, 0x00]),
         ("total 32", 32, &[0x00, 0x00, 0x02, 0x00]), // 131,072 LE
         ("fat size 32", 36, &[0xF1, 0x03, 0x00, 0x00]), // 1,009 LE
         ("ext flags", 40, &[0, 0]),
@@ -657,6 +668,20 @@ mod tests {
     }
 
     #[test]
+    fn hidden_sectors_round_trip_through_the_bpb() {
+        // the partition start rides at 0x1C verbatim, zero for a
+        // superfloppy, and the full u32 range is representable
+        for hidden in [0_u32, 2048, 0x0123_4567, u32::MAX] {
+            let mut input = sample_input();
+            input.hidden_sectors = hidden;
+            let boot = boot_sector(&input).expect("builds");
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&boot[28..32]);
+            assert_eq!(u32::from_le_bytes(bytes), hidden, "hidden {hidden}");
+        }
+    }
+
+    #[test]
     fn boot_sector_depends_on_the_geometry_only_in_its_bpb() {
         // the same 32 GiB volume class once at 512 and once at 4096
         // byte sectors: the boot sector is byte-identical outside its
@@ -668,6 +693,7 @@ mod tests {
             boot_sector(&BootSectorInput {
                 geometry,
                 volume_id: 0x1234,
+                hidden_sectors: 0,
                 label: None,
                 oem: DEFAULT_OEM,
             })
@@ -753,6 +779,7 @@ mod tests {
             let boot = boot_sector(&BootSectorInput {
                 geometry: &want,
                 volume_id: 0x1A2B_3C4D,
+                hidden_sectors: 0,
                 label: Some("RUFUS"),
                 oem: DEFAULT_OEM,
             })
@@ -771,6 +798,7 @@ mod tests {
         let boot = boot_sector(&BootSectorInput {
             geometry: &want,
             volume_id: 0x1A2B_3C4D,
+            hidden_sectors: 0,
             label: Some("RUFUS"),
             oem: DEFAULT_OEM,
         })

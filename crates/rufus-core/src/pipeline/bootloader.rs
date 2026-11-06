@@ -34,16 +34,21 @@
 //! Write order keeps slice 3's "boot code last" invariant per arm:
 //! syslinux lays companions, config, then the boot record; grub2
 //! places the UEFI file, then the core image, then the MBR sector;
-//! grub4dos writes the root loader, then the SBR, then the MBR sector.
+//! grub4dos checks the root loader first (writing nothing), then
+//! writes the SBR, then the MBR sector.
 //! A refused step leaves no boot code behind. The BIOS payloads never
 //! reach past the post-MBR gap: each arm bounds its core/SBR end
 //! through the same helper Mkpart stamps with, before any write.
 //!
 //! Payload provenance is honest per arm: GRUB2 ships no embedded
 //! fallback — `boot.img`, `core.img` and the UEFI image come only
-//! from the image tree — while GRUB4DOS carries its record and loader
-//! as embedded resources 450/451. FreeDOS carries its 27 payloads as
-//! embedded resources 300-326 (the locale `CONFIG.SYS`/`AUTOEXEC.BAT`
+//! from the image tree — while GRUB4DOS carries only its MBR/SBR record
+//! (resource 450). Its root `grldr` is never embedded: Rufus downloads
+//! the real GRUB4DOS loader, so the arm refuses unless the volume
+//! already carries one (from the image tree or the caller). Resource
+//! 451 is GRUB2's `core.img`, not a loader. FreeDOS carries its 27
+//! payloads as embedded resources 300-326 (the locale
+//! `CONFIG.SYS`/`AUTOEXEC.BAT`
 //! pair is rendered, not embedded); KolibriOS carries only its boot
 //! record as a transcription — the `MTLD_F32` loader comes from the
 //! image tree; MS-DOS carries nothing at all — `IO.SYS`,
@@ -221,12 +226,11 @@ pub(crate) enum Installed {
         uefi_placed: Option<String>,
         messages: Vec<String>,
     },
-    /// GRUB4DOS install: SBR byte count, whether the embedded loader
-    /// was written (`true`) or an existing root loader was kept
-    /// (`false`), and log lines.
+    /// GRUB4DOS install: SBR byte count and log lines. The root
+    /// `grldr` is always one already on the volume (the arm refuses
+    /// without it), so it is kept, never written.
     Grub4dos {
         sbr_bytes: u64,
-        embedded_grldr: bool,
         messages: Vec<String>,
     },
     /// FreeDOS install: files written and kept counts, bytes written,
@@ -609,12 +613,16 @@ fn install_grub2(
     })
 }
 
-/// GRUB4DOS branch: the root loader first, then the MBR+SBR (loader
-/// before boot code, the `install_boot` torn rule). The loader bytes
-/// are embedded (resource 451) unless the volume already carries a
-/// root loader — however it got there, including the copy step
-/// placing the image's own `/grldr` — in which case the existing file
-/// is kept, since the loader refuses to overwrite.
+/// GRUB4DOS branch: the MBR+SBR over a root loader the volume already
+/// carries.
+///
+/// Rufus does not bundle `grldr`: upstream downloads
+/// `grub4dos-0.4.6a/grldr`, and resource 451 is GRUB2's `core.img`. So
+/// the loader must reach the volume first, through the image tree (the
+/// copy step) or the caller. The arm refuses, before any write, while
+/// no root `/grldr` is present. Otherwise it keeps that file (the
+/// loader refuses to overwrite) and writes the MBR+SBR after it (the
+/// `install_boot` torn rule).
 fn install_grub4dos(
     fat: &mut Fat32,
     disk: &mut dyn Volume,
@@ -624,6 +632,15 @@ fn install_grub4dos(
 ) -> Result<Installed> {
     if cancelled() {
         return Err(CoreError::Cancelled);
+    }
+    let present = fat
+        .list_dir("/")?
+        .iter()
+        .any(|entry| entry.short_name == "GRLDR");
+    if !present {
+        return Err(CoreError::invalid(
+            "grub4dos needs a real grldr at the volume root: none is on the volume, and Rufus downloads it (grub4dos-0.4.6a/grldr) rather than bundling it: refusing",
+        ));
     }
     let mbr = load(Resource::Grub4DosMbr)?;
     // The SBR must end inside the post-MBR gap like the GRUB2 core:
@@ -641,21 +658,7 @@ fn install_grub4dos(
             grub4dos::SBR_OFFSET,
         )));
     }
-    let embedded = !fat
-        .list_dir("/")?
-        .iter()
-        .any(|entry| entry.short_name == "GRLDR");
-    let mut messages: Vec<String> = Vec::new();
-    if embedded {
-        let grldr = load(Resource::Grub4DosCore)?;
-        grub4dos::install_loader(fat, grldr.bytes())?;
-        messages.push(format!(
-            "writing embedded grldr ({} bytes)",
-            grldr.bytes().len(),
-        ));
-    } else {
-        messages.push("root /grldr already present, keeping it".to_string());
-    }
+    let mut messages: Vec<String> = vec!["root /grldr already present, keeping it".to_string()];
     if cancelled() {
         return Err(CoreError::Cancelled);
     }
@@ -667,7 +670,6 @@ fn install_grub4dos(
     ));
     Ok(Installed::Grub4dos {
         sbr_bytes,
-        embedded_grldr: embedded,
         messages,
     })
 }
@@ -1190,19 +1192,12 @@ pub(crate) fn run(
                 });
             }
         }
-        Installed::Grub4dos {
-            sbr_bytes,
-            embedded_grldr,
-            ..
-        } => {
-            let grldr = if *embedded_grldr {
-                "embedded grldr written"
-            } else {
-                "existing /grldr kept"
-            };
+        Installed::Grub4dos { sbr_bytes, .. } => {
             ctx.reporter.event(Event::Message {
                 level: "info",
-                text: format!("installed grub4dos boot record ({sbr_bytes} sbr bytes, {grldr})"),
+                text: format!(
+                    "installed grub4dos boot record ({sbr_bytes} sbr bytes, existing /grldr kept)"
+                ),
             });
         }
         Installed::Freedos {
@@ -2826,7 +2821,7 @@ mod tests {
             opener,
             target: None,
             table,
-            partitioned: false,
+            partitioned: None,
             logger: crate::log::Logger::new(crate::log::Level::Info),
             reporter,
             cancelled: &|| false,
@@ -3356,13 +3351,11 @@ mod tests {
         .expect("the install runs");
         let Installed::Grub4dos {
             sbr_bytes,
-            embedded_grldr,
             messages,
         } = installed
         else {
             panic!("a grub4dos install reports the Grub4dos variant");
         };
-        assert!(!embedded_grldr, "the existing loader wins");
         assert!(
             messages.iter().any(|line| line.contains("keeping it")),
             "the skip is reported: {messages:?}"
@@ -3385,12 +3378,16 @@ mod tests {
     }
 
     #[test]
-    fn grub4dos_writes_the_embedded_grldr() {
+    fn grub4dos_refuses_without_a_root_grldr() {
+        // No root `/grldr` (neither the image tree nor a caller placed
+        // one): the arm refuses before any write. It names the file
+        // Rufus downloads, leaves the root empty and the disk byte for
+        // byte unchanged, so no boot code lands without its loader.
         let (source, _boot, _core) = grub_tree(false);
-        let (backing, mut fat) = formatted();
-        let (mut target, _before) = prefilled_disk();
+        let (_backing, mut fat) = formatted();
+        let (mut target, before) = prefilled_disk();
         let mut disk = DiskView::new(&mut target);
-        let installed = install_tree(
+        let error = install_tree(
             &source,
             &mut fat,
             &mut disk,
@@ -3400,41 +3397,22 @@ mod tests {
             &|| false,
             &asset_loader,
         )
-        .expect("the install runs");
-        let Installed::Grub4dos { embedded_grldr, .. } = installed else {
-            panic!("a grub4dos install reports the Grub4dos variant");
-        };
-        assert!(embedded_grldr, "the embedded loader lands");
-        let expected = asset_loader(Resource::Grub4DosCore)
-            .expect("the loader loads")
-            .bytes()
-            .to_vec();
-        let back = fat.read_file("/grldr").expect("the loader reads");
-        assert_eq!(back, expected, "resource 451 lands byte-identical");
-        let listed = fat.list_dir("/").expect("the root lists");
+        .expect_err("a grub4dos install without a loader refuses");
+        let text = error.to_string();
+        assert!(text.contains("real grldr"), "names the need: {text}");
         assert!(
-            listed.iter().any(|entry| entry.short_name == "GRLDR"),
-            "the root lists GRLDR"
+            text.contains("grub4dos-0.4.6a/grldr"),
+            "names the download: {text}"
         );
-        fat.flush().expect("the partition flushes");
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let image = scratch.path().join("grub4dos.img");
-        std::fs::write(&image, backing.bytes.borrow().as_slice()).expect("the image dumps");
-        let output = match std::process::Command::new("fsck.fat")
-            .arg("-n")
-            .arg(&image)
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
-                return;
-            }
-        };
-        assert!(
-            output.status.success(),
-            "fsck.fat -n exits 0 after the grub4dos install ({})",
-            output.status
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        let listed = fat.list_dir("/").expect("the root lists");
+        assert!(listed.is_empty(), "no loader lands at the root: {listed:?}");
+        let mut after = vec![0u8; before.len()];
+        disk.read_exact_at(0, &mut after)
+            .expect("the disk reads back");
+        assert_eq!(
+            after, before,
+            "no byte moves: the arm refuses before writing"
         );
     }
 
@@ -3689,10 +3667,28 @@ pub(crate) mod end_to_end {
     /// 128 MiB stick image for the run.
     const DISK_BYTES: u64 = 128 * 1024 * 1024;
 
+    /// Stand-in GRUB4DOS `grldr` bytes for the fixtures. No real loader
+    /// is bundled (resource 451 is GRUB2's `core.img`), so the tests
+    /// carry a patterned blob and check only the file plumbing.
+    fn stand_in_grldr() -> Vec<u8> {
+        (0..4096)
+            .map(|index| ((index * 3 + 1) % 251) as u8)
+            .collect()
+    }
+
     /// Build the fixture ISO: primary + boot + terminator descriptors,
     /// a root holding `ISOLINUX/`, and six payload files under it, from
     /// the shared `copy::fixture` sector builders.
     fn syslinux_iso() -> Vec<u8> {
+        syslinux_iso_with(None)
+    }
+
+    /// The Syslinux 6.04 fixture, optionally carrying a root `grldr`
+    /// file (the image's own GRUB4DOS loader, which the GRUB4DOS arm
+    /// needs on the volume). The loader starts at sector 32, past the
+    /// 32-sector base image, and the descriptor's volume size follows
+    /// the real image length.
+    fn syslinux_iso_with(grldr: Option<&[u8]>) -> Vec<u8> {
         use crate::copy::source::fixture::*;
         const ROOT: u32 = 20;
         const DIR: u32 = 21;
@@ -3702,6 +3698,9 @@ pub(crate) mod end_to_end {
         const MENU: u32 = 25;
         const VESA: u32 = 26;
         const LIB: u32 = 27;
+        const LOADER: u32 = 32;
+        let loader_sectors = grldr.map_or(0, |bytes| bytes.len().div_ceil(SECTOR_BYTES));
+        let total_sectors = 32 + loader_sectors;
         let banner = b"ISOLINUX 6.04 20140611 test-image".to_vec();
         // Lowercase identifiers throughout: like the directory
         // above, the reader resolves file opens exactly, so only
@@ -3714,15 +3713,19 @@ pub(crate) mod end_to_end {
             (b"vesamenu.c32;1", VESA, b"vesamenu-stub".to_vec()),
             (b"libutil.c32;1", LIB, b"libutil-stub".to_vec()),
         ];
-        let mut image = vec![0u8; 32 * SECTOR_BYTES];
+        let mut image = vec![0u8; total_sectors * SECTOR_BYTES];
         let mut put = |sector: u32, bytes: &[u8]| {
             let base = sector as usize * SECTOR_BYTES;
             image[base..base + bytes.len()].copy_from_slice(bytes);
         };
-        put(16, &primary_sector("TESTVOL", ROOT, SECTOR_BYTES as u32));
+        let mut primary = primary_sector("TESTVOL", ROOT, SECTOR_BYTES as u32);
+        let total = total_sectors as u32;
+        primary[80..84].copy_from_slice(&total.to_le_bytes());
+        primary[84..88].copy_from_slice(&total.to_be_bytes());
+        put(16, &primary);
         put(17, &boot_sector());
         put(18, &terminator_sector());
-        let root = vec![
+        let mut root = vec![
             encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
             encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
             // Lowercase on purpose: the engine resolves payload
@@ -3730,6 +3733,10 @@ pub(crate) mod end_to_end {
             // case), so an upper-case directory is never located.
             encode_record(DIR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"isolinux"),
         ];
+        if let Some(bytes) = grldr {
+            root.push(encode_record(LOADER, bytes.len() as u32, 0, b"grldr;1"));
+            put(LOADER, bytes);
+        }
         let mut dir = vec![
             encode_record(DIR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
             encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
@@ -4223,12 +4230,15 @@ pub(crate) mod end_to_end {
             .join("../share/rufus-linux/assets");
         std::fs::create_dir_all(&dir).expect("the asset dir creates");
         let mut names: Vec<String> = vec![
+            // The Syslinux arm loads 400/401 for a 4.07 image and
+            // 402/403 for a 6.04 one, chosen from the image banner.
+            "RCDATA_400.bin".to_string(),
+            "RCDATA_401.bin".to_string(),
             "RCDATA_402.bin".to_string(),
             "RCDATA_403.bin".to_string(),
-            // The GRUB4DOS arm loads resources 450/451 through the
-            // production path, so its tests seed them here too.
+            // The GRUB4DOS arm loads resource 450 through the
+            // production path, so its tests seed it here too.
             "RCDATA_450.bin".to_string(),
-            "RCDATA_451.bin".to_string(),
             "RCDATA_502.bin".to_string(),
         ];
         for id in 300..=326u32 {
@@ -4870,6 +4880,7 @@ pub(crate) mod end_to_end {
         // Kolibri images carry their payloads, and the MS-DOS image is
         // patterned garbage proving no tree is ever opened.
         let syslinux = syslinux_iso();
+        let grub4dos = syslinux_iso_with(Some(&stand_in_grldr()));
         let (grub2_image, grub2_boot, grub2_core) = grub2_iso();
         let (kolibri_image, kolibri_loader) = kolibri_iso();
         let garbage: Vec<u8> = (0..4096)
@@ -4879,6 +4890,11 @@ pub(crate) mod end_to_end {
             Mode::Grub2 => (&grub2_image, 32 * SECTOR_BYTES as u64),
             Mode::Kolibri => (&kolibri_image, 32 * SECTOR_BYTES as u64),
             Mode::MsDos => (&garbage, garbage.len() as u64),
+            // The GRUB4DOS arm refuses without a root loader on the
+            // volume. The acceptance plan has no copy step, so the
+            // stand-in loader is staged onto the volume directly (see
+            // the two-phase branch below); the image only names it.
+            Mode::Grub4dos => (&grub4dos, grub4dos.len() as u64),
             _ => (&syslinux, 32 * SECTOR_BYTES as u64),
         };
         let iso_path = scratch.path().join("acceptance.iso");
@@ -4953,7 +4969,33 @@ pub(crate) mod end_to_end {
             let view = PartFile::open(&disk_path, base, len).expect("the view reopens");
             Fat32::open(Box::new(view)).expect("the volume opens")
         };
-        if uefi || mode == Mode::None {
+        // The GRUB4DOS fingerprint: the staged root loader is kept
+        // byte-identical and the MBR+SBR land over it. Both paths
+        // below reach it (the two-phase one returns early).
+        let grub4dos_fingerprint = || {
+            let expected = stand_in_grldr();
+            let mut fat = open_volume();
+            let back = fat.read_file("/GRLDR").expect("the loader reads back");
+            assert_eq!(back, expected, "the staged loader is kept byte-identical");
+            let mbr = load_from(&resources_dir(), Resource::Grub4DosMbr)
+                .expect("the mbr loads")
+                .bytes()
+                .to_vec();
+            let disk = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&disk_path)
+                .expect("the disk reopens");
+            let mut sector = [0u8; 512];
+            disk.read_exact_at(&mut sector, 0).expect("sector 0 reads");
+            assert_eq!(&sector[..423], &mbr[..423], "the mbr window lands");
+            assert_eq!(&sector[510..512], &[0x55, 0xAA], "the boot mark closes");
+            let sbr = &mbr[512..];
+            let mut sbr_back = vec![0u8; sbr.len()];
+            disk.read_exact_at(&mut sbr_back, 512)
+                .expect("the sbr reads");
+            assert_eq!(sbr_back, sbr, "the sbr lands whole at sector 1");
+        };
+        if uefi || mode == Mode::None || mode == Mode::Grub4dos {
             // Two phases: format first, snapshot the window, then the
             // bootloader step alone. A single plan could not isolate
             // the arm's own writes from the formatter's.
@@ -4968,6 +5010,14 @@ pub(crate) mod end_to_end {
                 &|| false,
             )
             .expect("wipe through mkfs runs");
+            if mode == Mode::Grub4dos {
+                // The copy step would place the image's root loader
+                // here; the plan has none, so stage the stand-in with
+                // the same byte-taking core the arm's loader uses.
+                let mut fat = open_volume();
+                crate::boot::grub4dos::install_loader(&mut fat, &stand_in_grldr())
+                    .expect("the staged loader lands");
+            }
             let disk = std::fs::OpenOptions::new()
                 .read(true)
                 .open(&disk_path)
@@ -4989,8 +5039,19 @@ pub(crate) mod end_to_end {
                     },
                     rufus_proto::Step::Finalize,
                 ]
+            } else if mode == Mode::Grub4dos {
+                // The GRUB4DOS arm bounds its record by the recorded
+                // table, so this phase stamps the record first too.
+                vec![
+                    rufus_proto::Step::Mklabel {
+                        scheme: rufus_proto::Scheme::Mbr,
+                    },
+                    rufus_proto::Step::Bootloader {
+                        mode: Mode::Grub4dos,
+                    },
+                ]
             } else {
-                vec![rufus_proto::Step::Bootloader { mode: Mode::None }]
+                vec![rufus_proto::Step::Bootloader { mode: mode.clone() }]
             };
             let mut reporter = Recorder::default();
             let report = crate::pipeline::run(
@@ -5023,11 +5084,17 @@ pub(crate) mod end_to_end {
                 disk.read_exact_at(&mut window, offset)
                     .expect("the esp window reads");
                 assert_eq!(window, shim, "the shim lands whole at the esp offset");
+            } else if mode == Mode::Grub4dos {
+                assert_eq!(
+                    step_names(&report),
+                    ["mklabel", "bootloader"],
+                    "the grub4dos phase runs in order"
+                );
             } else {
                 assert_eq!(
                     step_names(&report),
                     ["bootloader"],
-                    "the none phase runs its one step"
+                    "the bootloader phase runs its one step"
                 );
             }
             let mut after = vec![0u8; len as usize];
@@ -5037,6 +5104,9 @@ pub(crate) mod end_to_end {
                 after, before,
                 "the {mode:?} arm leaves the data window alone"
             );
+            if mode == Mode::Grub4dos {
+                grub4dos_fingerprint();
+            }
             return;
         }
         let mut reporter = Recorder::default();
@@ -5104,33 +5174,10 @@ pub(crate) mod end_to_end {
                 assert_eq!(core_back, grub2_core, "the core lands whole at sector 1");
             }
             Mode::Grub4dos => {
-                // The embedded loader plus MBR/SBR; the keep-existing
-                // path is the arm tests' province
-                // (`grub4dos_keeps_an_existing_grldr`).
-                let expected = load_from(&resources_dir(), Resource::Grub4DosCore)
-                    .expect("the loader loads")
-                    .bytes()
-                    .to_vec();
-                let mut fat = open_volume();
-                let back = fat.read_file("/GRLDR").expect("the loader reads back");
-                assert_eq!(back, expected, "resource 451 lands byte-identical");
-                let mbr = load_from(&resources_dir(), Resource::Grub4DosMbr)
-                    .expect("the mbr loads")
-                    .bytes()
-                    .to_vec();
-                let disk = std::fs::OpenOptions::new()
-                    .read(true)
-                    .open(&disk_path)
-                    .expect("the disk reopens");
-                let mut sector = [0u8; 512];
-                disk.read_exact_at(&mut sector, 0).expect("sector 0 reads");
-                assert_eq!(&sector[..423], &mbr[..423], "the mbr window lands");
-                assert_eq!(&sector[510..512], &[0x55, 0xAA], "the boot mark closes");
-                let sbr = &mbr[512..];
-                let mut sbr_back = vec![0u8; sbr.len()];
-                disk.read_exact_at(&mut sbr_back, 512)
-                    .expect("the sbr reads");
-                assert_eq!(sbr_back, sbr, "the sbr lands whole at sector 1");
+                // Every GRUB4DOS run takes the two-phase branch above,
+                // which runs this same fingerprint; the refusal without
+                // a loader is `grub4dos_refuses_without_a_root_grldr`.
+                grub4dos_fingerprint();
             }
             Mode::Freedos => {
                 // The pair, the 25 locale files and the rendered
@@ -5233,5 +5280,585 @@ pub(crate) mod end_to_end {
         ] {
             acceptance_one(mode);
         }
+    }
+
+    /// QEMU VGA-text boot capture for the BIOS bootloader modes
+    /// (test-only): each boot test below drives its disk file through
+    /// this instead of transcribing expectations from sources.
+    ///
+    /// Technique: the `isa-debugcon` / `-chardev file` path yields an
+    /// empty log on the QEMU + SeaBIOS builds this suite runs under,
+    /// so the harness boots with `-display none -monitor
+    /// unix:<sock>,server,nowait`, waits out the load, then sends
+    /// `pmemsave 0xb8000 4000 "<file>"` (double-quoted path) over the
+    /// monitor socket and decodes the dump as 25 rows of 80
+    /// character/attribute pairs. Boot media always come from
+    /// [`boot_disk`] (full plans with a partition table): bare FAT32
+    /// volumes cannot boot FreeDOS (its kernel assigns drive letters
+    /// from partition tables only) and GRUB4DOS likewise needs a
+    /// real partition entry.
+    ///
+    /// Every capture kills and reaps its child and drops its scratch
+    /// directory (socket and dump vanish with it) on every path, so
+    /// no machine and no file survives a failed assertion; every
+    /// monitor read carries a timeout, so a silent QEMU fails the
+    /// test instead of hanging it.
+    mod qemu {
+        use std::io::Read as _;
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        use crate::error::CoreError;
+        use crate::error::Result as TestResult;
+
+        /// VGA text buffer shape: 25 rows of 80
+        /// character/attribute pairs.
+        const VGA_ROWS: usize = 25;
+        const VGA_COLS: usize = 80;
+        const VGA_BYTES: usize = VGA_ROWS * VGA_COLS * 2;
+
+        /// Whether `qemu-system-x86_64` answers `--version`: the one
+        /// probe every boot test gates on (the same smoke shape as
+        /// the `fsck.fat` acceptances elsewhere in this file).
+        pub(crate) fn have_qemu() -> bool {
+            std::process::Command::new("qemu-system-x86_64")
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }
+
+        /// A spawned QEMU that is killed and reaped on drop, so no
+        /// machine survives a failed assertion or an early return.
+        struct Guard {
+            child: Option<std::process::Child>,
+        }
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Some(child) = self.child.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        /// Send one monitor line (the reply is drained by the
+        /// caller after it has had time to arrive).
+        fn send(stream: &mut UnixStream, line: &str) -> TestResult<()> {
+            stream
+                .write_all(line.as_bytes())
+                .map_err(|source| CoreError::io("qemu monitor", source))
+        }
+
+        /// Read and discard one monitor reply (greeting, command
+        /// reply, prompt): bounded by the stream timeout, so a
+        /// silent monitor fails instead of hanging.
+        fn drain(stream: &mut UnixStream) -> TestResult<()> {
+            let mut buf = [0u8; 65536];
+            stream
+                .read(&mut buf)
+                .map_err(|source| CoreError::io("qemu monitor", source))?;
+            Ok(())
+        }
+
+        /// Connect to the monitor socket, retrying while QEMU binds
+        /// it; a socket that never answers refuses naming it.
+        fn connect(sock: &std::path::Path) -> TestResult<UnixStream> {
+            let mut last = String::new();
+            for _ in 0..50 {
+                match UnixStream::connect(sock) {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => {
+                        last = error.to_string();
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            Err(CoreError::invalid(format!(
+                "qemu monitor at {} never answered ({last}): refusing",
+                sock.display()
+            )))
+        }
+
+        /// Decode a VGA dump into 25 right-trimmed rows: every second
+        /// byte is the character cell (the attribute byte interleaves
+        /// it), non-printable cells read as a space.
+        fn decode(dump: &[u8]) -> TestResult<Vec<String>> {
+            if dump.len() < VGA_BYTES {
+                return Err(CoreError::invalid(format!(
+                    "qemu vga dump holds {} bytes, the text buffer needs {VGA_BYTES}: refusing",
+                    dump.len()
+                )));
+            }
+            let mut lines = Vec::with_capacity(VGA_ROWS);
+            for row in 0..VGA_ROWS {
+                let mut text = String::with_capacity(VGA_COLS);
+                for col in 0..VGA_COLS {
+                    let byte = dump
+                        .get(row * VGA_COLS * 2 + col * 2)
+                        .expect("the vga window fits the length check above");
+                    text.push(if (0x20..0x7F).contains(byte) {
+                        *byte as char
+                    } else {
+                        ' '
+                    });
+                }
+                lines.push(text.trim_end().to_string());
+            }
+            Ok(lines)
+        }
+
+        /// Boot `disk` in QEMU, wait `wait`, capture the VGA text
+        /// buffer and quit the machine.
+        pub(crate) fn capture(disk: &std::path::Path, wait: Duration) -> TestResult<Vec<String>> {
+            capture_keys(disk, wait, &[])
+        }
+
+        /// [`capture`] plus one `sendkey` line per entry of `keys`
+        /// after the wait (then a settle wait before the dump): the
+        /// GRUB2 config test drives the loader shell this way.
+        pub(crate) fn capture_keys(
+            disk: &std::path::Path,
+            wait: Duration,
+            keys: &[&str],
+        ) -> TestResult<Vec<String>> {
+            let scratch = tempfile::tempdir().expect("a qemu scratch directory");
+            let sock = scratch.path().join("mon.sock");
+            let dump = scratch.path().join("vga.bin");
+            let child = std::process::Command::new("qemu-system-x86_64")
+                .arg("-m")
+                .arg("128")
+                .arg("-drive")
+                .arg(format!("file={},format=raw,if=ide", disk.display()))
+                .arg("-display")
+                .arg("none")
+                .arg("-no-reboot")
+                .arg("-monitor")
+                .arg(format!("unix:{},server,nowait", sock.display()))
+                .spawn()
+                .map_err(|source| CoreError::io("qemu-system-x86_64", source))?;
+            let guard = Guard { child: Some(child) };
+            std::thread::sleep(wait);
+            let mut stream = connect(&sock)?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|source| CoreError::io("qemu monitor", source))?;
+            drain(&mut stream)?;
+            for key in keys {
+                send(&mut stream, &format!("sendkey {key}\n"))?;
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            if !keys.is_empty() {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            // The dump path is double-quoted: the monitor splits
+            // unquoted paths on whitespace.
+            send(
+                &mut stream,
+                &format!("pmemsave 0xb8000 4000 \"{}\"\n", dump.display()),
+            )?;
+            std::thread::sleep(Duration::from_secs(1));
+            drain(&mut stream)?;
+            send(&mut stream, "quit\n")?;
+            std::thread::sleep(Duration::from_millis(300));
+            drop(guard);
+            let bytes = std::fs::read(&dump).map_err(|source| CoreError::io(&dump, source))?;
+            decode(&bytes)
+        }
+
+        /// Print the non-empty rows for the test log: every boot test
+        /// reports what it saw, so a failure quotes the screen.
+        pub(crate) fn log(lines: &[String]) {
+            eprintln!("qemu vga screen (non-empty rows only):");
+            for line in lines.iter().filter(|line| !line.is_empty()) {
+                eprintln!("  |{line}|");
+            }
+        }
+    }
+
+    /// Build the Syslinux 4.07 fixture ISO: the same descriptor and
+    /// directory shape as [`syslinux_iso`], but a 4.07 banner and no
+    /// `.c32` files. 4.07 needs no core library, which is what makes
+    /// it the bootable fixture: 6.04 needs real `.c32` modules no
+    /// test can provide, so a 6.04 stick can never get past its
+    /// loader.
+    fn syslinux_407_iso() -> Vec<u8> {
+        use crate::copy::source::fixture::*;
+        const ROOT: u32 = 20;
+        const DIR: u32 = 21;
+        const BIN: u32 = 22;
+        const CFG: u32 = 23;
+        let banner = b"ISOLINUX 4.07 20130725 test-image".to_vec();
+        // Lowercase identifiers with `;1` versions, like
+        // [`syslinux_iso`]: the reader resolves file opens exactly.
+        let files: Vec<(&[u8], u32, Vec<u8>)> = vec![
+            (b"isolinux.bin;1", BIN, banner),
+            (b"isolinux.cfg;1", CFG, b"DEFAULT linux\n".to_vec()),
+        ];
+        let mut image = vec![0u8; 32 * SECTOR_BYTES];
+        let mut put = |sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(16, &primary_sector("TESTVOL", ROOT, SECTOR_BYTES as u32));
+        put(17, &boot_sector());
+        put(18, &terminator_sector());
+        let root = vec![
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(DIR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"isolinux"),
+        ];
+        let mut dir = vec![
+            encode_record(DIR, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+        ];
+        for (identifier, sector, bytes) in &files {
+            dir.push(encode_record(*sector, bytes.len() as u32, 0, identifier));
+        }
+        put(ROOT, &dir_sector(&root));
+        put(DIR, &dir_sector(&dir));
+        for (_, sector, bytes) in &files {
+            put(*sector, bytes);
+        }
+        image
+    }
+
+    /// Build the GRUB2 boot fixture ISO from test-time bytes: real
+    /// `boot.img` and `core.img` under `boot/grub/i386-pc/` (what the
+    /// GRUB2 arm installs) plus the `grub.cfg` the Write step copies
+    /// to the partition (what the booted core reads). File data
+    /// starts at sector 24 and packs contiguously; the image sizes
+    /// itself around the three payloads.
+    fn grub2_boot_iso(boot: &[u8], core: &[u8], cfg: &[u8]) -> Vec<u8> {
+        use crate::copy::source::fixture::*;
+        const ROOT: u32 = 20;
+        const BOOT: u32 = 21;
+        const GRUB: u32 = 22;
+        const PC: u32 = 23;
+        let boot_at = 24u32;
+        let core_at = boot_at + boot.len().div_ceil(SECTOR_BYTES) as u32;
+        let cfg_at = core_at + core.len().div_ceil(SECTOR_BYTES) as u32;
+        let total = (cfg_at as usize + cfg.len().div_ceil(SECTOR_BYTES) + 1) * SECTOR_BYTES;
+        let mut image = vec![0u8; total];
+        let mut put = |sector: u32, bytes: &[u8]| {
+            let base = sector as usize * SECTOR_BYTES;
+            image[base..base + bytes.len()].copy_from_slice(bytes);
+        };
+        put(16, &primary_sector("TESTVOL", ROOT, SECTOR_BYTES as u32));
+        put(17, &boot_sector());
+        put(18, &terminator_sector());
+        let root = vec![
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(BOOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"boot"),
+        ];
+        let boot_dir = vec![
+            encode_record(BOOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(ROOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(GRUB, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"grub"),
+        ];
+        let grub_dir = vec![
+            encode_record(GRUB, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(BOOT, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(PC, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"i386-pc"),
+            encode_record(cfg_at, cfg.len() as u32, 0, b"grub.cfg;1"),
+        ];
+        let pc_dir = vec![
+            encode_record(PC, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x00"),
+            encode_record(GRUB, SECTOR_BYTES as u32, FLAG_DIRECTORY, b"\x01"),
+            encode_record(boot_at, boot.len() as u32, 0, b"boot.img;1"),
+            encode_record(core_at, core.len() as u32, 0, b"core.img;1"),
+        ];
+        put(ROOT, &dir_sector(&root));
+        put(BOOT, &dir_sector(&boot_dir));
+        put(GRUB, &dir_sector(&grub_dir));
+        put(PC, &dir_sector(&pc_dir));
+        put(boot_at, boot);
+        put(core_at, core);
+        put(cfg_at, cfg);
+        image
+    }
+
+    /// Run the acceptance plan over a fresh file-backed disk and hand
+    /// back the scratch directory (it owns the disk file, so it must
+    /// outlive the QEMU boot) plus the disk path to boot. `write_copy`
+    /// inserts a `Write { mode: Copy }` step between `Mkfs` and
+    /// `Bootloader` for the GRUB2 arm, whose `grub.cfg` must reach
+    /// the partition; every other arm reads the image tree straight
+    /// from the file, like [`acceptance_one`].
+    fn boot_disk(
+        iso_bytes: &[u8],
+        image_len: u64,
+        mode: rufus_proto::BootloaderMode,
+        write_copy: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let iso_path = scratch.path().join("boot.iso");
+        std::fs::write(&iso_path, iso_bytes).expect("the iso writes");
+        let disk_path = scratch.path().join("disk.img");
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&disk_path)
+            .expect("the disk creates")
+            .set_len(DISK_BYTES)
+            .expect("the disk sizes");
+        let (base, len) =
+            single_data_window(TableKind::Mbr, 512, DISK_BYTES).expect("the data window plans");
+        let opener = EndToEndOpener {
+            path: disk_path.clone(),
+            disk_len: DISK_BYTES,
+            base,
+            len,
+        };
+        let mut plan = acceptance_plan(
+            &iso_path,
+            image_len,
+            Filesystem::Fat32,
+            rufus_proto::Layout::Single,
+            mode,
+            None,
+        );
+        if write_copy {
+            // The copy must land before the bootloader step; look the
+            // step up rather than assume its index in the plan.
+            let bootloader = plan
+                .steps
+                .iter()
+                .position(|step| matches!(step, rufus_proto::Step::Bootloader { .. }))
+                .expect("the acceptance plan carries a bootloader step");
+            plan.steps.insert(
+                bootloader,
+                rufus_proto::Step::Write {
+                    mode: rufus_proto::WriteMode::Copy,
+                },
+            );
+        }
+        let mut reporter = Recorder::default();
+        crate::pipeline::run(&plan, &opener, &msdos_run_options(), &mut reporter, &|| {
+            false
+        })
+        .expect("the boot plan runs");
+        (scratch, disk_path)
+    }
+
+    /// Whether `grub-mkimage` answers `--version`: the GRUB2 boot
+    /// test builds its `core.img` at test time, so it gates on this
+    /// alongside [`qemu::have_qemu`].
+    fn have_grub_mkimage() -> bool {
+        std::process::Command::new("grub-mkimage")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn syslinux_407_boots_to_its_prompt_in_qemu() {
+        // Through the full six-step plan (partition table included)
+        // with the 4.07 fixture: the installed VBR and stage are the
+        // real embedded 4.07 payloads, so the stick boots for real.
+        if !qemu::have_qemu() {
+            eprintln!("skip: qemu-system-x86_64 is not on PATH");
+            return;
+        }
+        seed_exe_assets();
+        let iso = syslinux_407_iso();
+        let (_scratch, disk) = boot_disk(
+            &iso,
+            32 * SECTOR_BYTES as u64,
+            rufus_proto::BootloaderMode::Syslinux,
+            false,
+        );
+        let screen = qemu::capture(&disk, std::time::Duration::from_secs(10))
+            .expect("qemu captures the screen");
+        qemu::log(&screen);
+        assert!(
+            screen.iter().any(|line| line.contains("SYSLINUX 4.07")),
+            "the loader banner shows: {screen:?}"
+        );
+        assert!(
+            screen.iter().any(|line| line == "boot:"),
+            "the loader prompt shows: {screen:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a caller-supplied grldr: resource 451 is GRUB2 core.img and Rufus downloads the loader"]
+    fn grub4dos_boots_to_its_prompt_in_qemu() {
+        // Only a real GRUB4DOS `grldr` can produce this prompt, and no
+        // loader is bundled. The test therefore reads one from the path
+        // in `RUFUS_TEST_GRLDR` (run it with `--ignored`) and skips
+        // without it, rather than assert a prompt it cannot produce.
+        // The image carries that loader at its root, the record is the
+        // embedded MBR/SBR (resource 450), and the boot runs for real.
+        let Some(grldr_path) = std::env::var_os("RUFUS_TEST_GRLDR") else {
+            eprintln!("skip: set RUFUS_TEST_GRLDR to a real grldr to run this boot test");
+            return;
+        };
+        if !qemu::have_qemu() {
+            eprintln!("skip: qemu-system-x86_64 is not on PATH");
+            return;
+        }
+        seed_exe_assets();
+        let grldr = std::fs::read(&grldr_path).expect("the caller's grldr reads");
+        let iso = syslinux_iso_with(Some(&grldr));
+        let (_scratch, disk) = boot_disk(
+            &iso,
+            iso.len() as u64,
+            rufus_proto::BootloaderMode::Grub4dos,
+            true,
+        );
+        let screen = qemu::capture(&disk, std::time::Duration::from_secs(10))
+            .expect("qemu captures the screen");
+        qemu::log(&screen);
+        assert!(
+            screen.iter().any(|line| line.contains("grub>")),
+            "the loader prompt shows: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn freedos_boots_to_its_shell_in_qemu() {
+        // Through the full six-step plan (partition table included:
+        // the kernel assigns drive letters from partition tables
+        // only). The payloads and the record are the embedded ones,
+        // so the stick boots for real into the kernel and its shell.
+        if !qemu::have_qemu() {
+            eprintln!("skip: qemu-system-x86_64 is not on PATH");
+            return;
+        }
+        seed_exe_assets();
+        let iso = syslinux_iso();
+        let (_scratch, disk) = boot_disk(
+            &iso,
+            32 * SECTOR_BYTES as u64,
+            rufus_proto::BootloaderMode::Freedos,
+            false,
+        );
+        let screen = qemu::capture(&disk, std::time::Duration::from_secs(12))
+            .expect("qemu captures the screen");
+        qemu::log(&screen);
+        assert!(
+            screen
+                .iter()
+                .any(|line| line.contains("FreeDOS kernel 2043")),
+            "the kernel banner shows: {screen:?}"
+        );
+        // The kernel's own `C: HD1, Pri[ 1], ...` line also contains
+        // "C:", so the shell is pinned by its FreeCom prompt instead.
+        assert!(
+            screen.iter().any(|line| line.ends_with("C:\\>")),
+            "the FreeCom prompt shows: {screen:?}"
+        );
+        assert!(
+            screen.iter().any(|line| line.contains("FreeCom version")),
+            "the FreeCom banner shows: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn grub2_bios_boots_its_shell_and_reads_its_config_in_qemu() {
+        // Genuine GRUB2 binaries only: `core.img` is built at test
+        // time with the host `grub-mkimage` (prefix `/boot/grub`, an
+        // early config that roots the boot partition, and every
+        // module the boot needs embedded — no module loads from
+        // disk), and the record is the host `boot.img`. Both reach
+        // the stick through the image tree, exactly like a real
+        // image's payloads; the Write step copies the tree
+        // (including `grub.cfg`) to the partition first.
+        if !qemu::have_qemu() {
+            eprintln!("skip: qemu-system-x86_64 is not on PATH");
+            return;
+        }
+        if !have_grub_mkimage() {
+            eprintln!("skip: grub-mkimage is not on PATH");
+            return;
+        }
+        let boot_img = match std::fs::read("/usr/lib/grub/i386-pc/boot.img") {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("skip: the grub2 boot record is not present ({error})");
+                return;
+            }
+        };
+        seed_exe_assets();
+        let build = tempfile::tempdir().expect("a grub scratch directory");
+        std::fs::write(
+            build.path().join("early.cfg"),
+            b"search --set=root --file /boot/grub/grub.cfg\nset prefix=($root)/boot/grub\n",
+        )
+        .expect("the early config writes");
+        let core_path = build.path().join("core.img");
+        let built = std::process::Command::new("grub-mkimage")
+            .arg("-O")
+            .arg("i386-pc")
+            .arg("-o")
+            .arg(&core_path)
+            .arg("-p")
+            .arg("/boot/grub")
+            .arg("-c")
+            .arg(build.path().join("early.cfg"))
+            .args([
+                "biosdisk",
+                "part_msdos",
+                "fat",
+                "normal",
+                "configfile",
+                "search",
+                "search_fs_file",
+                "echo",
+            ])
+            .output();
+        let output = match built {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skip: grub-mkimage did not run ({error})");
+                return;
+            }
+        };
+        if !output.status.success() {
+            eprintln!(
+                "skip: grub-mkimage could not build the test core.img ({})",
+                output.status
+            );
+            return;
+        }
+        let core_img = std::fs::read(&core_path).expect("the test core reads back");
+        let cfg = b"set timeout=0\necho GRUB2-OK\n";
+        let iso = grub2_boot_iso(&boot_img, &core_img, cfg);
+        let iso_len = iso.len() as u64;
+        let (_scratch, disk) = boot_disk(&iso, iso_len, rufus_proto::BootloaderMode::Grub2, true);
+        // Fresh boot: the banner and the shell prove the record
+        // handed off to the core and the core reached `normal`.
+        let screen = qemu::capture(&disk, std::time::Duration::from_secs(10))
+            .expect("qemu captures the screen");
+        qemu::log(&screen);
+        assert!(
+            screen.iter().any(|line| line.contains("GNU GRUB")),
+            "the grub banner shows: {screen:?}"
+        );
+        assert!(
+            screen.iter().any(|line| line.contains("grub>")),
+            "the grub shell shows: {screen:?}"
+        );
+        // Driven shell: `configfile` loads the `grub.cfg` the Write
+        // step copied, proving the booted core reads the partition.
+        // (Boot-time `echo` output does not survive to the captured
+        // screen — the line below is what a driven load shows.)
+        let keys = [
+            "c", "o", "n", "f", "i", "g", "f", "i", "l", "e", "spc", "slash", "b", "o", "o", "t",
+            "slash", "g", "r", "u", "b", "slash", "g", "r", "u", "b", "dot", "c", "f", "g", "ret",
+        ];
+        let screen = qemu::capture_keys(&disk, std::time::Duration::from_secs(9), &keys)
+            .expect("qemu drives the shell");
+        qemu::log(&screen);
+        assert!(
+            screen.iter().any(|line| line.contains("GRUB2-OK")),
+            "the copied config runs: {screen:?}"
+        );
     }
 }

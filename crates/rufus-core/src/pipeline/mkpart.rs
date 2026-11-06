@@ -8,15 +8,18 @@
 //! (the trailing partial sector is unused by construction — e.g. a
 //! 64 MiB + 1234 byte target plans over full sectors only; a target
 //! smaller than one sector refuses, naming the size). The data
-//! type is [`MicrosoftBasicData`](crate::part::plan::DataType::MicrosoftBasicData)
-//! for now: per-filesystem types arrive with the CLI in slice 4, which
-//! knows the chosen filesystem. Every [`SectorWrite`](crate::part::plan::SectorWrite)
+//! type follows the plan's filesystem (see [`data_type_of`]): FAT32
+//! stamps `0x0c` so DOS-family loaders can read the volume, the ext
+//! family `0x83`, exFAT and NTFS `0x07`. The geometry does not depend
+//! on the type, so the platform opener's window math is unchanged.
+//! Every [`SectorWrite`](crate::part::plan::SectorWrite)
 //! goes down through the cancellable path (chunk = the sector size)
 //! with one [`Progress`](crate::pipeline::event::Event::Progress) per
 //! write, then `flush()` and `reread_partitions()` close the step and
 //! the partition counts as existing for
 //! [`Mkfs`](rufus_proto::Step::Mkfs).
 
+use rufus_proto::Filesystem;
 use rufus_proto::Layout;
 use rufus_proto::Scheme;
 
@@ -30,9 +33,34 @@ use crate::pipeline::steps::layout_kind_of;
 use crate::pipeline::steps::table_kind_of;
 use crate::pipeline::steps::table_name;
 
+/// The `data` partition's type for the plan's filesystem.
+///
+/// Each filesystem maps to the type its readers expect, and the
+/// planner derives both the MBR byte and the GPT GUID from it:
+/// FAT32 is `0x0c` (FAT32 LBA), which FreeDOS and the other DOS-family
+/// loaders need before they will read the volume at all. exFAT and
+/// NTFS are `0x07`, the ext family is `0x83` (Linux), and UDF takes
+/// the catch-all basic data type.
+fn data_type_of(filesystem: &Filesystem) -> plan::DataType {
+    match filesystem {
+        Filesystem::Fat32 => plan::DataType::Fat32,
+        Filesystem::Exfat => plan::DataType::Exfat,
+        Filesystem::Ntfs => plan::DataType::Ntfs,
+        Filesystem::Ext2 | Filesystem::Ext3 | Filesystem::Ext4 => plan::DataType::Linux,
+        Filesystem::Udf => plan::DataType::MicrosoftBasicData,
+    }
+}
+
 /// Stamp the table: plan the step's layout for the step's scheme,
-/// render it against the real geometry and write every sector.
-pub(crate) fn run(ctx: &mut RunContext<'_>, scheme: &Scheme, layout: &Layout) -> Result<()> {
+/// render it against the real geometry and write every sector. The
+/// `data` partition takes its type from `filesystem` (see
+/// [`data_type_of`]).
+pub(crate) fn run(
+    ctx: &mut RunContext<'_>,
+    scheme: &Scheme,
+    layout: &Layout,
+    filesystem: &Filesystem,
+) -> Result<()> {
     let kind = table_kind_of(scheme);
     let layout_kind = layout_kind_of(layout);
     match ctx.table {
@@ -56,7 +84,7 @@ pub(crate) fn run(ctx: &mut RunContext<'_>, scheme: &Scheme, layout: &Layout) ->
         kind,
         sector_size,
         size,
-        plan::DataType::MicrosoftBasicData,
+        data_type_of(filesystem),
     )?;
     let table_plan = plan::plan(&request)?;
     let rendered = plan::render(&table_plan, sector_size, request.last_lba)?;
@@ -96,6 +124,6 @@ pub(crate) fn run(ctx: &mut RunContext<'_>, scheme: &Scheme, layout: &Layout) ->
     }
     ctx.device()?.flush()?;
     ctx.device()?.reread_partitions()?;
-    ctx.partitioned = true;
+    ctx.partitioned = Some((kind, layout_kind));
     Ok(())
 }

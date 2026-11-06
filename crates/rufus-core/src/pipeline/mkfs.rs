@@ -18,9 +18,11 @@
 //!
 //! Engine mapping, exhaustive: FAT32 and exFAT format natively against
 //! the partition volume (serial from a fresh v4 UUID, non-zero refused
-//! rather than substituted); NTFS, ext2/3/4 and UDF drive their
-//! external tools against the partition node path with a run logger
-//! whose new records mirror into the event stream. Constructor
+//! rather than substituted; FAT32's BPB hidden-sectors field carries
+//! the partition's start LBA, read back from the stamped table); NTFS,
+//! ext2/3/4 and UDF drive their external tools against the partition
+//! node path with a run logger whose new records mirror into the event
+//! stream. Constructor
 //! refusals (a non-power-of-two cluster size, a bad label) pass
 //! through untouched.
 
@@ -37,6 +39,7 @@ use crate::fs::fat32;
 use crate::fs::ntfs;
 use crate::fs::udf;
 use crate::log::Logger;
+use crate::part::plan::data_window;
 use crate::pipeline::event::Event;
 use crate::pipeline::steps::RunContext;
 use crate::pipeline::steps::check_cancelled;
@@ -77,6 +80,29 @@ fn zero_partition(ctx: &RunContext<'_>, partition: &mut dyn Volume) -> Result<()
     Ok(())
 }
 
+/// The data partition's first sector, in units of the device's sector
+/// size: the value the FAT32 BPB's hidden-sectors field carries. The
+/// window is the one `Mkpart` stamped ([`RunContext::partitioned`]),
+/// read back through the same [`data_window`] the platform opener uses,
+/// so the field cannot drift from the table on the disk. Refuses by
+/// name when the start does not fit the field's `u32`.
+fn partition_start_lba(ctx: &mut RunContext<'_>) -> Result<u32> {
+    let (table, layout) = ctx.partitioned.ok_or_else(|| {
+        CoreError::invalid("no partition was created to format (run mkpart first)")
+    })?;
+    let size = ctx.device()?.size();
+    let sector_size = ctx.device()?.sector_size();
+    let (offset, _) = data_window(layout, table, sector_size, size)?;
+    let lba = offset
+        .checked_div(u64::from(sector_size))
+        .ok_or_else(|| CoreError::invalid("sector size is zero: no partition start lba"))?;
+    u32::try_from(lba).map_err(|_| {
+        CoreError::invalid(format!(
+            "partition start lba {lba} does not fit the u32 fat32 hidden-sectors field"
+        ))
+    })
+}
+
 /// Format through an external tool against the partition node path,
 /// mirroring the run logger's new records into the event stream on both
 /// paths: a failing tool's log lines are exactly what the caller needs
@@ -102,7 +128,7 @@ pub(crate) fn run(
     cluster_bytes: &Option<u32>,
     quick: bool,
 ) -> Result<()> {
-    if !ctx.partitioned {
+    if ctx.partitioned.is_none() {
         return Err(CoreError::invalid(
             "no partition was created to format (run mkpart first)",
         ));
@@ -126,10 +152,14 @@ pub(crate) fn run(
     check_cancelled(ctx)?;
     match filesystem {
         Filesystem::Fat32 => {
+            // The BPB carries the partition's start LBA: DOS-family
+            // loaders derive their read base from it (see `bpb`).
+            let hidden_sectors = partition_start_lba(ctx)?;
             let mut partition = ctx.opener.partition()?;
             let options = fat32::format::FormatOptions {
                 label: label.as_deref(),
                 volume_id: fresh_serial("fat32")?,
+                hidden_sectors,
                 oem: fat32::bpb::DEFAULT_OEM,
             };
             fat32::format::format(partition.as_mut(), &options)?;

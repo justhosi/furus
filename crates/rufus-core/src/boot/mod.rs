@@ -9,14 +9,17 @@
 //! point (it resolves through [`asset_path`](crate::paths::asset_path));
 //! [`load_from`] is the testable core over an explicit directory. The
 //! seven resources are the Syslinux 4.07 VBR/core (ids 400/401), the
-//! Syslinux 6.04 VBR/core (402/403), the Grub4DOS MBR/core
-//! (450/451) and the UEFI:NTFS shim image (502).
+//! Syslinux 6.04 VBR/core (402/403), the Grub4DOS MBR (450), the GRUB2
+//! `core.img` fallback (451) and the UEFI:NTFS shim image (502).
+//! Resource 451 is not a GRUB4DOS loader: Rufus downloads the GRUB4DOS
+//! `grldr` (`grub4dos-0.4.6a/grldr`) and bundles none.
 //!
 //! [`syslinux`] installs either Syslinux family (family decision,
 //! contiguous `ldlinux.sys` plus sector-map/ADV patch, companions,
 //! config wrapper, obsolete-module substitution); [`grub2`] installs a
 //! GRUB2 BIOS boot record and places a `grubx64.efi` image;
-//! [`grub4dos`] writes the GRUB4DOS MBR window, SBR and root `grldr`;
+//! [`grub4dos`] writes the GRUB4DOS MBR window and SBR, and places a
+//! caller-supplied root `grldr` (it refuses without one);
 //! [`uefi_ntfs`] writes the embedded 1 MiB UEFI:NTFS shim image
 //! verbatim at the ESP partition's offset (never formatted by us);
 //! [`kolibri`] places the KolibriOS `MTLD_F32` loader at the volume
@@ -71,7 +74,7 @@ use crate::paths::asset_path;
 /// One embedded bootloader payload, pinned against `assets/manifest.json`.
 ///
 /// The numeric ids are the manifest resource ids (400-403 Syslinux,
-/// 450-451 Grub4DOS, 502 UEFI:NTFS); the sizes and digests are the
+/// 450 Grub4DOS MBR, 451 GRUB2 `core.img`, 502 UEFI:NTFS); the sizes and digests are the
 /// manifest `bytes` and `sha256` values, so any manifest regeneration
 /// must update this enum in lockstep (the load test below guards the
 /// drift).
@@ -87,8 +90,12 @@ pub enum Resource {
     Syslinux604Core,
     /// Grub4DOS MBR (`grldr.mbr`), manifest id 450.
     Grub4DosMbr,
-    /// Grub4DOS core (`grldr`), manifest id 451.
-    Grub4DosCore,
+    /// GRUB2's embedded `core.img` fallback, manifest id 451. Despite
+    /// the historical name it is not GRUB4DOS's `grldr`: Rufus
+    /// downloads the GRUB4DOS loader (`grub4dos-0.4.6a/grldr`), so no
+    /// GRUB4DOS loader is bundled and nothing in this crate installs
+    /// this blob as `/grldr`.
+    Grub2CoreImg,
     /// UEFI:NTFS shim image (`uefi-ntfs.img`), manifest id 502: a 1 MiB
     /// FAT12 container holding the NTFS EFI driver, written verbatim at
     /// the ESP offset (see [`uefi_ntfs`](self::uefi_ntfs)).
@@ -105,7 +112,7 @@ impl Resource {
         Resource::Syslinux604Vbr,
         Resource::Syslinux604Core,
         Resource::Grub4DosMbr,
-        Resource::Grub4DosCore,
+        Resource::Grub2CoreImg,
         Resource::UefiNtfsImage,
     ];
 
@@ -118,7 +125,7 @@ impl Resource {
             Self::Syslinux604Vbr => 402,
             Self::Syslinux604Core => 403,
             Self::Grub4DosMbr => 450,
-            Self::Grub4DosCore => 451,
+            Self::Grub2CoreImg => 451,
             Self::UefiNtfsImage => 502,
         }
     }
@@ -132,7 +139,7 @@ impl Resource {
             Self::Syslinux604Vbr => "RCDATA_402.bin",
             Self::Syslinux604Core => "RCDATA_403.bin",
             Self::Grub4DosMbr => "RCDATA_450.bin",
-            Self::Grub4DosCore => "RCDATA_451.bin",
+            Self::Grub2CoreImg => "RCDATA_451.bin",
             Self::UefiNtfsImage => "RCDATA_502.bin",
         }
     }
@@ -146,7 +153,7 @@ impl Resource {
             Self::Syslinux604Vbr => 512,
             Self::Syslinux604Core => 68121,
             Self::Grub4DosMbr => 8192,
-            Self::Grub4DosCore => 42742,
+            Self::Grub2CoreImg => 42742,
             Self::UefiNtfsImage => 1_048_576,
         }
     }
@@ -168,7 +175,7 @@ impl Resource {
                 "73b62767a16200b9af193a7d5c94e9c294c6dbb6d5b17c15038c9f3173c9a7bc"
             }
             Self::Grub4DosMbr => "a2a8769371eb57c5e79b3cea4a911275af4743f10f420ed6d26e4eec5c865059",
-            Self::Grub4DosCore => {
+            Self::Grub2CoreImg => {
                 "9a2c946704017fa8dc4e03a8a58d754d2d1607c2d2cd74f0e2920133f1192809"
             }
             Self::UefiNtfsImage => {
@@ -186,7 +193,7 @@ impl Resource {
             Self::Syslinux604Vbr => "Syslinux 6.04 VBR",
             Self::Syslinux604Core => "Syslinux 6.04 core",
             Self::Grub4DosMbr => "Grub4DOS MBR",
-            Self::Grub4DosCore => "Grub4DOS core",
+            Self::Grub2CoreImg => "GRUB2 core.img",
             Self::UefiNtfsImage => "UEFI:NTFS image",
         }
     }
@@ -592,7 +599,7 @@ mod acceptance {
     #[test]
     fn one_stick_carries_every_installer() {
         let (backing, mut fat, vbr, core) = syslinux_installed();
-        let grldr = payload_bytes(Resource::Grub4DosCore);
+        let grldr = b"caller-supplied grldr bytes".to_vec();
         grub4dos::install_loader(&mut fat, &grldr).expect("the grldr lands");
         let uefi = uefi_image();
         grub2::install_uefi(&mut fat, &uefi).expect("the uefi image lands");
@@ -687,61 +694,12 @@ mod acceptance {
         );
     }
 
-    #[test]
-    fn images_boot_in_qemu_when_available() {
-        // Smoke shape (the loop-device suites use the same one): probe
-        // `qemu-system-x86_64 --version`, and skip on any spawn error.
-        // When QEMU runs, this proves SeaBIOS accepted the boot sector
-        // and handed off to the Syslinux stage; it cannot see the
-        // Syslinux menu, and the PLAN's "boots to a menu" done-when
-        // stays unverified wherever QEMU is absent.
-        let probe = std::process::Command::new("qemu-system-x86_64")
-            .arg("--version")
-            .output();
-        let probed = probe.map(|output| output.status.success()).unwrap_or(false);
-        if !probed {
-            eprintln!("skip: qemu-system-x86_64 is not on PATH");
-            return;
-        }
-        let (backing, _fat, _vbr, _core) = syslinux_installed();
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let picture = scratch.path().join("stick.img");
-        std::fs::write(&picture, backing.bytes.borrow().as_slice()).expect("the image dumps");
-        let log = scratch.path().join("debug.log");
-        let mut child = std::process::Command::new("qemu-system-x86_64")
-            .arg("-m")
-            .arg("128")
-            .arg("-drive")
-            .arg(format!("file={},format=raw,if=ide", picture.display()))
-            .arg("-display")
-            .arg("none")
-            .arg("-no-reboot")
-            .arg("-serial")
-            .arg("none")
-            .arg("-device")
-            .arg("isa-debugcon,iobase=0x402,chardev=dbg")
-            .arg("-chardev")
-            .arg(format!("file,id=dbg,path={}", log.display()))
-            .spawn()
-            .expect("qemu spawns");
-        // At most ~10 seconds of SeaBIOS time, then kill and reap.
-        for _ in 0..100 {
-            match child.try_wait().expect("qemu polls") {
-                Some(_) => break,
-                None => std::thread::sleep(std::time::Duration::from_millis(100)),
-            }
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        let transcript = std::fs::read(&log).expect("the debug log reads");
-        let text = String::from_utf8_lossy(&transcript);
-        assert!(
-            text.contains("Booting from Hard Disk"),
-            "seabios hands off the hard disk"
-        );
-        assert!(
-            !text.contains("Boot failed"),
-            "seabios finds a bootable sector"
-        );
-    }
+    // The ISA-debugcon QEMU smoke test lived here until the
+    // acceptance rig moved to VGA-text capture: `isa-debugcon` /
+    // `-chardev file` yields an empty log on current QEMU + SeaBIOS
+    // builds, so its `Booting from Hard Disk` assertion could never
+    // pass. Real boot acceptance for every BIOS mode now lives in
+    // `pipeline::bootloader::end_to_end`, which boots full plans
+    // (partition table included) and asserts each loader's own
+    // screen text.
 }

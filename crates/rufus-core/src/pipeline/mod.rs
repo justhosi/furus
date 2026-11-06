@@ -136,7 +136,9 @@ fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result
     match step {
         Step::Wipe => wipe::run(ctx),
         Step::Mklabel { scheme } => mklabel::run(ctx, scheme),
-        Step::Mkpart { scheme, layout } => mkpart::run(ctx, scheme, layout),
+        Step::Mkpart { scheme, layout } => {
+            mkpart::run(ctx, scheme, layout, &plan.options.filesystem)
+        }
         Step::Mkfs {
             filesystem,
             label,
@@ -197,7 +199,7 @@ pub fn run(
         opener,
         target: None,
         table: None,
-        partitioned: false,
+        partitioned: None,
         logger: Logger::new(Level::Info),
         reporter,
         cancelled,
@@ -272,6 +274,7 @@ mod tests {
     use crate::fs::Volume;
     use crate::hash::Algo;
     use crate::hash::hash_file_with;
+    use crate::part::plan;
     use crate::pipeline::event::VecReporter;
     use crate::pipeline::target::Target;
     use crate::pipeline::target::VecTarget;
@@ -1483,6 +1486,79 @@ mod tests {
         assert!(messages[0].contains("gpt"), "{}", messages[0]);
     }
 
+    /// The MBR type byte the planner gives a `Single` data partition of
+    /// `data_type` on a [`LAYOUT_LEN`] MBR disk. The stamp tests take
+    /// their expectation from here rather than restating the bytes.
+    fn planned_mbr_type(data_type: plan::DataType) -> u8 {
+        let request = plan::request(
+            plan::LayoutKind::Single,
+            crate::part::TableKind::Mbr,
+            512,
+            LAYOUT_LEN,
+            data_type,
+        )
+        .expect("the single request plans");
+        let table = plan::plan(&request).expect("the single table plans");
+        table.partitions[0].mbr_type
+    }
+
+    /// Stamp `Mklabel` + `Mkpart` (MBR, `Single`) for `filesystem` and
+    /// return the disk bytes.
+    fn stamp_mbr_for(filesystem: Filesystem) -> Vec<u8> {
+        let opener = TestOpener::new(LAYOUT_LEN);
+        let mut reporter = VecReporter::new();
+        let mut plan = test_plan(vec![
+            Step::Mklabel {
+                scheme: Scheme::Mbr,
+            },
+            Step::Mkpart {
+                scheme: Scheme::Mbr,
+                layout: rufus_proto::Layout::Single,
+            },
+        ]);
+        plan.options.filesystem = filesystem;
+        run(&plan, &opener, &run_options(), &mut reporter, &|| false)
+            .expect("mklabel and mkpart run");
+        opener.target.bytes().expect("bytes read back")
+    }
+
+    #[test]
+    fn mkpart_types_the_data_partition_by_filesystem() {
+        // Each stamp must carry the byte the planner gives that
+        // filesystem's data type, and must not be the Microsoft basic
+        // data byte every filesystem used to get. FAT32 is the one
+        // that matters: FreeDOS reads nothing from a 0x07 FAT32 volume.
+        // `parse_mbr` reads the slot back (its slug names FAT32, Linux
+        // and NTFS/exFAT); the raw byte is compared to the planner.
+        let basic = planned_mbr_type(plan::DataType::MicrosoftBasicData);
+        for (filesystem, data_type, slug) in [
+            (Filesystem::Fat32, plan::DataType::Fat32, "fat32"),
+            (Filesystem::Ext2, plan::DataType::Linux, "linux"),
+            (Filesystem::Ext3, plan::DataType::Linux, "linux"),
+            (Filesystem::Ext4, plan::DataType::Linux, "linux"),
+            (Filesystem::Exfat, plan::DataType::Exfat, "ntfs_exfat"),
+            (
+                Filesystem::Udf,
+                plan::DataType::MicrosoftBasicData,
+                "ntfs_exfat",
+            ),
+        ] {
+            let bytes = stamp_mbr_for(filesystem.clone());
+            let want = planned_mbr_type(data_type);
+            let parsed = crate::part::mbr::parse_mbr(&bytes[..512], 512)
+                .expect("the stamp parses as an mbr");
+            assert_eq!(parsed.len(), 1, "one data entry for {filesystem:?}");
+            assert_eq!(parsed[0].kind, slug, "the slot reads back as {slug}");
+            assert_eq!(
+                bytes[450], want,
+                "the raw type byte for {filesystem:?} is the planner's"
+            );
+            if want != basic {
+                assert_ne!(bytes[450], basic, "{filesystem:?} is not basic data");
+            }
+        }
+    }
+
     #[test]
     fn mkpart_stamps_a_signed_mbr() {
         let opener = TestOpener::new(LAYOUT_LEN);
@@ -1506,7 +1582,11 @@ mod tests {
         let bytes = opener.target.bytes().expect("bytes read back");
         assert_eq!(bytes[510], 0x55);
         assert_eq!(bytes[511], 0xAA);
-        assert_eq!(bytes[450], 0x07, "one Microsoft basic data entry");
+        assert_eq!(
+            bytes[450],
+            planned_mbr_type(plan::DataType::Fat32),
+            "one FAT32 data entry, typed as the plan's filesystem"
+        );
         for entry in [462, 478, 494] {
             assert_eq!(bytes[entry + 4], 0x00, "slot at {entry} stays empty");
         }
@@ -1572,29 +1652,35 @@ mod tests {
         // a literal position in either half.
         let opener = TestOpener::new(LAYOUT_LEN);
         let mut reporter = VecReporter::new();
-        run(
-            &test_plan(vec![
-                Step::Mklabel {
-                    scheme: Scheme::Mbr,
-                },
-                Step::Mkpart {
-                    scheme: Scheme::Mbr,
-                    layout: Layout::UefiNtfs,
-                },
-            ]),
-            &opener,
-            &run_options(),
-            &mut reporter,
-            &|| false,
-        )
-        .expect("mklabel and mkpart run the uefi-ntfs layout");
+        // The `uefi-ntfs` plan carries an NTFS (or exFAT) data
+        // partition, never FAT32, so the fixture says so too.
+        let mut plan = test_plan(vec![
+            Step::Mklabel {
+                scheme: Scheme::Mbr,
+            },
+            Step::Mkpart {
+                scheme: Scheme::Mbr,
+                layout: Layout::UefiNtfs,
+            },
+        ]);
+        plan.options.filesystem = Filesystem::Ntfs;
+        run(&plan, &opener, &run_options(), &mut reporter, &|| false)
+            .expect("mklabel and mkpart run the uefi-ntfs layout");
         let bytes = opener.target.bytes().expect("bytes read back");
         assert_eq!(bytes[510], 0x55);
         assert_eq!(bytes[511], 0xAA);
         // Slot 0 is the FAT ESP, slot 1 the NTFS data partition, the
         // rest stays empty.
-        assert_eq!(bytes[450], 0x0c, "the esp entry is FAT32 LBA");
-        assert_eq!(bytes[466], 0x07, "the data entry is NTFS");
+        assert_eq!(
+            bytes[450],
+            planned_mbr_type(plan::DataType::Fat32),
+            "the esp entry is FAT32"
+        );
+        assert_eq!(
+            bytes[466],
+            planned_mbr_type(plan::DataType::Ntfs),
+            "the data entry is NTFS"
+        );
         for entry in [478, 494] {
             assert_eq!(bytes[entry + 4], 0x00, "slot at {entry} stays empty");
         }
@@ -1727,6 +1813,54 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("mkfs"), "{text}");
         assert!(text.contains("mkpart"), "{text}");
+    }
+
+    #[test]
+    fn mkfs_fat32_stamps_the_partition_start_lba_into_the_bpb() {
+        // The data partition's boot sector carries the LBA the planner
+        // gave the window at 0x1C: the value comes from the same
+        // data_window the opener resolves, never from a literal.
+        let (_scratch, opener) = layout_opener();
+        let mut reporter = VecReporter::new();
+        run(
+            &test_plan(vec![
+                Step::Mklabel {
+                    scheme: Scheme::Mbr,
+                },
+                Step::Mkpart {
+                    scheme: Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
+                },
+                Step::Mkfs {
+                    filesystem: Filesystem::Fat32,
+                    label: None,
+                    cluster_bytes: None,
+                    quick: true,
+                },
+            ]),
+            &opener,
+            &run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("mklabel, mkpart and mkfs run");
+        let (offset, _) = crate::part::plan::data_window(
+            crate::part::plan::LayoutKind::Single,
+            crate::part::TableKind::Mbr,
+            512,
+            LAYOUT_LEN,
+        )
+        .expect("the single data window plans");
+        let planned = u32::try_from(offset / 512).expect("the start fits a u32");
+        assert_eq!(planned, 2048, "the single layout starts at LBA 2048");
+        let bytes = opener.target.bytes().expect("bytes read back");
+        let base = PART_BASE as usize;
+        assert_eq!(&bytes[base + 82..base + 90], b"FAT32   ");
+        assert_eq!(
+            &bytes[base + 28..base + 32],
+            &planned.to_le_bytes(),
+            "the bpb hidden sectors are the planned start lba"
+        );
     }
 
     #[test]

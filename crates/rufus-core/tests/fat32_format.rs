@@ -300,6 +300,7 @@ fn rufus_options() -> FormatOptions<'static> {
     FormatOptions {
         label: Some("RUFUS"),
         volume_id: VOLUME_ID,
+        hidden_sectors: 0,
         oem: DEFAULT_OEM,
     }
 }
@@ -466,6 +467,7 @@ fn fsck_fat_accepts_a_2_gib_image() {
     let options = FormatOptions {
         label: None,
         volume_id: VOLUME_ID,
+        hidden_sectors: 0,
         oem: DEFAULT_OEM,
     };
     let (geometry, format_elapsed) =
@@ -500,6 +502,7 @@ fn large_fat32_uses_64_kib_clusters_at_32_gib() {
     let options = FormatOptions {
         label: None,
         volume_id: VOLUME_ID,
+        hidden_sectors: 0,
         oem: DEFAULT_OEM,
     };
     let started = Instant::now();

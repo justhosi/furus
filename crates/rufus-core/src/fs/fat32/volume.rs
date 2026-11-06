@@ -1838,6 +1838,7 @@ mod tests {
         FormatOptions {
             label: Some("RUFUS"),
             volume_id: 0x1A2B_3C4D,
+            hidden_sectors: 0,
             oem: DEFAULT_OEM,
         }
     }

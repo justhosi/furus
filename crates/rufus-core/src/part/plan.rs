@@ -62,6 +62,7 @@ use crate::error::Result;
 use crate::part::TableKind;
 use crate::part::gpt::GptPartition;
 use crate::part::gpt::write_gpt;
+use crate::part::mbr::MBR_CHAINLOADER;
 use crate::part::mbr::MbrPartition;
 use crate::part::mbr::write_mbr;
 use crate::part::put;
@@ -74,11 +75,6 @@ const MIB_BYTES: u64 = 1_048_576;
 /// Divided by the sector size this yields the array's sector count —
 /// 32 on 512-byte disks, 4 on 4096-byte disks, exact in both cases.
 const GPT_ARRAY_BYTES: u64 = 128 * 128;
-
-/// A blank LBA0 boot area: freshly planned MBR disks carry no boot
-/// code (an ISO's own MBR is a later write-pipeline step, not a table
-/// decision here).
-const MBR_BLANK_BOOT_AREA: [u8; 446] = [0u8; 446];
 
 /// EFI System Partition type GUID (`c12a7328-f81f-11d2-ba4b-...`) in
 /// the on-disk mixed-endian byte order the entry format stores.
@@ -964,7 +960,7 @@ fn render_mbr(plan: &TablePlan, last_lba: u64) -> Result<Rendered> {
         });
     }
     let [s0, s1, s2, s3, ..] = plan.disk_guid;
-    let image = write_mbr(&MBR_BLANK_BOOT_AREA, [s0, s1, s2, s3], &entries)?;
+    let image = write_mbr(&MBR_CHAINLOADER, [s0, s1, s2, s3], &entries)?;
     Ok(Rendered {
         kind: TableKind::Mbr,
         writes: vec![SectorWrite {
@@ -1663,6 +1659,67 @@ mod tests {
         assert_eq!(rendered.writes[0].lba, 0);
         assert_eq!(rendered.writes[0].bytes.len(), 512);
         assert_eq!(rendered.byte_len(), 512);
+    }
+
+    #[test]
+    fn mbr_render_carries_the_chainloader_and_the_table_as_before() {
+        let last_lba = floor_lba(LayoutKind::Single, TableKind::Mbr, 512);
+        let planned = plan_for(LayoutKind::Single, TableKind::Mbr, 512, last_lba);
+        let rendered =
+            render(&planned, 512, last_lba).unwrap_or_else(|error| panic!("render mbr: {error}"));
+        let sector = &rendered.writes[0].bytes;
+
+        // The boot code is the chainloader byte for byte, not zeros.
+        // The tail of the boot area (440..446) carries the disk
+        // signature instead, checked below.
+        assert_eq!(&sector[..440], &MBR_CHAINLOADER[..440], "boot code");
+        assert_ne!(&sector[..440], &[0u8; 440][..], "not the old blank area");
+        assert_eq!(&sector[510..512], &[0x55, 0xAA], "boot mark");
+
+        // The disk signature is stamped over the boot area's tail.
+        let [s0, s1, s2, s3, ..] = planned.disk_guid;
+        assert_eq!(&sector[440..444], &[s0, s1, s2, s3], "disk signature");
+
+        // Entry 0 is the active planned partition, written as before.
+        let partition = planned.partitions.first().expect("one planned partition");
+        let entry = &sector[446..462];
+        assert_eq!(entry[0], 0x80, "entry 0 is the active one");
+        assert_eq!(entry[4], partition.mbr_type, "entry 0 type byte");
+        assert_eq!(
+            &entry[8..12],
+            &(partition.start_lba as u32).to_le_bytes()[..],
+            "entry 0 start lba"
+        );
+        let count = partition.last_lba - partition.start_lba + 1;
+        assert_eq!(
+            &entry[12..16],
+            &(count as u32).to_le_bytes()[..],
+            "entry 0 sector count"
+        );
+        assert_eq!(
+            &sector[462..510],
+            &[0u8; 48][..],
+            "entries 1..3 stay unused"
+        );
+    }
+
+    #[test]
+    fn gpt_render_keeps_a_blank_lba0_boot_area() {
+        let last_lba = floor_lba(LayoutKind::Single, TableKind::Gpt, 512);
+        let planned = plan_for(LayoutKind::Single, TableKind::Gpt, 512, last_lba);
+        let rendered =
+            render(&planned, 512, last_lba).unwrap_or_else(|error| panic!("render gpt: {error}"));
+        let lba0 = rendered
+            .writes
+            .iter()
+            .find(|write| write.lba == 0)
+            .expect("gpt writes LBA0");
+        assert_eq!(
+            &lba0.bytes[..440],
+            &[0u8; 440][..],
+            "the GPT protective MBR carries no legacy boot code"
+        );
+        assert_eq!(&lba0.bytes[510..512], &[0x55, 0xAA], "protective boot mark");
     }
 
     #[test]

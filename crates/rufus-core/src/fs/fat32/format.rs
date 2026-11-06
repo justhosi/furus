@@ -77,6 +77,11 @@ pub struct FormatOptions<'a> {
     /// as Rufus does), because `0` marks unformatted media and two
     /// freshly formatted sticks must stay distinguishable.
     pub volume_id: u32,
+    /// The partition's first sector in units of the volume's sector
+    /// size, written to the BPB's hidden-sectors field: the mkfs step
+    /// passes the data partition's start LBA, a plain volume (a
+    /// superfloppy, a test image) passes `0`.
+    pub hidden_sectors: u32,
     /// OEM name bytes, written verbatim; [`bpb::DEFAULT_OEM`] carries
     /// Rufus's `MSWIN4.1`.
     pub oem: [u8; 8],
@@ -85,13 +90,15 @@ pub struct FormatOptions<'a> {
 impl Default for FormatOptions<'_> {
     /// Builds the struct-level shape, *not* a valid request: the
     /// volume id stays `0` (refused by [`format`]) because the caller
-    /// must supply a real one; the OEM name is Rufus's and the label
-    /// empty. Intended for `spread { ..Default::default() }`-style
+    /// must supply a real one; the hidden sectors are `0` (a whole
+    /// volume, no partition in front), the OEM name is Rufus's and the
+    /// label empty. Intended for `spread { ..Default::default() }`-style
     /// extension, not for direct submission.
     fn default() -> Self {
         Self {
             label: None,
             volume_id: 0,
+            hidden_sectors: 0,
             oem: bpb::DEFAULT_OEM,
         }
     }
@@ -132,6 +139,7 @@ pub fn format(volume: &mut dyn Volume, options: &FormatOptions<'_>) -> Result<Ge
     let input = bpb::BootSectorInput {
         geometry: &geometry,
         volume_id: options.volume_id,
+        hidden_sectors: options.hidden_sectors,
         label: options.label,
         oem: options.oem,
     };
@@ -283,6 +291,7 @@ mod tests {
             let options = FormatOptions {
                 label: Some("Rufus"),
                 volume_id: 0x1A2B_3C4D,
+                hidden_sectors: 2048,
                 oem: bpb::DEFAULT_OEM,
             };
             (set, options)
@@ -301,6 +310,7 @@ mod tests {
         let boot_image = bpb::boot_sector(&bpb::BootSectorInput {
             geometry,
             volume_id: options.volume_id,
+            hidden_sectors: options.hidden_sectors,
             label: options.label,
             oem: options.oem,
         })
@@ -394,12 +404,35 @@ mod tests {
     }
 
     #[test]
+    fn hidden_sectors_land_in_the_bpb_and_a_superfloppy_writes_zero() {
+        // a partitioned volume carries its start LBA at 0x1C ...
+        let (_, partitioned) = sample();
+        let mut volume = VecVolume::new(SIXTY_FOUR_MIB, 512).expect("64 MiB of RAM");
+        format(&mut volume, partitioned).expect("the partitioned volume formats");
+        let mut window = [0u8; BOOT_SECTOR_BYTES];
+        volume.read_exact_at(0, &mut window).expect("boot");
+        assert_eq!(&window[28..32], &2048_u32.to_le_bytes(), "partition start");
+
+        // ... and a whole volume (no partition table) writes zero
+        let superfloppy = FormatOptions {
+            label: None,
+            volume_id: 0x1A2B,
+            ..FormatOptions::default()
+        };
+        let mut volume = VecVolume::new(SIXTY_FOUR_MIB, 512).expect("64 MiB of RAM");
+        format(&mut volume, &superfloppy).expect("the superfloppy formats");
+        volume.read_exact_at(0, &mut window).expect("boot");
+        assert_eq!(&window[28..32], &[0, 0, 0, 0], "superfloppy hidden sectors");
+    }
+
+    #[test]
     fn labels_optional_from_bpb_only() {
         // no label: the BPB carries NO NAME, the root directory stays
         // fully zero (its first byte the directory-end marker 0x00)
         let options = FormatOptions {
             label: None,
             volume_id: 0x1A2B,
+            hidden_sectors: 0,
             oem: bpb::DEFAULT_OEM,
         };
         let mut volume = VecVolume::new(SIXTY_FOUR_MIB, 512).expect("64 MiB of RAM");
@@ -422,6 +455,7 @@ mod tests {
         let options = FormatOptions {
             label: None,
             volume_id: 0,
+            hidden_sectors: 0,
             oem: bpb::DEFAULT_OEM,
         };
         let error = format(&mut volume, &options).expect_err("id 0 refused");
