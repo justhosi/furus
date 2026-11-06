@@ -36,7 +36,11 @@
 //!   (whose mkpart step carries no layout) is refused outright for
 //!   the same reason. v4 added the `kolibri` [`BootloaderMode`]
 //!   variant — so a v3 plan is refused outright for the same reason
-//!   (unknown enum variants refuse instead of guessing).
+//!   (unknown enum variants refuse instead of guessing). v5 added the
+//!   `msdos` [`BootloaderMode`] variant and appended
+//!   [`Options::msdos_dir`] (as the last options field, like
+//!   `confirmed_serial` before it) — so a v4 plan is refused
+//!   outright for the same reason.
 //! * `confirm` is the SHA-256 over the canonical JSON bytes of the plan
 //!   with `confirm` set to `""` (see [`Plan::confirm`]). serde_json writes
 //!   struct fields in declaration order, so the byte layout *is* the
@@ -78,12 +82,13 @@ pub mod events;
 
 pub use events::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, LogLine, Outcome, Progress};
 
-/// Schema version of [`Plan`]. v4 added the `kolibri`
-/// [`BootloaderMode`] variant and refuses v1/v2/v3 plans, fail
+/// Schema version of [`Plan`]. v5 added the `msdos`
+/// [`BootloaderMode`] variant and appended [`Options::msdos_dir`],
+/// and refuses v1/v2/v3/v4 plans, fail
 /// closed — see the schema history in the crate documentation. A
 /// plan carrying a higher or older version must be refused by the
 /// helper.
-pub const PLAN_VERSION: u32 = 4;
+pub const PLAN_VERSION: u32 = 5;
 
 /// A write plan: device, image, options, ordered steps and a confirm hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +244,13 @@ pub struct Options {
     /// device; `Some` only when `show_all` is true and the serial matched at
     /// plan time. `None` means no confirmation was given.
     pub confirmed_serial: Option<String>,
+    /// Directory holding the user-supplied MS-DOS system files
+    /// (`IO.SYS`, `MSDOS.SYS`, `COMMAND.COM`); `Some` only for `msdos`
+    /// bootloader plans, `None` for every other plan. The `--image`
+    /// reference stays required even for such plans (detection still
+    /// runs) but is unused by them: the installer reads this
+    /// directory, never the image.
+    pub msdos_dir: Option<String>,
 }
 
 /// Partition table scheme.
@@ -383,6 +395,12 @@ pub enum BootloaderMode {
     Freedos,
     /// KolibriOS.
     Kolibri,
+    /// MS-DOS from user-supplied system files: MS-DOS cannot be
+    /// bundled for licensing reasons, so the three files (`IO.SYS`,
+    /// `MSDOS.SYS`, `COMMAND.COM`) come from the plan's `msdos_dir`,
+    /// never from an embedded payload.
+    #[serde(rename = "msdos")]
+    MsDos,
     /// No bootloader (plain data media).
     None,
 }
@@ -423,7 +441,9 @@ fn hex(bytes: &[u8]) -> String {
 // (PLAN §6 rule 4's typed serial confirmation). S20 bumps it to v3:
 // `Step::Mkpart::layout` is appended (the partition layout the data
 // window derives from). S20 part 10 bumps it to v4: the `kolibri`
-// `BootloaderMode` variant is added. Bumping the version must be a
+// `BootloaderMode` variant is added. S20 part 11 bumps it to v5: the
+// `msdos` `BootloaderMode` variant is added and `Options.msdos_dir`
+// is appended (the user-supplied MS-DOS directory). Bumping the version must be a
 // deliberate commit that also regenerates every golden file (see the
 // crate documentation about field order and confirm hashes).
 const _: () = assert!(PLAN_VERSION >= 1, "PLAN_VERSION must stay positive");
@@ -464,6 +484,7 @@ mod tests {
                 persistence: false,
                 show_all: false,
                 confirmed_serial: Some("ABC123".to_string()),
+                msdos_dir: None,
             },
             steps: vec![
                 Step::Wipe,
@@ -493,8 +514,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_four_until_deliberately_bumped() {
-        assert_eq!(PLAN_VERSION, 4);
+    fn schema_version_is_five_until_deliberately_bumped() {
+        assert_eq!(PLAN_VERSION, 5);
         let mut plan = sample();
         plan.confirm = plan.confirm().expect("sample serialises to canonical JSON");
         assert_eq!(plan.version, PLAN_VERSION);
@@ -502,6 +523,20 @@ mod tests {
             serde_json::from_str::<Plan>(&serde_json::to_string(&plan).expect("sample serialises"))
                 .expect("sample round-trips");
         assert_eq!(plan, round);
+    }
+
+    #[test]
+    fn msdos_dir_round_trips() {
+        // v5's appended field survives the wire: a plan carrying a
+        // user-supplied MS-DOS directory deserialises to itself.
+        let mut plan = sample();
+        plan.options.msdos_dir = Some("/tmp/dos".to_string());
+        plan.confirm = plan.confirm().expect("sample serialises to canonical JSON");
+        let round =
+            serde_json::from_str::<Plan>(&serde_json::to_string(&plan).expect("sample serialises"))
+                .expect("sample round-trips");
+        assert_eq!(plan, round);
+        assert_eq!(round.options.msdos_dir.as_deref(), Some("/tmp/dos"));
     }
 
     #[test]
@@ -530,6 +565,7 @@ mod tests {
         // v2 appended `confirmed_serial` inside `options`; pin it after
         // `show_all` so a reordering cannot slip through a hash-only
         // equality (the hash would change too, but this names the field).
+        // v5 appended `msdos_dir` after it, for the same reason.
         let show_all_at = text.find(r#""show_all":"#).expect("show_all key");
         let confirmed_at = text
             .find(r#""confirmed_serial":"#)
@@ -538,14 +574,24 @@ mod tests {
             show_all_at < confirmed_at,
             "confirmed_serial must follow show_all: {text}"
         );
+        let msdos_at = text.find(r#""msdos_dir":"#).expect("msdos_dir key");
+        assert!(
+            confirmed_at < msdos_at,
+            "msdos_dir must follow confirmed_serial: {text}"
+        );
 
         // 2. Values and tags (order-insensitive via Value).
         let obj: serde_json::Value = serde_json::from_str(&text).expect("value");
-        assert_eq!(obj["version"], 4);
+        assert_eq!(obj["version"], 5);
         assert_eq!(obj["confirm"], plan.confirm);
         assert_eq!(
             obj["options"]["confirmed_serial"], "ABC123",
             "v2's typed serial confirmation rides in options"
+        );
+        assert_eq!(
+            obj["options"]["msdos_dir"],
+            serde_json::Value::Null,
+            "v5's user-supplied MS-DOS directory rides in options, null here"
         );
         let steps = obj["steps"].as_array().expect("steps array");
         assert_eq!(steps[0]["op"], "wipe");
@@ -600,7 +646,7 @@ mod tests {
             assert_ne!(fresh, base.confirm, "{label} did not change the hash");
         };
 
-        check("version", &|p| p.version = 5);
+        check("version", &|p| p.version = 6);
         check("created_by", &|p| p.created_by = "x".into());
         check("device.path", &|p| p.device.path = "/dev/sdc".into());
         check("device.block_device", &|p| p.device.block_device = false);
@@ -617,6 +663,12 @@ mod tests {
         // v2: dropping the typed confirmation must change the hash, or a
         // tampered plan could shed its serial and still verify.
         check("confirmed_serial", &|p| p.options.confirmed_serial = None);
+        // v5: changing the user-supplied MS-DOS directory must change
+        // the hash, or a tampered plan could swap its DOS files and
+        // still verify.
+        check("msdos_dir", &|p| {
+            p.options.msdos_dir = Some("/tmp/dos".to_string());
+        });
         check("steps", &|p| p.steps.truncate(1));
         check("step payload", &|p| {
             if let Step::Write { mode } = &mut p.steps[4] {
@@ -658,7 +710,7 @@ mod tests {
                           "cluster_bytes": null, "quick_format": false,
                           "bad_blocks": false, "verify": false,
                           "persistence": false, "show_all": false,
-                          "confirmed_serial": null,
+                          "confirmed_serial": null, "msdos_dir": null,
                           "future_switch": true},
             "steps": [{"op": "wipe", "future_hint": 1}],
             "confirm": ""
@@ -682,6 +734,7 @@ mod tests {
             (BootloaderMode::UefiNtfs, "uefi_ntfs"),
             (BootloaderMode::Freedos, "freedos"),
             (BootloaderMode::Kolibri, "kolibri"),
+            (BootloaderMode::MsDos, "msdos"),
             (BootloaderMode::None, "none"),
         ] {
             let wire = serde_json::to_string(&mode).expect("mode serialises");
@@ -692,6 +745,11 @@ mod tests {
         // fail-closed behaviour the version check wants.
         let mode: BootloaderMode = serde_json::from_str(r#""kolibri""#).expect("kolibri parses");
         assert_eq!(mode, BootloaderMode::Kolibri);
+        // The `msdos` tag is the v5 addition: it must deserialize
+        // back to the new variant, so a v4 reader's refusal is the
+        // fail-closed behaviour the version check wants.
+        let mode: BootloaderMode = serde_json::from_str(r#""msdos""#).expect("msdos parses");
+        assert_eq!(mode, BootloaderMode::MsDos);
     }
 
     #[test]

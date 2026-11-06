@@ -543,7 +543,10 @@ enum Command {
     /// mkfs, write, bootloader, finalize — deliberately without
     /// offset-level detail: exact LBA placement, alignment and engine
     /// arguments are computed by the S17 executor against the device
-    /// geometry. Nothing here writes to the device.
+    /// geometry. Nothing here writes to the device. An `msdos` plan
+    /// carries no write step (IO.SYS must be the first root entry of
+    /// the fresh volume); its `--image` reference is still required
+    /// but unused.
     Plan {
         /// Image file to write.
         #[arg(long, value_name = "FILE")]
@@ -573,12 +576,21 @@ enum Command {
         #[arg(long = "iso-mode")]
         iso_mode: bool,
         /// Bootloader installer for the copy step (default: auto, paired
-        /// with the write mode: auto|syslinux|grub2|grub4dos|uefi-ntfs|freedos|kolibri|none;
+        /// with the write mode: auto|syslinux|grub2|grub4dos|uefi-ntfs|freedos|kolibri|msdos|none;
         /// uefi-ntfs selects the two-partition UEFI:NTFS layout and
         /// forces copy mode, refused without --filesystem ntfs or
-        /// exfat; freedos and kolibri need --filesystem fat32).
+        /// exfat; freedos, kolibri and msdos need --filesystem fat32;
+        /// msdos plans no write step — IO.SYS must be the first root
+        /// entry — and needs --msdos-dir).
         #[arg(long, value_enum, default_value_t = plan::BootloaderOpt::Auto)]
         bootloader: plan::BootloaderOpt,
+        /// Directory holding the user's own MS-DOS system files
+        /// (IO.SYS, MSDOS.SYS, COMMAND.COM) for --bootloader msdos:
+        /// MS-DOS cannot be bundled for licensing reasons, so the
+        /// files must be legal copies the user supplies. Refused with
+        /// any other bootloader mode.
+        #[arg(long, value_name = "DIR")]
+        msdos_dir: Option<String>,
         /// Volume label (default: executor derives it from the image).
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
@@ -1650,6 +1662,7 @@ fn describe_step(step: &Step) -> String {
                 rufus_proto::BootloaderMode::UefiNtfs => "uefi_ntfs",
                 rufus_proto::BootloaderMode::Freedos => "freedos",
                 rufus_proto::BootloaderMode::Kolibri => "kolibri",
+                rufus_proto::BootloaderMode::MsDos => "msdos",
                 rufus_proto::BootloaderMode::None => "none",
             }
         ),
@@ -1712,6 +1725,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
             persistence,
             show_all,
             confirm_serial,
+            msdos_dir,
         } => {
             // Gate first, before grading or image inspection: in every
             // mode (JSON or human) an invalid cluster must exit 1 and
@@ -1757,6 +1771,7 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
                     filesystem: filesystem.clone(),
                     iso_mode: *iso_mode,
                     bootloader: *bootloader,
+                    msdos_dir: msdos_dir.clone(),
                     label: label.clone(),
                     cluster_bytes,
                     quick_format: *quick,
@@ -1981,6 +1996,7 @@ mod tests {
                 persistence: false,
                 show_all: false,
                 confirmed_serial: None,
+                msdos_dir: None,
             },
             steps,
             confirm: String::new(),

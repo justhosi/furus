@@ -1,5 +1,5 @@
-//! The bootloader step: Syslinux, GRUB2, GRUB4DOS, FreeDOS and
-//! KolibriOS installation from the image tree, UEFI GRUB placement,
+//! The bootloader step: Syslinux, GRUB2, GRUB4DOS, FreeDOS,
+//! KolibriOS and MS-DOS installation from the image tree, UEFI GRUB placement,
 //! and the UEFI:NTFS shim.
 //!
 //! What is wired today: explicit `Syslinux` mode installs one Syslinux
@@ -13,7 +13,13 @@
 //! `HD_Load/USB_Boot/MTLD_F32` loader in the image tree, places it at
 //! the volume root and writes the KolibriOS record (it does read the
 //! image tree — the loader comes from the image — and needs a FAT32
-//! volume); `Auto` takes the first match of syslinux, grub2, grub4dos,
+//! volume); explicit `MsDos` installs the caller-supplied `IO.SYS`
+//! (contiguous, first), `MSDOS.SYS` and `COMMAND.COM` from the plan's
+//! `msdos_dir` with the WinME jump patch applied where the bytes
+//! match (it reads no image tree — an `msdos` plan carries no write
+//! step, and nothing is bundled for licensing reasons — and needs a
+//! FAT32 volume); `Auto` takes the first match of syslinux,
+//! grub2, grub4dos,
 //! logging each probe. Explicit `UefiNtfs` is disk-only instead: it
 //! writes the embedded 1 MiB shim image at the ESP offset of the
 //! two-partition layout for NTFS or exFAT plans — no image tree, no
@@ -40,7 +46,9 @@
 //! embedded resources 300-326 (the locale `CONFIG.SYS`/`AUTOEXEC.BAT`
 //! pair is rendered, not embedded); KolibriOS carries only its boot
 //! record as a transcription — the `MTLD_F32` loader comes from the
-//! image tree.
+//! image tree; MS-DOS carries nothing at all — `IO.SYS`,
+//! `MSDOS.SYS` and `COMMAND.COM` all come from the user's
+//! `msdos_dir`, since MS-DOS cannot be bundled.
 
 use std::path::Path;
 
@@ -56,6 +64,8 @@ use crate::boot::freedos;
 use crate::boot::grub2;
 use crate::boot::grub4dos;
 use crate::boot::kolibri;
+use crate::boot::msdos;
+use crate::boot::msdos::PatchState;
 use crate::boot::syslinux;
 use crate::boot::syslinux::Family;
 use crate::boot::uefi_ntfs;
@@ -161,7 +171,8 @@ fn check_mode(mode: &BootloaderMode) -> Result<()> {
         | BootloaderMode::Grub4dos
         | BootloaderMode::UefiNtfs
         | BootloaderMode::Freedos
-        | BootloaderMode::Kolibri => Ok(()),
+        | BootloaderMode::Kolibri
+        | BootloaderMode::MsDos => Ok(()),
     }
 }
 
@@ -237,6 +248,19 @@ pub(crate) enum Installed {
         kept: bool,
         messages: Vec<String>,
     },
+    /// MS-DOS install: files written and kept counts, total bytes at
+    /// the root, both patch states (`IO.SYS`, then `COMMAND.COM`),
+    /// and log lines (the reference `Patching IO.SYS...` /
+    /// `Patching COMMAND.COM...` lines with their skip notes, then
+    /// kept-existing lines). Sector 0 is untouched: the formatter's
+    /// standard record stands.
+    MsDos {
+        written: usize,
+        kept: usize,
+        bytes: u64,
+        patch_states: (PatchState, PatchState),
+        messages: Vec<String>,
+    },
     /// UEFI:NTFS install: shim image byte count, the ESP offset it
     /// landed at, and log lines (the reference `Writing UEFI:NTFS
     /// data...` line). Only the disk-only [`run`] path builds this —
@@ -259,6 +283,7 @@ impl Installed {
             | Installed::Grub4dos { messages, .. }
             | Installed::Freedos { messages, .. }
             | Installed::Kolibri { messages, .. }
+            | Installed::MsDos { messages, .. }
             | Installed::UefiNtfs { messages, .. } => messages,
         }
     }
@@ -278,6 +303,7 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
         | Installed::Grub4dos { messages, .. }
         | Installed::Freedos { messages, .. }
         | Installed::Kolibri { messages, .. }
+        | Installed::MsDos { messages, .. }
         | Installed::UefiNtfs { messages, .. } => {
             messages.splice(..0, probes);
         }
@@ -302,7 +328,9 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
 /// BIOS branch plus UEFI placement; `Grub4dos` the embedded MBR/SBR
 /// plus the root loader; `Freedos` the FreeDOS payloads plus the
 /// locale files plus the boot record; `Kolibri` the image-tree loader
-/// plus the boot record; `Auto` takes the first match of syslinux,
+/// plus the boot record; `MsDos` the user-supplied files from
+/// `msdos_dir` (no boot record — the formatter's standard record
+/// stands); `Auto` takes the first match of syslinux,
 /// grub2, grub4dos. `UefiNtfs` refuses here as invalid rather than not
 /// implemented: the installer exists but is disk-only (no tree, no
 /// FAT32 volume — see [`install_uefi_ntfs`]), so [`run`] wires it
@@ -312,12 +340,22 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
 /// `table` is the recorded partition-table kind the BIOS arms bound
 /// their post-MBR gap through (see [`gap_end`]); the Syslinux-only
 /// paths ignore it.
+///
+/// `msdos_dir` is the user-supplied MS-DOS directory the `MsDos` arm
+/// reads through [`install_msdos`]; every other arm ignores it. `None`
+/// refuses the `MsDos` arm naming `--msdos-dir`, since the three
+/// files cannot be bundled.
+///
+/// Eight parameters because the core needs the whole install context
+/// at once; bundling them would only hide the same fields.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install_tree(
     source: &dyn TreeSource,
     fat: &mut Fat32,
     disk: &mut dyn Volume,
     mode: &BootloaderMode,
     table: Option<TableKind>,
+    msdos_dir: Option<&Path>,
     cancelled: &dyn Fn() -> bool,
     load: &dyn Fn(Resource) -> Result<Payload>,
 ) -> Result<Installed> {
@@ -371,6 +409,17 @@ pub(crate) fn install_tree(
         BootloaderMode::Grub4dos => install_grub4dos(fat, disk, table, cancelled, load),
         BootloaderMode::Freedos => install_freedos(fat, cancelled),
         BootloaderMode::Kolibri => install_kolibri(source, fat, cancelled),
+        // User-supplied files by design (see `install_msdos`): the
+        // directory rides in from the plan's `msdos_dir`, and no
+        // directory means no honest install.
+        BootloaderMode::MsDos => {
+            let Some(dir) = msdos_dir else {
+                return Err(CoreError::invalid(
+                    "msdos install needs the user-supplied directory (--msdos-dir) holding IO.SYS, MSDOS.SYS and COMMAND.COM: refusing".to_string(),
+                ));
+            };
+            install_msdos(fat, dir, cancelled)
+        }
         // Disk-only by design (see `install_uefi_ntfs`): the shim
         // lands on the whole disk at the ESP offset with no tree and
         // no FAT32 volume, so the tree core refuses it and `run`
@@ -701,6 +750,67 @@ fn install_kolibri(
     })
 }
 
+/// MS-DOS branch: the user-supplied `IO.SYS`, `MSDOS.SYS` and
+/// `COMMAND.COM` from `dir` at the volume root, with the WinME
+/// real-mode jump patch applied where the bytes match.
+///
+/// Reads no image tree: the files come from the user because MS-DOS
+/// cannot be bundled (see [`msdos`]), so `source` is unused here —
+/// like the FreeDOS arm, unlike the KolibriOS arm whose loader comes
+/// from the image. A missing file, an unreadable directory, a
+/// non-regular payload slot or an oversize file all surface with
+/// [`msdos`](crate::boot::msdos)'s own messages, before any write.
+/// The volume's real cluster size gates the install through
+/// [`msdos::check_cluster_size`](crate::boot::msdos::check_cluster_size):
+/// the `u64` geometry reading converts to `u32` with a refusal when
+/// it cannot fit, never a truncating cast. Sector 0 is untouched:
+/// MS-DOS uses the standard FAT record, so the formatter's stands
+/// (`src/format.c` writes it; this arm writes files only).
+fn install_msdos(fat: &mut Fat32, dir: &Path, cancelled: &dyn Fn() -> bool) -> Result<Installed> {
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let files = msdos::MsDosFiles::load(dir)?;
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let cluster = fat.geometry().cluster_bytes();
+    let cluster = u32::try_from(cluster).map_err(|_| {
+        CoreError::invalid(format!(
+            "msdos cluster size of {cluster} bytes does not fit u32: refusing"
+        ))
+    })?;
+    msdos::check_cluster_size(cluster)?;
+    let installed = msdos::install(fat, &files)?;
+    // Reference order: the `Patching ...` line prints before its
+    // file's write, with the skip note when the patch missed; the
+    // kept-existing lines close, like the FreeDOS arm's.
+    let mut messages = vec!["Patching IO.SYS...".to_string()];
+    if let Some(note) = installed.io_sys_patch().note() {
+        messages.push(note.to_string());
+    }
+    messages.push("Patching COMMAND.COM...".to_string());
+    if let Some(note) = installed.command_com_patch().note() {
+        messages.push(note.to_string());
+    }
+    for name in installed.kept() {
+        messages.push(format!("  Kept existing '{name}'"));
+    }
+    let kept = installed.kept().len();
+    let written = 3usize.saturating_sub(kept);
+    let bytes = installed
+        .io_sys()
+        .saturating_add(installed.msdos_sys())
+        .saturating_add(installed.command_com());
+    Ok(Installed::MsDos {
+        written,
+        kept,
+        bytes,
+        patch_states: (installed.io_sys_patch(), installed.command_com_patch()),
+        messages,
+    })
+}
+
 /// UEFI:NTFS gates plus the ESP window: the filesystem gate mirrors
 /// the reference (`rufus.c:2032-2037`: NTFS or exFAT only, naming the
 /// plan filesystem otherwise); the table gate mirrors [`gap_end`] (no
@@ -803,6 +913,13 @@ fn kolibri_summary(bytes: u64, kept: bool) -> String {
     format!("installed kolibri boot record ({bytes} loader bytes at '/MTLD_F32', {loader})")
 }
 
+/// The MS-DOS completion line: files written and kept counts plus
+/// the bytes at the root, shared by the tree-run summary match so
+/// both agree.
+fn msdos_summary(written: usize, kept: usize, bytes: u64) -> String {
+    format!("installed msdos ({written} files written, {kept} kept, {bytes} bytes)")
+}
+
 /// Run the UEFI:NTFS arm: gate the plan and resolve the ESP window
 /// first (a refused plan does no 1 MiB image read), then load the
 /// embedded shim, install it through [`install_uefi_ntfs`], flush the
@@ -867,11 +984,18 @@ fn filesystem_name(filesystem: &Filesystem) -> &'static str {
 /// the next run starts clean), then the install, one flush of the
 /// partition, and the run message. The disk-side stores flush inside
 /// their own install calls.
+///
+/// `msdos_dir` is the plan's user-supplied MS-DOS directory, read by
+/// the `MsDos` arm only (see [`install_tree`]); every other arm
+/// ignores it, so callers pass `None` there. An `msdos` plan carries
+/// no write step, but `run` still opens the image tree first — the
+/// step shape stays uniform and the gate order stays shared.
 pub(crate) fn run(
     ctx: &mut RunContext<'_>,
     mode: &BootloaderMode,
     image: &ImageRef,
     filesystem: &Filesystem,
+    msdos_dir: Option<&Path>,
 ) -> Result<()> {
     if *mode == BootloaderMode::None {
         ctx.reporter.event(Event::Message {
@@ -941,6 +1065,7 @@ pub(crate) fn run(
         &mut disk,
         mode,
         table,
+        msdos_dir,
         cancelled,
         &crate::boot::load,
     )?;
@@ -1025,6 +1150,17 @@ pub(crate) fn run(
                 text: kolibri_summary(*bytes, *kept),
             });
         }
+        Installed::MsDos {
+            written,
+            kept,
+            bytes,
+            ..
+        } => {
+            ctx.reporter.event(Event::Message {
+                level: "info",
+                text: msdos_summary(*written, *kept, *bytes),
+            });
+        }
         Installed::UefiNtfs { bytes, offset, .. } => {
             // The tree core never builds this variant (its UefiNtfs
             // arm refuses); the disk-only path reports the same line
@@ -1052,6 +1188,7 @@ mod tests {
     use crate::pipeline::target::VecTarget;
     use std::cell::Cell;
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::rc::Rc;
 
@@ -1285,6 +1422,7 @@ mod tests {
             &mut dummy,
             mode,
             table,
+            None,
             &|| false,
             &asset_loader,
         )
@@ -1526,6 +1664,7 @@ mod tests {
             BootloaderMode::UefiNtfs,
             BootloaderMode::Freedos,
             BootloaderMode::Kolibri,
+            BootloaderMode::MsDos,
             BootloaderMode::None,
         ] {
             check_mode(&mode).expect("a wired mode passes the gate");
@@ -1766,6 +1905,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Kolibri,
             None,
+            None,
             &|| false,
             &asset_loader,
         )
@@ -1788,7 +1928,559 @@ mod tests {
         );
     }
 
-    /// 64 MiB whole-disk double for the UEFI:NTFS arm: big enough for
+    /// Synthetic `IO.SYS`-shaped bytes at the exact expected size
+    /// with the reference signature planted: stand-in bytes for the
+    /// arm tests — synthetic, not real DOS bytes.
+    fn msdos_io_sys_input() -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0..crate::boot::msdos::IO_SYS_BYTES)
+            .map(|index| ((index * 7 + 3) % 251) as u8)
+            .collect();
+        let end = crate::boot::msdos::IO_SYS_SIGNATURE_OFFSET
+            + crate::boot::msdos::IO_SYS_SIGNATURE.len();
+        bytes[crate::boot::msdos::IO_SYS_SIGNATURE_OFFSET..end]
+            .copy_from_slice(&crate::boot::msdos::IO_SYS_SIGNATURE);
+        bytes
+    }
+
+    /// Synthetic `COMMAND.COM`-shaped bytes at the exact expected size
+    /// with the reference signature planted: stand-in bytes for the
+    /// arm tests — synthetic, not real DOS bytes.
+    fn msdos_command_com_input() -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0..crate::boot::msdos::COMMAND_COM_BYTES)
+            .map(|index| ((index * 5 + 1) % 251) as u8)
+            .collect();
+        let end = crate::boot::msdos::COMMAND_COM_SIGNATURE_OFFSET
+            + crate::boot::msdos::COMMAND_COM_SIGNATURE.len();
+        bytes[crate::boot::msdos::COMMAND_COM_SIGNATURE_OFFSET..end]
+            .copy_from_slice(&crate::boot::msdos::COMMAND_COM_SIGNATURE);
+        bytes
+    }
+
+    /// A scratch directory holding the three user-supplied files: the
+    /// caller passes the exact bytes, so the patch-miss test reuses
+    /// the same seam with short inputs.
+    fn msdos_scratch(io_sys: &[u8], msdos_sys: &[u8], command_com: &[u8]) -> tempfile::TempDir {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        std::fs::write(scratch.path().join("IO.SYS"), io_sys).expect("IO.SYS lands");
+        std::fs::write(scratch.path().join("MSDOS.SYS"), msdos_sys).expect("MSDOS.SYS lands");
+        std::fs::write(scratch.path().join("COMMAND.COM"), command_com).expect("COMMAND.COM lands");
+        scratch
+    }
+
+    /// Run [`install_tree`] with `dir` as the plan's `msdos_dir`: the
+    /// arm reads the directory, never the tree, so callers pass a
+    /// bare source on purpose.
+    fn msdos_install(source: &MemSource, fat: &mut Fat32, dir: &Path) -> Result<Installed> {
+        let mut dummy = VecVolume::new(512, 512).expect("one sector fits");
+        install_tree(
+            source,
+            fat,
+            &mut dummy,
+            &BootloaderMode::MsDos,
+            None,
+            Some(dir),
+            &|| false,
+            &asset_loader,
+        )
+    }
+
+    #[test]
+    fn msdos_installs_user_files_with_io_sys_first_and_contiguous() {
+        // A fresh FAT32 image through the `MsDos` arm: the three
+        // user-supplied files land with both patches applied, `IO.SYS`
+        // first, in one contiguous run, and sector 0 untouched (the
+        // formatter's standard record stands — MS-DOS uses it).
+        let io_sys = msdos_io_sys_input();
+        let msdos_sys = vec![0xABu8; 2048];
+        let command_com = msdos_command_com_input();
+        let scratch = msdos_scratch(&io_sys, &msdos_sys, &command_com);
+        let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
+        let source = source.with_file(&[b"a.txt"], b"x");
+        let (backing, mut fat) = formatted();
+        let before = backing.boot_sector();
+        let installed =
+            msdos_install(&source, &mut fat, scratch.path()).expect("the msdos install runs");
+        let Installed::MsDos {
+            written,
+            kept,
+            bytes,
+            patch_states,
+            messages,
+        } = installed
+        else {
+            panic!("an msdos install reports the MsDos variant");
+        };
+        assert_eq!(written, 3, "three files written");
+        assert_eq!(kept, 0, "a fresh install keeps nothing");
+        assert_eq!(
+            bytes,
+            (io_sys.len() + msdos_sys.len() + command_com.len()) as u64,
+            "the bytes count the three files"
+        );
+        assert_eq!(
+            patch_states,
+            (
+                crate::boot::msdos::PatchState::Applied,
+                crate::boot::msdos::PatchState::Applied
+            ),
+            "both patches land"
+        );
+        assert_eq!(messages.len(), 2, "no skip notes: {messages:?}");
+        assert_eq!(messages[0], "Patching IO.SYS...", "the bios line first");
+        assert_eq!(
+            messages[1], "Patching COMMAND.COM...",
+            "the shell line next"
+        );
+        assert!(
+            messages.iter().all(|line| line.is_ascii()),
+            "every message stays ASCII"
+        );
+
+        // The root holds the three files, with IO.SYS first.
+        let listed = fat.list_dir("/").expect("the root lists");
+        let shorts: Vec<&str> = listed
+            .iter()
+            .map(|entry| entry.short_name.as_str())
+            .collect();
+        assert_eq!(
+            shorts,
+            vec!["IO.SYS", "MSDOS.SYS", "COMMAND.COM"],
+            "the root lists the three files with IO.SYS first"
+        );
+
+        // The patched files carry 0xEB at the reference offsets and
+        // are otherwise byte-identical to the supplied copies; the
+        // kernel is verbatim.
+        let back = fat.read_file("/IO.SYS").expect("IO.SYS reads back");
+        assert_eq!(back.len(), io_sys.len(), "the bios length holds");
+        assert_eq!(
+            back[crate::boot::msdos::IO_SYS_PATCH_OFFSET],
+            0xEB,
+            "the bios patch byte lands"
+        );
+        for (index, (&was, &is)) in io_sys.iter().zip(back.iter()).enumerate() {
+            if index == crate::boot::msdos::IO_SYS_PATCH_OFFSET {
+                continue;
+            }
+            assert_eq!(was, is, "only the patch byte differs at {index}");
+        }
+        let back = fat.read_file("/MSDOS.SYS").expect("MSDOS.SYS reads back");
+        assert_eq!(back, msdos_sys, "the kernel is byte-correct");
+        let back = fat
+            .read_file("/COMMAND.COM")
+            .expect("COMMAND.COM reads back");
+        assert_eq!(back.len(), command_com.len(), "the shell length holds");
+        assert_eq!(
+            back[crate::boot::msdos::COMMAND_COM_PATCH_OFFSET],
+            0xEB,
+            "the shell patch byte lands"
+        );
+
+        // IO.SYS sits in one contiguous run ending in end-of-chain:
+        // walk the first FAT copy straight from the raw image. The
+        // allocator journals the chain and the arm never flushes, so
+        // the caller-side flush below materializes it first.
+        fat.flush().expect("the caller-side flush runs");
+        let geometry = *fat.geometry();
+        let io_entry = listed
+            .iter()
+            .find(|entry| entry.short_name == "IO.SYS")
+            .expect("IO.SYS is listed");
+        let cluster_bytes = geometry.cluster_bytes();
+        let clusters = (crate::boot::msdos::IO_SYS_BYTES as u64).div_ceil(cluster_bytes);
+        let count = u32::try_from(clusters).expect("the test run fits u32");
+        let fat_start = u64::from(geometry.reserved_sectors) * u64::from(geometry.bytes_per_sector);
+        let image = backing.bytes.borrow();
+        for offset in 0..count {
+            let cluster = io_entry
+                .first_cluster
+                .checked_add(offset)
+                .expect("the test cluster fits");
+            let at = usize::try_from(fat_start + u64::from(cluster) * 4)
+                .expect("the fat window fits usize");
+            let window = image.get(at..at + 4).expect("the fat entry fits");
+            let raw = u32::from_le_bytes([window[0], window[1], window[2], window[3]]);
+            if offset + 1 < count {
+                let next = cluster.checked_add(1).expect("the next cluster fits");
+                assert_eq!(
+                    raw, next,
+                    "cluster {cluster} links to the next cluster, not {raw:#010x}"
+                );
+            } else {
+                assert!(
+                    raw >= 0x0FFF_FFF8,
+                    "cluster {cluster} closes with end-of-chain, not {raw:#010x}"
+                );
+            }
+        }
+
+        // Sector 0 is untouched: MS-DOS uses the standard FAT record,
+        // so the formatter's stands.
+        assert_eq!(backing.boot_sector(), before, "no boot-sector byte moved");
+
+        // The composed image is fsck clean (read-only check over a
+        // dumped tempfile; the tool resolves through `PATH`).
+        let dump = tempfile::tempdir().expect("a scratch directory");
+        let dumped = dump.path().join("msdos.img");
+        std::fs::write(&dumped, backing.bytes.borrow().as_slice()).expect("the image dumps");
+        let output = match std::process::Command::new("fsck.fat")
+            .arg("-n")
+            .arg("-v")
+            .arg(&dumped)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("skip: the fsck acceptance needs fsck.fat on PATH ({error})");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "fsck.fat -n -v exits 0 after the msdos install ({}): stdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+
+        // The run summary names the files, the kept count and the bytes.
+        let summary = msdos_summary(written, kept, bytes);
+        assert!(summary.contains("3"), "names the files: {summary}");
+        assert!(
+            summary.contains(&bytes.to_string()),
+            "names the bytes: {summary}"
+        );
+        assert!(summary.contains("msdos"), "names the mode: {summary}");
+        assert!(summary.is_ascii(), "stays ASCII: {summary}");
+    }
+
+    #[test]
+    fn msdos_second_install_keeps() {
+        // A second install over identical bytes keeps all three: the
+        // kept files report with the reference `Kept existing`
+        // lines, and nothing writes.
+        let io_sys = msdos_io_sys_input();
+        let msdos_sys = vec![0xABu8; 2048];
+        let command_com = msdos_command_com_input();
+        let scratch = msdos_scratch(&io_sys, &msdos_sys, &command_com);
+        let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
+        let source = source.with_file(&[b"a.txt"], b"x");
+        let (_backing, mut fat) = formatted();
+        msdos_install(&source, &mut fat, scratch.path()).expect("the first install runs");
+        let again =
+            msdos_install(&source, &mut fat, scratch.path()).expect("identical bytes are kept");
+        let Installed::MsDos {
+            written,
+            kept,
+            messages,
+            ..
+        } = again
+        else {
+            panic!("a kept install reports the MsDos variant");
+        };
+        assert_eq!(written, 0, "nothing writes twice");
+        assert_eq!(kept, 3, "all three files kept");
+        for name in ["IO.SYS", "MSDOS.SYS", "COMMAND.COM"] {
+            assert!(
+                messages
+                    .iter()
+                    .any(|line| line == &format!("  Kept existing '{name}'")),
+                "the kept line reports {name}: {messages:?}"
+            );
+        }
+        assert!(
+            messages.iter().all(|line| line.is_ascii()),
+            "every message stays ASCII"
+        );
+        let back = fat.read_file("/IO.SYS").expect("the kept file reads back");
+        assert_eq!(back.len(), io_sys.len(), "kept bytes unchanged");
+        assert_eq!(
+            back[crate::boot::msdos::IO_SYS_PATCH_OFFSET],
+            0xEB,
+            "the kept patch byte holds"
+        );
+    }
+
+    #[test]
+    fn msdos_patch_miss_is_noted_and_copied_verbatim() {
+        // Short inputs miss the size check: the install still lands
+        // every file verbatim and replays the reference skip notes
+        // after each `Patching ...` line.
+        let io_sys = vec![0x11u8; 1024];
+        let msdos_sys = vec![0x22u8; 512];
+        let command_com = vec![0x33u8; 1024];
+        let scratch = msdos_scratch(&io_sys, &msdos_sys, &command_com);
+        let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
+        let source = source.with_file(&[b"a.txt"], b"x");
+        let (_backing, mut fat) = formatted();
+        let installed = msdos_install(&source, &mut fat, scratch.path())
+            .expect("a size-missed install still lands");
+        let Installed::MsDos {
+            patch_states,
+            messages,
+            ..
+        } = installed
+        else {
+            panic!("a missed install reports the MsDos variant");
+        };
+        assert_eq!(
+            patch_states,
+            (
+                crate::boot::msdos::PatchState::UnexpectedSize { observed: 1024 },
+                crate::boot::msdos::PatchState::UnexpectedSize { observed: 1024 }
+            ),
+            "both misses report their observed lengths"
+        );
+        assert_eq!(
+            messages,
+            vec![
+                "Patching IO.SYS...".to_string(),
+                "  unexpected file size".to_string(),
+                "Patching COMMAND.COM...".to_string(),
+                "  unexpected file size".to_string(),
+            ],
+            "each miss replays the reference note"
+        );
+        let back = fat.read_file("/IO.SYS").expect("IO.SYS reads back");
+        assert_eq!(back, io_sys, "a missed file copies verbatim");
+        let back = fat
+            .read_file("/COMMAND.COM")
+            .expect("COMMAND.COM reads back");
+        assert_eq!(back, command_com, "a missed shell copies verbatim");
+    }
+
+    #[test]
+    fn msdos_without_a_directory_refuses_naming_the_flag() {
+        // No directory means no honest install: the arm refuses
+        // naming `--msdos-dir` before any write, with the volume
+        // byte-identical.
+        let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
+        let source = source.with_file(&[b"a.txt"], b"x");
+        let (backing, mut fat) = formatted();
+        let before = backing.bytes.borrow().clone();
+        let error = tree_install(&source, &mut fat, &BootloaderMode::MsDos)
+            .expect_err("a directory-less msdos refuses");
+        let text = error.to_string();
+        assert!(text.contains("--msdos-dir"), "names the flag: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(
+            backing.bytes.borrow().as_slice(),
+            before.as_slice(),
+            "no volume byte moved in 67108864 bytes of image"
+        );
+    }
+
+    #[test]
+    fn msdos_missing_directory_refuses_naming_it() {
+        // A directory that does not exist is refused naming it, with
+        // the volume byte-identical (the load runs before any write).
+        let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
+        let source = source.with_file(&[b"a.txt"], b"x");
+        let (backing, mut fat) = formatted();
+        let before = backing.bytes.borrow().clone();
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let missing = scratch.path().join("no-such-dir");
+        let mut dummy = VecVolume::new(512, 512).expect("one sector fits");
+        let error = install_tree(
+            &source,
+            &mut fat,
+            &mut dummy,
+            &BootloaderMode::MsDos,
+            None,
+            Some(&missing),
+            &|| false,
+            &asset_loader,
+        )
+        .expect_err("a missing directory refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains(&missing.display().to_string()),
+            "names the directory: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(
+            backing.bytes.borrow().as_slice(),
+            before.as_slice(),
+            "no volume byte moved in 67108864 bytes of image"
+        );
+    }
+
+    #[test]
+    fn msdos_directory_slot_refuses() {
+        // A directory sitting in a payload slot (`IO.SYS` as a
+        // directory, not a file) refuses naming it instead of
+        // failing on the read, with the volume byte-identical.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        std::fs::create_dir(scratch.path().join("IO.SYS")).expect("the directory lands");
+        std::fs::write(scratch.path().join("MSDOS.SYS"), b"kernel-bytes")
+            .expect("the kernel lands");
+        std::fs::write(scratch.path().join("COMMAND.COM"), b"shell-bytes")
+            .expect("the shell lands");
+        let source = MemSource::new().with_dir(&[], vec![file_entry(b"a.txt", b"x")]);
+        let source = source.with_file(&[b"a.txt"], b"x");
+        let (backing, mut fat) = formatted();
+        let before = backing.bytes.borrow().clone();
+        let error =
+            msdos_install(&source, &mut fat, scratch.path()).expect_err("a directory slot refuses");
+        let text = error.to_string();
+        assert!(text.contains("IO.SYS"), "names the slot: {text}");
+        assert!(text.contains("regular file"), "names the problem: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(
+            backing.bytes.borrow().as_slice(),
+            before.as_slice(),
+            "no volume byte moved in 67108864 bytes of image"
+        );
+    }
+
+    /// Sparse block size: one FAT32 cluster at most (64 KiB), so a
+    /// block never straddles more than a couple of writes.
+    const SPARSE_BLOCK: u64 = 64 * 1024;
+
+    /// A sparse in-memory [`Volume`] reporting a large `total_bytes`
+    /// while storing only the windows written (zero elsewhere): the
+    /// stand-in for a multi-gigabyte device no test may allocate — a
+    /// real 32 GiB file would blow the tmpfs under `/tmp`, and a
+    /// 32 GiB `Vec` would blow the heap, while the format's few MiB
+    /// of FAT writes cost MiB here. Cloned handles share the blocks
+    /// (like [`SharedVolume`]), so the test still observes the
+    /// formatter's bytes after [`Fat32::format`] returns.
+    #[derive(Debug, Clone)]
+    struct SparseVolume {
+        blocks: Rc<RefCell<BTreeMap<u64, Vec<u8>>>>,
+        total: u64,
+    }
+
+    impl SparseVolume {
+        fn large(total: u64) -> Self {
+            Self {
+                blocks: Rc::new(RefCell::new(BTreeMap::new())),
+                total,
+            }
+        }
+
+        /// A copy of the stored blocks, for the unchanged comparisons.
+        fn snapshot(&self) -> BTreeMap<u64, Vec<u8>> {
+            self.blocks.borrow().clone()
+        }
+
+        /// Checked byte window of `len` bytes at `offset`, naming
+        /// offset, length and total on refusal.
+        fn window(&self, offset: u64, len: usize, direction: &str) -> Result<(u64, u64)> {
+            let end = offset.checked_add(len as u64).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "sparse test {direction} overflows the byte arithmetic"
+                ))
+            })?;
+            if end > self.total {
+                return Err(CoreError::invalid(format!(
+                    "sparse test {direction} of {len} bytes at offset {offset} runs past the {} byte volume",
+                    self.total,
+                )));
+            }
+            Ok((offset, end))
+        }
+    }
+
+    impl Volume for SparseVolume {
+        fn total_bytes(&self) -> u64 {
+            self.total
+        }
+
+        fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> TestResult<()> {
+            let (_, end) = self.window(offset, buf.len(), "read")?;
+            buf.fill(0);
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let stored = self.blocks.borrow();
+            let mut cursor = offset;
+            let mut done = 0usize;
+            while cursor < end {
+                let index = cursor / SPARSE_BLOCK;
+                let base = index * SPARSE_BLOCK;
+                let stop = (base + SPARSE_BLOCK).min(end);
+                let take =
+                    usize::try_from(stop - cursor).expect("a sparse block window fits usize");
+                if let Some(block) = stored.get(&index) {
+                    let from =
+                        usize::try_from(cursor - base).expect("a sparse block offset fits usize");
+                    buf[done..done + take].copy_from_slice(&block[from..from + take]);
+                }
+                done += take;
+                cursor = stop;
+            }
+            Ok(())
+        }
+
+        fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> TestResult<()> {
+            let (_, end) = self.window(offset, buf.len(), "write")?;
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let mut stored = self.blocks.borrow_mut();
+            let mut cursor = offset;
+            let mut done = 0usize;
+            while cursor < end {
+                let index = cursor / SPARSE_BLOCK;
+                let base = index * SPARSE_BLOCK;
+                let stop = (base + SPARSE_BLOCK).min(end);
+                let take =
+                    usize::try_from(stop - cursor).expect("a sparse block window fits usize");
+                let block = stored
+                    .entry(index)
+                    .or_insert_with(|| vec![0u8; SPARSE_BLOCK as usize]);
+                let from =
+                    usize::try_from(cursor - base).expect("a sparse block offset fits usize");
+                block[from..from + take].copy_from_slice(&buf[done..done + take]);
+                done += take;
+                cursor = stop;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn msdos_refuses_a_64kib_cluster_volume_before_any_write() {
+        // 32 GiB is the first geometry tier with 64 KiB clusters (see
+        // `CLUSTER_TIERS`/`LARGE_CLUSTER_BYTES`): MS-DOS cannot boot
+        // from it, so the arm refuses with the reference MSG_110
+        // sentence before any file lands. The volume is a sparse
+        // double (see `SparseVolume`), so the format's few MiB of FAT
+        // writes cost MiB, not GiB.
+        let io_sys = msdos_io_sys_input();
+        let msdos_sys = vec![0xABu8; 2048];
+        let command_com = msdos_command_com_input();
+        let scratch = msdos_scratch(&io_sys, &msdos_sys, &command_com);
+        let backing = SparseVolume::large(32 * 1024 * 1024 * 1024);
+        let mut fat = Fat32::format(
+            Box::new(backing.clone()),
+            &FormatOptions {
+                volume_id: 0x1234_5678,
+                ..Default::default()
+            },
+        )
+        .expect("the large volume formats");
+        assert_eq!(
+            fat.geometry().cluster_bytes(),
+            65_536,
+            "the tier premise holds: 32 GiB formats with 64 KiB clusters"
+        );
+        let before = backing.snapshot();
+        let error = install_msdos(&mut fat, scratch.path(), &|| false)
+            .expect_err("a 64 KiB cluster refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("MS-DOS cannot boot from a drive using a 64 kilobytes Cluster size."),
+            "the refusal carries the reference sentence verbatim: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(
+            backing.snapshot(),
+            before,
+            "no volume byte moved: the gate fires before any file write"
+        );
+    }
     /// the planner to lay the 1 MiB ESP window on, small enough to
     /// snapshot in RAM.
     const UEFI_DISK_BYTES: u64 = 64 * 1024 * 1024;
@@ -2114,6 +2806,7 @@ mod tests {
             &BootloaderMode::Syslinux,
             &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
             &rufus_proto::Filesystem::Exfat,
+            None,
         )
         .expect_err("a non-fat32 plan refuses");
         let text = error.to_string();
@@ -2136,6 +2829,7 @@ mod tests {
             &BootloaderMode::None,
             &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
             &rufus_proto::Filesystem::Fat32,
+            None,
         )
         .expect("none always runs");
         assert_eq!(partitions.get(), 0, "the partition never opens");
@@ -2160,6 +2854,7 @@ mod tests {
                 &mode,
                 &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
                 &rufus_proto::Filesystem::Fat32,
+                None,
             )
             .expect_err("a missing image refuses");
             assert!(
@@ -2191,6 +2886,7 @@ mod tests {
             &BootloaderMode::UefiNtfs,
             &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
             &rufus_proto::Filesystem::Ntfs,
+            None,
         )
         .expect("the run lands");
         assert_eq!(partitions.get(), 0, "the data partition never opens");
@@ -2255,6 +2951,7 @@ mod tests {
             &BootloaderMode::UefiNtfs,
             &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
             &rufus_proto::Filesystem::Fat32,
+            None,
         )
         .expect_err("a fat32 plan refuses");
         let text = error.to_string();
@@ -2287,6 +2984,7 @@ mod tests {
             &BootloaderMode::UefiNtfs,
             &image_ref("missing.iso", rufus_proto::ImageKind::Iso),
             &rufus_proto::Filesystem::Ntfs,
+            None,
         )
         .expect_err("a table-less run refuses");
         let text = error.to_string();
@@ -2368,6 +3066,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Grub2,
             Some(TableKind::Mbr),
+            None,
             &|| false,
             &asset_loader,
         )
@@ -2486,6 +3185,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Grub2,
             Some(TableKind::Mbr),
+            None,
             &|| false,
             &asset_loader,
         )
@@ -2517,6 +3217,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Grub2,
             None,
+            None,
             &|| false,
             &asset_loader,
         )
@@ -2541,6 +3242,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Grub2,
             Some(TableKind::Mbr),
+            None,
             &|| false,
             &asset_loader,
         )
@@ -2574,6 +3276,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Grub4dos,
             Some(TableKind::Mbr),
+            None,
             &|| false,
             &asset_loader,
         )
@@ -2620,6 +3323,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Grub4dos,
             Some(TableKind::Mbr),
+            None,
             &|| false,
             &asset_loader,
         )
@@ -2683,6 +3387,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Grub2,
             Some(TableKind::Mbr),
+            None,
             &|| false,
             &asset_loader,
         )
@@ -2754,6 +3459,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Auto,
             Some(TableKind::Mbr),
+            None,
             &|| false,
             &asset_loader,
         )
@@ -2793,6 +3499,7 @@ mod tests {
             &mut disk,
             &BootloaderMode::Auto,
             Some(TableKind::Mbr),
+            None,
             &|| false,
             &asset_loader,
         )
@@ -3417,6 +4124,7 @@ pub(crate) mod end_to_end {
                 persistence: false,
                 show_all: false,
                 confirmed_serial: None,
+                msdos_dir: None,
             },
             steps: vec![
                 rufus_proto::Step::Wipe,
@@ -3567,5 +4275,283 @@ pub(crate) mod end_to_end {
             0x5A,
             "the jump targets the code at 0x5A"
         );
+    }
+
+    /// Synthetic user-supplied MS-DOS directory: exact-size `IO.SYS`
+    /// and `COMMAND.COM` with the reference signatures planted plus a
+    /// 2 KiB `MSDOS.SYS` — stand-in bytes (synthetic, not real DOS
+    /// bytes), the same shape the arm-level tests use. The directory
+    /// returns alongside so it outlives the run.
+    fn msdos_user_dir() -> tempfile::TempDir {
+        use crate::boot::msdos as dos;
+        let mut io_sys: Vec<u8> = (0..dos::IO_SYS_BYTES)
+            .map(|index| ((index * 7 + 3) % 251) as u8)
+            .collect();
+        let end = dos::IO_SYS_SIGNATURE_OFFSET + dos::IO_SYS_SIGNATURE.len();
+        io_sys[dos::IO_SYS_SIGNATURE_OFFSET..end].copy_from_slice(&dos::IO_SYS_SIGNATURE);
+        let mut command_com: Vec<u8> = (0..dos::COMMAND_COM_BYTES)
+            .map(|index| ((index * 5 + 1) % 251) as u8)
+            .collect();
+        let end = dos::COMMAND_COM_SIGNATURE_OFFSET + dos::COMMAND_COM_SIGNATURE.len();
+        command_com[dos::COMMAND_COM_SIGNATURE_OFFSET..end]
+            .copy_from_slice(&dos::COMMAND_COM_SIGNATURE);
+        let dir = tempfile::tempdir().expect("the dos dir allocates");
+        std::fs::write(dir.path().join("IO.SYS"), &io_sys).expect("IO.SYS lands");
+        std::fs::write(dir.path().join("MSDOS.SYS"), vec![0xABu8; 2048]).expect("MSDOS.SYS lands");
+        std::fs::write(dir.path().join("COMMAND.COM"), &command_com).expect("COMMAND.COM lands");
+        dir
+    }
+
+    /// The MS-DOS plan over `iso` with `dos` as its user-supplied
+    /// directory (`None` for the refusal test): wipe, table,
+    /// partition, format, bootloader, finalize — never a write step,
+    /// since `IO.SYS` must be the first root entry of the fresh
+    /// volume.
+    fn msdos_plan(iso: &std::path::Path, dos: Option<&std::path::Path>) -> Plan {
+        Plan {
+            version: PLAN_VERSION,
+            created_by: "bootloader-msdos-e2e".to_string(),
+            device: DeviceRef {
+                path: "/dev/test".to_string(),
+                block_device: false,
+                size_bytes: None,
+                serial: None,
+                model: None,
+                sysfs: None,
+            },
+            image: ImageRef {
+                path: iso.display().to_string(),
+                size_bytes: 32 * SECTOR_BYTES as u64,
+                sha256: String::new(),
+                kind: ImageKind::Iso,
+            },
+            options: Options {
+                scheme: rufus_proto::Scheme::Mbr,
+                target: rufus_proto::Target::Dual,
+                filesystem: Filesystem::Fat32,
+                label: None,
+                cluster_bytes: None,
+                quick_format: true,
+                bad_blocks: false,
+                verify: false,
+                persistence: false,
+                show_all: false,
+                confirmed_serial: None,
+                msdos_dir: dos.map(|dir| dir.display().to_string()),
+            },
+            steps: vec![
+                rufus_proto::Step::Wipe,
+                rufus_proto::Step::Mklabel {
+                    scheme: rufus_proto::Scheme::Mbr,
+                },
+                rufus_proto::Step::Mkpart {
+                    scheme: rufus_proto::Scheme::Mbr,
+                    layout: rufus_proto::Layout::Single,
+                },
+                rufus_proto::Step::Mkfs {
+                    filesystem: Filesystem::Fat32,
+                    label: None,
+                    cluster_bytes: None,
+                    quick: true,
+                },
+                rufus_proto::Step::Bootloader {
+                    mode: rufus_proto::BootloaderMode::MsDos,
+                },
+                rufus_proto::Step::Finalize,
+            ],
+            confirm: String::new(),
+        }
+    }
+
+    /// A sparse 128 MiB disk image plus the opener serving it at the
+    /// Mkpart-planned window: the shared rig both MS-DOS run tests
+    /// drive (the refusal test snapshots the window between runs).
+    fn msdos_rig(scratch: &tempfile::TempDir) -> (std::path::PathBuf, EndToEndOpener, u64, u64) {
+        let disk_path = scratch.path().join("disk.img");
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&disk_path)
+            .expect("the disk creates")
+            .set_len(DISK_BYTES)
+            .expect("the disk sizes");
+        let (base, len) =
+            single_data_window(TableKind::Mbr, 512, DISK_BYTES).expect("the data window plans");
+        let opener = EndToEndOpener {
+            path: disk_path.clone(),
+            disk_len: DISK_BYTES,
+            base,
+            len,
+        };
+        (disk_path, opener, base, len)
+    }
+
+    /// The run options every MS-DOS run below shares: no read-back
+    /// check, no surface scan, instant retries.
+    fn msdos_run_options() -> crate::pipeline::RunOptions {
+        crate::pipeline::RunOptions {
+            verify: false,
+            badblocks: false,
+            retries: 3,
+            retry_delay: std::time::Duration::ZERO,
+            reset_usb: false,
+        }
+    }
+
+    #[test]
+    fn msdos_plan_installs_user_files_end_to_end() {
+        // The full pipeline proves both wirings at once: `run_step`
+        // threads `plan.options.msdos_dir` into `bootloader::run`,
+        // which threads it into `install_tree`. Reverting either to
+        // `None` refuses the run naming `--msdos-dir`, so this test
+        // fails. The ISO is only the still-required detection record:
+        // the arm never reads the tree (the plan carries no write
+        // step).
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let iso_path = scratch.path().join("dos.iso");
+        std::fs::write(&iso_path, syslinux_iso()).expect("the iso writes");
+        let (disk_path, opener, base, len) = msdos_rig(&scratch);
+        let dos = msdos_user_dir();
+        let mut reporter = Recorder::default();
+        let plan = msdos_plan(&iso_path, Some(dos.path()));
+        let report =
+            crate::pipeline::run(&plan, &opener, &msdos_run_options(), &mut reporter, &|| {
+                false
+            })
+            .expect("the msdos plan runs");
+        // All six steps ran, in order, with no transfer anywhere.
+        let names: Vec<&str> = report.steps.iter().map(|step| step.step).collect();
+        assert_eq!(
+            names,
+            [
+                "wipe",
+                "mklabel",
+                "mkpart",
+                "mkfs",
+                "bootloader",
+                "finalize"
+            ],
+            "every step runs in order, with no write step"
+        );
+        // The three files land through a fresh handle over the same
+        // window — which is what proves the run flushed — with both
+        // patches applied and the kernel byte-correct.
+        let view = PartFile::open(&disk_path, base, len).expect("the view reopens");
+        let mut fat = Fat32::open(Box::new(view)).expect("the volume opens");
+        let back = fat.read_file("/IO.SYS").expect("IO.SYS reads back");
+        assert_eq!(
+            back.len(),
+            crate::boot::msdos::IO_SYS_BYTES,
+            "the bios length holds"
+        );
+        assert_eq!(
+            back[crate::boot::msdos::IO_SYS_PATCH_OFFSET],
+            0xEB,
+            "the bios patch byte lands"
+        );
+        let back = fat.read_file("/MSDOS.SYS").expect("MSDOS.SYS reads back");
+        assert_eq!(back, vec![0xABu8; 2048], "the kernel is byte-correct");
+        let back = fat
+            .read_file("/COMMAND.COM")
+            .expect("COMMAND.COM reads back");
+        assert_eq!(
+            back.len(),
+            crate::boot::msdos::COMMAND_COM_BYTES,
+            "the shell length holds"
+        );
+        assert_eq!(
+            back[crate::boot::msdos::COMMAND_COM_PATCH_OFFSET],
+            0xEB,
+            "the shell patch byte lands"
+        );
+        // The run reports the reference lines plus the summary.
+        let texts: Vec<&str> = reporter
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                crate::pipeline::event::Event::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"Patching IO.SYS..."),
+            "the bios line reports: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Patching COMMAND.COM..."),
+            "the shell line reports: {texts:?}"
+        );
+        let total = (crate::boot::msdos::IO_SYS_BYTES
+            + 2048
+            + crate::boot::msdos::COMMAND_COM_BYTES) as u64;
+        let summary = format!("installed msdos (3 files written, 0 kept, {total} bytes)");
+        assert!(
+            texts.contains(&summary.as_str()),
+            "the summary names the files: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|line| line.is_ascii()),
+            "every message stays ASCII"
+        );
+    }
+
+    #[test]
+    fn msdos_plan_without_its_directory_refuses_leaving_the_volume_identical() {
+        // Same rig, two phases: format first, snapshot the partition
+        // window, then run the bootloader step with `msdos_dir: None`
+        // (as a hand-built plan without one would carry). The refusal
+        // names `--msdos-dir` (step-wrapped as `bootloader`) and not
+        // one window byte moves: the gate fires before any write, and
+        // a failed step never flushes on its behalf.
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let iso_path = scratch.path().join("dos.iso");
+        std::fs::write(&iso_path, syslinux_iso()).expect("the iso writes");
+        let (disk_path, opener, base, len) = msdos_rig(&scratch);
+        let mut reporter = Recorder::default();
+        let mut setup = msdos_plan(&iso_path, None);
+        setup.steps.truncate(4);
+        crate::pipeline::run(
+            &setup,
+            &opener,
+            &msdos_run_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("wipe through mkfs runs");
+        let disk = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&disk_path)
+            .expect("the disk reopens");
+        let mut before = vec![0u8; len as usize];
+        disk.read_exact_at(&mut before, base)
+            .expect("the window snapshots");
+        let mut reporter = Recorder::default();
+        let mut plan = msdos_plan(&iso_path, None);
+        plan.steps = vec![rufus_proto::Step::Bootloader {
+            mode: rufus_proto::BootloaderMode::MsDos,
+        }];
+        let error =
+            crate::pipeline::run(&plan, &opener, &msdos_run_options(), &mut reporter, &|| {
+                false
+            })
+            .expect_err("a directory-less msdos refuses");
+        assert!(
+            matches!(
+                error,
+                crate::error::CoreError::Step {
+                    step: "bootloader",
+                    ..
+                }
+            ),
+            "the refusal is step-wrapped: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("--msdos-dir"), "names the flag: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        let mut after = vec![0u8; len as usize];
+        disk.read_exact_at(&mut after, base)
+            .expect("the window reads back");
+        assert_eq!(after, before, "no volume byte moved");
     }
 }

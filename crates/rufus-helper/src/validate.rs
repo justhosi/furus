@@ -496,6 +496,32 @@ fn check_image(plan: &Plan) -> Result<(), Reject> {
 /// Rule 7: step arguments must be legal for this plan's options and
 /// image kind; one readable message per rule, step numbers 1-based.
 fn check_steps(plan: &Plan) -> Result<(), Reject> {
+    // The MS-DOS directory rides in the plan options for the `msdos`
+    // bootloader only: an `msdos` plan without it, or any other plan
+    // carrying it, is refused with the planner's own wording, so a
+    // hand-built plan cannot slip past the CLI gate. An empty string
+    // counts as absent, mirroring the planner.
+    let msdos_dir = plan
+        .options
+        .msdos_dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty());
+    let msdos_plan = plan
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Bootloader { mode } if *mode == BootloaderMode::MsDos));
+    if msdos_plan && msdos_dir.is_none() {
+        return Err(reject(
+            "invalid_step",
+            "MS-DOS needs --msdos-dir with the user's IO.SYS, MSDOS.SYS and COMMAND.COM",
+        ));
+    }
+    if !msdos_plan && msdos_dir.is_some() {
+        return Err(reject(
+            "invalid_step",
+            "--msdos-dir only applies to --bootloader msdos",
+        ));
+    }
     for (index, step) in plan.steps.iter().enumerate() {
         let number = index + 1;
         match step {
@@ -573,14 +599,18 @@ fn check_steps(plan: &Plan) -> Result<(), Reject> {
                 }
             }
             Step::Bootloader { mode }
-                if (*mode == BootloaderMode::Freedos || *mode == BootloaderMode::Kolibri)
+                if (*mode == BootloaderMode::Freedos
+                    || *mode == BootloaderMode::Kolibri
+                    || *mode == BootloaderMode::MsDos)
                     && plan.options.filesystem != Filesystem::Fat32 =>
             {
-                // Both installers write a FAT32 volume: any other
+                // The three installers write a FAT32 volume: any other
                 // filesystem is refused with the planner's own wording,
                 // so a hand-built plan cannot slip past the CLI gate.
                 let message = if *mode == BootloaderMode::Freedos {
                     "FreeDOS needs a FAT32 data partition; choose --filesystem fat32"
+                } else if *mode == BootloaderMode::MsDos {
+                    "MS-DOS needs a FAT32 data partition; choose --filesystem fat32"
                 } else {
                     "KolibriOS needs a FAT32 data partition; choose --filesystem fat32"
                 };
@@ -881,6 +911,7 @@ mod tests {
                     persistence: false,
                     show_all: false,
                     confirmed_serial: None,
+                    msdos_dir: None,
                 },
                 steps: vec![
                     Step::Wipe,
@@ -1392,10 +1423,11 @@ mod tests {
     }
 
     #[test]
-    fn freedos_and_kolibri_bootloaders_need_fat32() {
-        // Both installers write a FAT32 volume: a hand-built plan
-        // pairing either mode with NTFS is refused with the planner's
-        // own wording.
+    fn freedos_kolibri_and_msdos_bootloaders_need_fat32() {
+        // The three installers write a FAT32 volume: a hand-built plan
+        // pairing any of the modes with NTFS is refused with the
+        // planner's own wording. The `msdos` pairing also carries the
+        // directory, so only the filesystem pairing is under test.
         for (mode, message) in [
             (
                 BootloaderMode::Freedos,
@@ -1405,11 +1437,18 @@ mod tests {
                 BootloaderMode::Kolibri,
                 "KolibriOS needs a FAT32 data partition; choose --filesystem fat32",
             ),
+            (
+                BootloaderMode::MsDos,
+                "MS-DOS needs a FAT32 data partition; choose --filesystem fat32",
+            ),
         ] {
             let fixture = Fixture::new();
             let (mut plan, env, _device) = fixture.good(true);
             if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
                 *slot = mode.clone();
+            }
+            if mode == BootloaderMode::MsDos {
+                plan.options.msdos_dir = Some("/tmp/dos".to_string());
             }
             plan.options.filesystem = Filesystem::Ntfs;
             plan = signed(plan);
@@ -1420,17 +1459,84 @@ mod tests {
     }
 
     #[test]
-    fn freedos_and_kolibri_bootloaders_accepted_on_fat32() {
-        // Either mode over the FAT32 filesystem it writes passes: the
-        // rule only fires on a mismatched pairing.
-        for mode in [BootloaderMode::Freedos, BootloaderMode::Kolibri] {
+    fn freedos_kolibri_and_msdos_bootloaders_accepted_on_fat32() {
+        // Any of the modes over the FAT32 filesystem it writes passes:
+        // the rule only fires on a mismatched pairing.
+        for mode in [
+            BootloaderMode::Freedos,
+            BootloaderMode::Kolibri,
+            BootloaderMode::MsDos,
+        ] {
+            let fixture = Fixture::new();
+            let (mut plan, env, _device) = fixture.good(true);
+            if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+                *slot = mode.clone();
+            }
+            if mode == BootloaderMode::MsDos {
+                plan.options.msdos_dir = Some("/tmp/dos".to_string());
+            }
+            plan = signed(plan);
+            validate(&plan, &env).expect("the pairing passes");
+        }
+    }
+
+    #[test]
+    fn msdos_bootloader_needs_its_directory() {
+        // The three system files are user-supplied for licensing
+        // reasons: an `msdos` plan without one (or with an empty
+        // string, which counts as absent like the planner) is refused
+        // with the planner's own wording; a non-empty directory
+        // passes this rule.
+        for dir in [None, Some(String::new())] {
+            let fixture = Fixture::new();
+            let (mut plan, env, _device) = fixture.good(true);
+            if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+                *slot = BootloaderMode::MsDos;
+            }
+            plan.options.msdos_dir = dir;
+            plan = signed(plan);
+            let refused = validate(&plan, &env).expect_err("no dir refuses");
+            assert_eq!(refused.code, "invalid_step");
+            assert_eq!(
+                refused.message,
+                "MS-DOS needs --msdos-dir with the user's IO.SYS, MSDOS.SYS and COMMAND.COM"
+            );
+            assert!(refused.message.is_ascii(), "the refusal stays ASCII");
+        }
+        let fixture = Fixture::new();
+        let (mut plan, env, _device) = fixture.good(true);
+        if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+            *slot = BootloaderMode::MsDos;
+        }
+        plan.options.msdos_dir = Some("/tmp/dos".to_string());
+        plan = signed(plan);
+        validate(&plan, &env).expect("a directory passes");
+    }
+
+    #[test]
+    fn msdos_dir_with_other_modes_is_refused() {
+        // No other installer reads the directory: pairing it with any
+        // other bootloader mode is refused with the planner's own
+        // wording.
+        for mode in [
+            BootloaderMode::Auto,
+            BootloaderMode::Freedos,
+            BootloaderMode::None,
+        ] {
             let fixture = Fixture::new();
             let (mut plan, env, _device) = fixture.good(true);
             if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
                 *slot = mode;
             }
+            plan.options.msdos_dir = Some("/tmp/dos".to_string());
             plan = signed(plan);
-            validate(&plan, &env).expect("the pairing passes");
+            let refused = validate(&plan, &env).expect_err("a misplaced dir refuses");
+            assert_eq!(refused.code, "invalid_step");
+            assert_eq!(
+                refused.message,
+                "--msdos-dir only applies to --bootloader msdos"
+            );
+            assert!(refused.message.is_ascii(), "the refusal stays ASCII");
         }
     }
 

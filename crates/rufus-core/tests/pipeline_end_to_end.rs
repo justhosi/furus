@@ -384,6 +384,7 @@ fn plan_for(
             persistence: false,
             show_all: false,
             confirmed_serial: None,
+            msdos_dir: None,
         },
         steps: vec![
             Step::Wipe,

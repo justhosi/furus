@@ -6,7 +6,7 @@ constant in `crates/rufus-cli/tests/cli.rs`. Regenerate it with
 `json.dumps(report, indent=2)` from `rufus analyze --json` over those
 bytes.
 
-`plan-v4.json` is the exact `--json` output of
+`plan-v5.json` is the exact `--json` output of
 
 ```sh
 rufus plan --dry-run --json --target bios --filesystem fat32 \
@@ -24,12 +24,16 @@ platform-independent:
 Schema v2 added `options.confirmed_serial` (the typed show-all
 confirmation, PLAN §6 rule 4); schema v3 added the mkpart step's
 `layout` (the partition layout the data window derives from); schema
-v4 added the `kolibri` bootloader mode. On this
+v4 added the `kolibri` bootloader mode; schema v5 added the
+`msdos` bootloader mode and `options.msdos_dir` (the user-supplied
+MS-DOS directory, `null` here — an `msdos` plan would carry a path
+and no write step, so the default `--bootloader auto` golden keeps
+both the write step and the null). On this
 golden `confirmed_serial` is `null` — the plan targets `/dev/null`
 and never enables show-all — and `layout` is `"single"`, the
 `--bootloader auto` default.
 
-The test (`plan_dry_run_matches_golden_v4`, which lives in
+The test (`plan_dry_run_matches_golden_v5`, which lives in
 `crates/rufus-cli/tests/cli.rs`) rebuilds
 the same temp image from code (32,780 zero bytes with `CD001` at 0x8001 —
 it must be ≥ 0x8006 bytes or the magic physically does not fit), runs the
@@ -54,7 +58,7 @@ plan["created_by"] = "<created_by>"
 plan["confirm"] = ""
 plan["confirm"] = "sha256:" + hashlib.sha256(
     json.dumps(plan, separators=(",", ":")).encode()).hexdigest()
-open("crates/rufus-cli/tests/golden/plan-v4.json", "w").write(
+open("crates/rufus-cli/tests/golden/plan-v5.json", "w").write(
     json.dumps(plan, indent=2) + "\n")
 EOF
 ```

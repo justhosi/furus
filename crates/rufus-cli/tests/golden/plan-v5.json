@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "created_by": "<created_by>",
   "device": {
     "path": "/dev/null",
@@ -26,7 +26,8 @@
     "verify": false,
     "persistence": false,
     "show_all": false,
-    "confirmed_serial": null
+    "confirmed_serial": null,
+    "msdos_dir": null
   },
   "steps": [
     {
@@ -60,5 +61,5 @@
       "op": "finalize"
     }
   ],
-  "confirm": "sha256:d59ff59ad5282903163437c5106143de35f59fbf358b5ead668f5430e7418aa3"
+  "confirm": "sha256:a69551febdfc66d87f4aa61e1828c077d7f3cf314c6f07223646048299cf3503"
 }

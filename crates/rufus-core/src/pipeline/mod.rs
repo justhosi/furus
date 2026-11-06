@@ -126,7 +126,7 @@ pub fn step_name(step: &Step) -> &'static str {
 /// Run one step through the run context: wipe, label, partition,
 /// filesystem, write and bootloader stages live in their own modules
 /// (the bootloader arm runs [`bootloader::run`]: Syslinux, GRUB2 BIOS,
-/// GRUB4DOS, FreeDOS or KolibriOS on FAT32, the UEFI:NTFS shim on NTFS
+/// GRUB4DOS, FreeDOS, KolibriOS or MS-DOS on FAT32, the UEFI:NTFS shim on NTFS
 /// or exFAT).
 /// The match is exhaustive, so a new
 /// [`Step`] variant fails to compile here (and in [`step_name`]) until
@@ -144,7 +144,13 @@ fn run_step(plan: &Plan, step: &Step, ctx: &mut steps::RunContext<'_>) -> Result
         } => mkfs::run(ctx, filesystem, label, cluster_bytes, *quick),
         Step::Write { mode } => write::run(ctx, mode, &plan.image, &plan.options.filesystem),
         Step::Bootloader { mode } => {
-            bootloader::run(ctx, mode, &plan.image, &plan.options.filesystem)
+            // The plan's user-supplied MS-DOS directory rides in for
+            // the `MsDos` arm only; every other arm ignores it (`None`
+            // elsewhere). An `msdos` plan carries no write step, so the
+            // image reference here is the still-required detection
+            // record, never a transfer source.
+            let msdos_dir = plan.options.msdos_dir.as_deref().map(std::path::Path::new);
+            bootloader::run(ctx, mode, &plan.image, &plan.options.filesystem, msdos_dir)
         }
         Step::Finalize => {
             let size = ctx.device()?.size();
@@ -458,6 +464,7 @@ mod tests {
                 persistence: false,
                 show_all: false,
                 confirmed_serial: None,
+                msdos_dir: None,
             },
             steps,
             confirm: String::new(),

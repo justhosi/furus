@@ -63,6 +63,11 @@ pub enum BootloaderOpt {
     Freedos,
     /// KolibriOS.
     Kolibri,
+    /// MS-DOS from the user's own system files (`--msdos-dir`): no
+    /// write step is planned, since `IO.SYS` must be the first root
+    /// entry of the fresh volume.
+    #[value(name = "msdos")]
+    MsDos,
     /// No bootloader (plain data media).
     None,
 }
@@ -78,6 +83,7 @@ impl BootloaderOpt {
             BootloaderOpt::UefiNtfs => BootloaderMode::UefiNtfs,
             BootloaderOpt::Freedos => BootloaderMode::Freedos,
             BootloaderOpt::Kolibri => BootloaderMode::Kolibri,
+            BootloaderOpt::MsDos => BootloaderMode::MsDos,
             BootloaderOpt::None => BootloaderMode::None,
         }
     }
@@ -116,8 +122,16 @@ pub struct Options {
     /// `uefi-ntfs` additionally selects the UEFI:NTFS layout and
     /// forces copy mode (refused without an NTFS or exFAT filesystem
     /// in [`build`]; `freedos` and `kolibri` are refused without a
-    /// FAT32 filesystem there).
+    /// FAT32 filesystem there). `msdos` plans no write step at all
+    /// (see [`steps`]) and is refused without a FAT32 filesystem and
+    /// without a non-empty [`Options::msdos_dir`] there.
     pub bootloader: BootloaderOpt,
+    /// Directory holding the user-supplied MS-DOS system files
+    /// (`--msdos-dir`); only meaningful with the `msdos` bootloader,
+    /// refused with any other mode in [`build`]. An empty string
+    /// counts as absent, so only a non-empty path rides into the
+    /// plan's `msdos_dir`.
+    pub msdos_dir: Option<String>,
     /// Bad-block scan.
     pub bad_blocks: bool,
     /// Read-back verification.
@@ -285,13 +299,22 @@ fn write_mode(image: &Path, kind: &ImageKind, iso_mode: bool) -> WriteMode {
 /// (the shim boots a populated NTFS or exFAT data partition). The mkpart step
 /// carries the selector's layout (`UefiNtfs` for `uefi-ntfs`, `Single`
 /// otherwise).
+///
+/// `MsDos` plans no `Write` step: MS-DOS reads `IO.SYS` from the
+/// front of the root directory over one contiguous cluster chain, so
+/// the installer must place it as the first root entry of the fresh
+/// volume — a byte-for-byte image write would own the volume instead
+/// and leave no honest first slot. The `--image` reference stays
+/// required (detection still runs) but is unused by such a plan; the
+/// installer reads the user's `--msdos-dir` files, never the image.
 pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
     let (write, bootloader) = match options.bootloader {
+        BootloaderOpt::MsDos => (None, BootloaderMode::MsDos),
         BootloaderOpt::Auto => {
             let write = write_mode(image, kind, options.iso_mode);
             let needs_installer = write == WriteMode::Copy;
             (
-                write,
+                Some(write),
                 if needs_installer {
                     BootloaderMode::Auto
                 } else {
@@ -305,10 +328,10 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
             } else {
                 write_mode(image, kind, options.iso_mode)
             };
-            (write, selected.mode())
+            (Some(write), selected.mode())
         }
     };
-    vec![
+    let mut planned = vec![
         Step::Wipe,
         Step::Mklabel {
             scheme: options.scheme.clone(),
@@ -323,10 +346,15 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
             cluster_bytes: options.cluster_bytes,
             quick: options.quick_format,
         },
-        Step::Write { mode: write },
-        Step::Bootloader { mode: bootloader },
-        Step::Finalize,
-    ]
+    ];
+    // Only the MS-DOS plan skips the transfer: every other mode moves
+    // the image before installing its bootloader (see above).
+    if let Some(mode) = write {
+        planned.push(Step::Write { mode });
+    }
+    planned.push(Step::Bootloader { mode: bootloader });
+    planned.push(Step::Finalize);
+    planned
 }
 
 /// Build and seal the provisional [`Plan`] for `image`/`device`.
@@ -343,7 +371,12 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
 /// filesystem is a usage error. A `freedos` or `kolibri` bootloader
 /// without a FAT32 data filesystem is refused the same way: both
 /// installers write a FAT32 volume, so any other filesystem is a
-/// usage error naming the mode and the filesystem.
+/// usage error naming the mode and the filesystem. An `msdos`
+/// bootloader is refused without a FAT32 data filesystem the same
+/// way, and without a non-empty `msdos_dir` (the user's `IO.SYS`,
+/// `MSDOS.SYS` and `COMMAND.COM`, which licensing keeps out of the
+/// bundle); an `msdos_dir` with any other bootloader mode is
+/// refused, since no other installer reads it.
 pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Result<Plan, Fail> {
     if options.bootloader == BootloaderOpt::UefiNtfs
         && options.filesystem != Filesystem::Ntfs
@@ -371,6 +404,32 @@ pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Resu
             message: "KolibriOS needs a FAT32 data partition; choose --filesystem fat32".to_owned(),
         });
     }
+    if options.bootloader == BootloaderOpt::MsDos && options.filesystem != Filesystem::Fat32 {
+        return Err(Fail {
+            exit: crate::Exit::Usage,
+            kind: "usage",
+            message: "MS-DOS needs a FAT32 data partition; choose --filesystem fat32".to_owned(),
+        });
+    }
+    // An empty directory string counts as absent (see
+    // `Options::msdos_dir`), so only a non-empty path rides into the
+    // plan.
+    let msdos_dir = options.msdos_dir.clone().filter(|dir| !dir.is_empty());
+    if options.bootloader == BootloaderOpt::MsDos && msdos_dir.is_none() {
+        return Err(Fail {
+            exit: crate::Exit::Usage,
+            kind: "usage",
+            message: "MS-DOS needs --msdos-dir with the user's IO.SYS, MSDOS.SYS and COMMAND.COM"
+                .to_owned(),
+        });
+    }
+    if options.bootloader != BootloaderOpt::MsDos && msdos_dir.is_some() {
+        return Err(Fail {
+            exit: crate::Exit::Usage,
+            kind: "usage",
+            message: "--msdos-dir only applies to --bootloader msdos".to_owned(),
+        });
+    }
     let steps = steps(Path::new(&inspected.path), &inspected.kind, options);
     let mut plan = Plan {
         version: PLAN_VERSION,
@@ -394,6 +453,7 @@ pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Resu
             persistence: options.persistence,
             show_all: options.show_all,
             confirmed_serial: options.confirmed_serial.clone(),
+            msdos_dir,
         },
         steps,
         confirm: String::new(),
@@ -488,6 +548,7 @@ mod tests {
             persistence: false,
             show_all: false,
             confirmed_serial: None,
+            msdos_dir: None,
             iso_mode,
             bootloader: BootloaderOpt::Auto,
         }
@@ -784,5 +845,182 @@ mod tests {
                 assert!(refused.message.is_ascii(), "the refusal stays ASCII");
             }
         }
+    }
+
+    /// A dry-run device plus an inspected image for the MS-DOS rule
+    /// tests below.
+    fn msdos_probe() -> (DeviceRef, crate::image::Inspected) {
+        (
+            DeviceRef {
+                path: "/dev/null".to_string(),
+                block_device: false,
+                size_bytes: None,
+                serial: None,
+                model: None,
+                sysfs: None,
+            },
+            crate::image::Inspected {
+                path: "image.iso".to_string(),
+                size_bytes: 32_780,
+                sha256: "0".repeat(64),
+                kind: ImageKind::Iso,
+            },
+        )
+    }
+
+    #[test]
+    fn build_refuses_msdos_without_fat32() {
+        // The MS-DOS installer writes a FAT32 volume: any other
+        // filesystem is a usage refusal with the exact message, before
+        // any hash is sealed, so a plan cannot be built that is
+        // guaranteed to stop at the last step.
+        for (filesystem, accepted) in [
+            (Filesystem::Fat32, true),
+            (Filesystem::Exfat, false),
+            (Filesystem::Ntfs, false),
+            (Filesystem::Ext4, false),
+        ] {
+            let (device, inspected) = msdos_probe();
+            let mut options = test_options(false);
+            options.bootloader = BootloaderOpt::MsDos;
+            options.msdos_dir = Some("/tmp/dos".to_string());
+            options.filesystem = filesystem.clone();
+            if accepted {
+                let plan = match build(device, inspected, &options) {
+                    Ok(plan) => plan,
+                    Err(fail) => panic!("{filesystem:?} seals: {}", fail.message),
+                };
+                let mode = plan
+                    .steps
+                    .iter()
+                    .find_map(|step| match step {
+                        Step::Bootloader { mode } => Some(mode.clone()),
+                        _ => None,
+                    })
+                    .expect("the plan carries a bootloader step");
+                assert_eq!(mode, BootloaderMode::MsDos);
+            } else {
+                let refused = build(device, inspected, &options).expect_err("non-fat32 refuses");
+                assert_eq!(
+                    refused.message,
+                    "MS-DOS needs a FAT32 data partition; choose --filesystem fat32",
+                    "the refusal carries the exact message"
+                );
+                assert!(refused.message.is_ascii(), "the refusal stays ASCII");
+            }
+        }
+    }
+
+    #[test]
+    fn build_refuses_msdos_without_its_directory() {
+        // The three system files are user-supplied for licensing
+        // reasons: without `--msdos-dir` the plan refuses with the
+        // exact message, before any hash is sealed. An empty string
+        // counts as absent, so it refuses the same way.
+        for dir in [None, Some(String::new())] {
+            let (device, inspected) = msdos_probe();
+            let mut options = test_options(false);
+            options.bootloader = BootloaderOpt::MsDos;
+            options.msdos_dir = dir;
+            let refused = build(device, inspected, &options).expect_err("no dir refuses");
+            assert_eq!(
+                refused.message,
+                "MS-DOS needs --msdos-dir with the user's IO.SYS, MSDOS.SYS and COMMAND.COM",
+                "the refusal carries the exact message"
+            );
+            assert!(refused.message.is_ascii(), "the refusal stays ASCII");
+        }
+    }
+
+    #[test]
+    fn build_refuses_msdos_dir_with_other_modes() {
+        // No other installer reads the directory: pairing it with any
+        // other bootloader mode refuses with the exact message, before
+        // any hash is sealed.
+        for bootloader in [
+            BootloaderOpt::Auto,
+            BootloaderOpt::Syslinux,
+            BootloaderOpt::Freedos,
+            BootloaderOpt::None,
+        ] {
+            let (device, inspected) = msdos_probe();
+            let mut options = test_options(false);
+            options.bootloader = bootloader;
+            options.msdos_dir = Some("/tmp/dos".to_string());
+            let refused = build(device, inspected, &options).expect_err("a misplaced dir refuses");
+            assert_eq!(
+                refused.message, "--msdos-dir only applies to --bootloader msdos",
+                "the refusal carries the exact message for {bootloader:?}"
+            );
+            assert!(refused.message.is_ascii(), "the refusal stays ASCII");
+        }
+    }
+
+    #[test]
+    fn msdos_plans_no_write_step_but_keeps_bootloader_msdos() {
+        // MS-DOS needs `IO.SYS` as the first root entry of the fresh
+        // volume, so the plan carries no transfer step: wipe, table,
+        // partition, format, bootloader, finalize. The directory rides
+        // into the sealed options for the installer.
+        let (device, inspected) = msdos_probe();
+        let mut options = test_options(false);
+        options.bootloader = BootloaderOpt::MsDos;
+        options.msdos_dir = Some("/tmp/dos".to_string());
+        let plan = match build(device, inspected, &options) {
+            Ok(plan) => plan,
+            Err(fail) => panic!("the msdos plan seals: {}", fail.message),
+        };
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| !matches!(step, Step::Write { .. })),
+            "no write step in {:?}",
+            plan.steps
+        );
+        let bootloader = plan
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Bootloader { mode } => Some(mode.clone()),
+                _ => None,
+            })
+            .expect("the plan carries a bootloader step");
+        assert_eq!(bootloader, BootloaderMode::MsDos);
+        assert_eq!(
+            plan.steps.len(),
+            6,
+            "wipe, mklabel, mkpart, mkfs, bootloader, finalize"
+        );
+        assert_eq!(plan.options.msdos_dir.as_deref(), Some("/tmp/dos"));
+        // Every other mode still plans its transfer step: the omission
+        // belongs to `msdos` alone.
+        let mut options = test_options(false);
+        options.bootloader = BootloaderOpt::Freedos;
+        let plan = match build(
+            DeviceRef {
+                path: "/dev/null".to_string(),
+                block_device: false,
+                size_bytes: None,
+                serial: None,
+                model: None,
+                sysfs: None,
+            },
+            crate::image::Inspected {
+                path: "image.iso".to_string(),
+                size_bytes: 32_780,
+                sha256: "0".repeat(64),
+                kind: ImageKind::Iso,
+            },
+            &options,
+        ) {
+            Ok(plan) => plan,
+            Err(fail) => panic!("the freedos plan seals: {}", fail.message),
+        };
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| matches!(step, Step::Write { .. })),
+            "other modes keep their write step"
+        );
     }
 }
