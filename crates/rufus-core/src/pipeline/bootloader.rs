@@ -24,9 +24,11 @@
 //! writes the embedded 1 MiB shim image at the ESP offset of the
 //! two-partition layout for NTFS or exFAT plans — no image tree, no
 //! FAT32 volume (the copy step already placed the ISO files on the
-//! data partition). Explicit `Windows` refuses as not implemented
-//! instead: applying the
-//! WIM image and writing the BCD stores is slice 10 work.
+//! data partition). Explicit `Windows` is mount-based instead: it
+//! formats the ESP as FAT32, applies the WIM image onto the mounted
+//! NTFS data partition, builds both BCD stores, places the boot files
+//! and sets the offline SAN policy — no image tree, no FAT32 data
+//! volume (the WIM itself is the image).
 //!
 //! The obsolete-module replacement ([`Obsolete`](crate::boot::syslinux::Obsolete))
 //! is deliberately not applied here: no newer module bytes are
@@ -84,14 +86,19 @@ use crate::error::Result;
 use crate::fs::FileVolume;
 use crate::fs::Volume;
 use crate::fs::fat32::Fat32;
+use crate::fs::fat32::format::FormatOptions;
 use crate::iso::IsoReader;
 use crate::part::TableKind;
 use crate::part::plan::LayoutKind;
+use crate::part::plan::data_window;
+use crate::part::plan::esp_window;
 use crate::pipeline::event::Event;
+use crate::pipeline::opener::MountedPartition;
 use crate::pipeline::steps::RunContext;
 use crate::pipeline::target::Target;
 use crate::report::syslinux_banner;
 use crate::udf::UdfReader;
+use crate::windows::bcd;
 
 /// Whole-disk [`Volume`] over a pipeline [`Target`]: bounds-checked
 /// reads and writes delegating to `read_at`/`write_all_at`, `flush`
@@ -167,11 +174,10 @@ impl Volume for DiskView<'_> {
 /// [`run`], not [`install_tree`], which refuses it through its own
 /// explicit arm. (The mode names S20's UEFI:NTFS partition, not the
 /// UEFI GRUB file the GRUB arms place.) `Windows` passes here too —
-/// its WIM apply and BCD stores are slice 10 work, so both entry
-/// points refuse it through their own explicit arms (see
-/// [`windows_refusal`]). Every other mode is wired today, so this
-/// always passes for them; it stays as the shared gate so a future
-/// variant fails closed in both entry points.
+/// its mount-based arm lives in [`run`], not [`install_tree`], which
+/// refuses it through its own explicit arm. Every other mode is wired
+/// today, so this always passes for them; it stays as the shared gate
+/// so a future variant fails closed in both entry points.
 fn check_mode(mode: &BootloaderMode) -> Result<()> {
     match mode {
         BootloaderMode::None
@@ -184,16 +190,6 @@ fn check_mode(mode: &BootloaderMode) -> Result<()> {
         | BootloaderMode::Kolibri
         | BootloaderMode::MsDos
         | BootloaderMode::Windows => Ok(()),
-    }
-}
-
-/// Refusal for the `Windows` mode: applying the WIM image to the NTFS
-/// data partition and writing the BCD stores is slice 10 work, so
-/// both [`install_tree`] and [`run`] refuse as not implemented before
-/// touching the image or the device, naming what is missing.
-fn windows_refusal() -> CoreError {
-    CoreError::NotImplemented {
-        what: "windows bootloader installation (the wim apply and the BCD stores arrive in slice 10)",
     }
 }
 
@@ -357,9 +353,10 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
 /// implemented: the installer exists but is disk-only (no tree, no
 /// FAT32 volume — see [`install_uefi_ntfs`]), so [`run`] wires it
 /// directly and a tree install can never serve it. `Windows` refuses
-/// here as not implemented through [`windows_refusal`]: its WIM apply and BCD
-/// stores are slice 10 work, so no tree install can serve it either.
-/// Any future variant refuses through the shared [`check_mode`]
+/// here as invalid: the installer exists but is mount-based (the WIM
+/// applies onto the mounted data and ESP partitions — see
+/// [`run_windows`]), so [`run`] wires it directly and no tree install
+/// can serve it either. Any future variant refuses through the shared [`check_mode`]
 /// table before reaching here; the trailing `other` arm stays as
 /// fail-closed invalid, unreachable today.
 ///
@@ -453,10 +450,13 @@ pub(crate) fn install_tree(
         BootloaderMode::UefiNtfs => Err(CoreError::invalid(
             "uefi-ntfs installs the embedded image onto the whole disk at the ESP offset, not through the filesystem tree: refusing a tree install".to_string(),
         )),
-        // Slice 10 work by design (see `windows_refusal`): the WIM
-        // apply and the BCD stores have no installer yet, so the tree
-        // core refuses as not implemented and `run` refuses the same way.
-        BootloaderMode::Windows => Err(windows_refusal()),
+        // Mount-based by design (see `run_windows`): the WIM
+        // applies onto the mounted data and ESP partitions with no
+        // tree and no FAT32 data volume, so the tree core refuses it
+        // and `run` wires it directly.
+        BootloaderMode::Windows => Err(CoreError::invalid(
+            "windows installs the WIM image onto the mounted data and ESP partitions, not through the filesystem tree: refusing a tree install".to_string(),
+        )),
         // `None` returned above; any future unwired variant would
         // refuse in `check_mode` above, so this arm is unreachable
         // today. This names the mode rather than assuming the match
@@ -1035,6 +1035,463 @@ fn run_msdos(ctx: &mut RunContext<'_>, msdos_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// A [`Volume`] window over the whole-disk [`Target`] at
+/// `[base, base + len)`: the ESP the Windows arm formats. The data
+/// partition arrives through [`Opener::partition`](crate::pipeline::opener::Opener::partition),
+/// but the ESP has no volume seam — only a node path for mounting —
+/// so the formatter drives this window over the shared whole-disk
+/// handle instead, bounded before every I/O like [`DiskView`].
+struct EspView<'a> {
+    target: &'a mut dyn Target,
+    base: u64,
+    len: u64,
+    sector_size: u32,
+}
+
+impl<'a> EspView<'a> {
+    fn new(target: &'a mut dyn Target, base: u64, len: u64, sector_size: u32) -> Self {
+        Self {
+            target,
+            base,
+            len,
+            sector_size,
+        }
+    }
+}
+
+impl Volume for EspView<'_> {
+    fn total_bytes(&self) -> u64 {
+        self.len
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.sector_size
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let len_u64 = u64::try_from(buf.len())
+            .map_err(|_| CoreError::invalid("esp window read longer than u64: refusing"))?;
+        let end = offset.checked_add(len_u64).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "esp window read of {} bytes at offset {offset} overflows u64: refusing",
+                buf.len()
+            ))
+        })?;
+        if end > self.len {
+            return Err(CoreError::invalid(format!(
+                "esp window read of {} bytes at offset {offset} runs past the {len} byte window at base {base}: refusing",
+                buf.len(),
+                len = self.len,
+                base = self.base
+            )));
+        }
+        let at = self.base.checked_add(offset).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "esp window base {base} plus offset {offset} overflows u64: refusing",
+                base = self.base
+            ))
+        })?;
+        self.target.read_at(at, buf)
+    }
+
+    fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+        let len_u64 = u64::try_from(buf.len())
+            .map_err(|_| CoreError::invalid("esp window write longer than u64: refusing"))?;
+        let end = offset.checked_add(len_u64).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "esp window write of {} bytes at offset {offset} overflows u64: refusing",
+                buf.len()
+            ))
+        })?;
+        if end > self.len {
+            return Err(CoreError::invalid(format!(
+                "esp window write of {} bytes at offset {offset} runs past the {len} byte window at base {base}: refusing",
+                buf.len(),
+                len = self.len,
+                base = self.base
+            )));
+        }
+        let at = self.base.checked_add(offset).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "esp window base {base} plus offset {offset} overflows u64: refusing",
+                base = self.base
+            ))
+        })?;
+        self.target.write_all_at(at, buf)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.target.flush()
+    }
+}
+
+/// Copy 16 raw GUID bytes out of `buf` at `at`, naming the field on
+/// refusal. No indexing: the read stays total on a short buffer.
+fn guid_at(buf: &[u8], at: usize, field: &str) -> Result<[u8; 16]> {
+    let window = buf.get(
+        at..at
+            .checked_add(16)
+            .ok_or_else(|| CoreError::invalid(format!("{field} offset overflows: refusing")))?,
+    );
+    let bytes: &[u8] = window.ok_or_else(|| {
+        CoreError::invalid(format!("stamped GPT is too short for {field}: refusing"))
+    })?;
+    bytes
+        .try_into()
+        .map_err(|_| CoreError::invalid(format!("stamped GPT {field} is not 16 bytes: refusing")))
+}
+
+/// Read one little-endian `u64` at `at`, naming the field on refusal.
+fn u64_at(buf: &[u8], at: usize, field: &str) -> Result<u64> {
+    let end = at
+        .checked_add(8)
+        .ok_or_else(|| CoreError::invalid(format!("{field} offset overflows: refusing")))?;
+    let window = buf.get(at..end).ok_or_else(|| {
+        CoreError::invalid(format!("stamped GPT is too short for {field}: refusing"))
+    })?;
+    let unit: [u8; 8] = window
+        .try_into()
+        .map_err(|_| CoreError::invalid(format!("stamped GPT {field} is not 8 bytes: refusing")))?;
+    Ok(u64::from_le_bytes(unit))
+}
+
+/// Re-read the stamped GPT from the target and build the BCD device
+/// identity: the disk GUID from the primary header plus the unique
+/// GUID of the entry whose LBA span is the planner's data window
+/// (never a positional guess).
+///
+/// Every failure is [`CoreError::InvalidInput`] naming the problem:
+/// an unreadable header or entry array, a missing signature, a
+/// missing array location, an unparsable table, or no data entry at
+/// the planned span.
+fn windows_identity(
+    target: &mut dyn Target,
+    sector_size: u32,
+    size: u64,
+) -> Result<bcd::DeviceIdentity> {
+    let (data_offset, data_len) =
+        data_window(LayoutKind::WindowsToGo, TableKind::Gpt, sector_size, size)?;
+    let sector_u64 = u64::from(sector_size);
+    if sector_u64 == 0 {
+        return Err(CoreError::invalid(
+            "stamped GPT sector size is zero: cannot locate the data partition".to_string(),
+        ));
+    }
+    // The planner stamps 1 MiB-aligned spans, so a remainder here
+    // means the size or the sector size the caller passed disagrees
+    // with the stamped layout: refuse naming both numbers instead of
+    // truncating through the division below.
+    if data_offset % sector_u64 != 0 {
+        return Err(CoreError::invalid(format!(
+            "stamped GPT data offset {data_offset} is not a multiple of sector size {sector_size}: refusing"
+        )));
+    }
+    if data_len % sector_u64 != 0 {
+        return Err(CoreError::invalid(format!(
+            "stamped GPT data length {data_len} is not a multiple of sector size {sector_size}: refusing"
+        )));
+    }
+    let data_start_lba = data_offset / sector_u64;
+    let data_sectors = data_len / sector_u64;
+    let header_len = usize::try_from(sector_size).map_err(|_| {
+        CoreError::invalid(format!(
+            "stamped GPT sector size {sector_size} does not fit usize: refusing"
+        ))
+    })?;
+    let mut header = vec![0u8; header_len];
+    target.read_at(sector_u64, &mut header).map_err(|error| {
+        CoreError::invalid(format!(
+            "stamped GPT header cannot be read at offset {sector_u64}: {error}"
+        ))
+    })?;
+    let signature_ok = header.get(..8) == Some(b"EFI PART".as_slice());
+    if !signature_ok {
+        return Err(CoreError::invalid(
+            "stamped GPT header is missing the EFI PART signature: refusing".to_string(),
+        ));
+    }
+    let disk_guid = guid_at(&header, 56, "disk GUID")?;
+    let range = crate::part::gpt::gpt_entry_range(&header).ok_or_else(|| {
+        CoreError::invalid("stamped GPT entry array location is missing: refusing".to_string())
+    })?;
+    let entry_size_u64 = u64::from(range.entry_size);
+    let count_u64 = u64::from(range.count);
+    let entries_len_u64 = count_u64.checked_mul(entry_size_u64).ok_or_else(|| {
+        CoreError::invalid(format!(
+            "stamped GPT entry array of {} entries times {} bytes overflows u64: refusing",
+            range.count, range.entry_size
+        ))
+    })?;
+    // The array cannot outgrow the device it is stamped on: a header
+    // claiming more refuses before any allocation, so a corrupt
+    // `count` × `size` never sizes the next read. (`gpt_entry_range`
+    // already caps the shape at 128 entries of 4096 bytes, so the
+    // worst honest allocation stays at 512 KiB.)
+    if entries_len_u64 > size {
+        return Err(CoreError::invalid(format!(
+            "stamped GPT entry array of {entries_len_u64} bytes exceeds the {size} byte device: refusing"
+        )));
+    }
+    let entries_len = usize::try_from(entries_len_u64).map_err(|_| {
+        CoreError::invalid(format!(
+            "stamped GPT entry array of {entries_len_u64} bytes does not fit usize: refusing"
+        ))
+    })?;
+    let entries_base = range.entry_lba.checked_mul(sector_u64).ok_or_else(|| {
+        CoreError::invalid(format!(
+            "stamped GPT entry array at LBA {} times sector size {sector_size} overflows u64: refusing",
+            range.entry_lba
+        ))
+    })?;
+    let mut entries = vec![0u8; entries_len];
+    target
+        .read_at(entries_base, &mut entries)
+        .map_err(|error| {
+            CoreError::invalid(format!(
+                "stamped GPT entry array cannot be read at offset {entries_base}: {error}"
+            ))
+        })?;
+    // Validate through the parser first: a table that cannot be
+    // parsed refuses here, while soft rot only warns inside.
+    crate::part::gpt::parse_gpt(&header, &entries, sector_size)
+        .map_err(|error| CoreError::invalid(format!("stamped GPT cannot be parsed: {error}")))?;
+    let stride = usize::try_from(range.entry_size).map_err(|_| {
+        CoreError::invalid(format!(
+            "stamped GPT entry size {} does not fit usize: refusing",
+            range.entry_size
+        ))
+    })?;
+    let count = usize::try_from(range.count).map_err(|_| {
+        CoreError::invalid(format!(
+            "stamped GPT entry count {} does not fit usize: refusing",
+            range.count
+        ))
+    })?;
+    let mut index = 0usize;
+    while index < count {
+        let base = index.checked_mul(stride).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "stamped GPT entry {index} offset overflows: refusing"
+            ))
+        })?;
+        let end = base.checked_add(stride).ok_or_else(|| {
+            CoreError::invalid(format!("stamped GPT entry {index} end overflows: refusing"))
+        })?;
+        let Some(entry) = entries.get(base..end) else {
+            break;
+        };
+        let Some(kind) = entry.get(..16) else {
+            break;
+        };
+        let used = kind.iter().any(|byte| *byte != 0);
+        if !used {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let first_lba = u64_at(entry, 32, "partition start")?;
+        let last_lba = u64_at(entry, 40, "partition end")?;
+        let Some(sectors) = last_lba
+            .checked_sub(first_lba)
+            .and_then(|delta| delta.checked_add(1))
+        else {
+            index = index.saturating_add(1);
+            continue;
+        };
+        if first_lba == data_start_lba && sectors == data_sectors {
+            let partition_guid = guid_at(entry, 16, "partition GUID")?;
+            return Ok(bcd::DeviceIdentity::Gpt {
+                disk_guid,
+                partition_guid,
+            });
+        }
+        index = index.saturating_add(1);
+    }
+    Err(CoreError::invalid(format!(
+        "stamped GPT has no data partition at offset {data_offset} length {data_len}: refusing"
+    )))
+}
+
+/// Release both mounts after a failed Windows install step: a
+/// release failure warns naming both errors, while the run still
+/// reports the error that matters (the earlier one, never the
+/// teardown's).
+fn release_both_after_failure(
+    ctx: &mut RunContext<'_>,
+    data: &mut dyn MountedPartition,
+    esp: &mut dyn MountedPartition,
+    during: &str,
+) {
+    if let Err(error) = data.release() {
+        ctx.reporter.event(Event::Message {
+            level: "warn",
+            text: format!(
+                "mount release failed after {during} (data): {error}; reporting the earlier error"
+            ),
+        });
+    }
+    if let Err(error) = esp.release() {
+        ctx.reporter.event(Event::Message {
+            level: "warn",
+            text: format!(
+                "mount release failed after {during} (esp): {error}; reporting the earlier error"
+            ),
+        });
+    }
+}
+
+/// Run the Windows arm: GPT-only, ESP-first, then the WIM onto the
+/// mounted partitions.
+///
+/// The layout is GPT-only, so a non-GPT recorded table refuses up
+/// front naming what is needed. The ESP formats as FAT32 through the
+/// existing formatter (fresh serial, hidden sectors from the stamped
+/// window), then the stamped GPT is re-read for the BCD identity, the
+/// data partition mounts as NTFS and the ESP mounts (an ESP mount
+/// failure releases the data mount first), the WIM's boot index
+/// selects the image (1 unless the WIM reports a non-zero one), and
+/// [`crate::windows::to_go::install`] applies it. Both mounts release
+/// on every path: the earlier error wins and a release failure only
+/// warns, naming both. One info line reports the applied file/byte
+/// counts plus the placed file count.
+fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
+    let cancelled = ctx.cancelled;
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    match ctx.table {
+        Some(TableKind::Gpt) => {}
+        Some(_) => {
+            return Err(CoreError::invalid(
+                "windows installation needs a GPT table, the target carries a non-GPT table: refusing".to_string(),
+            ));
+        }
+        None => {
+            return Err(CoreError::invalid(
+                "windows installation needs a recorded GPT table: refusing".to_string(),
+            ));
+        }
+    }
+    let (sector_size, size) = {
+        let device = ctx.device()?;
+        (device.sector_size(), device.size())
+    };
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let (esp_offset, esp_len) =
+        esp_window(LayoutKind::WindowsToGo, TableKind::Gpt, sector_size, size)?;
+    // The planner stamps 1 MiB-aligned spans, so a remainder here
+    // means the size or the sector size the caller passed disagrees
+    // with the stamped layout: refuse naming both numbers instead of
+    // truncating into the `u32` hidden-sectors field below.
+    if esp_offset % u64::from(sector_size) != 0 {
+        return Err(CoreError::invalid(format!(
+            "windows ESP offset {esp_offset} is not a multiple of sector size {sector_size}: refusing"
+        )));
+    }
+    let esp_start_lba = esp_offset / u64::from(sector_size);
+    let esp_hidden = u32::try_from(esp_start_lba).map_err(|_| {
+        CoreError::invalid(format!(
+            "windows ESP start LBA {esp_start_lba} does not fit the u32 hidden-sectors field: refusing"
+        ))
+    })?;
+    ctx.reporter.event(Event::Message {
+        level: "info",
+        text: format!("formatting ESP as FAT32 ({esp_len} bytes at offset {esp_offset})"),
+    });
+    {
+        let device = ctx.device()?;
+        let mut view = EspView::new(device, esp_offset, esp_len, sector_size);
+        let options = FormatOptions {
+            label: None,
+            volume_id: crate::pipeline::mkfs::fresh_serial("esp")?,
+            hidden_sectors: esp_hidden,
+            oem: crate::fs::fat32::bpb::DEFAULT_OEM,
+        };
+        crate::fs::fat32::format::format(&mut view, &options)?;
+    }
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    let identity = {
+        let device = ctx.device()?;
+        windows_identity(device, sector_size, size)?
+    };
+    let mut data = ctx.opener.mount_partition(&Filesystem::Ntfs)?;
+    let mut esp = match ctx.opener.mount_esp() {
+        Ok(esp) => esp,
+        Err(mount_error) => {
+            if let Err(release_error) = data.release() {
+                ctx.reporter.event(Event::Message {
+                    level: "warn",
+                    text: format!(
+                        "mount release failed after the ESP mount (data): {release_error}; reporting the earlier error"
+                    ),
+                });
+            }
+            return Err(mount_error);
+        }
+    };
+    let installed = (|| -> Result<crate::windows::to_go::Installed> {
+        let path = Path::new(&image.path);
+        let wim = crate::windows::wim::Wim::open(path)?;
+        let info = wim.info()?;
+        let image_index = if info.boot_index != 0 {
+            info.boot_index
+        } else {
+            1
+        };
+        let request = crate::windows::to_go::Request {
+            wim: path,
+            image_index,
+            identity,
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        let cancelled = ctx.cancelled;
+        crate::windows::to_go::install(
+            data.as_mut(),
+            esp.as_mut(),
+            &request,
+            &mut *ctx.reporter,
+            cancelled,
+        )
+    })();
+    let installed = match installed {
+        Ok(installed) => installed,
+        Err(error) => {
+            release_both_after_failure(ctx, data.as_mut(), esp.as_mut(), "the windows install");
+            return Err(error);
+        }
+    };
+    let data_result = data.release();
+    let esp_result = esp.release();
+    match (data_result, esp_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(first), Ok(())) => return Err(first),
+        (Ok(()), Err(second)) => return Err(second),
+        (Err(first), Err(second)) => {
+            ctx.reporter.event(Event::Message {
+                level: "warn",
+                text: format!(
+                    "mount release failed for both partitions (data: {first}; esp: {second}); reporting the data error"
+                ),
+            });
+            return Err(first);
+        }
+    }
+    ctx.reporter.event(Event::Message {
+        level: "info",
+        text: format!(
+            "installed windows ({} files applied, {} bytes, {} boot files placed)",
+            installed.applied.files,
+            installed.applied.bytes,
+            installed.files.len()
+        ),
+    });
+    Ok(())
+}
+
 /// Filesystem name in plan vocabulary (`fat32`, `exfat`, ...).
 fn filesystem_name(filesystem: &Filesystem) -> &'static str {
     match filesystem {
@@ -1063,11 +1520,12 @@ fn filesystem_name(filesystem: &Filesystem) -> &'static str {
 /// straight onto the partition under the `msdos_dir` requirement —
 /// the image tree never opens, so the plan's image needs no readable
 /// tree at all (the CLI still requires the `--image` argument as the
-/// detection record). Every mode but `Windows` is wired today, so the
-/// run produces `NotImplemented` only through [`windows_refusal`];
-/// `Windows` refuses up front through that arm, and a future variant
-/// would refuse up front through the shared [`check_mode`] table,
-/// never reaching the image or the device, then
+/// detection record). `Windows` takes the mount-based path
+/// ([`run_windows`]) before the gates below: it formats the ESP,
+/// applies the WIM onto the mounted partitions and reports one
+/// summary line — no FAT32 data volume, no image tree. A future
+/// variant would refuse up front through the shared [`check_mode`]
+/// table, never reaching the image or the device, then
 /// non-FAT32 filesystems refuse naming the plan filesystem, then the
 /// image tree opens exactly like `write::run_copy` does. The partition
 /// and the whole-disk target open next; a cancellation check follows
@@ -1103,10 +1561,12 @@ pub(crate) fn run(
         return run_uefi_ntfs(ctx, filesystem);
     }
     if *mode == BootloaderMode::Windows {
-        // Slice 10 owns the WIM apply and the BCD stores: refuse
-        // before the filesystem gate and the image-tree setup below,
-        // so neither the image nor the device is touched.
-        return Err(windows_refusal());
+        // Mount-based arm, before the FAT32 gate and the image-tree
+        // setup below: the WIM applies onto the mounted data and ESP
+        // partitions, so neither the tree nor the FAT32 data volume is
+        // opened here. Every other mode keeps today's path
+        // byte-for-byte.
+        return run_windows(ctx, image);
     }
     // Unwired installers never reach the image or the device: same
     // table as `install_tree` (see `check_mode`).
@@ -1747,7 +2207,7 @@ mod tests {
     #[test]
     fn every_mode_passes_the_shared_gate() {
         // All modes pass the shared table today: `Windows` passes here
-        // but refuses at execution (slice 10 owns its installer), while
+        // and is wired in `run` (mount-based, like `UefiNtfs`), while
         // a future variant fails closed here until it is named.
         // (`UefiNtfs` passes here too; its disk-only arm lives in
         // `run`, and the tree core refuses it as invalid — see the
@@ -1789,53 +2249,806 @@ mod tests {
     }
 
     #[test]
-    fn install_tree_refuses_windows_as_slice_10_work() {
-        // The WIM apply and the BCD stores land in slice 10: the tree
-        // core refuses as not implemented naming them (the planner
-        // emits the mode today, unlike `UefiNtfs` above whose
-        // installer already exists).
+    fn install_tree_refuses_windows_as_mount_based() {
+        // The WIM applies onto the mounted data and ESP partitions, so
+        // the tree core refuses it — as invalid, not not implemented
+        // (the installer exists, in `run`), naming the mounted path.
         let source = syslinux_604_tree();
         let (_backing, mut fat) = formatted();
         let error = tree_install(&source, &mut fat, &BootloaderMode::Windows)
-            .expect_err("windows has no tree installer yet");
+            .expect_err("windows has no tree installer");
         assert!(
-            matches!(error, CoreError::NotImplemented { .. }),
-            "slice 10 work is NotImplemented: {error:?}"
+            !matches!(error, CoreError::NotImplemented { .. }),
+            "a wired mode is never NotImplemented: {error:?}"
         );
         let text = error.to_string();
         assert!(text.contains("windows"), "names the mode: {text}");
-        assert!(text.contains("slice 10"), "names the slice: {text}");
+        assert!(text.contains("mounted"), "names the path: {text}");
+        assert!(text.contains("tree install"), "names the refusal: {text}");
         assert!(text.is_ascii(), "stays ASCII: {text}");
     }
 
     #[test]
-    fn run_windows_refuses_before_opening_anything() {
-        // Through the real `run` path on an NTFS plan with a missing
-        // image: the slice 10 refusal lands before the image opens, so
-        // `partition()` is never called either.
+    fn run_windows_refuses_a_non_gpt_table() {
+        // A hand-built plan with a recorded MBR table: the GPT-only
+        // layout refuses before the device or the mounts are touched,
+        // naming what is needed.
         let partitions = Rc::new(Cell::new(0usize));
         let opener = CountingOpener {
             partitions: Rc::clone(&partitions),
         };
         let mut reporter = Recorder::default();
-        let mut ctx = run_context(&opener, &mut reporter);
+        let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Mbr));
         let error = run(
             &mut ctx,
             &BootloaderMode::Windows,
-            &image_ref("missing.iso", rufus_proto::ImageKind::Wim),
+            &image_ref("missing.wim", rufus_proto::ImageKind::Wim),
             &rufus_proto::Filesystem::Ntfs,
             None,
         )
-        .expect_err("windows has no installer yet");
+        .expect_err("a non-GPT table refuses");
         assert!(
-            matches!(error, CoreError::NotImplemented { .. }),
-            "slice 10 work is NotImplemented: {error:?}"
+            !matches!(error, CoreError::NotImplemented { .. }),
+            "a wired mode is never NotImplemented: {error:?}"
         );
         let text = error.to_string();
-        assert!(text.contains("windows"), "names the mode: {text}");
-        assert!(text.contains("slice 10"), "names the slice: {text}");
+        assert!(text.contains("GPT"), "names what is needed: {text}");
         assert!(text.is_ascii(), "stays ASCII: {text}");
         assert_eq!(partitions.get(), 0, "the partition never opens");
+    }
+
+    #[test]
+    fn run_windows_refuses_an_unparsable_stamped_gpt() {
+        // A recorded GPT table over a zeroed disk: the ESP formats, then
+        // the re-read finds no GPT header and refuses as invalid naming
+        // the problem, before any mount.
+        let target = VecTarget::new(256 * 1024 * 1024, 512).expect("the disk allocates");
+        let partitions = Rc::new(Cell::new(0usize));
+        let opener = DiskOpener {
+            target: target.clone(),
+            partitions: Rc::clone(&partitions),
+        };
+        let mut reporter = Recorder::default();
+        let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
+        let error = run(
+            &mut ctx,
+            &BootloaderMode::Windows,
+            &image_ref("missing.wim", rufus_proto::ImageKind::Wim),
+            &rufus_proto::Filesystem::Ntfs,
+            None,
+        )
+        .expect_err("an unparsable GPT refuses");
+        assert!(
+            !matches!(error, CoreError::NotImplemented { .. }),
+            "a wired mode is never NotImplemented: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("GPT"), "names the problem: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(partitions.get(), 0, "the data partition never opens");
+    }
+
+    /// A mounted-partition double over a shared temp dir: `free_bytes`
+    /// answers huge, `release` counts its calls and optionally fails.
+    /// The root is `Rc`-shared with the test so the placed files stay
+    /// inspectable after the run drops its own handle.
+    #[derive(Debug)]
+    struct CountingMount {
+        root: Rc<tempfile::TempDir>,
+        releases: Rc<Cell<usize>>,
+        fail_release: bool,
+    }
+
+    impl crate::pipeline::opener::MountedPartition for CountingMount {
+        fn path(&self) -> &std::path::Path {
+            self.root.path()
+        }
+
+        fn free_bytes(&self) -> TestResult<u64> {
+            Ok(u64::MAX)
+        }
+
+        fn release(&mut self) -> TestResult<()> {
+            self.releases.set(self.releases.get() + 1);
+            if self.fail_release {
+                return Err(CoreError::invalid("test mount release fails".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A test [`Opener`](crate::pipeline::opener::Opener) for the
+    /// Windows arm: the whole disk is one shared [`VecTarget`], the
+    /// data and ESP mounts are [`CountingMount`] doubles over distinct
+    /// temp dirs. The three knobs pin the three teardown paths: a
+    /// failing ESP mount, a failing data release, a failing ESP
+    /// release.
+    #[derive(Debug)]
+    struct WindowsOpener {
+        target: VecTarget,
+        data_root: Rc<tempfile::TempDir>,
+        esp_root: Rc<tempfile::TempDir>,
+        data_releases: Rc<Cell<usize>>,
+        esp_releases: Rc<Cell<usize>>,
+        fail_esp_mount: bool,
+        fail_data_release: bool,
+        fail_esp_release: bool,
+    }
+
+    impl WindowsOpener {
+        fn new(target: VecTarget) -> Self {
+            Self {
+                target,
+                data_root: Rc::new(tempfile::tempdir().expect("the data mount allocates")),
+                esp_root: Rc::new(tempfile::tempdir().expect("the esp mount allocates")),
+                data_releases: Rc::new(Cell::new(0)),
+                esp_releases: Rc::new(Cell::new(0)),
+                fail_esp_mount: false,
+                fail_data_release: false,
+                fail_esp_release: false,
+            }
+        }
+    }
+
+    impl crate::pipeline::opener::Opener for WindowsOpener {
+        fn device(&self) -> TestResult<Box<dyn crate::pipeline::target::Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> TestResult<Box<dyn Volume>> {
+            Err(CoreError::invalid(
+                "test opener has no partition".to_string(),
+            ))
+        }
+
+        fn partition_path(&self) -> TestResult<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no node".to_string()))
+        }
+
+        fn mount_partition(
+            &self,
+            _filesystem: &rufus_proto::Filesystem,
+        ) -> TestResult<Box<dyn crate::pipeline::opener::MountedPartition>> {
+            Ok(Box::new(CountingMount {
+                root: Rc::clone(&self.data_root),
+                releases: Rc::clone(&self.data_releases),
+                fail_release: self.fail_data_release,
+            }))
+        }
+
+        fn mount_esp(&self) -> TestResult<Box<dyn crate::pipeline::opener::MountedPartition>> {
+            if self.fail_esp_mount {
+                return Err(CoreError::invalid("test esp mount fails".to_string()));
+            }
+            Ok(Box::new(CountingMount {
+                root: Rc::clone(&self.esp_root),
+                releases: Rc::clone(&self.esp_releases),
+                fail_release: self.fail_esp_release,
+            }))
+        }
+    }
+
+    /// Stamp a `WindowsToGo` GPT onto a zeroed [`VecTarget`] of `size`
+    /// bytes with 512-byte sectors, through the same
+    /// `request`/`plan`/`render` the stamper runs, and hand back the
+    /// target plus the plan it stamped. The data partition's GUIDs come
+    /// out of the plan (never a positional literal), which is what the
+    /// identity tests compare against.
+    fn stamp_windows_gpt(size: u64) -> (VecTarget, crate::part::plan::TablePlan) {
+        let target = VecTarget::new(size, 512).expect("the disk allocates");
+        let request = crate::part::plan::request(
+            LayoutKind::WindowsToGo,
+            TableKind::Gpt,
+            512,
+            size,
+            crate::part::plan::DataType::MicrosoftBasicData,
+        )
+        .expect("the request plans");
+        let plan = crate::part::plan::plan(&request).expect("the layout plans");
+        let rendered =
+            crate::part::plan::render(&plan, 512, request.last_lba).expect("the table renders");
+        for write in &rendered.writes {
+            target
+                .write_all_at(write.lba * 512, &write.bytes)
+                .expect("the sector lands");
+        }
+        (target, plan)
+    }
+
+    /// 512 MiB with 512-byte sectors, the same shape as the
+    /// `data_window_matches_the_planned_data_role` fixture: the Windows
+    /// arm's stamped layout at a realistic scale.
+    const WINDOWS_DISK_BYTES: u64 = 512 * 1024 * 1024;
+
+    #[test]
+    fn windows_identity_reports_the_planned_data_partition() {
+        // The stamped GPT re-read through `windows_identity`: the disk
+        // GUID equals the renderer's, and the partition GUID equals the
+        // parsed entry at the planned data window — found by its LBA
+        // span, never by its table position.
+        let (mut target, plan) = stamp_windows_gpt(WINDOWS_DISK_BYTES);
+        let identity =
+            windows_identity(&mut target, 512, WINDOWS_DISK_BYTES).expect("the identity reads");
+        let bcd::DeviceIdentity::Gpt {
+            disk_guid,
+            partition_guid,
+        } = identity
+        else {
+            panic!("a GPT table reports the GPT identity");
+        };
+        assert_eq!(disk_guid, plan.disk_guid, "the disk GUID is the renderer's");
+        let data = plan
+            .partitions
+            .iter()
+            .find(|partition| partition.role == "data")
+            .expect("the plan holds a data partition");
+        assert_eq!(
+            partition_guid, data.unique_guid,
+            "the partition GUID is the data entry's"
+        );
+        // The same GUID through the parser: read the stamped header and
+        // entry array back and find the entry whose span is the planned
+        // data window.
+        let (data_offset, data_len) = data_window(
+            LayoutKind::WindowsToGo,
+            TableKind::Gpt,
+            512,
+            WINDOWS_DISK_BYTES,
+        )
+        .expect("the data window plans");
+        let data_start_lba = data_offset / 512;
+        let data_sectors = data_len / 512;
+        let mut header = vec![0u8; 512];
+        target.read_at(512, &mut header).expect("the header reads");
+        assert_eq!(
+            &header[56..72],
+            &disk_guid,
+            "the stamped header carries the disk GUID"
+        );
+        let range = crate::part::gpt::gpt_entry_range(&header).expect("the array locates");
+        let array_len = range.count as usize * range.entry_size as usize;
+        let mut array = vec![0u8; array_len];
+        target
+            .read_at(range.entry_lba * 512, &mut array)
+            .expect("the array reads");
+        let (entries, _warnings) =
+            crate::part::gpt::parse_gpt(&header, &array, 512).expect("the stamped table parses");
+        let entry = entries
+            .iter()
+            .find(|entry| entry.start_lba == data_start_lba && entry.sectors == data_sectors)
+            .expect("the parsed table holds the data entry");
+        assert_eq!(
+            entry.unique_guid.as_deref(),
+            Some(crate::part::gpt::guid_to_string(&partition_guid).as_str()),
+            "the parsed entry at the planned span carries the identity GUID"
+        );
+    }
+
+    #[test]
+    fn windows_identity_refuses_without_a_planned_data_entry() {
+        // The same stamped table with the data entry's span moved by one
+        // sector: the parser still reads (an entry-array CRC mismatch is
+        // only a warning), but no entry sits at the planned span, so the
+        // identity refuses naming the window.
+        let (mut target, plan) = stamp_windows_gpt(WINDOWS_DISK_BYTES);
+        let slot = plan
+            .partitions
+            .iter()
+            .position(|partition| partition.role == "data")
+            .expect("the plan holds a data partition");
+        // One entry is 128 bytes; the first-LBA field sits 32 bytes in.
+        // The primary array starts at LBA 2 (see `write_gpt`).
+        let at = 2 * 512 + slot as u64 * 128 + 32;
+        let mut first = [0u8; 8];
+        target.read_at(at, &mut first).expect("the entry reads");
+        let moved = u64::from_le_bytes(first).wrapping_add(1).to_le_bytes();
+        target.write_all_at(at, &moved).expect("the span moves");
+        let error = windows_identity(&mut target, 512, WINDOWS_DISK_BYTES)
+            .expect_err("a span-less table refuses");
+        let text = error.to_string();
+        assert!(text.contains("no data partition"), "names the miss: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+    }
+
+    #[test]
+    fn windows_install_failure_releases_both_mounts_once() {
+        // The full `run` with a WIM path that does not exist: the ESP
+        // formats and the identity reads, then the install refuses —
+        // and both mounts still release exactly once each, with the
+        // install error (never a teardown error) reported and no
+        // release-failure warn logged.
+        let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
+        let opener = WindowsOpener::new(target.clone());
+        let mut reporter = Recorder::default();
+        let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
+        let error = run(
+            &mut ctx,
+            &BootloaderMode::Windows,
+            &image_ref("missing.wim", rufus_proto::ImageKind::Wim),
+            &rufus_proto::Filesystem::Ntfs,
+            None,
+        )
+        .expect_err("a missing WIM refuses");
+        assert!(
+            !matches!(
+                error,
+                CoreError::Cancelled | CoreError::NotImplemented { .. }
+            ),
+            "a wired mode reports its install error: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("missing.wim") || text.contains("wimlib"),
+            "the install error reports the WIM: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(
+            opener.data_releases.get(),
+            1,
+            "the data mount releases exactly once"
+        );
+        assert_eq!(
+            opener.esp_releases.get(),
+            1,
+            "the esp mount releases exactly once"
+        );
+        let warns: Vec<&str> = reporter
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                crate::pipeline::event::Event::Message {
+                    level: "warn",
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            warns
+                .iter()
+                .all(|line| !line.contains("mount release failed")),
+            "no teardown warn fires on clean releases: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn windows_esp_mount_failure_releases_the_data_mount_once() {
+        // Two phases over fresh openers. First the ESP mount refuses
+        // while the data release succeeds: the data mount releases once
+        // and the ESP error returns with no teardown warn. Then the data
+        // release fails too: the release still runs once, the ESP error
+        // is still the one reported, and a warn names both the data
+        // release and the earlier ESP-mount failure.
+        for fail_data_release in [false, true] {
+            let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
+            let mut opener = WindowsOpener::new(target.clone());
+            opener.fail_esp_mount = true;
+            opener.fail_data_release = fail_data_release;
+            let mut reporter = Recorder::default();
+            let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
+            let error = run(
+                &mut ctx,
+                &BootloaderMode::Windows,
+                &image_ref("missing.wim", rufus_proto::ImageKind::Wim),
+                &rufus_proto::Filesystem::Ntfs,
+                None,
+            )
+            .expect_err("a failing ESP mount refuses");
+            let text = error.to_string();
+            assert!(
+                text.contains("test esp mount fails"),
+                "phase {fail_data_release}: the ESP error reports: {text}"
+            );
+            assert!(text.is_ascii(), "stays ASCII: {text}");
+            assert_eq!(
+                opener.data_releases.get(),
+                1,
+                "phase {fail_data_release}: the data mount releases exactly once"
+            );
+            assert_eq!(
+                opener.esp_releases.get(),
+                0,
+                "phase {fail_data_release}: the ESP mount never lived to release"
+            );
+            let warns: Vec<&str> = reporter
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::pipeline::event::Event::Message {
+                        level: "warn",
+                        text,
+                    } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if fail_data_release {
+                assert_eq!(
+                    warns.len(),
+                    1,
+                    "phase {fail_data_release}: the failed release warns once: {warns:?}"
+                );
+                assert!(
+                    warns[0].contains("data"),
+                    "phase {fail_data_release}: the warn names the data mount: {}",
+                    warns[0]
+                );
+                assert!(
+                    warns[0].contains("ESP mount"),
+                    "phase {fail_data_release}: the warn names the earlier ESP failure: {}",
+                    warns[0]
+                );
+                assert!(warns[0].is_ascii(), "stays ASCII: {}", warns[0]);
+            } else {
+                assert!(
+                    warns.is_empty(),
+                    "phase {fail_data_release}: a clean release warns nothing: {warns:?}"
+                );
+            }
+        }
+    }
+
+    /// Start a minimal hive: header plus two bins holding a `name` key
+    /// and free space — the same allocation shape the `to_go` fixture
+    /// uses, duplicated here because that helper is private to its
+    /// tests module. The BCD template names its root `System`; the
+    /// SYSTEM hive names its root `ROOT`.
+    fn windows_hive_root(name: &[u8]) -> crate::windows::regf::Hive {
+        use crate::windows::regf::HBIN_USABLE;
+        use crate::windows::regf::HDR_BIN_LENGTH;
+        use crate::windows::regf::HDR_CHECKSUM;
+        use crate::windows::regf::HDR_ROOT;
+        use crate::windows::regf::Hive;
+        use crate::windows::regf::NONE;
+        assert!(
+            name.len() <= 8,
+            "the fixture root name fits the hand-built cell"
+        );
+        let mut buf = vec![0u8; 0x200];
+        buf[0..4].copy_from_slice(b"regf");
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x18..0x1C].copy_from_slice(&3u32.to_le_bytes());
+        buf[HDR_ROOT..HDR_ROOT + 4].copy_from_slice(&0x20u32.to_le_bytes());
+        buf[HDR_BIN_LENGTH..HDR_BIN_LENGTH + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        buf.resize(0x3000, 0);
+        buf[0x1000..0x1004].copy_from_slice(b"hbin");
+        buf[0x1004..0x1008].copy_from_slice(&0u32.to_le_bytes());
+        buf[0x1008..0x100C].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[0x2000..0x2004].copy_from_slice(b"hbin");
+        buf[0x2004..0x2008].copy_from_slice(&0u32.to_le_bytes());
+        buf[0x2008..0x200C].copy_from_slice(&0x1000u32.to_le_bytes());
+        // Root key at cell 0x20: 4 + 0x4C + 4 = 84, rounded 88.
+        let root_file = 0x1020usize;
+        buf[root_file..root_file + 4].copy_from_slice(&(-88i32).to_le_bytes());
+        buf[root_file + 4..root_file + 6].copy_from_slice(b"nk");
+        buf[root_file + 6..root_file + 8].copy_from_slice(&0x20u16.to_le_bytes());
+        buf[root_file + 0x14..root_file + 0x18].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x20..root_file + 0x24].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x2C..root_file + 0x30].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x34..root_file + 0x38].copy_from_slice(&NONE.to_le_bytes());
+        let name_len = u16::try_from(name.len()).expect("the fixture root name fits u16");
+        buf[root_file + 0x4C..root_file + 0x4E].copy_from_slice(&name_len.to_le_bytes());
+        buf[root_file + 0x50..root_file + 0x50 + name.len()].copy_from_slice(name);
+        // Free cell covering the rest of the first bin.
+        let free_file = root_file + 88;
+        let free_size = 0x1000u32 - 0x20 - 88;
+        buf[free_file..free_file + 4].copy_from_slice(&(free_size as i32).to_le_bytes());
+        // Second bin stays one free cell.
+        let free2 = 0x2020usize;
+        buf[free2..free2 + 4].copy_from_slice(&(HBIN_USABLE as i32).to_le_bytes());
+        let checksum = Hive::header_checksum(&buf).expect("fixture header must checksum");
+        buf[HDR_CHECKSUM..HDR_CHECKSUM + 4].copy_from_slice(&checksum.to_le_bytes());
+        Hive::parse(&buf).expect("hand-built fixture must parse")
+    }
+
+    /// Add a subkey and return its cell offset.
+    fn windows_add_key(hive: &mut crate::windows::regf::Hive, parent: usize, name: &[u8]) -> usize {
+        hive.add_child_key(parent, name, None)
+            .expect("fixture key must allocate")
+    }
+
+    /// Add a DWORD value under `key`.
+    fn windows_add_dword(
+        hive: &mut crate::windows::regf::Hive,
+        key: usize,
+        name: &[u8],
+        value: u32,
+    ) {
+        hive.add_value(
+            key,
+            name,
+            crate::windows::regf::REG_DWORD,
+            &value.to_le_bytes(),
+        )
+        .expect("fixture DWORD must allocate");
+    }
+
+    /// Add an `Elements\{id}` subkey plus its `Element` value, mirroring
+    /// the `bcd` fixture pattern.
+    fn windows_add_element(
+        hive: &mut crate::windows::regf::Hive,
+        elements: usize,
+        id: &str,
+        vtype: u32,
+        data: &[u8],
+    ) {
+        let key = windows_add_key(hive, elements, id.as_bytes());
+        hive.add_value(key, b"Element", vtype, data)
+            .expect("fixture element must allocate");
+    }
+
+    /// A synthetic BCD template the builder accepts for both firmwares:
+    /// the same objects and elements the `to_go` fixture carries,
+    /// duplicated here because that helper is private to its tests
+    /// module. Stand-in bytes (synthetic, not a real Windows hive).
+    fn windows_template_bytes() -> Vec<u8> {
+        use crate::windows::bcd::OBJECT_BOOTMGR;
+        use crate::windows::bcd::OBJECT_MEMDIAG;
+        use crate::windows::bcd::TEMPLATE_LOADER_A194;
+        use crate::windows::bcd::TEMPLATE_LOADER_B012;
+        use crate::windows::bcd::TEMPLATE_LOADER_CBD9;
+        use crate::windows::regf::REG_BINARY;
+        use crate::windows::regf::REG_SZ;
+        use crate::windows::regf::utf16_nul;
+        let mut hive = {
+            let root = windows_hive_root(b"ROOT");
+            // Rename the root `ROOT` to `System`: the builder keys off
+            // the root name. The hand-built cell holds the name length
+            // at 0x4C and the bytes at 0x50; `System` fits the same
+            // 88-byte cell with room to spare.
+            let cell = root.root();
+            let file = crate::windows::regf::Hive::cell_file(cell, "fixture root")
+                .expect("the root cell locates");
+            let mut bytes = root.to_bytes();
+            bytes[file + 0x4C..file + 0x4E].copy_from_slice(&6u16.to_le_bytes());
+            bytes[file + 0x50..file + 0x56].copy_from_slice(b"System");
+            let parsed =
+                crate::windows::regf::Hive::parse(&bytes).expect("the renamed root must parse");
+            let checksum = crate::windows::regf::Hive::header_checksum(&parsed.to_bytes())
+                .expect("the renamed root must checksum");
+            let mut stamped = parsed.to_bytes();
+            stamped[crate::windows::regf::HDR_CHECKSUM..crate::windows::regf::HDR_CHECKSUM + 4]
+                .copy_from_slice(&checksum.to_le_bytes());
+            crate::windows::regf::Hive::parse(&stamped).expect("the stamped root must parse")
+        };
+        let root = hive.root();
+        let objects = windows_add_key(&mut hive, root, b"Objects");
+        let bootmgr = windows_add_key(&mut hive, objects, OBJECT_BOOTMGR.as_bytes());
+        let uefi = windows_add_key(&mut hive, objects, TEMPLATE_LOADER_B012.as_bytes());
+        let bios = windows_add_key(&mut hive, objects, TEMPLATE_LOADER_A194.as_bytes());
+        let memdiag = windows_add_key(&mut hive, objects, OBJECT_MEMDIAG.as_bytes());
+        let bootmgr_el = windows_add_key(&mut hive, bootmgr, b"Elements");
+        windows_add_element(
+            &mut hive,
+            bootmgr_el,
+            "23000003",
+            REG_SZ,
+            &utf16_nul(TEMPLATE_LOADER_CBD9),
+        );
+        windows_add_element(
+            &mut hive,
+            bootmgr_el,
+            "12000002",
+            REG_SZ,
+            &utf16_nul("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"),
+        );
+        windows_add_element(&mut hive, bootmgr_el, "25000004", REG_BINARY, &[0x1e]);
+        for (loader, suffix) in [
+            (uefi, "\\system32\\winload.efi"),
+            (bios, "\\system32\\winload.exe"),
+        ] {
+            let elements = windows_add_key(&mut hive, loader, b"Elements");
+            windows_add_element(
+                &mut hive,
+                elements,
+                "22000002",
+                REG_SZ,
+                &utf16_nul("\\windows"),
+            );
+            windows_add_element(&mut hive, elements, "42000002", REG_SZ, &utf16_nul(suffix));
+        }
+        let memdiag_el = windows_add_key(&mut hive, memdiag, b"Elements");
+        windows_add_element(
+            &mut hive,
+            memdiag_el,
+            "12000002",
+            REG_SZ,
+            &utf16_nul("\\boot\\memtest.exe"),
+        );
+        hive.update_checksum().expect("fixture checksum must store");
+        hive.into_bytes()
+    }
+
+    /// A minimal SYSTEM hive the SAN-policy patch accepts:
+    /// `Select\Current = 1` plus `ControlSet001\Services` with no
+    /// `partmgr` yet. Stand-in bytes (synthetic, not a real hive).
+    fn windows_system_bytes() -> Vec<u8> {
+        let mut hive = windows_hive_root(b"ROOT");
+        let root = hive.root();
+        let select = windows_add_key(&mut hive, root, b"Select");
+        windows_add_dword(&mut hive, select, b"Current", 1);
+        let control = windows_add_key(&mut hive, root, b"ControlSet001");
+        windows_add_key(&mut hive, control, b"Services");
+        hive.update_checksum().expect("fixture checksum must store");
+        hive.into_bytes()
+    }
+
+    /// Capture a synthetic Windows-shaped tree into a WIM: the fake
+    /// boot managers, `boot.sdi`, the synthetic BCD template and a
+    /// minimal SYSTEM hive. Enough for `to_go::install` to return `Ok`
+    /// — the smallest tree the installer accepts, with stand-in payload
+    /// bytes (synthetic, not real Windows files).
+    fn capture_windows_wim(dir: &std::path::Path) -> std::path::PathBuf {
+        let src = dir.join("src");
+        let config = src.join("Windows/System32/config");
+        std::fs::create_dir_all(&config).expect("the config dir creates");
+        std::fs::write(config.join("BCD-Template"), windows_template_bytes())
+            .expect("the template writes");
+        std::fs::write(config.join("SYSTEM"), windows_system_bytes()).expect("the system writes");
+        std::fs::create_dir_all(src.join("Windows/Boot/EFI")).expect("the efi dir creates");
+        std::fs::create_dir_all(src.join("Windows/Boot/PCAT")).expect("the pcat dir creates");
+        std::fs::write(
+            src.join("Windows/Boot/EFI/bootmgfw.efi"),
+            b"fake-windows-efi-loader",
+        )
+        .expect("the efi loader writes");
+        std::fs::write(
+            src.join("Windows/Boot/PCAT/bootmgr"),
+            b"fake-windows-bios-loader",
+        )
+        .expect("the bios loader writes");
+        std::fs::write(
+            src.join("Windows/Boot/PCAT/boot.sdi"),
+            b"fake-windows-boot-sdi",
+        )
+        .expect("boot.sdi writes");
+        let wim = dir.join("windows-test.wim");
+        let run = std::process::Command::new("wimlib-imagex")
+            .arg("capture")
+            .arg(&src)
+            .arg(&wim)
+            .arg("testimg")
+            .output()
+            .expect("wimlib-imagex capture spawns past the skip gate");
+        assert!(
+            run.status.success(),
+            "capture failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        wim
+    }
+
+    /// Skip gate (the `skip:` convention): the library probe first,
+    /// then the `wimlib-imagex` presence probe.
+    fn skip_without_wim_backend() -> bool {
+        if !wimlib_sys::linked() {
+            eprintln!(
+                "skip: the windows success install needs libwim, which this build did not link"
+            );
+            return true;
+        }
+        if std::process::Command::new("wimlib-imagex")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "skip: the windows success install needs wimlib-imagex, which this host does not ship"
+            );
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn windows_success_releases_both_mounts_once() {
+        // The full `run` against a synthetic WIM the installer accepts:
+        // both mounts release exactly once each (no double release, no
+        // leak), the summary reports, the UEFI store lands on the ESP,
+        // the BIOS boot files land on data, and the applied SYSTEM
+        // carries the offline SAN policy. Needs no root and no real
+        // device: the disk is a stamped `VecTarget`, the mounts are temp
+        // dirs, the WIM is captured at test time.
+        if skip_without_wim_backend() {
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let wim = capture_windows_wim(scratch.path());
+        let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
+        let opener = WindowsOpener::new(target.clone());
+        let mut reporter = Recorder::default();
+        let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
+        run(
+            &mut ctx,
+            &BootloaderMode::Windows,
+            &image_ref(&wim.display().to_string(), rufus_proto::ImageKind::Wim),
+            &rufus_proto::Filesystem::Ntfs,
+            None,
+        )
+        .expect("the windows install runs");
+        assert_eq!(
+            opener.data_releases.get(),
+            1,
+            "the data mount releases exactly once"
+        );
+        assert_eq!(
+            opener.esp_releases.get(),
+            1,
+            "the esp mount releases exactly once"
+        );
+        let texts: Vec<&str> = reporter
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                crate::pipeline::event::Event::Message { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.contains("installed windows (") && line.contains("files applied")),
+            "the summary reports the applied files: {texts:?}"
+        );
+        assert!(
+            texts.iter().all(|line| line.is_ascii()),
+            "every message stays ASCII"
+        );
+        assert!(
+            opener
+                .esp_root
+                .path()
+                .join("EFI/Microsoft/Boot/BCD")
+                .is_file(),
+            "the UEFI store lands on the ESP"
+        );
+        assert!(
+            opener.data_root.path().join("bootmgr").is_file(),
+            "the BIOS boot manager lands on data"
+        );
+        assert!(
+            opener.data_root.path().join("boot/boot.sdi").is_file(),
+            "boot.sdi lands on data"
+        );
+        // The SAN policy in the applied SYSTEM is offline (4).
+        use crate::windows::regf::Hive;
+        use crate::windows::regf::REG_DWORD;
+        let system = std::fs::read(
+            opener
+                .data_root
+                .path()
+                .join("Windows/System32/config/SYSTEM"),
+        )
+        .expect("the applied SYSTEM reads");
+        let hive = Hive::parse(&system).expect("the applied SYSTEM re-parses");
+        let root = hive.root();
+        let control = hive
+            .find_child(root, b"ControlSet001")
+            .expect("find control")
+            .expect("ControlSet001 survives");
+        let services = hive
+            .find_child(control, b"Services")
+            .expect("find services")
+            .expect("Services survives");
+        let partmgr = hive
+            .find_child(services, b"partmgr")
+            .expect("find partmgr")
+            .expect("partmgr exists after the patch");
+        let parameters = hive
+            .find_child(partmgr, b"Parameters")
+            .expect("find parameters")
+            .expect("Parameters exists after the patch");
+        let (vtype, value) = hive
+            .read_value(parameters, b"SanPolicy")
+            .expect("read SanPolicy")
+            .expect("SanPolicy exists after the patch");
+        let bytes: [u8; 4] = value.as_slice().try_into().expect("a DWORD stays 4 bytes");
+        assert_eq!(
+            (vtype, u32::from_le_bytes(bytes)),
+            (REG_DWORD, 4),
+            "the offline SAN policy lands"
+        );
     }
 
     #[test]
@@ -5333,7 +6546,7 @@ pub(crate) mod end_to_end {
             }
             Mode::Windows => {
                 panic!(
-                    "windows has no installer until slice 10: it never reaches the fingerprint table"
+                    "the windows arm is mount-based, not fingerprint-based: it applies a WIM onto the mounted data and ESP partitions, so it stays outside the fingerprint table"
                 );
             }
         }

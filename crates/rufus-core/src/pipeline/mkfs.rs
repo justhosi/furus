@@ -48,8 +48,10 @@ use crate::pipeline::steps::mirror_log;
 /// Zero piece for the full-surface pass (1 MiB, the wipe window).
 const ZERO_PIECE: u64 = 1024 * 1024;
 
-/// A fresh non-zero 32-bit volume serial from a v4 UUID.
-fn fresh_serial(what: &str) -> Result<u32> {
+/// A fresh non-zero 32-bit volume serial from a v4 UUID. Shared with
+/// the Windows bootloader arm, which formats the ESP through the same
+/// rule: a generated zero refuses rather than shipping an unset serial.
+pub(crate) fn fresh_serial(what: &str) -> Result<u32> {
     let serial = uuid::Uuid::new_v4().as_u128() as u32;
     if serial == 0 {
         return Err(CoreError::invalid(format!(
