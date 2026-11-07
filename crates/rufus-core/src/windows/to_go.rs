@@ -29,12 +29,34 @@
 //! Limitations, stated plainly: no Windows To Go image has been booted yet;
 //! boot acceptance is slices 10-11. The `SYSTEM` shape above is from the
 //! Windows 11 24H2 WinPE `SYSTEM` (root `ROOT`, `Select\Current` DWORD `1`).
+//!
+//! Slice 10 adds the executor ([`install`]): it applies one WIM image onto
+//! the mounted data partition, builds and disables recovery on both BCD
+//! stores, lays the boot files onto the ESP (UEFI) and the data partition
+//! (BIOS), and sets the offline SAN policy on the applied `SYSTEM` hive,
+//! in that order. The caller owns both mounts throughout: [`install`]
+//! never mounts and never releases either one.
+//!
+//! Partial failure is sticky, not transactional: a failure after a step
+//! leaves the earlier steps' writes on the target — there is no
+//! rollback, and the caller must recreate the partitions to retry. A
+//! failed in-place `SYSTEM` rewrite can leave that hive truncated,
+//! which is why [`install`] stages the patched hive in a temporary
+//! file in the same directory and renames it over the original
+//! (removing the temporary on failure) instead of truncating in place.
+
+use std::path::Path;
+use std::path::PathBuf;
 
 use super::regf::Hive;
 use super::regf::REG_BINARY;
 use super::regf::REG_DWORD;
 use crate::error::CoreError;
 use crate::error::Result;
+use crate::pipeline::MountedPartition;
+use crate::pipeline::event::Reporter;
+use crate::windows::bcd;
+use crate::windows::boot_files;
 
 /// The documented "make internal drives offline" SAN policy value.
 pub const SAN_POLICY_OFFLINE: u32 = 4;
@@ -166,9 +188,242 @@ pub fn disable_recovery(store: &[u8], default_object: &str) -> Result<Vec<u8>> {
     Ok(hive.into_bytes())
 }
 
+/// What [`install`] needs: the source WIM and image, the disk identity
+/// the BCD device elements encode (already stamped by `Mkpart`), and
+/// the boot-loader flavour.
+pub struct Request<'a> {
+    /// The source `install.wim`.
+    pub wim: &'a Path,
+    /// The 1-based image index to apply.
+    pub image_index: u32,
+    /// Disk identity already stamped by `Mkpart`.
+    pub identity: bcd::DeviceIdentity,
+    /// Edition description for the loader, when known.
+    pub description: Option<&'a str>,
+    /// Opt into the 2023-signed `_EX` boot loaders (see
+    /// [`boot_files::install`]).
+    pub use_2023_bootloaders: bool,
+}
+
+/// What one [`install`] laid down: the apply counts plus every boot
+/// file written, in order (the UEFI set first, then the BIOS set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    /// The apply counts from the reporting tree walk (see
+    /// [`crate::windows::apply::apply`]).
+    pub applied: crate::windows::apply::Applied,
+    /// Every file placed, deterministic order: the UEFI install's
+    /// files first, then the BIOS install's, each in the order that
+    /// install returned them.
+    pub files: Vec<PathBuf>,
+}
+
+/// Lay a Windows To Go USB onto two already-mounted partitions: apply
+/// the WIM image onto `data`, build both BCD stores from the applied
+/// image's own `BCD-Template`, disable recovery on each, copy the boot
+/// files onto the ESP (UEFI) and `data` (BIOS), and set the offline SAN
+/// policy on the applied `SYSTEM` hive in place.
+///
+/// The contract, in order:
+/// 0. Refuse when both mount roots are the same path, before the WIM
+///    is opened or applied ([`boot_files::install`] only catches the
+///    shared root after the apply).
+/// 1. Open the WIM with [`crate::windows::wim::Wim::open`] and apply
+///    the image with [`crate::windows::apply::apply`] (progress and
+///    cancellation included; a set probe refuses before touching the
+///    target).
+/// 2. Read `<data>/Windows/System32/config/BCD-Template`; refuse with
+///    [`CoreError::InvalidInput`] naming the path when it is absent or
+///    unreadable (a WIM that is not a Windows image). A symlink at the
+///    template path refuses without being followed: a crafted WIM
+///    could otherwise redirect the read outside the mount roots.
+/// 3. Build both stores with [`bcd::build`]: UEFI first (with
+///    `identity`), BIOS second.
+/// 4. [`disable_recovery`] on each store with [`bcd::default_object`].
+/// 5. [`boot_files::install`] the UEFI store (ESP plus `data` as the
+///    image root), then the BIOS store with the BIOS install.
+/// 6. [`offline_san_policy`] on `<data>/Windows/System32/config/SYSTEM`,
+///    written back atomically (a temporary file in the same directory
+///    renamed over the original, removed on failure); refuse with
+///    [`CoreError::InvalidInput`] naming the path when the hive is
+///    absent. A symlink at the hive path refuses without being
+///    followed, on the read and on the write back alike: a crafted
+///    WIM could otherwise redirect either outside the mount roots.
+/// 7. Return the apply counts plus the union of placed files (UEFI
+///    then BIOS, in the order the installs return them).
+///
+/// Partial failure leaves partial writes: a failure after a step
+/// leaves the earlier steps' writes on the target — there is no
+/// rollback, and the caller must recreate the partitions to retry. A
+/// failed in-place `SYSTEM` rewrite can leave that hive truncated;
+/// the temporary-plus-rename staging above is what keeps a failed
+/// rewrite from truncating the original, while everything already
+/// written still stands.
+///
+/// The mounts are borrowed, never released: the caller mounts both and
+/// releases both, mirroring the copy arm's rule. Nothing is ever
+/// deleted outside the two mount roots, and every path written derives
+/// from `data.path()` or `esp.path()`.
+pub fn install(
+    data: &mut dyn MountedPartition,
+    esp: &mut dyn MountedPartition,
+    request: &Request<'_>,
+    reporter: &mut dyn Reporter,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Installed> {
+    // Clone the mount roots once so no borrow of the guards crosses
+    // the calls below; every path written later hangs off these two.
+    let data_root: PathBuf = data.path().to_path_buf();
+    let esp_root: PathBuf = esp.path().to_path_buf();
+    // 0. Distinct filesystems first: sharing one root would mix the
+    // UEFI and BIOS placements, so refuse before the WIM is opened or
+    // applied rather than after the apply like the boot-file layer.
+    if data_root == esp_root {
+        return Err(CoreError::invalid(format!(
+            "esp path {} must differ from the data path {}: they are separate filesystems",
+            esp_root.display(),
+            data_root.display()
+        )));
+    }
+    // 1. The image first: a malformed WIM refuses before either mount
+    // is touched, and a set probe refuses before extraction starts.
+    let wim = crate::windows::wim::Wim::open(request.wim)?;
+    let applied =
+        crate::windows::apply::apply(data, &wim, request.image_index, reporter, cancelled)?;
+    // 2. The applied image's own template: absent or unreadable means
+    // the WIM was not a Windows image at all. A symlink refuses
+    // without being followed (see above).
+    let template_path = data_root.join("Windows/System32/config/BCD-Template");
+    refuse_symlink(&template_path, "read", "the BCD template")?;
+    let template = match std::fs::read(&template_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(CoreError::invalid(format!(
+                "applied image has no readable BCD template at {}: refusing a WIM that is not a Windows image",
+                template_path.display()
+            )));
+        }
+    };
+    // 3. Both stores from the same template, UEFI first.
+    let uefi_request = bcd::StoreRequest {
+        firmware: bcd::Firmware::Uefi,
+        identity: request.identity,
+        description: request.description,
+    };
+    let bios_request = bcd::StoreRequest {
+        firmware: bcd::Firmware::Bios,
+        identity: request.identity,
+        description: request.description,
+    };
+    let uefi_store = bcd::build(&template, &uefi_request)?;
+    let bios_store = bcd::build(&template, &bios_request)?;
+    // 4. Recovery off on each store's default loader.
+    let uefi_store = disable_recovery(&uefi_store, bcd::default_object(bcd::Firmware::Uefi))?;
+    let bios_store = disable_recovery(&bios_store, bcd::default_object(bcd::Firmware::Bios))?;
+    // 5. Boot files: the UEFI set onto the ESP, the BIOS set onto the
+    // data partition itself.
+    let uefi = boot_files::install(
+        &data_root,
+        &esp_root,
+        bcd::Firmware::Uefi,
+        &uefi_store,
+        request.use_2023_bootloaders,
+    )?;
+    let bios = boot_files::install(
+        &data_root,
+        &esp_root,
+        bcd::Firmware::Bios,
+        &bios_store,
+        request.use_2023_bootloaders,
+    )?;
+    // 6. The SAN policy on the applied SYSTEM hive, staged beside
+    // the original and renamed over it. Both the read and the write
+    // back refuse a symlink without following it (see above).
+    let system_path = data_root.join("Windows/System32/config/SYSTEM");
+    refuse_symlink(&system_path, "read", "the SYSTEM hive")?;
+    let system = match std::fs::read(&system_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CoreError::invalid(format!(
+                "applied image has no SYSTEM hive at {}: cannot set the offline SAN policy",
+                system_path.display()
+            )));
+        }
+        Err(error) => return Err(CoreError::io(&system_path, error)),
+    };
+    let patched = offline_san_policy(&system)?;
+    replace_system_hive(&system_path, &patched)?;
+    // 7. The apply counts plus both placements, UEFI then BIOS.
+    let mut files = uefi.files;
+    files.extend(bios.files);
+    Ok(Installed { applied, files })
+}
+
+/// Refuse when `path` is a symlink, naming the path: `verb` is
+/// `"read"` or `"write"` and `what` names the hive (`"the BCD
+/// template"`, `"the SYSTEM hive"`). The check uses
+/// [`std::fs::symlink_metadata`] so the link is never followed — a
+/// crafted WIM can restore either hive as a symlink to a host path,
+/// and following it would read or write outside the mount roots. A
+/// missing path is not a symlink: `Ok` lets the caller report the
+/// absent file its own way.
+fn refuse_symlink(path: &Path, verb: &str, what: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::invalid(format!(
+            "refusing to {verb} {what} through a symlink at {}: a crafted image must not redirect access outside the mounted partitions",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CoreError::io(path, error)),
+    }
+}
+
+/// Stage `patched` in a temporary file in the same directory as
+/// `path` and rename it over the original, removing the temporary on
+/// failure: a failed rewrite never truncates the original in place.
+/// The write back refuses a symlink without following it (see
+/// [`refuse_symlink`]), so a link swapped in between the read and
+/// this write still cannot redirect bytes outside the mount roots —
+/// the rename would replace the link itself, but the refusal fires
+/// first. The staging file itself is created with `create_new` so a
+/// symlink planted at the deterministic `SYSTEM.tmp` name refuses
+/// instead of redirecting the write outside the mounts.
+fn replace_system_hive(path: &Path, patched: &[u8]) -> Result<()> {
+    refuse_symlink(path, "write", "the SYSTEM hive")?;
+    let tmp = path.with_extension("tmp");
+    let mut staged = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(staged) => staged,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CoreError::invalid(format!(
+                "refusing to stage the SYSTEM hive at {}: a crafted image must not redirect writes outside the mounted partition",
+                tmp.display()
+            )));
+        }
+        Err(error) => return Err(CoreError::io(&tmp, error)),
+    };
+    if let Err(error) =
+        std::io::Write::write_all(&mut staged, patched).map_err(|error| CoreError::io(&tmp, error))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    drop(staged);
+    if let Err(error) = std::fs::rename(&tmp, path).map_err(|error| CoreError::io(path, error)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::event::VecReporter;
     use crate::windows::bcd::DeviceIdentity;
     use crate::windows::bcd::Firmware;
     use crate::windows::bcd::OBJECT_BOOTMGR;
@@ -657,5 +912,821 @@ mod tests {
             .expect("16000009 must exist");
         assert_eq!(vtype, REG_BINARY);
         assert_eq!(data, vec![0u8]);
+    }
+
+    /// Local fake [`MountedPartition`](crate::pipeline::MountedPartition):
+    /// a directory path, a fixed `free_bytes` answer, and a counted
+    /// `release` the executor must never call (the caller owns both
+    /// mounts).
+    struct FakeMount {
+        path: PathBuf,
+        free: u64,
+        releases: usize,
+    }
+
+    impl FakeMount {
+        fn new(path: PathBuf, free: u64) -> Self {
+            Self {
+                path,
+                free,
+                releases: 0,
+            }
+        }
+    }
+
+    impl MountedPartition for FakeMount {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn free_bytes(&self) -> Result<u64> {
+            Ok(self.free)
+        }
+
+        fn release(&mut self) -> Result<()> {
+            self.releases = self.releases.saturating_add(1);
+            Ok(())
+        }
+    }
+
+    /// A dummy GPT identity for the executor tests: the device elements
+    /// encode whatever the caller stamps, so any fixed GUIDs do.
+    fn test_identity() -> DeviceIdentity {
+        DeviceIdentity::Gpt {
+            disk_guid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            partition_guid: [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+        }
+    }
+
+    /// Skip gate (the `skip:` convention): the library probe comes
+    /// first, then the `wimlib-imagex` presence probe.
+    fn skip_without_backend() -> bool {
+        if !wimlib_sys::linked() {
+            eprintln!(
+                "skip: to go install needs libwim, which this build did not link (wimlib_present is off)"
+            );
+            return true;
+        }
+        if std::process::Command::new("wimlib-imagex")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "skip: to go install needs wimlib-imagex, which this host does not ship (install wimlib and re-run)"
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Capture the scratch tree at `src` into `dir/cap.wim` with image
+    /// name `testimg`. Returns the WIM path.
+    fn capture_tree(dir: &Path, src: &std::path::Path) -> PathBuf {
+        let wim = dir.join("cap.wim");
+        let run = std::process::Command::new("wimlib-imagex")
+            .arg("capture")
+            .arg(src)
+            .arg(&wim)
+            .arg("testimg")
+            .output()
+            .expect("wimlib-imagex capture must spawn past the skip gate");
+        assert!(
+            run.status.success(),
+            "capture failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        wim
+    }
+
+    #[test]
+    fn install_refuses_a_missing_wim() {
+        // No assets and no backend: opening the WIM fails before either
+        // mount is touched, with or without libwim linked.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let data_path = root.path().join("data");
+        let esp_path = root.path().join("esp");
+        std::fs::create_dir_all(&data_path).expect("data dir must create");
+        std::fs::create_dir_all(&esp_path).expect("esp dir must create");
+        let mut data = FakeMount::new(data_path.clone(), u64::MAX);
+        let mut esp = FakeMount::new(esp_path.clone(), u64::MAX);
+        let missing = root.path().join("no-such.wim");
+        let request = Request {
+            wim: &missing,
+            image_index: 1,
+            identity: test_identity(),
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        let mut reporter = VecReporter::new();
+        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
+            .expect_err("a missing WIM must refuse");
+        assert!(err.to_string().is_ascii(), "{err}");
+        assert_eq!(
+            data.releases, 0,
+            "a refused install never releases the data mount"
+        );
+        assert_eq!(
+            esp.releases, 0,
+            "a refused install never releases the esp mount"
+        );
+        assert_eq!(
+            std::fs::read_dir(&data_path)
+                .expect("data must list")
+                .count(),
+            0,
+            "a refused install writes nothing to data"
+        );
+        assert_eq!(
+            std::fs::read_dir(&esp_path).expect("esp must list").count(),
+            0,
+            "a refused install writes nothing to the esp"
+        );
+    }
+
+    #[test]
+    fn install_refuses_identical_mount_roots_before_opening_the_wim() {
+        // One directory mounted twice: the shared root refuses before
+        // the WIM is opened or applied (today `boot_files::install`
+        // only catches it after the apply), so neither mount is
+        // touched and nothing is written.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let shared = root.path().join("shared");
+        std::fs::create_dir_all(&shared).expect("shared dir must create");
+        let mut data = FakeMount::new(shared.clone(), u64::MAX);
+        let mut esp = FakeMount::new(shared.clone(), u64::MAX);
+        let missing = root.path().join("no-such.wim");
+        let request = Request {
+            wim: &missing,
+            image_index: 1,
+            identity: test_identity(),
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        let mut reporter = VecReporter::new();
+        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
+            .expect_err("a shared mount root must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("must differ"), "{text}");
+        assert!(text.contains(&shared.display().to_string()), "{text}");
+        assert!(text.is_ascii(), "{text}");
+        assert_eq!(
+            data.releases, 0,
+            "a refused install never releases the data mount"
+        );
+        assert_eq!(
+            esp.releases, 0,
+            "a refused install never releases the esp mount"
+        );
+        assert_eq!(
+            std::fs::read_dir(&shared)
+                .expect("shared must list")
+                .count(),
+            0,
+            "a refused install writes nothing"
+        );
+    }
+
+    #[test]
+    fn system_rewrite_stages_beside_the_original() {
+        // The atomic helper, without any backend: a plain file is
+        // replaced with the new bytes and no temporary is left
+        // behind.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let hive = root.path().join("SYSTEM");
+        std::fs::write(&hive, b"original-hive-bytes").expect("hive must write");
+        replace_system_hive(&hive, b"patched-hive-bytes").expect("the rewrite must land");
+        assert_eq!(
+            std::fs::read(&hive).expect("hive must read"),
+            b"patched-hive-bytes"
+        );
+        assert!(
+            !root.path().join("SYSTEM.tmp").exists(),
+            "the staging temporary must not survive success"
+        );
+        // A missing parent refuses as I/O and leaves nothing behind.
+        let missing = root.path().join("no-such-dir/SYSTEM");
+        let err = replace_system_hive(&missing, b"patched").expect_err("a missing parent refuses");
+        assert!(matches!(err, CoreError::Io { .. }), "must be Io, got {err}");
+        assert!(err.to_string().is_ascii(), "{err}");
+        assert!(
+            !root.path().join("no-such-dir/SYSTEM.tmp").exists(),
+            "a failed staging must leave no temporary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_rewrite_refuses_a_symlink_without_writing_through() {
+        // A hive path that is a symlink to a host file: the write
+        // back refuses naming the link, the host target keeps its
+        // bytes, and no temporary is staged.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let outside = root.path().join("host-secret");
+        std::fs::write(&outside, b"host-secret-must-survive").expect("outside must write");
+        let link = root.path().join("SYSTEM");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink must create");
+        let err = replace_system_hive(&link, b"patched").expect_err("a symlinked hive refuses");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("symlink"), "{text}");
+        assert!(text.contains("SYSTEM"), "{text}");
+        assert!(
+            text.contains(&link.display().to_string()),
+            "the refusal names the link path, got {text}"
+        );
+        assert!(text.is_ascii(), "{text}");
+        assert_eq!(
+            std::fs::read(&outside).expect("outside must read"),
+            b"host-secret-must-survive",
+            "nothing is written through the link"
+        );
+        assert!(
+            !root.path().join("SYSTEM.tmp").exists(),
+            "a refused rewrite stages no temporary"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link must stat")
+                .file_type()
+                .is_symlink(),
+            "the refused rewrite leaves the link itself alone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_rewrite_refuses_a_symlinked_staging_temporary() {
+        // A crafted image restores `SYSTEM.tmp` as a symlink to a host
+        // file: staging with `create_new` refuses naming the temporary,
+        // the host target keeps its bytes, the link stays a link, and
+        // the original hive is untouched.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let outside = root.path().join("host-secret");
+        std::fs::write(&outside, b"host-secret-must-survive").expect("outside must write");
+        let hive = root.path().join("SYSTEM");
+        std::fs::write(&hive, b"original-hive-bytes").expect("hive must write");
+        let tmp = root.path().join("SYSTEM.tmp");
+        std::os::unix::fs::symlink(&outside, &tmp).expect("symlink must create");
+        let err =
+            replace_system_hive(&hive, b"patched-hive-bytes").expect_err("a symlinked tmp refuses");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("SYSTEM.tmp"), "{text}");
+        assert!(
+            text.contains(&tmp.display().to_string()),
+            "the refusal names the staging path, got {text}"
+        );
+        assert!(
+            text.contains("crafted image must not redirect writes outside the mounted partition"),
+            "{text}"
+        );
+        assert!(text.is_ascii(), "{text}");
+        assert_eq!(
+            std::fs::read(&outside).expect("outside must read"),
+            b"host-secret-must-survive",
+            "nothing is written through the staging link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&tmp)
+                .expect("link must stat")
+                .file_type()
+                .is_symlink(),
+            "the refused staging leaves the link itself alone"
+        );
+        assert_eq!(
+            std::fs::read(&hive).expect("hive must read"),
+            b"original-hive-bytes",
+            "the refused staging leaves the original hive alone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_symlinked_bcd_template() {
+        if skip_without_backend() {
+            return;
+        }
+        // The applied tree carries `BCD-Template` as a symlink to a
+        // host file: the template read refuses without following the
+        // link, so the host bytes are never parsed as a hive and the
+        // mounts are never released. A real file (`a.txt`) rides along
+        // so the apply's reporting walk still finds a regular file.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let outside = root.path().join("host-secret");
+        std::fs::write(&outside, b"host-secret-must-survive").expect("outside must write");
+        let src = root.path().join("src");
+        let config = src.join("Windows/System32/config");
+        std::fs::create_dir_all(&config).expect("config dir must create");
+        std::fs::write(src.join("a.txt"), b"not windows\n").expect("scratch file must write");
+        std::os::unix::fs::symlink(&outside, config.join("BCD-Template"))
+            .expect("symlink must create");
+        let wim_path = capture_tree(root.path(), &src);
+        let data_path = root.path().join("data");
+        let esp_path = root.path().join("esp");
+        std::fs::create_dir_all(&data_path).expect("data dir must create");
+        std::fs::create_dir_all(&esp_path).expect("esp dir must create");
+        let mut data = FakeMount::new(data_path.clone(), u64::MAX);
+        let mut esp = FakeMount::new(esp_path, u64::MAX);
+        let request = Request {
+            wim: &wim_path,
+            image_index: 1,
+            identity: test_identity(),
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        let mut reporter = VecReporter::new();
+        let template_path = data_path.join("Windows/System32/config/BCD-Template");
+        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
+            .expect_err("a symlinked template must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("symlink"), "{text}");
+        assert!(text.contains("BCD-Template"), "{text}");
+        assert!(
+            text.contains(&template_path.display().to_string()),
+            "the refusal names the link path, got {text}"
+        );
+        assert!(text.is_ascii(), "{text}");
+        assert_eq!(
+            std::fs::read(&outside).expect("outside must read"),
+            b"host-secret-must-survive",
+            "nothing is read or written through the link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&template_path)
+                .expect("link must stat")
+                .file_type()
+                .is_symlink(),
+            "the refused install leaves the link itself alone"
+        );
+        assert_eq!(
+            data.releases, 0,
+            "a refused install never releases the data mount"
+        );
+        assert_eq!(
+            esp.releases, 0,
+            "a refused install never releases the esp mount"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_symlinked_system_hive() {
+        if skip_without_backend() {
+            return;
+        }
+        // A Windows-shaped tree with a valid template and boot
+        // sources, but `SYSTEM` as a symlink to a host file: the boot
+        // files still land (partial failure stands — there is no
+        // rollback), then the hive step refuses without following the
+        // link, so the host bytes keep their content.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let outside = root.path().join("host-secret");
+        std::fs::write(&outside, b"host-secret-must-survive").expect("outside must write");
+        let src = root.path().join("src");
+        let config = src.join("Windows/System32/config");
+        std::fs::create_dir_all(&config).expect("config dir must create");
+        std::fs::write(config.join("BCD-Template"), template_fixture())
+            .expect("template must write");
+        std::os::unix::fs::symlink(&outside, config.join("SYSTEM")).expect("symlink must create");
+        std::fs::create_dir_all(src.join("Windows/Boot/EFI")).expect("efi dir must create");
+        std::fs::create_dir_all(src.join("Windows/Boot/PCAT")).expect("pcat dir must create");
+        std::fs::write(
+            src.join("Windows/Boot/EFI/bootmgfw.efi"),
+            b"fake-efi-loader",
+        )
+        .expect("efi loader must write");
+        std::fs::write(src.join("Windows/Boot/PCAT/bootmgr"), b"fake-bios-loader")
+            .expect("bios loader must write");
+        std::fs::write(src.join("Windows/Boot/PCAT/boot.sdi"), b"fake-boot-sdi")
+            .expect("boot.sdi must write");
+        let wim_path = capture_tree(root.path(), &src);
+        let data_path = root.path().join("data");
+        let esp_path = root.path().join("esp");
+        std::fs::create_dir_all(&data_path).expect("data dir must create");
+        std::fs::create_dir_all(&esp_path).expect("esp dir must create");
+        let mut data = FakeMount::new(data_path.clone(), u64::MAX);
+        let mut esp = FakeMount::new(esp_path, u64::MAX);
+        let request = Request {
+            wim: &wim_path,
+            image_index: 1,
+            identity: test_identity(),
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        let mut reporter = VecReporter::new();
+        let system_path = data_path.join("Windows/System32/config/SYSTEM");
+        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
+            .expect_err("a symlinked SYSTEM hive must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("symlink"), "{text}");
+        assert!(text.contains("SYSTEM"), "{text}");
+        assert!(
+            text.contains(&system_path.display().to_string()),
+            "the refusal names the link path, got {text}"
+        );
+        assert!(text.is_ascii(), "{text}");
+        assert_eq!(
+            std::fs::read(&outside).expect("outside must read"),
+            b"host-secret-must-survive",
+            "nothing is written through the link"
+        );
+        assert!(
+            std::fs::symlink_metadata(&system_path)
+                .expect("link must stat")
+                .file_type()
+                .is_symlink(),
+            "the refused install leaves the link itself alone"
+        );
+        assert!(
+            !data_path
+                .join("Windows/System32/config/SYSTEM.tmp")
+                .exists(),
+            "a refused rewrite stages no temporary"
+        );
+        assert_eq!(
+            data.releases, 0,
+            "a refused install never releases the data mount"
+        );
+        assert_eq!(
+            esp.releases, 0,
+            "a refused install never releases the esp mount"
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_wim_without_a_windows_template() {
+        if skip_without_backend() {
+            return;
+        }
+        // A plain-files WIM: the apply succeeds, then the missing
+        // `BCD-Template` refuses as a non-Windows image.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).expect("scratch tree must create");
+        std::fs::write(src.join("a.txt"), b"not windows\n").expect("scratch file must write");
+        let wim_path = capture_tree(root.path(), &src);
+        let data_path = root.path().join("data");
+        let esp_path = root.path().join("esp");
+        std::fs::create_dir_all(&data_path).expect("data dir must create");
+        std::fs::create_dir_all(&esp_path).expect("esp dir must create");
+        let mut data = FakeMount::new(data_path.clone(), u64::MAX);
+        let mut esp = FakeMount::new(esp_path, u64::MAX);
+        let request = Request {
+            wim: &wim_path,
+            image_index: 1,
+            identity: test_identity(),
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        let mut reporter = VecReporter::new();
+        let template_path = data_path.join("Windows/System32/config/BCD-Template");
+        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
+            .expect_err("a WIM without a Windows template must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("BCD-Template"), "{text}");
+        assert!(
+            text.contains(&template_path.display().to_string()),
+            "the refusal names the template path, got {text}"
+        );
+        assert!(text.is_ascii(), "{text}");
+        assert_eq!(
+            data.releases, 0,
+            "a refused install never releases the data mount"
+        );
+        assert_eq!(
+            esp.releases, 0,
+            "a refused install never releases the esp mount"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_applied_image_without_a_system_hive() {
+        if skip_without_backend() {
+            return;
+        }
+        // A Windows-shaped tree (valid template plus boot sources so
+        // the boot-file step passes) but no SYSTEM hive: the SAN policy
+        // step refuses naming the path.
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let src = root.path().join("src");
+        let config = src.join("Windows/System32/config");
+        std::fs::create_dir_all(&config).expect("config dir must create");
+        std::fs::write(config.join("BCD-Template"), template_fixture())
+            .expect("template must write");
+        std::fs::create_dir_all(src.join("Windows/Boot/EFI")).expect("efi dir must create");
+        std::fs::create_dir_all(src.join("Windows/Boot/PCAT")).expect("pcat dir must create");
+        std::fs::write(
+            src.join("Windows/Boot/EFI/bootmgfw.efi"),
+            b"fake-efi-loader",
+        )
+        .expect("efi loader must write");
+        std::fs::write(src.join("Windows/Boot/PCAT/bootmgr"), b"fake-bios-loader")
+            .expect("bios loader must write");
+        std::fs::write(src.join("Windows/Boot/PCAT/boot.sdi"), b"fake-boot-sdi")
+            .expect("boot.sdi must write");
+        let wim_path = capture_tree(root.path(), &src);
+        let data_path = root.path().join("data");
+        let esp_path = root.path().join("esp");
+        std::fs::create_dir_all(&data_path).expect("data dir must create");
+        std::fs::create_dir_all(&esp_path).expect("esp dir must create");
+        let mut data = FakeMount::new(data_path.clone(), u64::MAX);
+        let mut esp = FakeMount::new(esp_path, u64::MAX);
+        let request = Request {
+            wim: &wim_path,
+            image_index: 1,
+            identity: test_identity(),
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        let mut reporter = VecReporter::new();
+        let system_path = data_path.join("Windows/System32/config/SYSTEM");
+        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
+            .expect_err("an image without SYSTEM must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("SYSTEM"), "{text}");
+        assert!(
+            text.contains(&system_path.display().to_string()),
+            "the refusal names the SYSTEM path, got {text}"
+        );
+        assert!(text.is_ascii(), "{text}");
+        assert!(
+            !system_path.exists(),
+            "the missing SYSTEM hive is never invented"
+        );
+        assert_eq!(
+            data.releases, 0,
+            "a refused install never releases the data mount"
+        );
+        assert_eq!(
+            esp.releases, 0,
+            "a refused install never releases the esp mount"
+        );
+    }
+
+    /// Copy a directory tree (regular files and subdirectories only).
+    fn copy_tree(source: &std::path::Path, dest: &std::path::Path) {
+        std::fs::create_dir_all(dest).expect("copy dest must create");
+        let listing = std::fs::read_dir(source).expect("copy source must list");
+        for entry in listing {
+            let entry = entry.expect("copy entry must read");
+            let kind = entry.file_type().expect("copy entry must stat");
+            let target = dest.join(entry.file_name());
+            if kind.is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), &target).expect("copy file must copy");
+            }
+        }
+    }
+
+    /// Full executor over the real assets. Ignored by default: set
+    /// `RUFUS_TEST_WINDOWS_TREE` to the extracted image root (with
+    /// `Windows/Boot` beneath it), `RUFUS_TEST_BCD_TEMPLATE` to the
+    /// extracted `Windows/System32/config/BCD-Template` path, and
+    /// `RUFUS_TEST_SYSTEM_HIVE` to the extracted
+    /// `Windows/System32/config/SYSTEM` path to run it.
+    #[test]
+    #[ignore]
+    fn real_windows_tree_installs_end_to_end() {
+        if skip_without_backend() {
+            return;
+        }
+        let Ok(tree) = std::env::var("RUFUS_TEST_WINDOWS_TREE") else {
+            println!("skip: RUFUS_TEST_WINDOWS_TREE is not set");
+            return;
+        };
+        let tree = PathBuf::from(tree);
+        let Ok(template_source) = std::env::var("RUFUS_TEST_BCD_TEMPLATE") else {
+            println!("skip: RUFUS_TEST_BCD_TEMPLATE is not set");
+            return;
+        };
+        let template_source = PathBuf::from(template_source);
+        let Ok(system_source) = std::env::var("RUFUS_TEST_SYSTEM_HIVE") else {
+            println!("skip: RUFUS_TEST_SYSTEM_HIVE is not set");
+            return;
+        };
+        let system_source = PathBuf::from(system_source);
+        // The tree is either the image root (with `Windows/Boot`
+        // beneath) or the `Boot` directory itself.
+        let boot_source = if tree.join("Windows/Boot/EFI").is_dir() {
+            tree.join("Windows/Boot")
+        } else {
+            tree.clone()
+        };
+        let loader_source = boot_source.join("EFI/bootmgfw.efi");
+        assert!(
+            loader_source.is_file(),
+            "real tree must carry a uefi boot manager at {}",
+            loader_source.display()
+        );
+        let template = std::fs::read(&template_source).expect("template must read");
+        assert_eq!(&template[0..4], b"regf");
+        let system = std::fs::read(&system_source).expect("system hive must read");
+        assert_eq!(&system[0..4], b"regf");
+
+        // A small fake Windows image: the real `Boot` tree plus the
+        // real `BCD-Template` and `SYSTEM` hives.
+        let work = tempfile::tempdir().expect("scratch dir must create");
+        let src = work.path().join("src");
+        copy_tree(&boot_source, &src.join("Windows/Boot"));
+        let config = src.join("Windows/System32/config");
+        std::fs::create_dir_all(&config).expect("config dir must create");
+        std::fs::copy(&template_source, config.join("BCD-Template")).expect("template must copy");
+        std::fs::copy(&system_source, config.join("SYSTEM")).expect("system must copy");
+        let wim_path = capture_tree(work.path(), &src);
+
+        let data_dir = tempfile::tempdir().expect("data scratch must create");
+        let esp_dir = tempfile::tempdir().expect("esp scratch must create");
+        let mut data = FakeMount::new(data_dir.path().to_path_buf(), u64::MAX);
+        let mut esp = FakeMount::new(esp_dir.path().to_path_buf(), u64::MAX);
+        let request = Request {
+            wim: &wim_path,
+            image_index: 1,
+            identity: test_identity(),
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        let mut reporter = VecReporter::new();
+        let installed = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
+            .expect("the fake windows image must install");
+        // The applied tree carries the fake Windows files.
+        let loader_bytes = std::fs::read(&loader_source).expect("real loader must read");
+        assert_eq!(
+            std::fs::read(data_dir.path().join("Windows/Boot/EFI/bootmgfw.efi"))
+                .expect("applied loader must read"),
+            loader_bytes,
+            "the applied tree must carry the real boot manager"
+        );
+        assert!(
+            data_dir
+                .path()
+                .join("Windows/System32/config/SYSTEM")
+                .is_file(),
+            "the applied tree must carry the SYSTEM hive"
+        );
+        assert!(
+            installed.applied.files > 0,
+            "the apply must report extracted files"
+        );
+        assert_eq!(data.releases, 0, "install never releases the data mount");
+        assert_eq!(esp.releases, 0, "install never releases the esp mount");
+        // The UEFI store lands on the ESP with recovery disabled on the
+        // UEFI default loader.
+        let uefi_bcd = esp_dir.path().join("EFI/Microsoft/Boot/BCD");
+        assert!(uefi_bcd.is_file(), "the uefi store must land on the ESP");
+        let uefi_bytes = std::fs::read(&uefi_bcd).expect("uefi store must read");
+        let uefi_default = crate::windows::bcd::default_object(Firmware::Uefi);
+        assert_eq!(
+            read_bcd_element(&uefi_bytes, uefi_default, ELEMENT_AUTO_RECOVERY_ENABLED),
+            Some((REG_BINARY, vec![0u8])),
+            "the uefi store must carry {{default}}\\16000009 as inline 00"
+        );
+        // The ESP carries the loader twice, the fonts and the store.
+        assert_eq!(
+            std::fs::read(esp_dir.path().join("EFI/Microsoft/Boot/bootmgfw.efi"))
+                .expect("esp loader must read"),
+            loader_bytes
+        );
+        assert_eq!(
+            std::fs::read(esp_dir.path().join("EFI/Boot/BOOTX64.EFI"))
+                .expect("esp fallback must read"),
+            loader_bytes
+        );
+        let mut font_names: Vec<PathBuf> = Vec::new();
+        let fonts_dir = boot_source.join("Fonts");
+        for entry in std::fs::read_dir(&fonts_dir).expect("real fonts must list") {
+            let entry = entry.expect("real font entry must read");
+            if entry.file_type().expect("real font must stat").is_file() {
+                font_names.push(entry.file_name().into());
+            }
+        }
+        assert!(!font_names.is_empty(), "real tree must carry boot fonts");
+        font_names.sort();
+        for name in &font_names {
+            let source_bytes = std::fs::read(fonts_dir.join(name)).expect("real font must read");
+            assert_eq!(
+                std::fs::read(esp_dir.path().join("EFI/Microsoft/Boot/Fonts").join(name))
+                    .expect("placed font must read"),
+                source_bytes,
+                "font must copy byte for byte"
+            );
+        }
+        // The BIOS store lands on the data partition with recovery
+        // disabled on the BIOS default loader.
+        let bios_bcd = data_dir.path().join("boot/bcd");
+        assert!(bios_bcd.is_file(), "the bios store must land on data");
+        let bios_bytes = std::fs::read(&bios_bcd).expect("bios store must read");
+        let bios_default = crate::windows::bcd::default_object(Firmware::Bios);
+        assert_eq!(
+            read_bcd_element(&bios_bytes, bios_default, ELEMENT_AUTO_RECOVERY_ENABLED),
+            Some((REG_BINARY, vec![0u8])),
+            "the bios store must carry {{default}}\\16000009 as inline 00"
+        );
+        // The data partition carries the BIOS boot files.
+        assert_eq!(
+            std::fs::read(data_dir.path().join("bootmgr")).expect("bootmgr must read"),
+            std::fs::read(boot_source.join("PCAT/bootmgr")).expect("real bootmgr must read"),
+            "data must carry the real bios boot manager"
+        );
+        let sdi_primary = boot_source.join("PCAT/boot.sdi");
+        let sdi_fallback = boot_source.join("DVD/PCAT/boot.sdi");
+        let sdi_wanted = if sdi_primary.is_file() {
+            &sdi_primary
+        } else {
+            &sdi_fallback
+        };
+        assert!(sdi_wanted.is_file(), "real tree must carry a boot.sdi");
+        assert_eq!(
+            std::fs::read(data_dir.path().join("boot/boot.sdi")).expect("boot.sdi must read"),
+            std::fs::read(sdi_wanted).expect("real boot.sdi must read"),
+            "data must carry the real boot.sdi"
+        );
+        // The SAN policy in the applied SYSTEM is offline (4).
+        let applied_system = std::fs::read(data_dir.path().join("Windows/System32/config/SYSTEM"))
+            .expect("applied SYSTEM must read");
+        assert_eq!(
+            lookup_sanpolicy(&applied_system),
+            Some((REG_DWORD, SAN_POLICY_OFFLINE))
+        );
+        // The placed files are the UEFI set then the BIOS set, every
+        // one under one of the two mount roots.
+        assert!(!installed.files.is_empty(), "install must place files");
+        let split = installed
+            .files
+            .iter()
+            .position(|file| file.starts_with(data_dir.path()))
+            .expect("the bios set must place data files");
+        assert!(
+            installed.files[..split]
+                .iter()
+                .all(|file| file.starts_with(esp_dir.path())),
+            "the uefi set comes first, all on the ESP: {:?}",
+            installed.files
+        );
+        assert!(
+            installed.files[split..]
+                .iter()
+                .all(|file| file.starts_with(data_dir.path())),
+            "the bios set comes second, all on data: {:?}",
+            installed.files
+        );
+        assert_eq!(
+            installed.files.last().expect("files must exist"),
+            &bios_bcd,
+            "the bios store is the last file placed"
+        );
+        // A pre-cancelled run refuses as cancelled on fresh mounts.
+        let fresh_data = tempfile::tempdir().expect("fresh data must create");
+        let fresh_esp = tempfile::tempdir().expect("fresh esp must create");
+        let mut fresh_data_mount = FakeMount::new(fresh_data.path().to_path_buf(), u64::MAX);
+        let mut fresh_esp_mount = FakeMount::new(fresh_esp.path().to_path_buf(), u64::MAX);
+        let mut cancelled_reporter = VecReporter::new();
+        let err = install(
+            &mut fresh_data_mount,
+            &mut fresh_esp_mount,
+            &request,
+            &mut cancelled_reporter,
+            &|| true,
+        )
+        .expect_err("a pre-cancelled run must refuse");
+        assert!(
+            matches!(err, CoreError::Cancelled),
+            "a pre-cancelled run must be Cancelled, got {err}"
+        );
+        assert_eq!(
+            fresh_data_mount.releases, 0,
+            "a cancelled run never releases"
+        );
+        assert_eq!(
+            fresh_esp_mount.releases, 0,
+            "a cancelled run never releases"
+        );
     }
 }

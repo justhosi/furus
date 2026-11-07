@@ -14,7 +14,9 @@
 //! standard files by default, the 2023-signed `_EX` builds only on
 //! opt-in), the memory diagnostics, the fonts and the built stores
 //! onto the ESP and the data partition, and [`to_go`]
-//! applies the offline SAN policy and disabled-recovery tweaks host-side;
+//! applies the offline SAN policy and disabled-recovery tweaks host-side
+//! (plus the [`install`](to_go::install) executor that applies one WIM
+//! image and lays out both firmwares' boot files);
 //! the hive writers share the small in-crate `regf` editor.
 //!
 //! The reader side stays where it is: [`crate::wim`] (S16) parses the

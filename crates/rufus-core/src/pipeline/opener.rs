@@ -104,6 +104,30 @@ pub trait Opener {
             what: "mounting the data partition",
         })
     }
+
+    /// The node path of the EFI System Partition, when the layout has
+    /// one. The default refuses: only the device opener (which knows
+    /// the disk name and the sysfs root to wait on) overrides it; a
+    /// file seam keeps the refusal (it has no partition nodes), and a
+    /// test opener without one returns `NotImplemented` the same way.
+    fn esp_path(&self) -> Result<std::path::PathBuf> {
+        Err(crate::error::CoreError::NotImplemented {
+            what: "an EFI System Partition on this target",
+        })
+    }
+
+    /// Mount the ESP (FAT32) so the Windows boot files can land on it.
+    /// `Ok` owns the mount until
+    /// [`release`](MountedPartition::release) (or the guard's
+    /// best-effort drop), like
+    /// [`mount_partition`](Opener::mount_partition). The default
+    /// refuses for the same reason: mounting needs a partition node,
+    /// which only the device opener has.
+    fn mount_esp(&self) -> Result<Box<dyn MountedPartition>> {
+        Err(crate::error::CoreError::NotImplemented {
+            what: "mounting the EFI System Partition",
+        })
+    }
 }
 
 #[cfg(test)]
@@ -148,5 +172,36 @@ mod tests {
         assert!(text.contains("mounting"), "{text}");
         assert!(text.contains("not implemented"), "{text}");
         assert!(text.is_ascii(), "{text}");
+    }
+
+    #[test]
+    fn esp_seam_defaults_to_named_refusals() {
+        let opener = PlainOpener;
+        let Err(error) = opener.esp_path() else {
+            panic!("an opener without an ESP refuses");
+        };
+        assert!(
+            matches!(
+                error,
+                CoreError::NotImplemented {
+                    what: "an EFI System Partition on this target"
+                }
+            ),
+            "the refusal names the ESP: {error:?}"
+        );
+        assert!(error.to_string().is_ascii(), "{error}");
+        let Err(error) = opener.mount_esp() else {
+            panic!("an opener without an ESP mount refuses");
+        };
+        assert!(
+            matches!(
+                error,
+                CoreError::NotImplemented {
+                    what: "mounting the EFI System Partition"
+                }
+            ),
+            "the refusal names mounting: {error:?}"
+        );
+        assert!(error.to_string().is_ascii(), "{error}");
     }
 }

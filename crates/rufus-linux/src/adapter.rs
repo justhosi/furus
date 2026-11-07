@@ -36,6 +36,11 @@
 //! through
 //! [`data_partition_number`](rufus_core::part::plan::data_partition_number),
 //! so the node names the data partition however the layout orders it.
+//! The ESP node follows the same tuple through
+//! [`esp_window`](rufus_core::part::plan::esp_window): the lookup
+//! proves the layout stamps an `esp` role before any node is named,
+//! and layouts without one (`Single`, `Persistence`) refuse instead
+//! of guessing `/dev/<disk>1`.
 
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
@@ -52,6 +57,7 @@ use rufus_core::part::TableKind;
 use rufus_core::part::plan::LayoutKind;
 use rufus_core::part::plan::data_partition_number;
 use rufus_core::part::plan::data_window;
+use rufus_core::part::plan::esp_window;
 use rufus_core::pipeline::MountedPartition;
 use rufus_core::pipeline::Opener;
 use rufus_core::pipeline::Target;
@@ -253,6 +259,11 @@ enum Backend {
         path: PathBuf,
         disk_name: String,
         part_name: String,
+        /// The ESP node spelling, derived at construction from the
+        /// planner's `esp` role like `part_name`: `None` when the
+        /// layout stamps no ESP, so [`esp_path`](Opener::esp_path)
+        /// refuses instead of naming a node that is not an ESP.
+        esp_name: Option<String>,
         size: u64,
         logical: u32,
         physical: u32,
@@ -376,6 +387,13 @@ impl DeviceOpener {
     /// geometry the planner rejects fails construction here, on every
     /// layout, so no caller can name a node (`partition_path`) or
     /// mount one (`mount_partition`) before the derivation succeeds.
+    /// The ESP spelling derives the same way in the same call: the
+    /// planner's `esp` role proves the layout stamps one (both ESP
+    /// layouts stamp it first, so index 1 through the same
+    /// sysfs-aware spelling), while a layout with no ESP records
+    /// `None` and [`esp_path`](Opener::esp_path) refuses there. A
+    /// table the layout cannot support (say `WindowsToGo` on MBR)
+    /// fails here through the planner, before any node is named.
     /// The later window call then plans the same derivation again
     /// over the live handle.
     pub fn new(
@@ -386,10 +404,16 @@ impl DeviceOpener {
     ) -> Result<Self> {
         let part_index =
             data_partition_number(layout, table, device.sector_size, device.size_bytes)?;
+        let esp_name = match esp_window(layout, table, device.sector_size, device.size_bytes) {
+            Ok(_) => Some(partition_name(device, 1)),
+            Err(error) if error.to_string().contains("planned no esp partition") => None,
+            Err(error) => return Err(error),
+        };
         let backend = Backend::Device {
             path: PathBuf::from(&device.dev_path),
             disk_name: device.name.clone(),
             part_name: partition_name(device, part_index),
+            esp_name,
             size: device.size_bytes,
             logical: device.sector_size,
             physical: device.physical_sector_size,
@@ -456,6 +480,59 @@ impl Opener for DeviceOpener {
         Ok(Box::new(mounted))
     }
 
+    /// The ESP node: the layout's planner-derived `esp` role
+    /// spelling, resolved through the same
+    /// [`wait_for_partitions`](crate::wipe::wait_for_partitions) poll
+    /// the data partition path uses, so the kernel knows the node
+    /// before a formatter or a mount may claim it. A layout with no
+    /// ESP role refuses here with the layout in the message instead
+    /// of naming a node that is not an ESP; a table the layout cannot
+    /// support already failed construction through the planner.
+    fn esp_path(&self) -> Result<PathBuf> {
+        let Backend::Device {
+            disk_name,
+            esp_name,
+            sysfs,
+            ..
+        } = &self.0.backend
+        else {
+            return Err(CoreError::invalid(
+                "device opener lost its device backend".to_string(),
+            ));
+        };
+        let Some(esp_name) = esp_name else {
+            return Err(CoreError::invalid(format!(
+                "the {} layout has no EFI System Partition to mount",
+                self.0.layout.label()
+            )));
+        };
+        // After Mkpart the kernel must know the new table before the
+        // node exists: poll sysfs (bounded — an already-present node
+        // answers on the first check) and name the node on timeout.
+        // This is the one poll: no second wait lives anywhere on this
+        // path.
+        wait_for_partitions(
+            sysfs,
+            disk_name,
+            std::slice::from_ref(esp_name),
+            PARTITION_POLL_TIMEOUT,
+            PARTITION_POLL_INTERVAL,
+        )?;
+        Ok(PathBuf::from(format!("/dev/{esp_name}")))
+    }
+
+    /// Mount the ESP node (resolved through
+    /// [`esp_path`](DeviceOpener::esp_path), so the kernel knows the
+    /// node first) as FAT32 through
+    /// [`mount`](crate::mount::partition::mount): the guard owns the
+    /// mount until its explicit release or its best-effort drop, and
+    /// answers the copy pre-flight with `statvfs`.
+    fn mount_esp(&self) -> Result<Box<dyn MountedPartition>> {
+        let path = self.esp_path()?;
+        let mounted = crate::mount::partition::mount(&path, &Filesystem::Fat32)?;
+        Ok(Box::new(mounted))
+    }
+
     fn reset_device(&self) -> Result<bool> {
         let Backend::Device {
             disk_name,
@@ -512,7 +589,10 @@ impl Opener for DeviceOpener {
 /// real-device-only while the native engines run unchanged. Mounting
 /// keeps the same default refusal for the same reason: a file seam has
 /// no partition node to mount, so
-/// [`mount_partition`](Opener::mount_partition) is not overridden here.
+/// [`mount_partition`](Opener::mount_partition) is not overridden here,
+/// and neither are [`esp_path`](Opener::esp_path) nor
+/// [`mount_esp`](Opener::mount_esp) (the file seam has no partition
+/// nodes at all).
 #[derive(Debug)]
 pub struct FileOpener(Arc<Shared>);
 
@@ -1045,6 +1125,62 @@ mod tests {
     }
 
     #[test]
+    fn windows_to_go_opener_names_the_esp_node_first() {
+        use crate::model::Transport;
+
+        // The ESP spelling follows the layout's planner-derived `esp`
+        // role — first on `WindowsToGo`, like the data node follows
+        // the `data` role — through the same sysfs poll the data node
+        // uses. `WindowsToGo` needs GPT (the MSR has no MBR type
+        // byte), so the opener is built for GPT on a disk large
+        // enough to hold the ESP, the MSR and the data window.
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let sysfs = dir.path().join("sys");
+        // The kernel side: the ESP node exists under the disk, so the
+        // wait answers on its first check.
+        for node in ["sdb1", "sdb2", "sdb3"] {
+            std::fs::create_dir_all(sysfs.join("class/block/sdb").join(node))
+                .expect("node dir creates");
+        }
+        let device = Device {
+            sysfs: sysfs.join("class/block/sdb").display().to_string(),
+            name: "sdb".to_string(),
+            dev_path: "/dev/sdb".to_string(),
+            size_bytes: 1024 * 1024 * 1024,
+            sector_size: 512,
+            physical_sector_size: 512,
+            removable: true,
+            read_only: false,
+            usb: true,
+            vendor: None,
+            model: None,
+            serial: None,
+            transport: Transport::Unknown,
+            partition_table: None,
+            vid_pid: None,
+            port_path: None,
+            partitions: Vec::new(),
+        };
+        let opener = DeviceOpener::new(
+            &device,
+            TableKind::Gpt,
+            LayoutKind::WindowsToGo,
+            SysfsRoot::new(sysfs),
+        )
+        .expect("a plannable windows-to-go geometry opens");
+        assert_eq!(
+            opener.esp_path().expect("the ESP node waits"),
+            PathBuf::from("/dev/sdb1")
+        );
+        // The data partition is third on this layout, not first: the
+        // ESP node never collides with it.
+        assert_eq!(
+            opener.partition_path().expect("the data node waits"),
+            PathBuf::from("/dev/sdb3")
+        );
+    }
+
+    #[test]
     fn device_opener_refuses_a_geometry_the_planner_rejects() {
         use crate::model::Transport;
 
@@ -1088,6 +1224,87 @@ mod tests {
             message.contains("windows-to-go"),
             "the refusal names the layout: {message}"
         );
+        assert!(
+            message.contains("mbr"),
+            "the refusal names the unsupported table: {message}"
+        );
+        assert!(
+            message.contains("gpt"),
+            "the refusal names the required table: {message}"
+        );
+        assert!(
+            !message.contains("/dev/"),
+            "no node is named on the way out: {message}"
+        );
+    }
+
+    #[test]
+    fn layouts_without_an_esp_name_no_esp_node() {
+        use crate::model::Partition;
+        use crate::model::Transport;
+
+        // `Single` stamps no ESP on either table (and `Persistence`
+        // neither): the data opener still builds — the data partition
+        // is real — but `esp_path` refuses with the layout in the
+        // message instead of guessing `/dev/sdb1`, which is the data
+        // node on these layouts.
+        for table in [TableKind::Mbr, TableKind::Gpt] {
+            let dir = tempfile::tempdir().expect("scratch dir");
+            let sysfs = dir.path().join("sys");
+            // The kernel side: the data node exists under the disk, so
+            // the data wait answers on its first check.
+            std::fs::create_dir_all(sysfs.join("class/block/sdb").join("sdb1"))
+                .expect("node dir creates");
+            let device = Device {
+                sysfs: sysfs.join("class/block/sdb").display().to_string(),
+                name: "sdb".to_string(),
+                dev_path: "/dev/sdb".to_string(),
+                size_bytes: 64 * 1024 * 1024,
+                sector_size: 512,
+                physical_sector_size: 512,
+                removable: true,
+                read_only: false,
+                usb: true,
+                vendor: None,
+                model: None,
+                serial: None,
+                transport: Transport::Unknown,
+                partition_table: None,
+                vid_pid: None,
+                port_path: None,
+                partitions: vec![Partition {
+                    name: "sdb1".to_string(),
+                    number: Some(1),
+                    size_bytes: 63 * 1024 * 1024,
+                    fstype: None,
+                }],
+            };
+            let opener =
+                DeviceOpener::new(&device, table, LayoutKind::Single, SysfsRoot::new(sysfs))
+                    .expect("a plannable single geometry opens");
+            let error = opener
+                .esp_path()
+                .expect_err("a layout without an ESP names no node");
+            let message = error.to_string();
+            assert!(message.is_ascii(), "the refusal stays ASCII: {message}");
+            assert!(
+                message.contains("single"),
+                "the refusal names the layout: {message}"
+            );
+            assert!(
+                message.contains("no EFI System Partition"),
+                "the refusal names the missing role: {message}"
+            );
+            assert!(
+                !message.contains("/dev/"),
+                "no node is named on the way out: {message}"
+            );
+            // The data node is unaffected: still the first partition.
+            assert_eq!(
+                opener.partition_path().expect("the data node waits"),
+                PathBuf::from("/dev/sdb1")
+            );
+        }
     }
 
     #[test]
@@ -1106,6 +1323,48 @@ mod tests {
         // No partition node behind a file.
         let error = opener.partition_path().expect_err("the seam has no node");
         assert!(error.to_string().contains("no partition node"), "{error:?}");
+    }
+
+    #[test]
+    fn file_seam_has_no_esp_nodes_either() {
+        use rufus_core::error::CoreError;
+
+        // The file seam keeps the default ESP refusals: no partition
+        // nodes behind a file, data or ESP alike, and nothing to mount.
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("stick.img");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("seam file creates")
+            .set_len(64 * 1024 * 1024)
+            .expect("seam file sizes");
+        let opener =
+            FileOpener::open(&path, TableKind::Mbr, LayoutKind::Single).expect("seam opens");
+        let error = opener.esp_path().expect_err("the seam has no ESP node");
+        assert!(
+            matches!(
+                error,
+                CoreError::NotImplemented {
+                    what: "an EFI System Partition on this target"
+                }
+            ),
+            "the ESP path refusal names the ESP: {error:?}"
+        );
+        let Err(error) = opener.mount_esp() else {
+            panic!("the seam mounts no ESP");
+        };
+        assert!(
+            matches!(
+                error,
+                CoreError::NotImplemented {
+                    what: "mounting the EFI System Partition"
+                }
+            ),
+            "the ESP mount refusal names mounting: {error:?}"
+        );
     }
 
     #[test]

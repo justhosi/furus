@@ -163,25 +163,85 @@ fn read_source(path: &Path, description: &str) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|cause| CoreError::io(path, cause))
 }
 
-/// Write `bytes` to `dest`, creating parent directories as needed and
-/// recording the path. Existing files are overwritten, so re-running is
-/// idempotent.
-fn write_dest(dest: &Path, bytes: &[u8], files: &mut Vec<PathBuf>) -> Result<()> {
+/// Refuse when `dest` itself is a symlink, without following it: a
+/// crafted image that ships a destination as a link must not redirect
+/// the write outside the mount root.
+fn refuse_dest_symlink(dest: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::invalid(format!(
+            "refusing to write {}: a crafted image must not redirect writes outside the mounted partition",
+            dest.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CoreError::io(dest, error)),
+    }
+}
+
+/// Require an existing `probe` to resolve inside `root`: canonicalize
+/// both and refuse unless the probe starts with the root. Names
+/// `dest` (the file about to be written) so the refusal points at
+/// the offending path.
+fn require_existing_inside(root: &Path, probe: &Path, dest: &Path) -> Result<()> {
+    let root_canon = std::fs::canonicalize(root).map_err(|cause| CoreError::io(root, cause))?;
+    let probe_canon = std::fs::canonicalize(probe).map_err(|cause| CoreError::io(probe, cause))?;
+    if !probe_canon.starts_with(&root_canon) {
+        return Err(CoreError::invalid(format!(
+            "refusing to write {}: a crafted image must not redirect writes outside the mounted partition",
+            dest.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Require the nearest existing ancestor of `parent` to resolve inside
+/// `root`, before `parent` is created: a symlinked prefix (an applied
+/// image that ships `boot` or `EFI` as a link) refuses here instead of
+/// letting `create_dir_all` build directories outside the mount root.
+fn require_prefix_inside(root: &Path, parent: &Path, dest: &Path) -> Result<()> {
+    let mut probe: &Path = parent;
+    loop {
+        match std::fs::symlink_metadata(probe) {
+            Ok(_) => return require_existing_inside(root, probe, dest),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match probe.parent() {
+                Some(next) if !next.as_os_str().is_empty() => {
+                    probe = next;
+                }
+                _ => return require_existing_inside(root, root, dest),
+            },
+            Err(error) => return Err(CoreError::io(probe, error)),
+        }
+    }
+}
+
+/// Write `bytes` to `dest` under `root`, creating parent directories as
+/// needed and recording the path. Existing files are overwritten, so
+/// re-running is idempotent. Before every write the destination's
+/// parent chain must resolve inside `root` (canonicalized) and the
+/// destination itself must not be a symlink, or the write refuses.
+fn write_dest(root: &Path, dest: &Path, bytes: &[u8], files: &mut Vec<PathBuf>) -> Result<()> {
+    refuse_dest_symlink(dest)?;
     if let Some(parent) = dest.parent()
         && !parent.as_os_str().is_empty()
     {
+        require_prefix_inside(root, parent, dest)?;
         std::fs::create_dir_all(parent).map_err(|cause| CoreError::io(parent, cause))?;
+        require_existing_inside(root, parent, dest)?;
+        refuse_dest_symlink(dest)?;
     }
     std::fs::write(dest, bytes).map_err(|cause| CoreError::io(dest, cause))?;
     files.push(dest.to_path_buf());
     Ok(())
 }
 
-/// Write pre-read `fonts` (see [`read_fonts`]) into `dest_dir`.
-/// An empty set writes nothing, not even the directory; any other
-/// failure names the path. Names arrive in sorted order so
-/// [`Placement::files`] stays deterministic.
+/// Write pre-read `fonts` (see [`read_fonts`]) into `dest_dir` under
+/// `root`. An empty set writes nothing, not even the directory; any
+/// other failure names the path. Names arrive in sorted order so
+/// [`Placement::files`] stays deterministic. The same parent-inside
+/// plus no-destination-symlink rule as [`write_dest`] applies to every
+/// font file.
 fn write_fonts(
+    root: &Path,
     dest_dir: &Path,
     fonts: &[(PathBuf, Vec<u8>)],
     files: &mut Vec<PathBuf>,
@@ -189,9 +249,13 @@ fn write_fonts(
     if fonts.is_empty() {
         return Ok(());
     }
+    require_prefix_inside(root, dest_dir, dest_dir)?;
     std::fs::create_dir_all(dest_dir).map_err(|cause| CoreError::io(dest_dir, cause))?;
+    require_existing_inside(root, dest_dir, dest_dir)?;
     for (name, bytes) in fonts {
         let dest = dest_dir.join(name);
+        refuse_dest_symlink(&dest)?;
+        require_existing_inside(root, dest_dir, &dest)?;
         std::fs::write(&dest, bytes).map_err(|cause| CoreError::io(&dest, cause))?;
         files.push(dest);
     }
@@ -304,13 +368,13 @@ pub fn install(
             };
             let fonts = read_fonts(&fonts_source(data, use_2023_bootloaders))?;
             let boot_dir = esp.join("EFI/Microsoft/Boot");
-            write_dest(&boot_dir.join("bootmgfw.efi"), &loader, &mut files)?;
-            write_dest(&esp.join("EFI/Boot/BOOTX64.EFI"), &loader, &mut files)?;
+            write_dest(esp, &boot_dir.join("bootmgfw.efi"), &loader, &mut files)?;
+            write_dest(esp, &esp.join("EFI/Boot/BOOTX64.EFI"), &loader, &mut files)?;
             if let Some(bytes) = &memtest {
-                write_dest(&boot_dir.join("memtest.efi"), bytes, &mut files)?;
+                write_dest(esp, &boot_dir.join("memtest.efi"), bytes, &mut files)?;
             }
-            write_fonts(&boot_dir.join("Fonts"), &fonts, &mut files)?;
-            write_dest(&boot_dir.join("BCD"), store, &mut files)?;
+            write_fonts(esp, &boot_dir.join("Fonts"), &fonts, &mut files)?;
+            write_dest(esp, &boot_dir.join("BCD"), store, &mut files)?;
         }
         Firmware::Bios => {
             let normal = data.join("Windows/Boot/PCAT/bootmgr");
@@ -325,14 +389,14 @@ pub fn install(
                 None
             };
             let fonts = read_fonts(&fonts_source(data, use_2023_bootloaders))?;
-            write_dest(&data.join("bootmgr"), &manager, &mut files)?;
+            write_dest(data, &data.join("bootmgr"), &manager, &mut files)?;
             let boot_dir = data.join("boot");
-            write_dest(&boot_dir.join("boot.sdi"), &sdi, &mut files)?;
+            write_dest(data, &boot_dir.join("boot.sdi"), &sdi, &mut files)?;
             if let Some(bytes) = &memtest {
-                write_dest(&boot_dir.join("memtest.exe"), bytes, &mut files)?;
+                write_dest(data, &boot_dir.join("memtest.exe"), bytes, &mut files)?;
             }
-            write_fonts(&boot_dir.join("fonts"), &fonts, &mut files)?;
-            write_dest(&boot_dir.join("bcd"), store, &mut files)?;
+            write_fonts(data, &boot_dir.join("fonts"), &fonts, &mut files)?;
+            write_dest(data, &boot_dir.join("bcd"), store, &mut files)?;
         }
     }
     Ok(Placement { files })
@@ -838,6 +902,157 @@ mod tests {
                 .all(|path| !path.starts_with(&missing_esp)),
             "bios must write nothing under the missing esp"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_parent_directory_refuses_without_writing_outside() {
+        // A crafted image ships `boot` (BIOS) or `EFI` (UEFI) as a
+        // symlink: every destination beneath it must refuse, naming the
+        // offending path, with nothing written outside the root.
+        let phrase = "a crafted image must not redirect writes outside the mounted partition";
+        // BIOS: `data/boot` points outside.
+        {
+            let (data, esp) = full_tree();
+            let store = fake_store();
+            let outside = tempfile::tempdir().expect("outside must create");
+            let link = data.path().join("boot");
+            std::os::unix::fs::symlink(outside.path(), &link).expect("symlink must create");
+            let err = install(data.path(), esp.path(), Firmware::Bios, &store, false)
+                .expect_err("a symlinked boot dir must refuse");
+            assert!(
+                matches!(err, CoreError::InvalidInput { .. }),
+                "must be InvalidInput, got {err}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains(&link.display().to_string()) || text.contains("boot"),
+                "{text}"
+            );
+            assert!(text.contains(phrase), "{text}");
+            assert!(text.is_ascii(), "{text}");
+            assert_eq!(
+                std::fs::read_dir(outside.path())
+                    .expect("outside must list")
+                    .count(),
+                0,
+                "nothing is written through the symlinked boot dir"
+            );
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("link must stat")
+                    .file_type()
+                    .is_symlink(),
+                "the refused install leaves the link itself alone"
+            );
+        }
+        // UEFI: `esp/EFI` points outside.
+        {
+            let (data, esp) = full_tree();
+            let store = fake_store();
+            let outside = tempfile::tempdir().expect("outside must create");
+            let link = esp.path().join("EFI");
+            std::os::unix::fs::symlink(outside.path(), &link).expect("symlink must create");
+            let err = install(data.path(), esp.path(), Firmware::Uefi, &store, false)
+                .expect_err("a symlinked EFI dir must refuse");
+            assert!(
+                matches!(err, CoreError::InvalidInput { .. }),
+                "must be InvalidInput, got {err}"
+            );
+            let text = err.to_string();
+            assert!(text.contains("EFI"), "{text}");
+            assert!(text.contains(phrase), "{text}");
+            assert!(text.is_ascii(), "{text}");
+            assert_eq!(
+                std::fs::read_dir(outside.path())
+                    .expect("outside must list")
+                    .count(),
+                0,
+                "nothing is written through the symlinked EFI dir"
+            );
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("link must stat")
+                    .file_type()
+                    .is_symlink(),
+                "the refused install leaves the link itself alone"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_destination_file_refuses_without_writing_outside() {
+        // A crafted image ships a destination file itself as a symlink:
+        // the write refuses without following the link.
+        let phrase = "a crafted image must not redirect writes outside the mounted partition";
+        // BIOS: `data/bootmgr` points at a host file.
+        {
+            let (data, esp) = full_tree();
+            let store = fake_store();
+            let outside = tempfile::tempdir().expect("outside must create");
+            let target = outside.path().join("host-secret");
+            std::fs::write(&target, b"host-secret-must-survive").expect("outside must write");
+            let link = data.path().join("bootmgr");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink must create");
+            let err = install(data.path(), esp.path(), Firmware::Bios, &store, false)
+                .expect_err("a symlinked bootmgr must refuse");
+            assert!(
+                matches!(err, CoreError::InvalidInput { .. }),
+                "must be InvalidInput, got {err}"
+            );
+            let text = err.to_string();
+            assert!(text.contains(&link.display().to_string()), "{text}");
+            assert!(text.contains(phrase), "{text}");
+            assert!(text.is_ascii(), "{text}");
+            assert_eq!(
+                std::fs::read(&target).expect("outside must read"),
+                b"host-secret-must-survive",
+                "nothing is written through the symlinked file"
+            );
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("link must stat")
+                    .file_type()
+                    .is_symlink(),
+                "the refused install leaves the link itself alone"
+            );
+        }
+        // UEFI: the ESP store destination points at a host file. The
+        // parent chain exists so the refusal names the file itself.
+        {
+            let (data, esp) = full_tree();
+            let store = fake_store();
+            let outside = tempfile::tempdir().expect("outside must create");
+            let target = outside.path().join("host-secret");
+            std::fs::write(&target, b"host-secret-must-survive").expect("outside must write");
+            let boot_dir = esp.path().join("EFI/Microsoft/Boot");
+            std::fs::create_dir_all(&boot_dir).expect("esp parents must create");
+            let link = boot_dir.join("BCD");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink must create");
+            let err = install(data.path(), esp.path(), Firmware::Uefi, &store, false)
+                .expect_err("a symlinked BCD must refuse");
+            assert!(
+                matches!(err, CoreError::InvalidInput { .. }),
+                "must be InvalidInput, got {err}"
+            );
+            let text = err.to_string();
+            assert!(text.contains(&link.display().to_string()), "{text}");
+            assert!(text.contains(phrase), "{text}");
+            assert!(text.is_ascii(), "{text}");
+            assert_eq!(
+                std::fs::read(&target).expect("outside must read"),
+                b"host-secret-must-survive",
+                "nothing is written through the symlinked ESP file"
+            );
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .expect("link must stat")
+                    .file_type()
+                    .is_symlink(),
+                "the refused install leaves the link itself alone"
+            );
+        }
     }
 
     /// Copy a directory tree (regular files and subdirectories only).
