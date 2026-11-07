@@ -40,6 +40,8 @@
 //!   `msdos` [`BootloaderMode`] variant and appended
 //!   [`Options::msdos_dir`] (as the last options field, like
 //!   `confirmed_serial` before it) — so a v4 plan is refused
+//!   outright for the same reason. v6 added the `windows`
+//!   [`BootloaderMode`] variant — so a v5 plan is refused
 //!   outright for the same reason.
 //! * `confirm` is the SHA-256 over the canonical JSON bytes of the plan
 //!   with `confirm` set to `""` (see [`Plan::confirm`]). serde_json writes
@@ -82,13 +84,12 @@ pub mod events;
 
 pub use events::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, LogLine, Outcome, Progress};
 
-/// Schema version of [`Plan`]. v5 added the `msdos`
-/// [`BootloaderMode`] variant and appended [`Options::msdos_dir`],
-/// and refuses v1/v2/v3/v4 plans, fail
-/// closed — see the schema history in the crate documentation. A
-/// plan carrying a higher or older version must be refused by the
+/// Schema version of [`Plan`]. v6 added the `windows`
+/// [`BootloaderMode`] variant, and refuses v1/v2/v3/v4/v5 plans,
+/// fail closed — see the schema history in the crate documentation.
+/// A plan carrying a higher or older version must be refused by the
 /// helper.
-pub const PLAN_VERSION: u32 = 5;
+pub const PLAN_VERSION: u32 = 6;
 
 /// A write plan: device, image, options, ordered steps and a confirm hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +405,11 @@ pub enum BootloaderMode {
     /// no readable tree.
     #[serde(rename = "msdos")]
     MsDos,
+    /// Windows To Go: applies a WIM image to the NTFS data partition
+    /// of a GPT [`Layout::WindowsToGo`] plan, creates the BCD stores
+    /// and places the boot files. [`WriteMode::Copy`] carries the
+    /// write.
+    Windows,
     /// No bootloader (plain data media).
     None,
 }
@@ -446,7 +452,10 @@ fn hex(bytes: &[u8]) -> String {
 // window derives from). S20 part 10 bumps it to v4: the `kolibri`
 // `BootloaderMode` variant is added. S20 part 11 bumps it to v5: the
 // `msdos` `BootloaderMode` variant is added and `Options.msdos_dir`
-// is appended (the user-supplied MS-DOS directory). Bumping the version must be a
+// is appended (the user-supplied MS-DOS directory). S21 bumps it to
+// v6: the `windows` `BootloaderMode` variant is added (the Windows To
+// Go installer, whose WIM apply and BCD stores land in slice 10).
+// Bumping the version must be a
 // deliberate commit that also regenerates every golden file (see the
 // crate documentation about field order and confirm hashes).
 const _: () = assert!(PLAN_VERSION >= 1, "PLAN_VERSION must stay positive");
@@ -517,8 +526,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_five_until_deliberately_bumped() {
-        assert_eq!(PLAN_VERSION, 5);
+    fn schema_version_is_six_until_deliberately_bumped() {
+        assert_eq!(PLAN_VERSION, 6);
         let mut plan = sample();
         plan.confirm = plan.confirm().expect("sample serialises to canonical JSON");
         assert_eq!(plan.version, PLAN_VERSION);
@@ -585,7 +594,7 @@ mod tests {
 
         // 2. Values and tags (order-insensitive via Value).
         let obj: serde_json::Value = serde_json::from_str(&text).expect("value");
-        assert_eq!(obj["version"], 5);
+        assert_eq!(obj["version"], 6);
         assert_eq!(obj["confirm"], plan.confirm);
         assert_eq!(
             obj["options"]["confirmed_serial"], "ABC123",
@@ -649,7 +658,7 @@ mod tests {
             assert_ne!(fresh, base.confirm, "{label} did not change the hash");
         };
 
-        check("version", &|p| p.version = 6);
+        check("version", &|p| p.version = 7);
         check("created_by", &|p| p.created_by = "x".into());
         check("device.path", &|p| p.device.path = "/dev/sdc".into());
         check("device.block_device", &|p| p.device.block_device = false);
@@ -738,6 +747,7 @@ mod tests {
             (BootloaderMode::Freedos, "freedos"),
             (BootloaderMode::Kolibri, "kolibri"),
             (BootloaderMode::MsDos, "msdos"),
+            (BootloaderMode::Windows, "windows"),
             (BootloaderMode::None, "none"),
         ] {
             let wire = serde_json::to_string(&mode).expect("mode serialises");
@@ -753,6 +763,11 @@ mod tests {
         // fail-closed behaviour the version check wants.
         let mode: BootloaderMode = serde_json::from_str(r#""msdos""#).expect("msdos parses");
         assert_eq!(mode, BootloaderMode::MsDos);
+        // The `windows` tag is the v6 addition: it must deserialize
+        // back to the new variant, so a v5 reader's refusal is the
+        // fail-closed behaviour the version check wants.
+        let mode: BootloaderMode = serde_json::from_str(r#""windows""#).expect("windows parses");
+        assert_eq!(mode, BootloaderMode::Windows);
     }
 
     #[test]

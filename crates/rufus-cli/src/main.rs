@@ -578,10 +578,13 @@ enum Command {
         #[arg(long = "iso-mode")]
         iso_mode: bool,
         /// Bootloader installer for the copy step (default: auto, paired
-        /// with the write mode: auto|syslinux|grub2|grub4dos|uefi-ntfs|freedos|kolibri|msdos|none;
+        /// with the write mode: auto|syslinux|grub2|grub4dos|uefi-ntfs|freedos|kolibri|msdos|windows|none;
         /// uefi-ntfs selects the two-partition UEFI:NTFS layout and
         /// forces copy mode, refused without --filesystem ntfs or
-        /// exfat; freedos, kolibri and msdos need --filesystem fat32;
+        /// exfat; windows selects the Windows To Go layout and forces
+        /// copy mode with an NTFS data partition (--filesystem is
+        /// overridden; --scheme mbr is refused later by the layout);
+        /// freedos, kolibri and msdos need --filesystem fat32;
         /// msdos plans no write step — IO.SYS must be the first root
         /// entry — and needs --msdos-dir).
         #[arg(long, value_enum, default_value_t = plan::BootloaderOpt::Auto)]
@@ -1665,6 +1668,7 @@ fn describe_step(step: &Step) -> String {
                 rufus_proto::BootloaderMode::Freedos => "freedos",
                 rufus_proto::BootloaderMode::Kolibri => "kolibri",
                 rufus_proto::BootloaderMode::MsDos => "msdos",
+                rufus_proto::BootloaderMode::Windows => "windows",
                 rufus_proto::BootloaderMode::None => "none",
             }
         ),

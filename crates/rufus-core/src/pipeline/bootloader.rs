@@ -24,7 +24,9 @@
 //! writes the embedded 1 MiB shim image at the ESP offset of the
 //! two-partition layout for NTFS or exFAT plans — no image tree, no
 //! FAT32 volume (the copy step already placed the ISO files on the
-//! data partition).
+//! data partition). Explicit `Windows` refuses as not implemented
+//! instead: applying the
+//! WIM image and writing the BCD stores is slice 10 work.
 //!
 //! The obsolete-module replacement ([`Obsolete`](crate::boot::syslinux::Obsolete))
 //! is deliberately not applied here: no newer module bytes are
@@ -164,9 +166,12 @@ impl Volume for DiskView<'_> {
 /// entry point. `UefiNtfs` passes here — its disk-only arm lives in
 /// [`run`], not [`install_tree`], which refuses it through its own
 /// explicit arm. (The mode names S20's UEFI:NTFS partition, not the
-/// UEFI GRUB file the GRUB arms place.) Every mode is wired today, so
-/// this always passes; it stays as the shared gate so a future variant
-/// fails closed in both entry points.
+/// UEFI GRUB file the GRUB arms place.) `Windows` passes here too —
+/// its WIM apply and BCD stores are slice 10 work, so both entry
+/// points refuse it through their own explicit arms (see
+/// [`windows_refusal`]). Every other mode is wired today, so this
+/// always passes for them; it stays as the shared gate so a future
+/// variant fails closed in both entry points.
 fn check_mode(mode: &BootloaderMode) -> Result<()> {
     match mode {
         BootloaderMode::None
@@ -177,7 +182,18 @@ fn check_mode(mode: &BootloaderMode) -> Result<()> {
         | BootloaderMode::UefiNtfs
         | BootloaderMode::Freedos
         | BootloaderMode::Kolibri
-        | BootloaderMode::MsDos => Ok(()),
+        | BootloaderMode::MsDos
+        | BootloaderMode::Windows => Ok(()),
+    }
+}
+
+/// Refusal for the `Windows` mode: applying the WIM image to the NTFS
+/// data partition and writing the BCD stores is slice 10 work, so
+/// both [`install_tree`] and [`run`] refuse as not implemented before
+/// touching the image or the device, naming what is missing.
+fn windows_refusal() -> CoreError {
+    CoreError::NotImplemented {
+        what: "windows bootloader installation (the wim apply and the BCD stores arrive in slice 10)",
     }
 }
 
@@ -340,10 +356,12 @@ fn prepend_log(installed: &mut Installed, probes: Vec<String>) {
 /// grub2, grub4dos. `UefiNtfs` refuses here as invalid rather than not
 /// implemented: the installer exists but is disk-only (no tree, no
 /// FAT32 volume — see [`install_uefi_ntfs`]), so [`run`] wires it
-/// directly and a tree install can never serve it. Any future variant
-/// refuses through the shared [`check_mode`] table before reaching
-/// here; the trailing `other` arm stays as fail-closed invalid,
-/// unreachable today.
+/// directly and a tree install can never serve it. `Windows` refuses
+/// here as not implemented through [`windows_refusal`]: its WIM apply and BCD
+/// stores are slice 10 work, so no tree install can serve it either.
+/// Any future variant refuses through the shared [`check_mode`]
+/// table before reaching here; the trailing `other` arm stays as
+/// fail-closed invalid, unreachable today.
 ///
 /// `table` is the recorded partition-table kind the BIOS arms bound
 /// their post-MBR gap through (see [`gap_end`]); the Syslinux-only
@@ -435,6 +453,10 @@ pub(crate) fn install_tree(
         BootloaderMode::UefiNtfs => Err(CoreError::invalid(
             "uefi-ntfs installs the embedded image onto the whole disk at the ESP offset, not through the filesystem tree: refusing a tree install".to_string(),
         )),
+        // Slice 10 work by design (see `windows_refusal`): the WIM
+        // apply and the BCD stores have no installer yet, so the tree
+        // core refuses as not implemented and `run` refuses the same way.
+        BootloaderMode::Windows => Err(windows_refusal()),
         // `None` returned above; any future unwired variant would
         // refuse in `check_mode` above, so this arm is unreachable
         // today. This names the mode rather than assuming the match
@@ -1041,10 +1063,11 @@ fn filesystem_name(filesystem: &Filesystem) -> &'static str {
 /// straight onto the partition under the `msdos_dir` requirement —
 /// the image tree never opens, so the plan's image needs no readable
 /// tree at all (the CLI still requires the `--image` argument as the
-/// detection record). Every mode is wired today, so the run never
-/// produces `NotImplemented` itself; a future variant would refuse
-/// up front through the shared [`check_mode`]
-/// table (never reaching the image or the device), then
+/// detection record). Every mode but `Windows` is wired today, so the
+/// run produces `NotImplemented` only through [`windows_refusal`];
+/// `Windows` refuses up front through that arm, and a future variant
+/// would refuse up front through the shared [`check_mode`] table,
+/// never reaching the image or the device, then
 /// non-FAT32 filesystems refuse naming the plan filesystem, then the
 /// image tree opens exactly like `write::run_copy` does. The partition
 /// and the whole-disk target open next; a cancellation check follows
@@ -1078,6 +1101,12 @@ pub(crate) fn run(
         // neither the tree nor the FAT32 volume is opened here. Every
         // other mode keeps today's path byte-for-byte.
         return run_uefi_ntfs(ctx, filesystem);
+    }
+    if *mode == BootloaderMode::Windows {
+        // Slice 10 owns the WIM apply and the BCD stores: refuse
+        // before the filesystem gate and the image-tree setup below,
+        // so neither the image nor the device is touched.
+        return Err(windows_refusal());
     }
     // Unwired installers never reach the image or the device: same
     // table as `install_tree` (see `check_mode`).
@@ -1717,8 +1746,9 @@ mod tests {
 
     #[test]
     fn every_mode_passes_the_shared_gate() {
-        // All modes are wired today: the shared table passes each one,
-        // so a future variant fails closed here until it is named.
+        // All modes pass the shared table today: `Windows` passes here
+        // but refuses at execution (slice 10 owns its installer), while
+        // a future variant fails closed here until it is named.
         // (`UefiNtfs` passes here too; its disk-only arm lives in
         // `run`, and the tree core refuses it as invalid — see the
         // next test.)
@@ -1731,6 +1761,7 @@ mod tests {
             BootloaderMode::Freedos,
             BootloaderMode::Kolibri,
             BootloaderMode::MsDos,
+            BootloaderMode::Windows,
             BootloaderMode::None,
         ] {
             check_mode(&mode).expect("a wired mode passes the gate");
@@ -1755,6 +1786,56 @@ mod tests {
         assert!(text.contains("uefi-ntfs"), "names the mode: {text}");
         assert!(text.contains("whole disk"), "names the path: {text}");
         assert!(text.is_ascii(), "stays ASCII: {text}");
+    }
+
+    #[test]
+    fn install_tree_refuses_windows_as_slice_10_work() {
+        // The WIM apply and the BCD stores land in slice 10: the tree
+        // core refuses as not implemented naming them (the planner
+        // emits the mode today, unlike `UefiNtfs` above whose
+        // installer already exists).
+        let source = syslinux_604_tree();
+        let (_backing, mut fat) = formatted();
+        let error = tree_install(&source, &mut fat, &BootloaderMode::Windows)
+            .expect_err("windows has no tree installer yet");
+        assert!(
+            matches!(error, CoreError::NotImplemented { .. }),
+            "slice 10 work is NotImplemented: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("windows"), "names the mode: {text}");
+        assert!(text.contains("slice 10"), "names the slice: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+    }
+
+    #[test]
+    fn run_windows_refuses_before_opening_anything() {
+        // Through the real `run` path on an NTFS plan with a missing
+        // image: the slice 10 refusal lands before the image opens, so
+        // `partition()` is never called either.
+        let partitions = Rc::new(Cell::new(0usize));
+        let opener = CountingOpener {
+            partitions: Rc::clone(&partitions),
+        };
+        let mut reporter = Recorder::default();
+        let mut ctx = run_context(&opener, &mut reporter);
+        let error = run(
+            &mut ctx,
+            &BootloaderMode::Windows,
+            &image_ref("missing.iso", rufus_proto::ImageKind::Wim),
+            &rufus_proto::Filesystem::Ntfs,
+            None,
+        )
+        .expect_err("windows has no installer yet");
+        assert!(
+            matches!(error, CoreError::NotImplemented { .. }),
+            "slice 10 work is NotImplemented: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("windows"), "names the mode: {text}");
+        assert!(text.contains("slice 10"), "names the slice: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        assert_eq!(partitions.get(), 0, "the partition never opens");
     }
 
     #[test]
@@ -5249,6 +5330,11 @@ pub(crate) mod end_to_end {
             }
             Mode::UefiNtfs | Mode::Auto | Mode::None => {
                 panic!("the two-phase arms above return early; auto is never accepted here");
+            }
+            Mode::Windows => {
+                panic!(
+                    "windows has no installer until slice 10: it never reaches the fingerprint table"
+                );
             }
         }
     }

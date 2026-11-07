@@ -43,7 +43,10 @@ use crate::image::Inspected;
 /// The `--bootloader` selector: which installer the plan's bootloader
 /// step carries. `Auto` keeps the write-mode pairing (a `Dd` write
 /// already laid the image's own boot code, so no installer; a `Copy`
-/// write needs one); any explicit mode is emitted verbatim.
+/// write needs one); any explicit mode is emitted verbatim, except
+/// that `Windows` additionally selects the Windows To Go layout and
+/// forces `Copy` with an NTFS data partition (the WIM apply and the
+/// BCD stores land in slice 10).
 /// `UefiNtfs` additionally selects the two-partition UEFI:NTFS layout
 /// and forces `Copy` (the shim boots an NTFS or exFAT data partition
 /// the image tree populates); every other mode stays on the single layout.
@@ -68,6 +71,12 @@ pub enum BootloaderOpt {
     /// entry of the fresh volume.
     #[value(name = "msdos")]
     MsDos,
+    /// Windows To Go: the GPT `WindowsToGo` layout, `Copy` write mode
+    /// and an NTFS data partition (`--filesystem` is overridden; a
+    /// `--scheme mbr` plan is refused later by the layout, which is
+    /// GPT-only). The installer itself lands in slice 10.
+    #[value(name = "windows")]
+    Windows,
     /// No bootloader (plain data media).
     None,
 }
@@ -84,6 +93,7 @@ impl BootloaderOpt {
             BootloaderOpt::Freedos => BootloaderMode::Freedos,
             BootloaderOpt::Kolibri => BootloaderMode::Kolibri,
             BootloaderOpt::MsDos => BootloaderMode::MsDos,
+            BootloaderOpt::Windows => BootloaderMode::Windows,
             BootloaderOpt::None => BootloaderMode::None,
         }
     }
@@ -92,6 +102,7 @@ impl BootloaderOpt {
     fn layout(self) -> Layout {
         match self {
             BootloaderOpt::UefiNtfs => Layout::UefiNtfs,
+            BootloaderOpt::Windows => Layout::WindowsToGo,
             _ => Layout::Single,
         }
     }
@@ -122,7 +133,11 @@ pub struct Options {
     /// `uefi-ntfs` additionally selects the UEFI:NTFS layout and
     /// forces copy mode (refused without an NTFS or exFAT filesystem
     /// in [`build`]; `freedos` and `kolibri` are refused without a
-    /// FAT32 filesystem there). `msdos` plans no write step at all
+    /// FAT32 filesystem there). `windows` selects the Windows To Go
+    /// layout and forces copy mode with an NTFS data partition: the
+    /// `--filesystem` flag is overridden (the plan records NTFS) and
+    /// a `--scheme mbr` plan is refused later by the layout, which is
+    /// GPT-only. `msdos` plans no write step at all
     /// (see [`steps`]) and is refused without a FAT32 filesystem and
     /// without a non-empty [`Options::msdos_dir`] there.
     pub bootloader: BootloaderOpt,
@@ -296,9 +311,16 @@ fn write_mode(image: &Path, kind: &ImageKind, iso_mode: bool) -> WriteMode {
 /// [`BootloaderMode::None`]; a `Copy` write needs the installer, so it
 /// emits [`BootloaderMode::Auto`]. An explicit selector is emitted
 /// verbatim instead, except that `UefiNtfs` forces [`WriteMode::Copy`]
-/// (the shim boots a populated NTFS or exFAT data partition). The mkpart step
-/// carries the selector's layout (`UefiNtfs` for `uefi-ntfs`, `Single`
-/// otherwise).
+/// (the shim boots a populated NTFS or exFAT data partition) and
+/// `Windows` forces [`WriteMode::Copy`] whatever the image kind
+/// (the WIM apply copies the image tree onto the data partition).
+/// The mkpart step carries the selector's layout (`UefiNtfs` for
+/// `uefi-ntfs`, `WindowsToGo` for `windows`, `Single` otherwise),
+/// and a `windows` plan formats the data partition NTFS whatever
+/// `--filesystem` says: the `--filesystem` flag is overridden for
+/// this mode (the ESP is separate and is not this step). A `windows`
+/// plan with `--scheme mbr` still plans here and is refused later by
+/// the layout, which is GPT-only.
 ///
 /// `MsDos` plans no `Write` step: MS-DOS reads `IO.SYS` from the
 /// front of the root directory over one contiguous cluster chain, so
@@ -310,6 +332,10 @@ fn write_mode(image: &Path, kind: &ImageKind, iso_mode: bool) -> WriteMode {
 pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
     let (write, bootloader) = match options.bootloader {
         BootloaderOpt::MsDos => (None, BootloaderMode::MsDos),
+        // A Windows To Go plan always copies: the WIM apply (slice 10)
+        // populates the NTFS data partition from the image tree,
+        // whatever the image kind.
+        BootloaderOpt::Windows => (Some(WriteMode::Copy), BootloaderMode::Windows),
         BootloaderOpt::Auto => {
             let write = write_mode(image, kind, options.iso_mode);
             let needs_installer = write == WriteMode::Copy;
@@ -331,6 +357,14 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
             (Some(write), selected.mode())
         }
     };
+    // A Windows To Go plan formats the data partition NTFS whatever
+    // `--filesystem` says (the flag is overridden for this mode; the
+    // ESP is separate and is not this step).
+    let filesystem = if options.bootloader == BootloaderOpt::Windows {
+        Filesystem::Ntfs
+    } else {
+        options.filesystem.clone()
+    };
     let mut planned = vec![
         Step::Wipe,
         Step::Mklabel {
@@ -341,7 +375,7 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
             layout: options.bootloader.layout(),
         },
         Step::Mkfs {
-            filesystem: options.filesystem.clone(),
+            filesystem,
             label: options.label.clone(),
             cluster_bytes: options.cluster_bytes,
             quick: options.quick_format,
@@ -368,7 +402,11 @@ pub fn steps(image: &Path, kind: &ImageKind, options: &Options) -> Vec<Step> {
 /// A `uefi-ntfs` bootloader without an NTFS or exFAT data filesystem
 /// is refused here, before any step is built: the shim boots an NTFS
 /// or exFAT partition the image tree populates, so any other
-/// filesystem is a usage error. A `freedos` or `kolibri` bootloader
+/// filesystem is a usage error. A `windows` bootloader overrides the
+/// `--filesystem` flag instead: the plan records NTFS in both the
+/// options and the mkfs step, whatever was asked. A `windows` plan
+/// with `--scheme mbr` still seals here and is refused later by the
+/// layout, which is GPT-only. A `freedos` or `kolibri` bootloader
 /// without a FAT32 data filesystem is refused the same way: both
 /// installers write a FAT32 volume, so any other filesystem is a
 /// usage error naming the mode and the filesystem. An `msdos`
@@ -431,6 +469,13 @@ pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Resu
         });
     }
     let steps = steps(Path::new(&inspected.path), &inspected.kind, options);
+    // A Windows To Go plan records NTFS whatever `--filesystem` said
+    // (see `steps`): options and the mkfs step agree.
+    let filesystem = if options.bootloader == BootloaderOpt::Windows {
+        Filesystem::Ntfs
+    } else {
+        options.filesystem.clone()
+    };
     let mut plan = Plan {
         version: PLAN_VERSION,
         created_by: rufus_core::user_agent(),
@@ -444,7 +489,7 @@ pub fn build(device: DeviceRef, inspected: Inspected, options: &Options) -> Resu
         options: rufus_proto::Options {
             scheme: options.scheme.clone(),
             target: options.target.clone(),
-            filesystem: options.filesystem.clone(),
+            filesystem,
             label: options.label.clone(),
             cluster_bytes: options.cluster_bytes,
             quick_format: options.quick_format,
@@ -869,6 +914,86 @@ mod tests {
     }
 
     #[test]
+    fn windows_selects_windows_to_go_layout_forces_copy_and_ntfs() {
+        // A Windows To Go plan always copies onto an NTFS data
+        // partition in the three-partition layout: the write mode, the
+        // mkfs filesystem and the layout ignore the image kind and the
+        // `--filesystem` flag alike (the installer itself is slice 10
+        // work, so `--scheme mbr` still plans here and is refused later
+        // by the layout).
+        for (name, kind) in [("image.iso", ImageKind::Iso), ("image.iso", ImageKind::Wim)] {
+            let mut options = test_options(false);
+            options.bootloader = BootloaderOpt::Windows;
+            options.filesystem = Filesystem::Fat32;
+            let mut write = None;
+            let mut bootloader = None;
+            let mut mkfs = None;
+            for step in steps(Path::new(name), &kind, &options) {
+                match step {
+                    Step::Write { mode } => write = Some(mode),
+                    Step::Bootloader { mode } => bootloader = Some(mode),
+                    Step::Mkfs { filesystem, .. } => mkfs = Some(filesystem),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                write.expect("the plan carries a write step"),
+                WriteMode::Copy,
+                "{name} sniffed as {kind:?} still copies"
+            );
+            assert_eq!(
+                bootloader.expect("the plan carries a bootloader step"),
+                BootloaderMode::Windows,
+                "windows is emitted verbatim"
+            );
+            assert_eq!(
+                mkfs.expect("the plan carries a mkfs step"),
+                Filesystem::Ntfs,
+                "the data partition is NTFS whatever --filesystem says"
+            );
+            assert_eq!(
+                planned_layout(name, &kind, BootloaderOpt::Windows),
+                Layout::WindowsToGo,
+                "windows stamps the Windows To Go layout"
+            );
+        }
+        // The sealed plan records the overridden NTFS in its options
+        // too, so options and the mkfs step agree — while an mbr
+        // scheme still seals here (the layout refuses it later).
+        let device = DeviceRef {
+            path: "/dev/null".to_string(),
+            block_device: false,
+            size_bytes: None,
+            serial: None,
+            model: None,
+            sysfs: None,
+        };
+        let inspected = crate::image::Inspected {
+            path: "image.iso".to_string(),
+            size_bytes: 32_780,
+            sha256: "0".repeat(64),
+            kind: ImageKind::Wim,
+        };
+        let mut options = test_options(false);
+        options.bootloader = BootloaderOpt::Windows;
+        options.filesystem = Filesystem::Fat32;
+        let plan = match build(device, inspected, &options) {
+            Ok(plan) => plan,
+            Err(fail) => panic!("the windows plan seals: {}", fail.message),
+        };
+        assert_eq!(plan.options.filesystem, Filesystem::Ntfs);
+        let mkfs = plan
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Mkfs { filesystem, .. } => Some(filesystem.clone()),
+                _ => None,
+            })
+            .expect("the plan carries a mkfs step");
+        assert_eq!(mkfs, Filesystem::Ntfs);
+    }
+
+    #[test]
     fn build_refuses_msdos_without_fat32() {
         // The MS-DOS installer writes a FAT32 volume: any other
         // filesystem is a usage refusal with the exact message, before
@@ -940,6 +1065,7 @@ mod tests {
         for bootloader in [
             BootloaderOpt::Auto,
             BootloaderOpt::Syslinux,
+            BootloaderOpt::Windows,
             BootloaderOpt::Freedos,
             BootloaderOpt::None,
         ] {

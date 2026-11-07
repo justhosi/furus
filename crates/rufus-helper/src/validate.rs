@@ -537,6 +537,29 @@ fn check_steps(plan: &Plan) -> Result<(), Reject> {
             "an msdos plan must not carry a write step (IO.SYS must be the first root entry) - rebuild the plan",
         ));
     }
+    // A `windows` plan formats the data partition NTFS whatever
+    // `--filesystem` says and stamps the Windows To Go layout (see the
+    // planner): a hand-built plan pairing the bootloader with any other
+    // mkfs filesystem or mkpart layout is refused with the planner's
+    // own shape, mirroring the UefiNtfs layout arm below.
+    let windows_plan = plan
+        .steps
+        .iter()
+        .any(|step| matches!(step, Step::Bootloader { mode } if *mode == BootloaderMode::Windows));
+    if windows_plan {
+        let mkfs_ntfs = plan.steps.iter().any(
+            |step| matches!(step, Step::Mkfs { filesystem, .. } if *filesystem == Filesystem::Ntfs),
+        );
+        let mkpart_wtg = plan.steps.iter().any(
+            |step| matches!(step, Step::Mkpart { layout, .. } if *layout == Layout::WindowsToGo),
+        );
+        if !mkfs_ntfs || !mkpart_wtg {
+            return Err(reject(
+                "invalid_step",
+                "Windows needs an NTFS data partition in the Windows To Go layout; rebuild the plan with --bootloader windows and --filesystem ntfs",
+            ));
+        }
+    }
     for (index, step) in plan.steps.iter().enumerate() {
         let number = index + 1;
         match step {
@@ -1434,6 +1457,84 @@ mod tests {
             plan.options.filesystem = filesystem.clone();
             plan = signed(plan);
             validate(&plan, &env).expect("the pairing passes");
+        }
+    }
+
+    #[test]
+    fn windows_bootloader_plan_is_accepted() {
+        // The planner's Windows To Go shape — WindowsToGo layout, NTFS
+        // data, copy write of a WIM, windows bootloader — passes: the
+        // installer refusal is the executor's job in slice 10, not the
+        // validator's.
+        let fixture = Fixture::new();
+        let (mut plan, env, _device) = fixture.good(true);
+        plan.image.kind = ImageKind::Wim;
+        if let Step::Mkpart { layout, .. } = &mut plan.steps[2] {
+            *layout = rufus_proto::Layout::WindowsToGo;
+        }
+        if let Step::Mkfs { filesystem, .. } = &mut plan.steps[3] {
+            *filesystem = Filesystem::Ntfs;
+        }
+        if let Step::Write { mode } = &mut plan.steps[4] {
+            *mode = WriteMode::Copy;
+        }
+        if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+            *slot = BootloaderMode::Windows;
+        }
+        plan.options.filesystem = Filesystem::Ntfs;
+        plan = signed(plan);
+        validate(&plan, &env).expect("the windows plan passes");
+    }
+
+    #[test]
+    fn windows_bootloader_needs_ntfs_and_windows_to_go() {
+        // Mirror of the planner's override (NTFS data, Windows To Go
+        // layout): a hand-built windows plan with any other mkfs
+        // filesystem or mkpart layout is refused naming what the
+        // windows plan requires.
+        for (label, layout, filesystem) in [
+            (
+                "fat32 data",
+                rufus_proto::Layout::WindowsToGo,
+                Filesystem::Fat32,
+            ),
+            (
+                "single layout",
+                rufus_proto::Layout::Single,
+                Filesystem::Ntfs,
+            ),
+        ] {
+            let fixture = Fixture::new();
+            let (mut plan, env, _device) = fixture.good(true);
+            plan.image.kind = ImageKind::Wim;
+            if let Step::Mkpart { layout: slot, .. } = &mut plan.steps[2] {
+                *slot = layout;
+            }
+            if let Step::Mkfs {
+                filesystem: slot, ..
+            } = &mut plan.steps[3]
+            {
+                *slot = filesystem;
+            }
+            if let Step::Write { mode } = &mut plan.steps[4] {
+                *mode = WriteMode::Copy;
+            }
+            if let Step::Bootloader { mode: slot } = &mut plan.steps[5] {
+                *slot = BootloaderMode::Windows;
+            }
+            plan.options.filesystem = Filesystem::Ntfs;
+            plan = signed(plan);
+            let refused = validate(&plan, &env).expect_err("a mismatched windows plan refuses");
+            assert_eq!(refused.code, "invalid_step", "{label}");
+            assert_eq!(
+                refused.message,
+                "Windows needs an NTFS data partition in the Windows To Go layout; rebuild the plan with --bootloader windows and --filesystem ntfs",
+                "{label}"
+            );
+            assert!(
+                refused.message.is_ascii(),
+                "the refusal stays ASCII: {label}"
+            );
         }
     }
 
