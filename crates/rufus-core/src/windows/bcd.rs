@@ -42,7 +42,10 @@
 //! `12000002` (the winload path) and, when the caller names one, the
 //! `12000004` edition description; `{bootmgr}` is repointed at that
 //! loader (`23000003`, `24000001`, `24000010`); `{memdiag}` gets the
-//! `11000001` boot device. No other bytes change except the header
+//! `11000001` boot device and a per-firmware `12000002` path
+//! (`\EFI\Microsoft\Boot\memtest.efi` for UEFI, `\boot\memtest.exe`
+//! for BIOS, matching where the boot files land). No other bytes
+//! change except the header
 //! checksum (and, when the template's own free space runs out, one
 //! appended hive bin plus the header length that describes it, see
 //! below).
@@ -227,8 +230,9 @@ pub const ELEMENT_TOOLS_DISPLAY_ORDER: u32 = 0x2400_0010;
 /// application path on `{bootmgr}` and on
 /// the minimal template loader. [`build`] adds it on the chosen
 /// loader as the full winload path, sets it to `\bootmgr` on
-/// `{bootmgr}` for [`Firmware::Bios`], and keeps the template's EFI
-/// path on `{bootmgr}` for [`Firmware::Uefi`].
+/// `{bootmgr}` for [`Firmware::Bios`], keeps the template's EFI
+/// path on `{bootmgr}` for [`Firmware::Uefi`], and sets it on
+/// `{memdiag}` to [`memdiag_path`] per firmware.
 pub const ELEMENT_PATH: u32 = 0x1200_0002;
 
 /// `0x12000004` (class `0x12`, string): the description element; [`build`]
@@ -440,6 +444,17 @@ fn expected_loader_suffix(firmware: Firmware) -> &'static str {
     }
 }
 
+/// The `{memdiag}` application path (`12000002`), per firmware: the
+/// UEFI memory diagnostics live beside the boot manager on the ESP,
+/// while BIOS keeps the template's `\boot\memtest.exe` on the data
+/// partition.
+fn memdiag_path(firmware: Firmware) -> &'static str {
+    match firmware {
+        Firmware::Uefi => "\\EFI\\Microsoft\\Boot\\memtest.efi",
+        Firmware::Bios => "\\boot\\memtest.exe",
+    }
+}
+
 /// The 88-byte boot device element for `{memdiag}\11000001`
 /// (`REG_BINARY`): 16 zero bytes, type 5 (`u32` at `0x10`), zero at
 /// `0x14`, length `0x48` (`u32` at `0x18`), zeros after.
@@ -491,7 +506,8 @@ pub fn partition_device(identity: DeviceIdentity) -> [u8; 88] {
 /// `11000001`/`21000001` partition devices, `12000002`, and the
 /// edition description when given; `{bootmgr}` is repointed at it
 /// (plus `\bootmgr` at its `12000002` for [`Firmware::Bios`});
-/// `{memdiag}` gains the boot device; the header checksum is
+/// `{memdiag}` gains the boot device and the per-firmware
+/// application path (see [`memdiag_path`]); the header checksum is
 /// recomputed. Refuses with [`CoreError::InvalidInput`] naming what is
 /// wrong when the template is not a `regf` hive, is truncated, lacks
 /// `System\Objects`, `{bootmgr}`, the required loader or
@@ -618,6 +634,7 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
         hive.set_element_sz(loader_elements, ELEMENT_DESCRIPTION, description)?;
     }
     hive.set_element_binary(memdiag_elements, ELEMENT_DEVICE, &boot_device())?;
+    hive.set_element_sz(memdiag_elements, ELEMENT_PATH, memdiag_path(firmware))?;
     hive.update_checksum()?;
     Ok(Store {
         bytes: hive.into_bytes(),
@@ -1433,6 +1450,17 @@ mod tests {
                 .expect("memdiag 11000001 must exist");
             assert_eq!(vtype, REG_BINARY);
             assert_eq!(data, boot_device().to_vec());
+
+            // The memory-diagnostic application path is per firmware:
+            // the UEFI diagnostics live on the ESP next to the boot
+            // manager, while BIOS keeps the template's data-partition
+            // path.
+            let (vtype, data) = hive
+                .element_data(OBJECT_MEMDIAG, ELEMENT_PATH)
+                .expect("read memdiag path")
+                .expect("memdiag 12000002 must survive");
+            assert_eq!(vtype, REG_SZ);
+            assert_eq!(decode_sz(&data).expect("path text"), memdiag_path(firmware));
         }
     }
 
@@ -1857,6 +1885,13 @@ mod tests {
                 .expect("read")
                 .expect("memdiag device");
             assert_eq!(data, boot_device().to_vec());
+
+            let (vtype, data) = hive
+                .element_data(OBJECT_MEMDIAG, ELEMENT_PATH)
+                .expect("read")
+                .expect("memdiag 12000002");
+            assert_eq!(vtype, REG_SZ);
+            assert_eq!(decode_sz(&data).expect("path"), memdiag_path(firmware));
         }
     }
 }
