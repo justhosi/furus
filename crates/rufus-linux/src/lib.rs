@@ -71,12 +71,12 @@
 //! block layer needs) plus the S17 SIGINT install (one `signal` call).
 
 // Unsafe policy (S07, extended S17): the workspace lint is `deny` and
-// this crate inherits it; exactly two `#[allow(unsafe_code)]` sites
-// exist in the whole tree — the `ioctl_raw` shim inside `crate::ioctl`
+// this crate inherits it. This crate carries two documented
+// `#[allow(unsafe_code)]` sites: the `ioctl_raw` shim in `ioctl.rs`
 // (see that module header for what is allowed and why) and the SIGINT
-// install inside `crate::signal` (see that module charter). There must
-// be no third unsafe use anywhere — the other crates still carry
-// crate-level `#![forbid(unsafe_code)]`.
+// install in `signal.rs` (see that module charter). The other two
+// sites of the tree live in `wimlib-sys` (see that crate's own
+// header). Every other crate root keeps `#![forbid(unsafe_code)]`.
 
 pub mod adapter;
 pub mod block;

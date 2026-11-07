@@ -57,15 +57,14 @@ const BLKFLSBUF: libc::c_ulong = 0x1261;
 /// device behind the fd (re-enumeration; the node stays valid).
 const USBDEVFS_RESET: libc::c_ulong = 0x5514;
 
-/// The raw `ioctl(2)` shim and one of the two unsafe blocks in the
-/// workspace (the other is the SIGINT install in `crate::signal`).
+/// The raw `ioctl(2)` shim and one of this crate's two unsafe sites
+/// (the other is the SIGINT install in `crate::signal`).
 ///
-/// One of the two `#[allow(unsafe_code)]` sites of the tree lives
-/// *here* — on this one function — and nowhere else besides
-/// `crate::signal`: the workspace lint is `deny`, every other module
-/// inherits it, and the module charter above describes exactly what
-/// this body may do (one `ioctl` call, five requests, caller-owned
-/// stack arguments).
+/// One of the two `#[allow(unsafe_code)]` sites of this crate lives
+/// *here* — on this one function: the workspace lint is `deny`, every
+/// other module inherits it, and the module charter above describes
+/// exactly what this body may do (one `ioctl` call, five requests,
+/// caller-owned stack arguments).
 #[allow(unsafe_code)]
 fn ioctl_raw(fd: RawFd, request: libc::c_ulong, arg: *mut libc::c_void) -> io::Result<()> {
     // SAFETY: one variadic `ioctl(2)` call; the file descriptor is

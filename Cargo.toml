@@ -24,8 +24,15 @@ publish = false
 # the kernel ioctl shim in rufus-linux (four block ioctls rustix does
 # not wrap), and it carries the one `#[allow(unsafe_code)]` of the
 # workspace. Every other crate still carries an explicit
-# `#![forbid(unsafe_code)]` at its root, so the shim remains the single
-# place in the tree that compiles unsafe code at all.
+# `#![forbid(unsafe_code)]` at its root, so the shim was then the single
+# place in the tree that compiled unsafe code at all.
+# S21: four allowances now, in two crates that carry no crate-level
+# forbid (the workspace `deny` still applies): rufus-linux keeps the
+# ioctl shim plus the SIGINT handler install in signal.rs, and
+# wimlib-sys adds the raw wimlib declarations in ffi.rs and the safe
+# facade in safe/bound.rs - the C calls, trampolines and string
+# decoding, the only two modules that touch wimlib. Every other
+# crate root keeps `#![forbid(unsafe_code)]`.
 [workspace.lints.rust]
 unsafe_code = "deny"
 

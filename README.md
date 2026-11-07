@@ -138,7 +138,7 @@ write side is the most complete part:
 * Bootloader installation (S19/S20) is wired as the `bootloader`
   pipeline step. `rufus plan --bootloader <mode>` selects the installer
   explicitly (`auto`, `syslinux`, `grub2`, `grub4dos`, `uefi-ntfs`,
-  `freedos`, `kolibri`, `msdos` or `none`); `auto` keeps the write-mode
+  `freedos`, `kolibri`, `msdos`, `windows` or `none`); `auto` keeps the write-mode
   pairing (a `Dd` write already laid the image's own boot code, so
   `none`; a `Copy` write needs one, so `auto`), and every other mode is
   emitted verbatim. `auto` probes Syslinux, then GRUB2, then GRUB4DOS
@@ -171,6 +171,12 @@ write side is the most complete part:
   GRUB4DOS boot test is `#[ignore]`d behind `RUFUS_TEST_GRLDR` because
   the payload is not bundled; each suite prints one `skip:` line when
   qemu, grub-mkimage, mkntfs, OVMF or another tool is absent.
+  `windows` plans a GPT Windows To Go layout (100 MiB ESP, MSR, NTFS
+  data partition), applies the image's WIM via wimlib, formats the ESP FAT32,
+  builds the UEFI/BIOS BCD stores from the image's own `BCD-Template` (no
+  Windows tools or Wine on the host), places boot manager, store, fonts, sets
+  offline SAN policy 4, disables WinRE recovery and refuses any non-Windows
+  image. Nothing it writes has booted; boot acceptance is pending.
 * The GUI is still a stub: it prints version/help and otherwise reports
   "GUI arrives in S24".
 
@@ -231,13 +237,15 @@ The crate layering keeps privileged I/O in `rufus-linux` /
 `rufus-helper` and the formatter logic in `rufus-core`, which never
 depends on `rufus-linux` (see `crates/rufus-core/src/fs/mod.rs`).
 
-Safety and dependencies: every crate root carries
-`#![forbid(unsafe_code)]`, and the workspace denies unsafe code, with
-exactly two allowances - the four block ioctls
+Safety and dependencies: the workspace denies unsafe code; `rufus-linux`
+carries two documented allowances - the four block ioctls
 (BLKZEROOUT/BLKDISCARD/BLKRRPART/BLKFLSBUF) in
-`crates/rufus-linux/src/ioctl.rs` that rustix does not wrap, and the one
+`crates/rufus-linux/src/ioctl.rs` that rustix does not wrap, and the
 SIGINT handler install in `crates/rufus-linux/src/signal.rs` (one atomic
-store, nothing else).
+store, nothing else) - and `wimlib-sys` carries two more (the raw FFI
+declarations in `src/ffi.rs` and the safe facade in `src/safe/bound.rs`
+with its C calls, trampolines and string decoding). Every other crate
+root keeps `#![forbid(unsafe_code)]`.
 `rufus-core` is dependency-light by design: no async runtime, no logging
 framework, no regex.
 
