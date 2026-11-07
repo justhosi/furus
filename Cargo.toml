@@ -80,6 +80,8 @@ zbus = { version = "6" }
 rufus-core = { path = "crates/rufus-core" }
 rufus-proto = { path = "crates/rufus-proto" }
 rufus-linux = { path = "crates/rufus-linux" }
+# S21: the safe wimlib facade for WIM apply (used by rufus-core).
+wimlib-sys = { path = "crates/wimlib-sys" }
 
 [profile.release]
 opt-level = "z"

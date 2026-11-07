@@ -23,18 +23,34 @@
 //! re-exported items (or the S21 safe wrapper built on top of them).
 
 // Unsafe policy (S21, following `rufus-linux`): the workspace lint is
-// `deny` and this crate inherits it. There is exactly one
-// `#[allow(unsafe_code)]` site in this crate — the FFI module
-// declaration in `src/ffi.rs`, whose header documents what it may
-// contain (raw C declarations mirroring `/usr/include/wimlib.h` and
-// the two null-checked CStr wrappers, nothing else). There must be no
-// second unsafe use anywhere: no crate-level `#![allow(unsafe_code)]`,
-// no other `#[allow(unsafe_code)]` attribute in this crate.
+// `deny` and this crate inherits it. There are exactly two
+// `#[allow(unsafe_code)]` sites in this crate, both documented at the
+// top of their module: `src/ffi.rs` (the raw wimlib declarations, see
+// that module header) and `src/safe/bound.rs` (the linked safe facade
+// that calls those declarations, decodes their C strings, and hosts
+// the progress trampoline C calls back into). There must be no third
+// unsafe use anywhere: no crate-level `#![allow(unsafe_code)]`, no
+// other `#[allow(unsafe_code)]` attribute in this crate.
 
+/// Error type for the safe facade (both build configurations).
+pub mod error;
 #[cfg(wimlib_present)]
 mod ffi;
+/// Safe, configuration-independent facade over wimlib (S21).
+pub mod safe;
+// Private single source of truth for the raw wimlib integers both
+// `ffi` (when linked) and `safe` (always) need; see `consts.rs`.
+mod consts;
+pub use error::WimlibError;
 #[cfg(wimlib_present)]
 pub use ffi::*;
+pub use safe::Compression;
+pub use safe::ERR_ABORTED_BY_PROGRESS;
+pub use safe::ExtractFlags;
+pub use safe::ExtractProgress;
+pub use safe::OpenFlags;
+pub use safe::Wim;
+pub use safe::WimInfo;
 
 /// Whether this build linked `libwim`.
 ///

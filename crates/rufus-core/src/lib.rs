@@ -103,6 +103,11 @@
 //!   behind [`WimReader`](wim::WimReader). No decompressor: the XML
 //!   resource measures as always uncompressed (see the module docs),
 //!   so non-UTF-16 bytes read as absent rather than erroring.
+//! * [`windows`] — the Windows image side (S21, slice 2 of 12):
+//!   opening a WIM through the safe `wimlib-sys` facade, listing its
+//!   images, and extracting one into an existing directory
+//!   ([`wim`](windows::wim)). The S16 reader above stays the
+//!   inspection path; this is the path that gets bytes out.
 //! * [`report`] — the S16 image report (slice 1 of 6): the label
 //!   candidates, the [`ImageReport`](report::ImageReport) shape later
 //!   slices fill, and the case-insensitive tree index behind it.
@@ -140,6 +145,7 @@ pub mod udf;
 pub mod units;
 pub mod version;
 pub mod wim;
+pub mod windows;
 
 pub use config::AdvancedConfig;
 pub use config::Config;

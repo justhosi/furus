@@ -6,7 +6,12 @@ publish.workspace = true
 links = "wim"
 
 [lints]
-# Inherit the workspace-wide `unsafe_code = "deny"`; the single
-# `#[allow(unsafe_code)]` site of this crate lives in src/ffi.rs
-# (the raw wimlib declarations, see that module header).
+# Inherit the workspace-wide `unsafe_code = "deny"`; the `#[allow(unsafe_code)]`
+# sites of this crate live in src/ffi.rs (the raw declarations) and
+# src/safe/bound.rs (the linked facade calling them) — see those headers.
 workspace = true
+
+[dev-dependencies]
+# Scratch directories for the capture/apply roundtrip test (already a
+# workspace dependency, so no new crate).
+tempfile = { workspace = true }

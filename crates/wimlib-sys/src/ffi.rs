@@ -4,11 +4,15 @@
 //!
 //! Exactly the C declarations below, mirroring `/usr/include/wimlib.h`
 //! (wimlib 1.14.x) field for field, plus the two null-checked `CStr`
-//! wrappers ([`version`], [`error_string`]). Nothing else may be added
-//! without review: no safe logic, no allocation policy, no second
-//! `#[allow(unsafe_code)]` site — the whole file lives inside the one
-//! module-level allowance, and the S21 wrapper (a different crate) owns
-//! every call.
+//! wrappers ([`version`], [`error_string`]) and the `pub const`
+//! aliases that value the shared integers from [`crate::consts`].
+//! Nothing else may be added without review: no safe logic beyond the
+//! wrappers, no allocation policy. There are two
+//! `#[allow(unsafe_code)]` sites in this crate — this FFI module (the
+//! raw declarations and the two wrappers) and `safe/bound.rs` (the
+//! linked safe facade: the progress trampoline C calls back into and
+//! the C-string decoding). Downstream crates use the safe facade
+//! (`safe`), never these externs directly.
 //!
 //! # Mapping notes
 //!
@@ -40,10 +44,12 @@
 //! lives behind this module and the `wimlib_present` gate in
 //! `src/lib.rs`.
 
-// The single `#[allow(unsafe_code)]` site of this crate covers the
-// whole FFI module: raw pointers, the `union`, the `extern` block, and
-// the two wrappers that dereference C strings are all unsafe-capable,
-// so scoping the allowance any tighter would only add noise.
+// One of the two `#[allow(unsafe_code)]` sites of this crate covers
+// the whole FFI module: raw pointers, the `union`, the `extern` block,
+// and the two wrappers that dereference C strings are all
+// unsafe-capable, so scoping the allowance any tighter would only add
+// noise. The other site is `safe/bound.rs` (the linked facade calling
+// these declarations). No third site may be added without review.
 #![allow(unsafe_code)]
 
 use core::ffi::CStr;
@@ -167,22 +173,41 @@ pub type WimlibProgressFunc = Option<
 // ---------------------------------------------------------------------------
 
 /// Verify the WIM against its integrity table while opening, if present.
-pub const WIMLIB_OPEN_FLAG_CHECK_INTEGRITY: c_int = 0x0000_0001;
+///
+/// Valued from [`crate::consts`]: the same integer the safe facade
+/// uses, so the two sides cannot drift.
+pub const WIMLIB_OPEN_FLAG_CHECK_INTEGRITY: c_int = crate::consts::WIMLIB_OPEN_FLAG_CHECK_INTEGRITY;
 /// Fail with `WIMLIB_ERR_IS_SPLIT_WIM` when the WIM is a split part.
-pub const WIMLIB_OPEN_FLAG_ERROR_IF_SPLIT: c_int = 0x0000_0002;
+///
+/// Valued from [`crate::consts`]: the same integer the safe facade
+/// uses, so the two sides cannot drift.
+pub const WIMLIB_OPEN_FLAG_ERROR_IF_SPLIT: c_int = crate::consts::WIMLIB_OPEN_FLAG_ERROR_IF_SPLIT;
 /// Check writability now (fail fast instead of at overwrite time).
-pub const WIMLIB_OPEN_FLAG_WRITE_ACCESS: c_int = 0x0000_0004;
+///
+/// Valued from [`crate::consts`]: the same integer the safe facade
+/// uses, so the two sides cannot drift.
+pub const WIMLIB_OPEN_FLAG_WRITE_ACCESS: c_int = crate::consts::WIMLIB_OPEN_FLAG_WRITE_ACCESS;
 
 /// Extract directly to an unmounted NTFS volume (needs libntfs-3g).
-pub const WIMLIB_EXTRACT_FLAG_NTFS: c_int = 0x0000_0001;
+///
+/// Valued from [`crate::consts`]: the same integer the safe facade
+/// uses, so the two sides cannot drift.
+pub const WIMLIB_EXTRACT_FLAG_NTFS: c_int = crate::consts::WIMLIB_EXTRACT_FLAG_NTFS;
 /// Extract UNIX metadata captured with `WIMLIB_ADD_FLAG_UNIX_DATA`.
 pub const WIMLIB_EXTRACT_FLAG_UNIX_DATA: c_int = 0x0000_0020;
 /// Do not extract security descriptors (conflicts with `STRICT_ACLS`).
-pub const WIMLIB_EXTRACT_FLAG_NO_ACLS: c_int = 0x0000_0040;
+///
+/// Valued from [`crate::consts`]: the same integer the safe facade
+/// uses, so the two sides cannot drift.
+pub const WIMLIB_EXTRACT_FLAG_NO_ACLS: c_int = crate::consts::WIMLIB_EXTRACT_FLAG_NO_ACLS;
 /// Fail instead of downgrading an unsettable security descriptor.
 pub const WIMLIB_EXTRACT_FLAG_STRICT_ACLS: c_int = 0x0000_0080;
 /// Do not extract Windows file attributes (readonly, hidden, ...).
-pub const WIMLIB_EXTRACT_FLAG_NO_ATTRIBUTES: c_int = 0x0010_0000;
+///
+/// Valued from [`crate::consts`]: the same integer the safe facade
+/// uses, so the two sides cannot drift.
+pub const WIMLIB_EXTRACT_FLAG_NO_ATTRIBUTES: c_int =
+    crate::consts::WIMLIB_EXTRACT_FLAG_NO_ATTRIBUTES;
 
 // ---------------------------------------------------------------------------
 // Error codes
@@ -235,7 +260,11 @@ pub const WIMLIB_ERR_WRITE: c_int = 72;
 pub const WIMLIB_ERR_XML: c_int = 73;
 pub const WIMLIB_ERR_WIM_IS_ENCRYPTED: c_int = 74;
 pub const WIMLIB_ERR_WIMBOOT: c_int = 75;
-pub const WIMLIB_ERR_ABORTED_BY_PROGRESS: c_int = 76;
+/// Returned when the progress callback aborts the operation.
+///
+/// Valued from [`crate::consts`]: the same integer the safe facade
+/// uses, so the two sides cannot drift.
+pub const WIMLIB_ERR_ABORTED_BY_PROGRESS: c_int = crate::consts::WIMLIB_ERR_ABORTED_BY_PROGRESS;
 pub const WIMLIB_ERR_WIM_IS_INCOMPLETE: c_int = 84;
 
 // ---------------------------------------------------------------------------
@@ -321,6 +350,15 @@ unsafe extern "C" {
     pub fn wimlib_get_version_string() -> *const wimlib_tchar;
     /// Release a `WIMStruct` (null is a no-op).
     pub fn wimlib_free(wim: *mut WIMStruct);
+    /// Name of one image (empty when unnamed, null when the index is
+    /// out of range). Header line: `wimlib_get_image_name(const
+    /// WIMStruct *wim, int image);` (`G_wim_information`).
+    pub fn wimlib_get_image_name(wim: *const WIMStruct, image: c_int) -> *const wimlib_tchar;
+    /// Description of one image (null when missing or the index is out
+    /// of range). Header line: `wimlib_get_image_description(const
+    /// WIMStruct *wim, int image);` (`G_wim_information`).
+    pub fn wimlib_get_image_description(wim: *const WIMStruct, image: c_int)
+    -> *const wimlib_tchar;
     /// Library global init (auto-runs with flags 0 if skipped).
     pub fn wimlib_global_init(init_flags: c_int) -> c_int;
     /// Release library-global resources.
@@ -328,7 +366,7 @@ unsafe extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// Safe wrappers (the only place the externs are called)
+// Null-checked C string readers (the only safe wrappers in this module)
 // ---------------------------------------------------------------------------
 
 /// Library version string, e.g. `"1.14.5"`.

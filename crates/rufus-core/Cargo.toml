@@ -19,6 +19,9 @@ uuid = { workspace = true }
 # S15: the image container module reports the shared `ImageKind` (one
 # definition, owned by `rufus-proto`).
 rufus-proto = { workspace = true }
+# S21: the safe wimlib facade behind the Windows image (`windows::wim`)
+# apply layer.
+wimlib-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

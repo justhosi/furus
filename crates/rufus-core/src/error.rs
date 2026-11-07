@@ -110,6 +110,23 @@ pub enum CoreError {
         /// Why resolution failed (searched locations, missing variable...).
         reason: String,
     },
+    /// A wimlib call failed. The `path` names the WIM the call
+    /// targeted, `code` is the `wimlib_error_code` value, and
+    /// `message` is the library text for that code (read at
+    /// construction time, so carrying the error needs no library).
+    #[error("wimlib failed on '{path}': {message}")]
+    Wim {
+        /// WIM the failing call targeted.
+        path: String,
+        /// The `wimlib_error_code` value (an `int` in C).
+        code: i32,
+        /// Human-readable description of `code`.
+        message: String,
+    },
+    /// The operation needs wimlib, but this build linked no `libwim`
+    /// (the `wimlib_present` gate is off): the call never ran.
+    #[error("wimlib is not available: this build has no libwim")]
+    WimUnavailable,
 }
 
 /// `rufus-core` result type.
@@ -215,5 +232,23 @@ mod tests {
         };
         assert!(wrapped.to_string().contains("c.toml"));
         assert!(wrapped.source().is_some());
+    }
+
+    #[test]
+    fn wim_errors_display_path_code_and_message() {
+        let failed = CoreError::Wim {
+            path: "install.wim".to_string(),
+            code: 43,
+            message: "not a wim file".to_string(),
+        };
+        let text = failed.to_string();
+        assert!(text.contains("install.wim"), "{text}");
+        assert!(text.contains("not a wim file"), "{text}");
+        assert!(failed.source().is_none());
+
+        let unavailable = CoreError::WimUnavailable;
+        let text = unavailable.to_string();
+        assert!(text.contains("no libwim"), "{text}");
+        assert!(unavailable.source().is_none());
     }
 }
