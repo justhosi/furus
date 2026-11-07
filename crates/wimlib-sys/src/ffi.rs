@@ -359,6 +359,17 @@ unsafe extern "C" {
     /// WIMStruct *wim, int image);` (`G_wim_information`).
     pub fn wimlib_get_image_description(wim: *const WIMStruct, image: c_int)
     -> *const wimlib_tchar;
+    /// Value of one per-image XML property (for example "NAME",
+    /// "DESCRIPTION", or "TOTALBYTES"). Header line:
+    /// `wimlib_get_image_property(const WIMStruct *wim, int image, const
+    /// wimlib_tchar *property_name);` (`G_wim_information`, since
+    /// wimlib v1.8.3). Returns null when the image has no such
+    /// property; the string is only valid until the next library call.
+    pub fn wimlib_get_image_property(
+        wim: *const WIMStruct,
+        image: c_int,
+        property_name: *const wimlib_tchar,
+    ) -> *const wimlib_tchar;
     /// Library global init (auto-runs with flags 0 if skipped).
     pub fn wimlib_global_init(init_flags: c_int) -> c_int;
     /// Release library-global resources.

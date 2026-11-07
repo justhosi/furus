@@ -43,6 +43,11 @@ impl Wim {
         Err(WimlibError::NotLinked)
     }
 
+    /// Always fails with [`WimlibError::NotLinked`].
+    pub fn image_property(&self, _image: u32, _name: &str) -> Result<Option<String>, WimlibError> {
+        Err(WimlibError::NotLinked)
+    }
+
     /// Always fails with [`WimlibError::NotLinked`]; the `progress`
     /// callback is never invoked.
     pub fn extract_image(

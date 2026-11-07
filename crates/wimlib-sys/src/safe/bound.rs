@@ -171,6 +171,31 @@ impl Wim {
         Ok(decode_string(raw))
     }
 
+    /// Value of one per-image XML property (for example "TOTALBYTES").
+    /// `None` when the index cannot be a C `int`, when `name` carries an
+    /// interior NUL (reported as `InvalidPath`), when the image has no
+    /// such property (null return), or when the value is not valid
+    /// UTF-8 (never a lossy string that could parse as a wrong number).
+    pub fn image_property(&self, image: u32, name: &str) -> Result<Option<String>, WimlibError> {
+        let Ok(index) = i32::try_from(image) else {
+            return Ok(None);
+        };
+        let native = CString::new(name).map_err(|_| WimlibError::InvalidPath {
+            path: name
+                .bytes()
+                .map(|byte| {
+                    if byte.is_ascii_graphic() || byte == b' ' {
+                        byte as char
+                    } else {
+                        '?'
+                    }
+                })
+                .collect(),
+        })?;
+        let raw = unsafe { ffi::wimlib_get_image_property(self.raw, index, native.as_ptr()) };
+        Ok(decode_string(raw))
+    }
+
     /// Extract (`apply`) the 1-based `image` into `target`.
     ///
     /// The `progress` callback receives the running

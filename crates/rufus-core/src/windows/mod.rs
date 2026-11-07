@@ -15,4 +15,6 @@
 //! integrity-checked opens, the NTFS-volume extraction mode, BCD
 //! store editing, and the S21 VBR-fix hook of PLAN lines 948-949.
 
+/// Apply one WIM image onto the mounted data partition.
+pub mod apply;
 pub mod wim;

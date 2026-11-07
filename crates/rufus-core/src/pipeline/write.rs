@@ -560,8 +560,9 @@ pub(crate) fn emit_progress(
 
 /// The reporter half of [`emit_progress`]: the same cadence for
 /// producers that own no [`RunContext`] (the copy walk's
-/// [`CopyProgress`] bridge), so every producer throttles alike.
-fn emit_progress_to(
+/// [`CopyProgress`] bridge and the WIM apply bridge), so every
+/// producer throttles alike.
+pub(crate) fn emit_progress_to(
     reporter: &mut dyn Reporter,
     step: &'static str,
     done: u64,

@@ -197,6 +197,49 @@ impl Wim {
         Ok(out)
     }
 
+    /// Uncompressed payload total of the 1-based `index`, from the
+    /// image's `TOTALBYTES` XML property.
+    ///
+    /// Validates `index` exactly like [`Wim::extract`]: `0` and anything
+    /// past `image_count` fail with [`CoreError::InvalidInput`] naming
+    /// the index and the count. Otherwise reads `TOTALBYTES`, trims
+    /// ASCII whitespace, and accepts only all-digit strings that parse
+    /// as `u64`; absent, empty, non-digit, or overflowing values read as
+    /// `Ok(None)`, never an error. Library failures map the way the
+    /// other methods map them (`NotLinked` to
+    /// [`CoreError::WimUnavailable`], the rest through the path, code,
+    /// and message).
+    pub fn uncompressed_bytes(&self, index: u32) -> Result<Option<u64>> {
+        if index == 0 {
+            return Err(CoreError::invalid(format!(
+                "wim image index 0 is out of range: indices start at 1 (from '{}')",
+                self.path.display(),
+            )));
+        }
+        let count = self.info()?.image_count;
+        if index > count {
+            return Err(CoreError::invalid(format!(
+                "wim image index {index} is out of range: '{}' holds {count} image(s)",
+                self.path.display(),
+            )));
+        }
+        let raw = self
+            .inner
+            .image_property(index, "TOTALBYTES")
+            .map_err(|error| map_error(&self.path, error))?;
+        let Some(text) = raw else {
+            return Ok(None);
+        };
+        let trimmed = text.trim_matches(|slot: char| slot.is_ascii_whitespace());
+        if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Ok(None);
+        }
+        match trimmed.parse::<u64>() {
+            Ok(total) => Ok(Some(total)),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Extract (`apply`) the 1-based `index` into `target`, reporting
     /// through `progress` and honouring [`Progress::cancelled`].
     ///
