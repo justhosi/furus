@@ -53,6 +53,7 @@ use super::Compression;
 use super::ExtractFlags;
 use super::ExtractProgress;
 use super::OpenFlags;
+use super::SplitProgress;
 use super::WimInfo;
 
 /// An open WIM handle: owns the `WIMStruct` from `wimlib_open_wim` and
@@ -87,6 +88,22 @@ struct Ctx<'a> {
     cb: &'a mut dyn FnMut(&ExtractProgress) -> bool,
     /// Running totals across the messages seen so far.
     msg: ExtractProgress,
+    /// A caught callback panic, re-raised by the facade after the
+    /// wimlib call returns (never across the FFI boundary).
+    panic: Option<Box<dyn Any + Send>>,
+}
+
+/// Callback state living on the `split` stack frame: the same shape
+/// as [`Ctx`] (caller's callback, running [`SplitProgress`]
+/// accumulator, stashed panic payload), kept as a separate struct so
+/// each trampoline names its own progress type while the handling
+/// stays identical — first payload wins, re-raised after the wimlib
+/// call returns and the registration is removed.
+struct SplitCtx<'a> {
+    /// Caller callback: `false` aborts the split.
+    cb: &'a mut dyn FnMut(&SplitProgress) -> bool,
+    /// Running totals across the split messages seen so far.
+    msg: SplitProgress,
     /// A caught callback panic, re-raised by the facade after the
     /// wimlib call returns (never across the FFI boundary).
     panic: Option<Box<dyn Any + Send>>,
@@ -245,6 +262,66 @@ impl Wim {
             Err(code_error(code))
         }
     }
+
+    /// Split the open WIM into FAT32-sized parts starting at `dest`.
+    ///
+    /// `dest` names the first part (for example `install.swm`); the
+    /// library names the rest by appending `2`, `3`, ... before the
+    /// suffix (`install2.swm`, ...). `part_size` is a maximum in bytes
+    /// but is not guaranteed: a single resource larger than it cannot
+    /// be split and will overshoot its part. Callers should refuse a
+    /// zero `part_size` before calling (this facade also refuses it
+    /// with `WIMLIB_ERR_INVALID_PARAM` without invoking the library,
+    /// so no file is created). No write flags are needed for splitting,
+    /// so `0` is passed. The WIM is opened read-only by callers: a C
+    /// probe on wimlib 1.14.5 showed `wimlib_open_wim` with flags `0`
+    /// followed by `wimlib_split` succeeding, so `WRITE_ACCESS` is not
+    /// required (splitting only reads the source).
+    ///
+    /// The `progress` callback receives the running
+    /// [`SplitProgress`](super::SplitProgress) after every
+    /// `SPLIT_BEGIN_PART`/`SPLIT_END_PART` message and returns whether
+    /// to continue: `false` aborts the split, which surfaces as
+    /// [`WimlibError::Code`] with code
+    /// [`ERR_ABORTED_BY_PROGRESS`](super::ERR_ABORTED_BY_PROGRESS).
+    /// A panicking callback unwinds out of this function (re-raised
+    /// after the wimlib call returns and the registration is removed):
+    /// it is never reported as a cancellation and never unwinds into C.
+    ///
+    /// The progress registration lives only for the duration of this
+    /// call (unregistered before returning), so the stack [`SplitCtx`]
+    /// pointer never outlives the borrow.
+    pub fn split(
+        &self,
+        dest: &Path,
+        part_size: u64,
+        progress: &mut dyn FnMut(&SplitProgress) -> bool,
+    ) -> Result<(), WimlibError> {
+        if part_size == 0 {
+            return Err(code_error(ffi::WIMLIB_ERR_INVALID_PARAM));
+        }
+        let native = to_cstring(dest)?;
+        let mut ctx = SplitCtx {
+            cb: progress,
+            msg: SplitProgress::default(),
+            panic: None,
+        };
+        let ctx_ptr = (&mut ctx as *mut SplitCtx<'_>) as *mut c_void;
+        let code = unsafe {
+            ffi::wimlib_register_progress_function(self.raw, Some(split_trampoline), ctx_ptr);
+            let code = ffi::wimlib_split(self.raw, native.as_ptr(), part_size, 0);
+            ffi::wimlib_register_progress_function(self.raw, None, std::ptr::null_mut());
+            code
+        };
+        if let Some(payload) = ctx.panic {
+            resume_unwind(payload);
+        }
+        if code == ffi::WIMLIB_ERR_SUCCESS {
+            Ok(())
+        } else {
+            Err(code_error(code))
+        }
+    }
 }
 
 /// Run `wimlib_global_init` exactly once per process, caching the
@@ -374,6 +451,69 @@ unsafe extern "C" fn extract_trampoline(
         return ffi::WIMLIB_PROGRESS_STATUS_CONTINUE;
     }
     fold_sample(msg, extract, &mut ctx.msg);
+    match catch_unwind(AssertUnwindSafe(|| (ctx.cb)(&ctx.msg))) {
+        Ok(true) => ffi::WIMLIB_PROGRESS_STATUS_CONTINUE,
+        Ok(false) => ffi::WIMLIB_PROGRESS_STATUS_ABORT,
+        Err(payload) => {
+            if ctx.panic.is_none() {
+                ctx.panic = Some(payload);
+            }
+            ffi::WIMLIB_PROGRESS_STATUS_ABORT
+        }
+    }
+}
+
+/// Fold one split progress message into the accumulator.
+///
+/// Only `SPLIT_BEGIN_PART`/`SPLIT_END_PART` (19/20) are ever folded:
+/// the trampoline only calls this for those two codes, so the `split`
+/// union member is the valid one. `WRITE_STREAMS` (12) also arrives
+/// during a split since 1.13.4 but reports the current part only and
+/// must never be read as `split` — hence the dispatch in
+/// [`split_trampoline`], not a guess here.
+fn fold_split_sample(split: &ffi::WimlibProgressInfoSplit, acc: &mut SplitProgress) {
+    acc.total_bytes = split.total_bytes;
+    acc.completed_bytes = split.completed_bytes;
+    acc.part = split.cur_part_number;
+    acc.total_parts = split.total_parts;
+    acc.part_name = decode_string(split.part_name);
+}
+
+/// Progress trampoline handed to C for [`Wim::split`]: folds only
+/// 19/20 into the accumulator, runs the Rust callback, and returns
+/// continue/abort.
+///
+/// A callback panic is caught and recorded (first payload wins); the
+/// trampoline answers abort so the operation stops, and the facade
+/// re-raises the panic after the wimlib call returns — never across
+/// the FFI boundary. The handling mirrors [`extract_trampoline`]:
+/// same `catch_unwind`/`AssertUnwindSafe` shape, same first-wins
+/// payload rule, same unregister-before-return in the caller.
+///
+/// Any other message (notably `WRITE_STREAMS`/12, the per-part stream
+/// reports, plus 13/14 metadata markers seen on the wire) and null
+/// pointers continue silently without invoking the callback: only
+/// 19/20 carry the `split` member this facade reads.
+unsafe extern "C" fn split_trampoline(
+    msg: c_int,
+    info: *const ffi::WimlibProgressInfo,
+    progctx: *mut c_void,
+) -> c_int {
+    if msg != ffi::WIMLIB_PROGRESS_MSG_SPLIT_BEGIN_PART
+        && msg != ffi::WIMLIB_PROGRESS_MSG_SPLIT_END_PART
+    {
+        return ffi::WIMLIB_PROGRESS_STATUS_CONTINUE;
+    }
+    let (split, ctx) = unsafe {
+        match (
+            info.as_ref().map(|info| &info.split),
+            (progctx as *mut SplitCtx<'_>).as_mut(),
+        ) {
+            (Some(split), Some(ctx)) => (split, ctx),
+            _ => return ffi::WIMLIB_PROGRESS_STATUS_CONTINUE,
+        }
+    };
+    fold_split_sample(split, &mut ctx.msg);
     match catch_unwind(AssertUnwindSafe(|| (ctx.cb)(&ctx.msg))) {
         Ok(true) => ffi::WIMLIB_PROGRESS_STATUS_CONTINUE,
         Ok(false) => ffi::WIMLIB_PROGRESS_STATUS_ABORT,

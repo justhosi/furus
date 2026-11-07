@@ -136,6 +136,35 @@ pub struct ExtractProgress {
     pub completed_files: u64,
 }
 
+/// One split progress sample: the running totals after folding the
+/// latest split progress message into the accumulator (see `bound`).
+///
+/// Only `SPLIT_BEGIN_PART`/`SPLIT_END_PART` (19/20) are folded in:
+/// `WRITE_STREAMS` (12) also arrives during a split since wimlib
+/// 1.13.4 but reports the current part only, so the facade ignores it
+/// and the callback only runs for 19/20.
+///
+/// `total_bytes`/`completed_bytes` are compressed resource bytes (the
+/// WIM's own size, not the parts' summed file sizes): `completed`
+/// starts at 0 and ends at `total`. Part numbers are 1-based: `part`
+/// is the part that just started (19) or finished (20), and
+/// `total_parts` is the part count the library committed to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SplitProgress {
+    /// Total size of the original WIM's file and metadata resources
+    /// (compressed).
+    pub total_bytes: u64,
+    /// Bytes of file and metadata resources copied out so far.
+    pub completed_bytes: u64,
+    /// 1-based number of the part starting or just finished.
+    pub part: u32,
+    /// Total number of split parts being written.
+    pub total_parts: u32,
+    /// Name of the part starting or just finished (`None` when wimlib
+    /// hands back null or undecodable text).
+    pub part_name: Option<String>,
+}
+
 /// Extraction flags (the `WIMLIB_EXTRACT_FLAG_` subset S21 uses).
 ///
 /// Bitflags-free on purpose: four named values plus `BitOr` combining

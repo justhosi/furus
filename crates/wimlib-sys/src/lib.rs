@@ -49,6 +49,7 @@ pub use safe::ERR_ABORTED_BY_PROGRESS;
 pub use safe::ExtractFlags;
 pub use safe::ExtractProgress;
 pub use safe::OpenFlags;
+pub use safe::SplitProgress;
 pub use safe::Wim;
 pub use safe::WimInfo;
 

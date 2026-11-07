@@ -26,11 +26,11 @@
 //!   declared as a single [`WimlibWimInfo::flags`] `u32` with the bit
 //!   positions documented there (reading bitfields from Rust would
 //!   need layout guesses; a plain word does not).
-//! * [`WimlibProgressInfo`] declares only the `extract` member: S21
-//!   only registers progress for extraction, so that is the only
-//!   member ever read, and only ever through a `*const` handed to the
-//!   callback by C. Its size is never relied on as anything but a
-//!   pointee.
+//! * [`WimlibProgressInfo`] declares only the `extract` and `split`
+//!   members: S21 only registers progress for extraction and splitting,
+//!   so those are the only members ever read, and only ever through a
+//!   `*const` handed to the callback by C. Its size is never relied on
+//!   as anything but a pointee.
 //! * The 1.14.x header no longer defines `WIMLIB_EXTRACT_FLAG_HARDLINK`,
 //!   `WIMLIB_EXTRACT_FLAG_SYMLINK`, `WIMLIB_EXTRACT_FLAG_VERBOSE`, or
 //!   `WIMLIB_EXTRACT_FLAG_SEQUENTIAL` (verified by reading the header:
@@ -87,8 +87,8 @@ pub type wimlib_tchar = c_char;
 
 /// Progress message codes (`enum wimlib_progress_msg`).
 ///
-/// Only the messages S21 extraction can receive are listed; the values
-/// are copied from the header.
+/// Only the messages S21 extraction and splitting can receive are
+/// listed; the values are copied from the header.
 pub const WIMLIB_PROGRESS_MSG_EXTRACT_IMAGE_BEGIN: c_int = 0;
 pub const WIMLIB_PROGRESS_MSG_EXTRACT_TREE_BEGIN: c_int = 1;
 pub const WIMLIB_PROGRESS_MSG_EXTRACT_FILE_STRUCTURE: c_int = 3;
@@ -97,6 +97,17 @@ pub const WIMLIB_PROGRESS_MSG_EXTRACT_SPWM_PART_BEGIN: c_int = 5;
 pub const WIMLIB_PROGRESS_MSG_EXTRACT_METADATA: c_int = 6;
 pub const WIMLIB_PROGRESS_MSG_EXTRACT_IMAGE_END: c_int = 7;
 pub const WIMLIB_PROGRESS_MSG_EXTRACT_TREE_END: c_int = 8;
+/// File data is being written; since wimlib 1.13.4 this also arrives
+/// while `wimlib_split` writes each part (reporting the current part
+/// only). There is deliberately no `write_streams` member in
+/// [`WimlibProgressInfo`]: a split callback must switch on the message
+/// code and only read `split` for 19/20, never for 12, or it would
+/// misread one union member as the other.
+pub const WIMLIB_PROGRESS_MSG_WRITE_STREAMS: c_int = 12;
+/// A new split part is about to start; `info.split` is valid.
+pub const WIMLIB_PROGRESS_MSG_SPLIT_BEGIN_PART: c_int = 19;
+/// A split part has just finished; `info.split` is valid.
+pub const WIMLIB_PROGRESS_MSG_SPLIT_END_PART: c_int = 20;
 
 /// Progress function return values (`enum wimlib_progress_status`).
 pub const WIMLIB_PROGRESS_STATUS_CONTINUE: c_int = 0;
@@ -145,14 +156,42 @@ pub struct WimlibProgressInfoExtract {
 
 /// Progress payload union (`union wimlib_progress_info`).
 ///
-/// Only the `extract` member is declared: it is the only one S21 reads,
-/// and only through a `*const` supplied by C to the progress callback.
-/// The union is never constructed or written from Rust.
+/// Only the `extract` and `split` members are declared: they are the
+/// only ones S21 reads, and only through a `*const` supplied by C to
+/// the progress callback. The union is never constructed or written
+/// from Rust. `WRITE_STREAMS` (12) also arrives during a split since
+/// 1.13.4 but has no member here on purpose (see the message-constant
+/// comment): the callback switches on the code and reads `split` only
+/// for 19/20.
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub union WimlibProgressInfo {
     /// Valid for every `EXTRACT_*` message listed above.
     pub extract: WimlibProgressInfoExtract,
+    /// Valid for `SPLIT_BEGIN_PART`/`SPLIT_END_PART` only.
+    pub split: WimlibProgressInfoSplit,
+}
+
+/// Per-split progress payload (`struct wimlib_progress_info_split`).
+///
+/// Field order and types mirror the header exactly. The name pointer
+/// is declared `*const` (the header uses a mutable pointer because the
+/// library lets a 19 handler redirect the next part; S21 only reads it,
+/// so `const` is the honest type here).
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct WimlibProgressInfoSplit {
+    /// Total size of the original WIM's file and metadata resources
+    /// (compressed).
+    pub total_bytes: u64,
+    /// Bytes of file and metadata resources copied out so far.
+    pub completed_bytes: u64,
+    /// 1-based number of the part starting (19) or just finished (20).
+    pub cur_part_number: c_uint,
+    /// Total number of split parts being written.
+    pub total_parts: c_uint,
+    /// Name of the part starting (19) or just finished (20).
+    pub part_name: *const wimlib_tchar,
 }
 
 /// Progress callback type (`wimlib_progress_func_t`).
@@ -423,6 +462,19 @@ pub fn error_string(code: c_int) -> Option<String> {
 mod tests {
     use super::*;
     use core::mem::size_of;
+
+    #[test]
+    fn split_info_layout_matches_header_1_14() {
+        // u64 + u64 (16) + u32 + u32 (8) + pointer (8) = 32,
+        // alignment 8. Matches `sizeof(struct
+        // wimlib_progress_info_split)` from /usr/include/wimlib.h
+        // 1.14.5, checked with the C compiler.
+        assert_eq!(
+            size_of::<WimlibProgressInfoSplit>(),
+            32,
+            "split info size drifted from the 1.14.5 header"
+        );
+    }
 
     #[test]
     fn extract_info_layout_matches_header_1_14() {

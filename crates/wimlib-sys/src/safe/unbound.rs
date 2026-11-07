@@ -12,6 +12,7 @@ use crate::error::WimlibError;
 use super::ExtractFlags;
 use super::ExtractProgress;
 use super::OpenFlags;
+use super::SplitProgress;
 use super::WimInfo;
 
 /// Stand-in for the linked [`Wim`](super::Wim): unconstructible, and
@@ -56,6 +57,17 @@ impl Wim {
         _target: &Path,
         _flags: ExtractFlags,
         _progress: &mut dyn FnMut(&ExtractProgress) -> bool,
+    ) -> Result<(), WimlibError> {
+        Err(WimlibError::NotLinked)
+    }
+
+    /// Always fails with [`WimlibError::NotLinked`]; the `progress`
+    /// callback is never invoked.
+    pub fn split(
+        &self,
+        _dest: &Path,
+        _part_size: u64,
+        _progress: &mut dyn FnMut(&SplitProgress) -> bool,
     ) -> Result<(), WimlibError> {
         Err(WimlibError::NotLinked)
     }
