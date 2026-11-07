@@ -1,4 +1,4 @@
-//! Windows image handling (S21, slice 6 of 12): WIM apply and split, and the BCD store builder.
+//! Windows image handling (S21, slice 7 of 12): WIM apply and split, BCD stores, To Go tweaks.
 //!
 //! A Windows USB needs the installer image from `install.wim` (or
 //! `install.esd`) laid onto the target filesystem — the equivalent of
@@ -10,7 +10,9 @@
 //! [`split`] turns an oversized `install.wim` into FAT32-sized parts
 //! with the same progress and cancellation shape. [`bcd`] builds the
 //! UEFI and BIOS stores by patching the applied image's own
-//! `BCD-Template` with a small in-crate `regf` editor.
+//! `BCD-Template`, and [`to_go`] applies the offline SAN policy and
+//! disabled-recovery tweaks host-side; both writers share the small
+//! in-crate `regf` editor.
 //!
 //! The reader side stays where it is: [`crate::wim`] (S16) parses the
 //! header and XML for inspection without the library. Anything that
@@ -24,5 +26,9 @@
 pub mod apply;
 /// BCD store builder: patches the applied image's `BCD-Template` host-side.
 pub mod bcd;
+/// Generic `regf` hive editor backing the BCD and To Go writers.
+pub(crate) mod regf;
 pub mod split;
+/// Windows To Go tweaks: offline SAN policy and disabled recovery, host-side.
+pub mod to_go;
 pub mod wim;
