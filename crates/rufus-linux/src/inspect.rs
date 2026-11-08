@@ -281,9 +281,13 @@ fn device_swap_sources(device: &Device, options: &Options<'_>) -> Vec<SwapEntry>
 }
 
 /// The kernel name for a layout partition index: the sysfs-listed
-/// partition with that number when present, else the plain-digit form of
-/// the disk name (S04 lists with the same rule, and `p`-separated disks
-/// such as `nvme0n1` get the `p` form their kernel uses).
+/// partition with that number when present, else the kernel spelling
+/// derived from the disk name — `{disk}p{index}` when the disk name
+/// ends in an ASCII digit (`loop1` → `loop1p3`, `nvme0n1` →
+/// `nvme0n1p3`, `mmcblk0` → `mmcblk0p1`), `{disk}{index}` otherwise
+/// (`sdb` → `sdb3`). The digit rule mirrors how the kernel names
+/// partition nodes; the enumerated list cannot decide it because a
+/// blank disk (or a bare NVMe namespace) lists no partitions at all.
 ///
 /// Public since S17: the write adapter resolves the partition node for
 /// the external formatters through it, so core never invents the name.
@@ -296,7 +300,7 @@ pub fn partition_name(device: &Device, index: u32) -> String {
         return part.name.clone();
     }
     let disk = device_text(&device.name);
-    if device.partitions.iter().any(|part| part.number.is_none()) {
+    if matches!(disk.chars().last(), Some(last) if last.is_ascii_digit()) {
         format!("{disk}p{index}")
     } else {
         format!("{disk}{index}")
@@ -664,7 +668,9 @@ mod tests {
     use super::Options;
     use super::SwapEntry;
     use super::inspect;
+    use super::partition_name;
     use crate::model::Device;
+    use crate::model::Partition;
     use crate::mounts::parse_swaps;
     use crate::sysfs::SysfsRoot;
     use crate::sysfs::enumerate;
@@ -1563,5 +1569,92 @@ mod tests {
         assert!(said.is_ascii(), "{said:?}");
         // The stick itself is still judged as the normal Safe case.
         assert_eq!(judge(&inspected.target), SafetyVerdict::Safe);
+    }
+
+    // ------------------------------------------------------------------
+    // partition_name follows the kernel node rule: `{disk}p{index}`
+    // when the disk name ends in an ASCII digit, `{disk}{index}`
+    // otherwise. A blank loop image lists no partitions at all, so the
+    // rule must not depend on the enumerated list.
+    // ------------------------------------------------------------------
+
+    /// A device with `partitions` as its whole partition list: only the
+    /// name and the list matter to [`partition_name`].
+    fn named_device(name: &str, partitions: Vec<Partition>) -> Device {
+        Device {
+            sysfs: format!("class/block/{name}"),
+            name: name.to_owned(),
+            dev_path: format!("/dev/{name}"),
+            size_bytes: 32 * 1024 * 1024 * 1024,
+            sector_size: 512,
+            physical_sector_size: 512,
+            removable: false,
+            read_only: false,
+            usb: false,
+            vendor: None,
+            model: None,
+            serial: None,
+            transport: crate::model::Transport::Other,
+            partition_table: None,
+            vid_pid: None,
+            port_path: None,
+            partitions,
+        }
+    }
+
+    #[test]
+    fn digit_ending_disk_without_partitions_uses_the_p_form() {
+        for name in ["loop1", "nvme0n1", "mmcblk0"] {
+            let device = named_device(name, Vec::new());
+            let expected = format!("{name}p3");
+            assert_eq!(
+                partition_name(&device, 3),
+                expected,
+                "a blank {name} still spells its third node {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn letter_ending_disk_without_partitions_uses_the_plain_form() {
+        let device = named_device("sdb", Vec::new());
+        assert_eq!(partition_name(&device, 3), "sdb3");
+    }
+
+    #[test]
+    fn listed_partition_with_a_matching_number_wins_over_the_rule() {
+        let device = named_device(
+            "loop1",
+            vec![Partition {
+                name: "loop1p1-odd-sysfs-name".to_owned(),
+                number: Some(1),
+                size_bytes: 1024,
+                fstype: None,
+            }],
+        );
+        assert_eq!(
+            partition_name(&device, 1),
+            "loop1p1-odd-sysfs-name",
+            "the real sysfs name answers when its number matches"
+        );
+        assert_eq!(
+            partition_name(&device, 3),
+            "loop1p3",
+            "an unknown index still follows the digit rule"
+        );
+    }
+
+    #[test]
+    fn p_named_listing_without_a_number_keeps_the_p_form_for_unknowns() {
+        let device = named_device(
+            "nvme0n1",
+            vec![Partition {
+                name: "nvme0n1p1".to_owned(),
+                number: None,
+                size_bytes: 1024,
+                fstype: None,
+            }],
+        );
+        assert_eq!(partition_name(&device, 3), "nvme0n1p3");
     }
 }

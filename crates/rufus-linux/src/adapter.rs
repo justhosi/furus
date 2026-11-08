@@ -724,7 +724,8 @@ impl DeviceOpener {
     /// `table` and the layout `layout`: nothing opens yet. The
     /// partition node spelling comes from the sysfs partition list
     /// when it names the data partition's planner-derived index, else
-    /// the plain-digit rule — the same rule `S04` lists with. The
+    /// the kernel node rule from the disk name (`{disk}p{index}` when
+    /// the name ends in an ASCII digit, `{disk}{index}` otherwise). The
     /// index is the layout's `data` role position (second for
     /// `UefiNtfs`, third for `WindowsToGo`), never a literal: a
     /// geometry the planner rejects fails construction here, on every
