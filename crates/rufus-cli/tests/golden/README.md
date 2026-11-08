@@ -30,7 +30,8 @@ MS-DOS directory, `null` here — an `msdos` plan would carry a path
 and no write step, so the default `--bootloader auto` golden keeps
 both the write step and the null). Schema v6 added the `windows`
 bootloader mode (a Windows To Go plan: `windows_to_go` layout, NTFS
-data partition, `copy` write). On this
+data partition, no write step (the bootloader step applies the
+WIM)). On this
 golden `confirmed_serial` is `null` — the plan targets `/dev/null`
 and never enables show-all — and `layout` is `"single"`, the
 `--bootloader auto` default.

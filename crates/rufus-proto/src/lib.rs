@@ -407,8 +407,8 @@ pub enum BootloaderMode {
     MsDos,
     /// Windows To Go: applies a WIM image to the NTFS data partition
     /// of a GPT [`Layout::WindowsToGo`] plan, creates the BCD stores
-    /// and places the boot files. [`WriteMode::Copy`] carries the
-    /// write.
+    /// and places the boot files. The plan carries no write step
+    /// because this step applies the image itself.
     Windows,
     /// No bootloader (plain data media).
     None,

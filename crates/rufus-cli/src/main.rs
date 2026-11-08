@@ -581,8 +581,8 @@ enum Command {
         /// with the write mode: auto|syslinux|grub2|grub4dos|uefi-ntfs|freedos|kolibri|msdos|windows|none;
         /// uefi-ntfs selects the two-partition UEFI:NTFS layout and
         /// forces copy mode, refused without --filesystem ntfs or
-        /// exfat; windows selects the Windows To Go layout and forces
-        /// copy mode with an NTFS data partition (--filesystem is
+        /// exfat; windows selects the Windows To Go layout with an NTFS
+        /// data partition and no write step (--filesystem is
         /// overridden; --scheme mbr is refused later by the layout);
         /// freedos, kolibri and msdos need --filesystem fat32;
         /// msdos plans no write step — IO.SYS must be the first root

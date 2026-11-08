@@ -172,7 +172,8 @@ write side is the most complete part:
   the payload is not bundled; each suite prints one `skip:` line when
   qemu, grub-mkimage, mkntfs, OVMF or another tool is absent.
   `windows` plans a GPT Windows To Go layout (100 MiB ESP, MSR, NTFS
-  data partition), applies the image's WIM via wimlib, formats the ESP FAT32,
+  data partition) with no write step because the bootloader step
+  applies the image's WIM via wimlib, formats the ESP FAT32,
   builds the UEFI/BIOS BCD stores from the image's own `BCD-Template` (no
   Windows tools or Wine on the host), places boot manager, store, fonts, sets
   offline SAN policy 4, disables WinRE recovery and refuses any non-Windows
