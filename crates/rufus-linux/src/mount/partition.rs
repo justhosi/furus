@@ -36,6 +36,8 @@ use super::LiveOps;
 use super::MountOps;
 use super::MountRecord;
 use super::Recorder;
+use super::unmount_with_fallback;
+use crate::mounts::MountTable;
 
 /// How many fresh mount-point names to try before refusing: the pid
 /// plus a process-wide counter collide only with a leftover directory
@@ -239,13 +241,51 @@ impl<M: MountOps> Drop for Mounted<M> {
     }
 }
 
+/// Release any existing mount of `source` before the pipeline mounts
+/// the node itself.
+///
+/// A desktop automounter mounts the freshly formatted partition as
+/// soon as the kernel announces it, and ntfs3 refuses a second mount
+/// of the same node with EBUSY — so mounting without releasing first
+/// fails on a desktop session. Each table entry whose source names
+/// `source` is unmounted once, in table order, through
+/// [`unmount_with_fallback`](super::unmount_with_fallback) (busy
+/// targets get the detach fallback there); entries for other devices
+/// are untouched. A failed release reports the mount point it could
+/// not free.
+fn release_existing_mounts(
+    table: &MountTable,
+    source: &Path,
+    ops: &mut dyn MountOps,
+) -> Result<()> {
+    let wanted = source.display().to_string();
+    for entry in table.entries() {
+        if entry.source != wanted {
+            continue;
+        }
+        let mountpoint = Path::new(&entry.mountpoint);
+        unmount_with_fallback(ops, mountpoint).map_err(|error| CoreError::io(mountpoint, error))?;
+    }
+    Ok(())
+}
+
 /// Mount `source` (a partition node) for `filesystem` on a fresh
 /// mount-point directory and return the owning guard. Refusals (an
-/// unwired filesystem) happen before any directory is created or any
-/// mount is attempted; a failed mount removes the directory it just
-/// created, so no empty mount point is left behind.
+/// unwired filesystem) happen before the mount table is read, before
+/// any directory is created and before any mount is attempted; then
+/// any existing mount of the same node is released (a desktop
+/// automounter mount would make the pipeline mount fail with EBUSY),
+/// and only then is the fresh directory created and mounted. A failed
+/// release reports the mount point it could not free; a failed mount
+/// removes the directory it just created, so no empty mount point is
+/// left behind.
 pub fn mount(source: &Path, filesystem: &Filesystem) -> Result<Mounted<LiveOps>> {
     let fstype = fstype_of(filesystem)?;
+    let table = MountTable::read(None)?;
+    {
+        let mut live = LiveOps;
+        release_existing_mounts(&table, source, &mut live)?;
+    }
     let dir = fresh_mount_dir()?;
     match Mounted::mount_with_ops(source, &dir, fstype, LiveOps, statvfs_free) {
         Ok(guard) => Ok(guard),
@@ -647,6 +687,68 @@ mod tests {
             assert!(text.contains(name), "{text}");
             assert!(text.is_ascii(), "{text}");
         }
+    }
+
+    #[test]
+    fn pre_mount_release_frees_only_the_same_node_in_table_order() {
+        // The desktop automounter case: the same node mounted twice
+        // (two mountpoints, standing in for /run/media/u/A and
+        // /run/media/u/B) plus one unrelated device. The helper must
+        // release exactly the two matching mounts, in table order.
+        let temp = tempfile::tempdir().expect("scratch fits");
+        let first_mp = temp.path().join("a");
+        std::fs::create_dir(&first_mp).expect("scratch mountpoint creates");
+        let second_mp = temp.path().join("b");
+        std::fs::create_dir(&second_mp).expect("scratch mountpoint creates");
+        let other_mp = temp.path().join("other");
+        std::fs::create_dir(&other_mp).expect("scratch mountpoint creates");
+        let node = "/dev/rufus-test-part";
+        let text = format!(
+            "1 0 8:1 / {} rw - vfat {} rw\n2 0 8:2 / {} rw - vfat /dev/other rw\n3 0 8:1 / {} rw - vfat {} rw\n",
+            first_mp.display(),
+            node,
+            other_mp.display(),
+            second_mp.display(),
+            node
+        );
+        let table = crate::mounts::MountTable::parse(&text).expect("fixture table parses");
+        let mut fake = FakeOps::new();
+        release_existing_mounts(&table, Path::new(node), &mut fake).expect("releases land");
+        assert_eq!(
+            fake.unmounts(),
+            vec![
+                (first_mp.display().to_string(), false),
+                (second_mp.display().to_string(), false),
+            ],
+            "releases exactly the same node mounts in table order"
+        );
+
+        // A table with no entry for the node releases nothing.
+        let clean_text = format!("1 0 8:2 / {} rw - vfat /dev/other rw\n", other_mp.display());
+        let clean = crate::mounts::MountTable::parse(&clean_text).expect("fixture table parses");
+        let mut clean_fake = FakeOps::new();
+        release_existing_mounts(&clean, Path::new(node), &mut clean_fake).expect("no match is ok");
+        assert!(
+            clean_fake.unmounts().is_empty(),
+            "no entry for the node releases nothing"
+        );
+    }
+
+    #[test]
+    fn pre_mount_release_failure_names_the_mountpoint() {
+        let temp = tempfile::tempdir().expect("scratch fits");
+        let first_mp = temp.path().join("a");
+        std::fs::create_dir(&first_mp).expect("scratch mountpoint creates");
+        let node = "/dev/rufus-test-part";
+        let text = format!("1 0 8:1 / {} rw - vfat {} rw\n", first_mp.display(), node);
+        let table = crate::mounts::MountTable::parse(&text).expect("fixture table parses");
+        let mut fake = FakeOps::new();
+        fake.locked = vec![first_mp.display().to_string()];
+        let error = release_existing_mounts(&table, Path::new(node), &mut fake)
+            .expect_err("a hard unmount failure surfaces");
+        let text = error.to_string();
+        assert!(text.contains(&first_mp.display().to_string()), "{text}");
+        assert!(text.is_ascii(), "{text}");
     }
 
     #[test]

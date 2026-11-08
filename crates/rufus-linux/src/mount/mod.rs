@@ -224,7 +224,7 @@ impl Drop for Recorder<'_> {
 /// One unmount through the seam with the documented `MNT_DETACH`
 /// fallback: `ResourceBusy` is retried detached once; any other
 /// failure (or a failed retry) is returned unchanged.
-fn unmount_with_fallback(ops: &mut dyn MountOps, target: &Path) -> io::Result<()> {
+pub(crate) fn unmount_with_fallback(ops: &mut dyn MountOps, target: &Path) -> io::Result<()> {
     match ops.unmount(target, false) {
         Err(err) if err.kind() == io::ErrorKind::ResourceBusy => ops.unmount(target, true),
         other => other,
