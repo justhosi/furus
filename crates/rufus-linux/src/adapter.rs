@@ -63,6 +63,7 @@ use rufus_core::pipeline::Opener;
 use rufus_core::pipeline::Target;
 use rufus_proto::Filesystem;
 
+use crate::block::AlignedBuf;
 use crate::block::BlockDevice;
 use crate::block::Sink;
 use crate::inspect::partition_name;
@@ -72,8 +73,10 @@ use crate::wipe::PARTITION_POLL_INTERVAL;
 use crate::wipe::PARTITION_POLL_TIMEOUT;
 use crate::wipe::wait_for_partitions;
 
-/// A core [`Target`] over any block [`Sink`]: every call delegates to
-/// the sink unchanged. The sector size is stored, not probed — a
+/// A core [`Target`] over any block [`Sink`]: buffered sinks delegate
+/// unchanged, while a direct sink (the kernel accepted `O_DIRECT`)
+/// bounces unaligned caller slices through an aligned block first.
+/// The sector size is stored, not probed — a
 /// [`Sink`] has no sector concept (alignment is a direct-I/O property,
 /// not geometry), so the opener supplies the discovery value the
 /// device was opened with.
@@ -90,6 +93,329 @@ impl<S: Sink> SinkTarget<S> {
     }
 }
 
+/// One aligned unit of the direct-I/O bounce below, in bytes.
+const BOUNCE_ALIGN_U64: u64 = AlignedBuf::ALIGN as u64;
+
+/// Whether a caller pointer already meets the direct-I/O address rule.
+fn ptr_is_aligned(ptr: usize) -> bool {
+    ptr.is_multiple_of(AlignedBuf::ALIGN)
+}
+
+/// Whether offset, pointer and length already meet the direct rule, so
+/// the call can run straight through to the sink.
+fn request_is_aligned(offset: u64, ptr: usize, len: usize) -> bool {
+    ptr_is_aligned(ptr)
+        && offset.is_multiple_of(BOUNCE_ALIGN_U64)
+        && (len as u64).is_multiple_of(BOUNCE_ALIGN_U64)
+}
+
+/// Write `buf` at `offset` through whole aligned blocks, using `bounce`
+/// (exactly one [`AlignedBuf::ALIGN`] byte) as the kernel-facing
+/// window. Fully covered blocks copy straight in; edge blocks
+/// read-modify-write so neighbouring bytes survive. The caller window
+/// must already be validated (non-empty, `offset + len` inside the
+/// sink); invalid windows never reach here — the wrappers delegate
+/// those to the sink for its canonical message.
+fn bounce_write_range<S: Sink>(
+    sink: &S,
+    bounce: &mut AlignedBuf,
+    offset: u64,
+    buf: &[u8],
+) -> Result<()> {
+    if bounce.len() != AlignedBuf::ALIGN {
+        return Err(CoreError::invalid(format!(
+            "bounce buffer has {} bytes, needs {}",
+            bounce.len(),
+            AlignedBuf::ALIGN
+        )));
+    }
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+        CoreError::invalid(format!(
+            "bounce write of {} bytes at offset {offset} overflows",
+            buf.len()
+        ))
+    })?;
+    let mut block_start = offset / BOUNCE_ALIGN_U64 * BOUNCE_ALIGN_U64;
+    while block_start < end {
+        let block_end = block_start.checked_add(BOUNCE_ALIGN_U64).ok_or_else(|| {
+            CoreError::invalid(format!("bounce block at offset {block_start} overflows"))
+        })?;
+        let ov_start = if block_start > offset {
+            block_start
+        } else {
+            offset
+        };
+        let ov_end = if block_end < end { block_end } else { end };
+        if ov_start >= ov_end {
+            return Err(CoreError::invalid(format!(
+                "bounce block at offset {block_start} misses the write window at offset {offset}"
+            )));
+        }
+        let caller_start = usize::try_from(ov_start - offset).map_err(|_| {
+            CoreError::invalid(format!("bounce write offset {ov_start} does not fit usize"))
+        })?;
+        let caller_len = usize::try_from(ov_end - ov_start).map_err(|_| {
+            CoreError::invalid(format!(
+                "bounce write length for block at offset {block_start} does not fit usize"
+            ))
+        })?;
+        let bounce_start = usize::try_from(ov_start - block_start).map_err(|_| {
+            CoreError::invalid(format!("bounce block offset {ov_start} does not fit usize"))
+        })?;
+        let caller_end = caller_start.checked_add(caller_len).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bounce write window at offset {offset} overflows usize"
+            ))
+        })?;
+        let bounce_end = bounce_start.checked_add(caller_len).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bounce block window at offset {block_start} overflows usize"
+            ))
+        })?;
+        if ov_start == block_start && ov_end == block_end {
+            let src = buf.get(caller_start..caller_end).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "bounce write window at offset {offset} runs past the caller buffer"
+                ))
+            })?;
+            let dst = bounce.as_mut_slice().get_mut(..caller_len).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "bounce block at offset {block_start} runs past the bounce buffer"
+                ))
+            })?;
+            dst.copy_from_slice(src);
+            sink.write_all_at(block_start, bounce.as_slice())?;
+        } else {
+            sink.read_at(block_start, bounce.as_mut_slice())?;
+            let src = buf.get(caller_start..caller_end).ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "bounce write window at offset {offset} runs past the caller buffer"
+                ))
+            })?;
+            let dst = bounce
+                .as_mut_slice()
+                .get_mut(bounce_start..bounce_end)
+                .ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "bounce block at offset {block_start} runs past the bounce buffer"
+                    ))
+                })?;
+            dst.copy_from_slice(src);
+            sink.write_all_at(block_start, bounce.as_slice())?;
+        }
+        block_start = block_end;
+    }
+    Ok(())
+}
+
+/// Read `buf.len()` bytes at `offset` through whole aligned blocks,
+/// using `bounce` as the kernel-facing window and copying only the
+/// requested overlap out. The caller window must already be validated
+/// like [`bounce_write_range`] — invalid windows never reach here.
+fn bounce_read_range<S: Sink>(
+    sink: &S,
+    bounce: &mut AlignedBuf,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<()> {
+    if bounce.len() != AlignedBuf::ALIGN {
+        return Err(CoreError::invalid(format!(
+            "bounce buffer has {} bytes, needs {}",
+            bounce.len(),
+            AlignedBuf::ALIGN
+        )));
+    }
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
+        CoreError::invalid(format!(
+            "bounce read of {} bytes at offset {offset} overflows",
+            buf.len()
+        ))
+    })?;
+    let mut block_start = offset / BOUNCE_ALIGN_U64 * BOUNCE_ALIGN_U64;
+    while block_start < end {
+        let block_end = block_start.checked_add(BOUNCE_ALIGN_U64).ok_or_else(|| {
+            CoreError::invalid(format!("bounce block at offset {block_start} overflows"))
+        })?;
+        let ov_start = if block_start > offset {
+            block_start
+        } else {
+            offset
+        };
+        let ov_end = if block_end < end { block_end } else { end };
+        if ov_start >= ov_end {
+            return Err(CoreError::invalid(format!(
+                "bounce block at offset {block_start} misses the read window at offset {offset}"
+            )));
+        }
+        let caller_start = usize::try_from(ov_start - offset).map_err(|_| {
+            CoreError::invalid(format!("bounce read offset {ov_start} does not fit usize"))
+        })?;
+        let caller_len = usize::try_from(ov_end - ov_start).map_err(|_| {
+            CoreError::invalid(format!(
+                "bounce read length for block at offset {block_start} does not fit usize"
+            ))
+        })?;
+        let bounce_start = usize::try_from(ov_start - block_start).map_err(|_| {
+            CoreError::invalid(format!("bounce block offset {ov_start} does not fit usize"))
+        })?;
+        let caller_end = caller_start.checked_add(caller_len).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bounce read window at offset {offset} overflows usize"
+            ))
+        })?;
+        let bounce_end = bounce_start.checked_add(caller_len).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bounce block window at offset {block_start} overflows usize"
+            ))
+        })?;
+        sink.read_at(block_start, bounce.as_mut_slice())?;
+        let src = bounce
+            .as_slice()
+            .get(bounce_start..bounce_end)
+            .ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "bounce block at offset {block_start} runs past the bounce buffer"
+                ))
+            })?;
+        let dst = buf.get_mut(caller_start..caller_end).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bounce read window at offset {offset} runs past the caller buffer"
+            ))
+        })?;
+        dst.copy_from_slice(src);
+        block_start = block_end;
+    }
+    Ok(())
+}
+
+/// Whole-buffer write over `sink`: the fast path when everything is
+/// already aligned (or the sink is buffered), otherwise the aligned
+/// bounce. Invalid windows delegate to the sink for its canonical
+/// bounds message — the bounce never masks one.
+fn direct_write_all_at<S: Sink>(sink: &S, offset: u64, buf: &[u8]) -> Result<()> {
+    if !sink.is_direct() {
+        return sink.write_all_at(offset, buf);
+    }
+    if buf.is_empty() {
+        return sink.write_all_at(offset, buf);
+    }
+    let end = match offset.checked_add(buf.len() as u64) {
+        Some(end) => end,
+        None => return sink.write_all_at(offset, buf),
+    };
+    if end > sink.size() {
+        return sink.write_all_at(offset, buf);
+    }
+    if request_is_aligned(offset, buf.as_ptr() as usize, buf.len()) {
+        return sink.write_all_at(offset, buf);
+    }
+    let mut bounce = AlignedBuf::with_len(AlignedBuf::ALIGN);
+    bounce_write_range(sink, &mut bounce, offset, buf)
+}
+
+/// Positional read over `sink` with the same fast/bounce split as
+/// [`direct_write_all_at`]: aligned caller windows run straight
+/// through, anything else is covered block by block.
+fn direct_read_at<S: Sink>(sink: &S, offset: u64, buf: &mut [u8]) -> Result<()> {
+    if !sink.is_direct() {
+        return sink.read_at(offset, buf);
+    }
+    if buf.is_empty() {
+        return sink.read_at(offset, buf);
+    }
+    let end = match offset.checked_add(buf.len() as u64) {
+        Some(end) => end,
+        None => return sink.read_at(offset, buf),
+    };
+    if end > sink.size() {
+        return sink.read_at(offset, buf);
+    }
+    if request_is_aligned(offset, buf.as_ptr() as usize, buf.len()) {
+        return sink.read_at(offset, buf);
+    }
+    let mut bounce = AlignedBuf::with_len(AlignedBuf::ALIGN);
+    bounce_read_range(sink, &mut bounce, offset, buf)
+}
+
+/// Chunked write over `sink`: the fast path when the whole buffer is
+/// already aligned (the sink keeps its own chunk and cancellation
+/// semantics), otherwise one bounce per caller chunk so cancellation
+/// still stops on whole-chunk boundaries with whole-chunk counts.
+fn direct_write_cancellable<S: Sink>(
+    sink: &S,
+    offset: u64,
+    buf: &[u8],
+    chunk: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<u64> {
+    if chunk == 0 {
+        return sink.write_all_at_cancellable(offset, buf, chunk, cancelled);
+    }
+    if !sink.is_direct() {
+        return sink.write_all_at_cancellable(offset, buf, chunk, cancelled);
+    }
+    if buf.is_empty() {
+        return sink.write_all_at_cancellable(offset, buf, chunk, cancelled);
+    }
+    let end = match offset.checked_add(buf.len() as u64) {
+        Some(end) => end,
+        None => return sink.write_all_at_cancellable(offset, buf, chunk, cancelled),
+    };
+    if end > sink.size() {
+        return sink.write_all_at_cancellable(offset, buf, chunk, cancelled);
+    }
+    if request_is_aligned(offset, buf.as_ptr() as usize, buf.len()) {
+        return sink.write_all_at_cancellable(offset, buf, chunk, cancelled);
+    }
+    let mut bounce = AlignedBuf::with_len(AlignedBuf::ALIGN);
+    let total = buf.len();
+    let mut done: usize = 0;
+    while done < total {
+        if cancelled() {
+            return Ok(done as u64);
+        }
+        let remaining = match total.checked_sub(done) {
+            Some(remaining) => remaining,
+            None => {
+                return Err(CoreError::invalid(format!(
+                    "bounce cancellable write at offset {offset} underflows"
+                )));
+            }
+        };
+        let piece_len = remaining.min(chunk);
+        let piece_end = match done.checked_add(piece_len) {
+            Some(piece_end) => piece_end,
+            None => {
+                return Err(CoreError::invalid(format!(
+                    "bounce cancellable write at offset {offset} overflows usize"
+                )));
+            }
+        };
+        let piece = buf.get(done..piece_end).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bounce cancellable write at offset {offset} runs past the caller buffer"
+            ))
+        })?;
+        let piece_offset = match offset.checked_add(done as u64) {
+            Some(piece_offset) => piece_offset,
+            None => {
+                return Err(CoreError::invalid(format!(
+                    "bounce cancellable write at offset {offset} overflows"
+                )));
+            }
+        };
+        bounce_write_range(sink, &mut bounce, piece_offset, piece)?;
+        done = piece_end;
+    }
+    Ok(total as u64)
+}
+
 impl<S: Sink> Target for SinkTarget<S> {
     fn size(&self) -> u64 {
         self.sink.size()
@@ -100,11 +426,11 @@ impl<S: Sink> Target for SinkTarget<S> {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        self.sink.read_at(offset, buf)
+        direct_read_at(&*self.sink, offset, buf)
     }
 
     fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        self.sink.write_all_at(offset, buf)
+        direct_write_all_at(&*self.sink, offset, buf)
     }
 
     fn write_all_at_cancellable(
@@ -114,8 +440,7 @@ impl<S: Sink> Target for SinkTarget<S> {
         chunk: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<u64> {
-        self.sink
-            .write_all_at_cancellable(offset, buf, chunk, cancelled)
+        direct_write_cancellable(&*self.sink, offset, buf, chunk, cancelled)
     }
 
     fn zero_range(&self, offset: u64, len: u64, _cancelled: &dyn Fn() -> bool) -> Result<()> {
@@ -211,7 +536,16 @@ impl<S: Sink> Volume for SinkVolume<S> {
                 self.base
             )));
         }
-        self.sink.read_at(self.base + offset, buf)
+        let at = match self.base.checked_add(offset) {
+            Some(at) => at,
+            None => {
+                return Err(CoreError::invalid(format!(
+                    "partition window base {} plus offset {offset} overflows u64: refusing",
+                    self.base
+                )));
+            }
+        };
+        direct_read_at(&*self.sink, at, buf)
     }
 
     fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
@@ -229,7 +563,16 @@ impl<S: Sink> Volume for SinkVolume<S> {
                 self.base
             )));
         }
-        self.sink.write_all_at(self.base + offset, buf)
+        let at = match self.base.checked_add(offset) {
+            Some(at) => at,
+            None => {
+                return Err(CoreError::invalid(format!(
+                    "partition window base {} plus offset {offset} overflows u64: refusing",
+                    self.base
+                )));
+            }
+        };
+        direct_write_all_at(&*self.sink, at, buf)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -857,6 +1200,221 @@ mod tests {
         target.reread_partitions().expect("rescan lands");
         // The bytes went to the shared sink, not a copy.
         assert_eq!(&sink.snapshot()[100..116], &[7u8; 16]);
+    }
+
+    /// A RAM sink that enforces the direct rule like [`BlockDevice`]
+    /// does on a real `O_DIRECT` fd: every offset, length and buffer
+    /// address must line up on [`AlignedBuf::ALIGN`], otherwise the
+    /// call refuses with the same `unaligned O_DIRECT ...` text. A
+    /// plain [`MemorySink`] (or the core `VecTarget`) would never
+    /// catch the pipeline bug: RAM needs no alignment story, so an
+    /// ordinary 512-byte caller slice sails through there while the
+    /// real device refuses it. This double is the closest seam that
+    /// exercises the adapter bounce without needing a loop device.
+    struct DirectRamSink {
+        store: Mutex<Vec<u8>>,
+    }
+
+    impl DirectRamSink {
+        fn new(len: usize) -> Self {
+            Self {
+                store: Mutex::new(vec![0u8; len]),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        fn check_window(&self, offset: u64, len: u64, verb: &str) -> Result<()> {
+            match offset.checked_add(len) {
+                Some(end) if end <= self.size() => Ok(()),
+                Some(end) => Err(CoreError::invalid(format!(
+                    "{verb} range [{offset}, {end}) does not fit the sink size {}",
+                    self.size()
+                ))),
+                None => Err(CoreError::invalid(format!(
+                    "{verb} range [{offset}, ...) overflows past the sink size {}",
+                    self.size()
+                ))),
+            }
+        }
+
+        fn check_direct(&self, offset: u64, ptr: usize, len: usize, verb: &str) -> Result<()> {
+            if !ptr.is_multiple_of(AlignedBuf::ALIGN)
+                || !offset.is_multiple_of(AlignedBuf::ALIGN as u64)
+                || !(len as u64).is_multiple_of(AlignedBuf::ALIGN as u64)
+            {
+                return Err(CoreError::invalid(format!(
+                    "unaligned O_DIRECT {verb}: offset {offset}, length {len}, buffer at {:#x}",
+                    ptr
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    impl Sink for DirectRamSink {
+        fn size(&self) -> u64 {
+            self.store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len() as u64
+        }
+
+        fn is_direct(&self) -> bool {
+            true
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.check_window(offset, buf.len() as u64, "read")?;
+            self.check_direct(offset, buf.as_ptr() as usize, buf.len(), "read")?;
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let base = offset as usize;
+            buf.copy_from_slice(&store[base..base + buf.len()]);
+            Ok(())
+        }
+
+        fn write_all_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            self.check_window(offset, buf.len() as u64, "write")?;
+            self.check_direct(offset, buf.as_ptr() as usize, buf.len(), "write")?;
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let base = offset as usize;
+            store[base..base + buf.len()].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn write_all_at_cancellable(
+            &self,
+            offset: u64,
+            buf: &[u8],
+            chunk: usize,
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<u64> {
+            self.check_window(offset, buf.len() as u64, "write")?;
+            self.check_direct(offset, buf.as_ptr() as usize, buf.len(), "write")?;
+            if chunk == 0 {
+                return Err(CoreError::invalid(
+                    "write chunk size must be non-zero".to_string(),
+                ));
+            }
+            let mut done = 0usize;
+            while done < buf.len() {
+                if cancelled() {
+                    return Ok(done as u64);
+                }
+                let piece = (buf.len() - done).min(chunk);
+                let base = offset as usize + done;
+                self.store
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())[base..base + piece]
+                    .copy_from_slice(&buf[done..done + piece]);
+                done += piece;
+            }
+            Ok(done as u64)
+        }
+
+        fn zero_range(&self, _offset: u64, _len: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn discard(&self, _offset: u64, _len: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn reread_partitions(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn direct_target_bounces_unaligned_caller_slices() {
+        // The real failure: the mkpart table write hands the block
+        // target a plain 512-byte `Vec` (heap address 16 bytes off
+        // `ALIGN`, length 512) at offset 0, and the GPT header read
+        // asks for 512 bytes at offset 512 into another plain `Vec`.
+        // A test `Target` (`VecTarget`) never takes the direct path,
+        // so it accepts both windows and the bug stays invisible —
+        // only a direct sink refuses them, which is what this double
+        // pins. The adapter must bounce both shapes through aligned
+        // blocks; the bytes on the medium must match the caller bytes.
+        let sink = Arc::new(DirectRamSink::new(8192));
+        let target = SinkTarget::new(Arc::clone(&sink), 512);
+
+        // A deliberately unaligned 512-byte caller slice: one byte
+        // past an aligned base, so the address misses `ALIGN` while
+        // the length (512) misses it too — the mkpart table shape.
+        let mut backing = AlignedBuf::with_len(1024);
+        for (index, byte) in backing.as_mut_slice().iter_mut().enumerate() {
+            *byte = (index % 251 + 1) as u8;
+        }
+        let caller = &backing.as_slice()[1..513];
+        assert_eq!(caller.len(), 512);
+        assert_ne!(
+            caller.as_ptr() as usize % AlignedBuf::ALIGN,
+            0,
+            "the fixture slice is really unaligned"
+        );
+        target
+            .write_all_at(0, caller)
+            .expect("the adapter bounces the unaligned table write");
+        assert_eq!(
+            &sink.snapshot()[0..512],
+            caller,
+            "the device holds exactly the caller bytes"
+        );
+
+        // The GPT header shape: 512 bytes at offset 512, still an
+        // unaligned offset and length through an unaligned pointer.
+        let mut second = AlignedBuf::with_len(1024);
+        second.as_mut_slice().fill(0x5A);
+        let header = &second.as_slice()[1..513];
+        target
+            .write_all_at_cancellable(512, header, 512, &|| false)
+            .expect("the cancellable path bounces too");
+        assert_eq!(
+            &sink.snapshot()[512..1024],
+            header,
+            "the second sector holds exactly the caller bytes"
+        );
+
+        // Reads bounce the other way: an unaligned caller buffer
+        // still fills with the device bytes.
+        let mut out_backing = AlignedBuf::with_len(1024);
+        {
+            let out = &mut out_backing.as_mut_slice()[1..513];
+            target.read_at(0, out).expect("the read bounces too");
+            assert_eq!(out, caller, "the read returns the written bytes");
+        }
+        {
+            let out = &mut out_backing.as_mut_slice()[1..513];
+            target
+                .read_at(512, out)
+                .expect("the offset read bounces too");
+            assert_eq!(out, header, "the second sector reads back");
+        }
+
+        // Neighbours survive the read-modify-write edges: only the
+        // two sectors changed, the rest of the first two blocks stays
+        // zero, and nothing past offset 1024 was touched.
+        let image = sink.snapshot();
+        assert!(
+            image[1024..].iter().all(|&byte| byte == 0),
+            "nothing past the two sectors was touched"
+        );
     }
 
     #[test]
