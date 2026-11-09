@@ -9,7 +9,9 @@
 //!   created when absent, sized from its own length.
 //!
 //! The sharing is load-bearing, not convenience. [`BlockDevice`] opens
-//! `O_RDWR|O_EXCL`, and on Linux the exclusive claim is per-disk: while
+//! `O_RDWR|O_EXCL` (a busy refusal first releases stale mounts of that
+//! disk and its partitions, then retries the claim once), and on Linux
+//! the exclusive claim is per-disk: while
 //! the whole-disk handle is open, opening `/dev/sdb1` (or running a
 //! formatter that wants its own claim) fails with `EBUSY`. So
 //! [`Opener::partition`](rufus_core::pipeline::Opener::partition)
@@ -68,6 +70,7 @@ use crate::block::BlockDevice;
 use crate::block::Sink;
 use crate::inspect::partition_name;
 use crate::model::Device;
+use crate::mounts::MountTable;
 use crate::sysfs::SysfsRoot;
 use crate::wipe::PARTITION_POLL_INTERVAL;
 use crate::wipe::PARTITION_POLL_TIMEOUT;
@@ -622,6 +625,8 @@ impl Backend {
     /// Open the backing store. Real nodes go through
     /// [`BlockDevice::open_with`] (exclusive, discovery geometry);
     /// files through [`BlockDevice::open`] (buffered, own length).
+    /// A busy whole-disk refusal releases stale mounts of that disk
+    /// and its partitions, then retries the claim once.
     fn open(&self) -> Result<BlockDevice> {
         match self {
             Backend::Device {
@@ -629,10 +634,115 @@ impl Backend {
                 size,
                 logical,
                 physical,
+                disk_name,
                 ..
-            } => BlockDevice::open_with(path, *size, *logical, *physical),
+            } => retry_busy_open(
+                || BlockDevice::open_with(path, *size, *logical, *physical),
+                || {
+                    // Reading the table must never mask the busy verdict:
+                    // a table that cannot be read leaves the mounts in
+                    // place and the retry below returns the busy error,
+                    // not the table error.
+                    let table = match MountTable::read(None) {
+                        Ok(table) => table,
+                        Err(_) => return Ok(()),
+                    };
+                    let mut live = crate::mount::LiveOps;
+                    release_stale_mounts(&table, disk_name, &mut live)
+                },
+            ),
             Backend::File { path } => BlockDevice::open(path),
         }
+    }
+}
+
+/// Whether `error` is the exclusive-open busy verdict: [`BlockDevice`]
+/// maps the `EBUSY` from its `O_RDWR|O_EXCL` claim to an `InvalidInput`
+/// naming the busy device (see `open_stop` in the block layer), so no
+/// `ErrorKind` survives to match on here and the message text is the
+/// seam. Both halves must match so an unrelated invalid input never
+/// triggers a release.
+fn is_busy_error(error: &CoreError) -> bool {
+    match error {
+        CoreError::InvalidInput { message } => {
+            message.contains("is busy") && message.contains("O_EXCL")
+        }
+        _ => false,
+    }
+}
+
+/// Whether mount `source` names the disk node itself or a partition
+/// node of `disk_name`: exactly `/dev/<disk>`, or `/dev/<disk>` plus a
+/// decimal suffix (`/dev/sdb1`), or plus a `p` decimal suffix
+/// (`/dev/nvme0n1p1`, `/dev/rufus-testp1`). Both partition spellings
+/// match regardless of the digit rule so one check covers plain and
+/// digit-ending disks; any other name (another disk whose name merely
+/// shares the prefix) does not match.
+fn source_belongs_to_disk(source: &str, disk_name: &str) -> bool {
+    let prefix = format!("/dev/{disk_name}");
+    if source == prefix {
+        return true;
+    }
+    let Some(rest) = source.strip_prefix(prefix.as_str()) else {
+        return false;
+    };
+    if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+    if let Some(digits) = rest.strip_prefix('p') {
+        return !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    false
+}
+
+/// Mountpoints in `table` (in table order) whose source is the disk
+/// node itself or a partition node of `disk_name` (see
+/// [`source_belongs_to_disk`)). The pure seam the tests drive
+/// directly: no syscalls, no unmounts, just the match.
+fn stale_mounts_for(table: &MountTable, disk_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in table.entries() {
+        if source_belongs_to_disk(entry.source.as_str(), disk_name) {
+            out.push(entry.mountpoint.clone());
+        }
+    }
+    out
+}
+
+/// Release every stale mount of `disk_name` in `table` (in table
+/// order) through [`unmount_with_fallback`](crate::mount::unmount_with_fallback)
+/// so busy targets get the detach fallback there. A failed release
+/// reports the mountpoint it could not free and aborts with no retry.
+fn release_stale_mounts(
+    table: &MountTable,
+    disk_name: &str,
+    ops: &mut dyn crate::mount::MountOps,
+) -> Result<()> {
+    for mountpoint in stale_mounts_for(table, disk_name) {
+        let target = Path::new(mountpoint.as_str());
+        crate::mount::unmount_with_fallback(ops, target)
+            .map_err(|error| CoreError::io(target, error))?;
+    }
+    Ok(())
+}
+
+/// Attempt `open`; when it fails with the busy verdict (see
+/// [`is_busy_error`]), run `release` once, then retry `open` exactly
+/// once. A first success never releases and never retries; a non-busy
+/// failure never releases and never retries; a release failure aborts
+/// with the release error and no retry; a retried open returns as-is
+/// whether it lands or not. No loops, no sleeps.
+fn retry_busy_open<T>(
+    mut open: impl FnMut() -> Result<T>,
+    mut release: impl FnMut() -> Result<()>,
+) -> Result<T> {
+    match open() {
+        Ok(value) => Ok(value),
+        Err(error) if is_busy_error(&error) => {
+            release()?;
+            open()
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -2067,5 +2177,172 @@ mod tests {
         let error = FileOpener::open(&dangling, TableKind::Mbr, LayoutKind::Single)
             .expect_err("dangling refuses");
         assert!(error.to_string().contains("symlink"), "{error:?}");
+    }
+
+    /// A recording [`MountOps`](crate::mount::MountOps) for the stale
+    /// release tests: unmounts always land, recording `(target,
+    /// detach)` in call order.
+    struct StaleFakeOps {
+        calls: Vec<(String, bool)>,
+    }
+
+    impl StaleFakeOps {
+        fn new() -> Self {
+            Self { calls: Vec::new() }
+        }
+    }
+
+    impl crate::mount::MountOps for StaleFakeOps {
+        fn mount(
+            &mut self,
+            _source: &Path,
+            _target: &Path,
+            _fstype: Option<&str>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn unmount(&mut self, target: &Path, detach: bool) -> std::io::Result<()> {
+            self.calls.push((target.display().to_string(), detach));
+            Ok(())
+        }
+    }
+
+    /// The busy verdict the block layer maps from `EBUSY`: the exact
+    /// seam [`is_busy_error`] matches on.
+    fn busy_error() -> CoreError {
+        CoreError::invalid(
+            "block device '/dev/rufus-test' is busy: it is mounted or opened by another process (O_EXCL refuses to share it) - unmount it or close the holder first",
+        )
+    }
+
+    #[test]
+    fn stale_mounts_match_disk_and_both_partition_spellings() {
+        // The automounter case: the whole disk plus both partition
+        // spellings are mounted, plus one unrelated device. All three
+        // disk mounts release in table order; the other device is
+        // untouched.
+        let text = "1 0 8:16 / /run/media/u/a rw - vfat /dev/rufus-test rw\n\
+             2 0 8:17 / /run/media/u/b rw - vfat /dev/rufus-test1 rw\n\
+             3 0 8:18 / /run/media/u/c rw - vfat /dev/rufus-testp1 rw\n\
+             4 0 8:33 / /run/media/u/d rw - vfat /dev/other1 rw\n";
+        let table = MountTable::parse(text).expect("fixture table parses");
+        assert_eq!(
+            stale_mounts_for(&table, "rufus-test"),
+            vec![
+                "/run/media/u/a".to_string(),
+                "/run/media/u/b".to_string(),
+                "/run/media/u/c".to_string(),
+            ],
+            "disk plus both partition spellings match in table order"
+        );
+        let mut fake = StaleFakeOps::new();
+        release_stale_mounts(&table, "rufus-test", &mut fake).expect("releases land");
+        assert_eq!(
+            fake.calls,
+            vec![
+                ("/run/media/u/a".to_string(), false),
+                ("/run/media/u/b".to_string(), false),
+                ("/run/media/u/c".to_string(), false),
+            ],
+            "exactly the disk mounts release, unrelated untouched"
+        );
+    }
+
+    #[test]
+    fn stale_mounts_with_no_match_release_nothing() {
+        let text = "1 0 8:33 / /run/media/u/d rw - vfat /dev/other1 rw\n";
+        let table = MountTable::parse(text).expect("fixture table parses");
+        assert!(
+            stale_mounts_for(&table, "rufus-test").is_empty(),
+            "no entry for the disk means no stale mounts"
+        );
+        let mut fake = StaleFakeOps::new();
+        release_stale_mounts(&table, "rufus-test", &mut fake).expect("no match is ok");
+        assert!(
+            fake.calls.is_empty(),
+            "no match releases nothing: {:?}",
+            fake.calls
+        );
+    }
+
+    #[test]
+    fn retry_open_runs_once_on_success_and_twice_on_busy() {
+        use std::cell::Cell;
+
+        // A first success never releases and never retries.
+        let opens = Cell::new(0);
+        let releases = Cell::new(0);
+        let result = retry_busy_open(
+            || {
+                opens.set(opens.get() + 1);
+                Ok::<u32, CoreError>(7)
+            },
+            || {
+                releases.set(releases.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result.expect("first success lands"), 7);
+        assert_eq!(opens.get(), 1, "one open when the first lands");
+        assert_eq!(releases.get(), 0, "no release when the first lands");
+
+        // A busy first attempt releases once, then retries once.
+        let opens = Cell::new(0);
+        let releases = Cell::new(0);
+        let result = retry_busy_open(
+            || {
+                let count = opens.get();
+                opens.set(count + 1);
+                if count == 0 {
+                    Err(busy_error())
+                } else {
+                    Ok(9u32)
+                }
+            },
+            || {
+                releases.set(releases.get() + 1);
+                Ok(())
+            },
+        );
+        assert_eq!(result.expect("retry lands"), 9);
+        assert_eq!(opens.get(), 2, "busy retries the open exactly once");
+        assert_eq!(releases.get(), 1, "busy releases exactly once");
+
+        // A busy retry that still fails returns the retry error as-is.
+        let opens = Cell::new(0);
+        let releases = Cell::new(0);
+        let error = retry_busy_open(
+            || {
+                opens.set(opens.get() + 1);
+                Err::<u32, CoreError>(busy_error())
+            },
+            || {
+                releases.set(releases.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("a still-busy retry fails");
+        assert!(is_busy_error(&error), "the retry error is the busy verdict");
+        assert_eq!(opens.get(), 2, "still busy means exactly two opens");
+        assert_eq!(releases.get(), 1, "still busy means exactly one release");
+
+        // A non-busy failure never releases and never retries.
+        let opens = Cell::new(0);
+        let releases = Cell::new(0);
+        let error = retry_busy_open(
+            || {
+                opens.set(opens.get() + 1);
+                Err::<u32, CoreError>(CoreError::invalid("plain failure"))
+            },
+            || {
+                releases.set(releases.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("a plain failure surfaces");
+        assert!(!is_busy_error(&error), "a plain failure is not busy");
+        assert_eq!(opens.get(), 1, "plain failure means one open");
+        assert_eq!(releases.get(), 0, "plain failure means no release");
     }
 }
