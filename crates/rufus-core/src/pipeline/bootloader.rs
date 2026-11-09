@@ -1345,8 +1345,10 @@ fn release_both_after_failure(
 /// The layout is GPT-only, so a non-GPT recorded table refuses up
 /// front naming what is needed. The ESP formats as FAT32 through the
 /// existing formatter (fresh serial, hidden sectors from the stamped
-/// window), then the stamped GPT is re-read for the BCD identity, the
-/// data partition mounts as NTFS and the ESP mounts (an ESP mount
+/// window), then the stamped GPT is re-read for the BCD identity. The
+/// whole-disk handle releases next (the mounts need the partition
+/// nodes, and the next `device` reopens from scratch), then the data
+/// partition mounts as NTFS and the ESP mounts (an ESP mount
 /// failure releases the data mount first), the WIM's boot index
 /// selects the image (1 unless the WIM reports a non-zero one), and
 /// [`crate::windows::to_go::install`] applies it. Both mounts release
@@ -1417,6 +1419,10 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
         let device = ctx.device()?;
         windows_identity(device, sector_size, size)?
     };
+    // Release first: the mounts want their own claim on the partition
+    // nodes, and an open exclusive whole-disk handle makes that claim
+    // fail with EBUSY (see `release_device`).
+    ctx.release_device()?;
     let mut data = ctx.opener.mount_partition(&Filesystem::Ntfs)?;
     let mut esp = match ctx.opener.mount_esp() {
         Ok(esp) => esp,
@@ -2370,6 +2376,7 @@ mod tests {
         esp_root: Rc<tempfile::TempDir>,
         data_releases: Rc<Cell<usize>>,
         esp_releases: Rc<Cell<usize>>,
+        events: Rc<RefCell<Vec<&'static str>>>,
         fail_esp_mount: bool,
         fail_data_release: bool,
         fail_esp_release: bool,
@@ -2383,6 +2390,7 @@ mod tests {
                 esp_root: Rc::new(tempfile::tempdir().expect("the esp mount allocates")),
                 data_releases: Rc::new(Cell::new(0)),
                 esp_releases: Rc::new(Cell::new(0)),
+                events: Rc::new(RefCell::new(Vec::new())),
                 fail_esp_mount: false,
                 fail_data_release: false,
                 fail_esp_release: false,
@@ -2392,6 +2400,7 @@ mod tests {
 
     impl crate::pipeline::opener::Opener for WindowsOpener {
         fn device(&self) -> TestResult<Box<dyn crate::pipeline::target::Target>> {
+            self.events.borrow_mut().push("device");
             Ok(Box::new(self.target.clone()))
         }
 
@@ -2405,10 +2414,16 @@ mod tests {
             Err(CoreError::invalid("test opener has no node".to_string()))
         }
 
+        fn release(&self) -> TestResult<()> {
+            self.events.borrow_mut().push("release");
+            Ok(())
+        }
+
         fn mount_partition(
             &self,
             _filesystem: &rufus_proto::Filesystem,
         ) -> TestResult<Box<dyn crate::pipeline::opener::MountedPartition>> {
+            self.events.borrow_mut().push("mount_data");
             Ok(Box::new(CountingMount {
                 root: Rc::clone(&self.data_root),
                 releases: Rc::clone(&self.data_releases),
@@ -2417,6 +2432,7 @@ mod tests {
         }
 
         fn mount_esp(&self) -> TestResult<Box<dyn crate::pipeline::opener::MountedPartition>> {
+            self.events.borrow_mut().push("mount_esp");
             if self.fail_esp_mount {
                 return Err(CoreError::invalid("test esp mount fails".to_string()));
             }
@@ -2685,6 +2701,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn windows_releases_the_disk_before_mounting_the_partitions() {
+        // The whole-disk handle stays open exclusively on a real
+        // device, so opening a partition node while it is open fails
+        // with EBUSY: `run_windows` releases the disk after the last
+        // raw read (the BCD identity) and before the first mount, and
+        // the opener reopens lazily on the next use. The run below
+        // fails later at the missing WIM, which is past both mounts,
+        // so the event log pins the order: exactly one release, ahead
+        // of either mount.
+        let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
+        let opener = WindowsOpener::new(target.clone());
+        let mut reporter = Recorder::default();
+        let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
+        let error = run(
+            &mut ctx,
+            &BootloaderMode::Windows,
+            &image_ref("missing.wim", rufus_proto::ImageKind::Wim),
+            &rufus_proto::Filesystem::Ntfs,
+            None,
+        )
+        .expect_err("a missing WIM refuses after the mounts");
+        let text = error.to_string();
+        assert!(
+            text.contains("missing.wim") || text.contains("wimlib"),
+            "the install error reports the WIM: {text}"
+        );
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+        let events = opener.events.borrow();
+        assert_eq!(
+            events.iter().filter(|event| **event == "release").count(),
+            1,
+            "the disk releases exactly once: {events:?}"
+        );
+        let release = events
+            .iter()
+            .position(|event| *event == "release")
+            .expect("the release is logged");
+        let mount_data = events
+            .iter()
+            .position(|event| *event == "mount_data")
+            .expect("the data mount is logged");
+        let mount_esp = events
+            .iter()
+            .position(|event| *event == "mount_esp")
+            .expect("the ESP mount is logged");
+        assert!(
+            release < mount_data,
+            "the disk releases before the data mount: {events:?}"
+        );
+        assert!(
+            release < mount_esp,
+            "the disk releases before the ESP mount: {events:?}"
+        );
     }
 
     /// Start a minimal hive: header plus two bins holding a `name` key

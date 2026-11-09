@@ -98,7 +98,9 @@ pub trait Opener {
     /// best-effort drop). The default refuses: only an opener with a
     /// partition node to mount (the device opener) overrides it; a
     /// file seam keeps the refusal (it has no node), and a test opener
-    /// without a mount returns `NotImplemented` the same way.
+    /// without a mount returns `NotImplemented` the same way. The
+    /// Windows arm releases the whole-disk handle first for the same
+    /// reason as the tool formatters: mounting needs the node.
     fn mount_partition(&self, _filesystem: &Filesystem) -> Result<Box<dyn MountedPartition>> {
         Err(crate::error::CoreError::NotImplemented {
             what: "mounting the data partition",
