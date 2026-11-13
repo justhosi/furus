@@ -177,7 +177,10 @@ write side is the most complete part:
   builds the UEFI/BIOS BCD stores from the image's own `BCD-Template` (no
   Windows tools or Wine on the host), places boot manager, store, fonts, sets
   offline SAN policy 4, disables WinRE recovery and refuses any non-Windows
-  image. Nothing it writes has booted; boot acceptance is pending.
+  image. The write path is verified end to end on real USB hardware;
+  UEFI boot acceptance is pending/parked because an un-specialized
+  Windows 11 deployment image halts in bootmgr with `0xc0000001` before
+  Setup's specialize pass runs.
 * The GUI is still a stub: it prints version/help and otherwise reports
   "GUI arrives in S24".
 
@@ -303,6 +306,8 @@ ntfscp, unshare, ntfs-3g or the OVMF images are absent).
 
 * `DECISIONS.md` - frozen S00 planning decisions; implementation has
   since advanced (its section 4 records the post-S00 tool amendment).
+* `TECHNICAL.md` - technical notes and architectural decisions (including
+  the S21 Windows To Go design, registry tweaks, and hardware acceptance findings).
 * `LICENSES.md` - asset licence audit for the Rufus 4.15 resources the
   implementation reuses; the code licence is GPL-3.0-or-later (decision
   A1, still proposed).
