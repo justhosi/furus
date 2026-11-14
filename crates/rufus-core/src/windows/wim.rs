@@ -302,6 +302,60 @@ impl Wim {
             Err(error) => Err(map_error(&self.path, error)),
         }
     }
+
+    /// Extract (`apply`) the 1-based `index` into `device` (a raw NTFS block
+    /// device node) in NTFS-volume mode, reporting through `progress` and
+    /// honouring [`Progress::cancelled`].
+    ///
+    /// Validation runs before any wimlib extraction call: an index
+    /// outside `1..=image_count` fails with [`CoreError::InvalidInput`]
+    /// naming the index and the count (index `0` is refused without
+    /// even asking the library, since indices start at 1). Unlike [`Wim::extract`],
+    /// `device` is not checked for being a directory since it is a raw block
+    /// device node (e.g. `/dev/sdb1`).
+    pub fn extract_ntfs(
+        &self,
+        index: u32,
+        device: &Path,
+        progress: &mut dyn Progress,
+    ) -> Result<Summary> {
+        if index == 0 {
+            return Err(CoreError::invalid(format!(
+                "wim image index 0 is out of range: indices start at 1 (from '{}')",
+                self.path.display(),
+            )));
+        }
+        let count = self.info()?.image_count;
+        if index > count {
+            return Err(CoreError::invalid(format!(
+                "wim image index {index} is out of range: '{}' holds {count} image(s)",
+                self.path.display(),
+            )));
+        }
+        let mut last = Summary { bytes: 0, files: 0 };
+        let outcome =
+            self.inner
+                .extract_image(index, device, ExtractFlags::ntfs(), &mut |sample| {
+                    last = Summary {
+                        bytes: sample.completed_bytes,
+                        files: sample.completed_files,
+                    };
+                    progress.report(
+                        sample.completed_bytes,
+                        sample.total_bytes,
+                        sample.completed_files,
+                        sample.total_files,
+                    );
+                    !progress.cancelled()
+                });
+        match outcome {
+            Ok(()) => Ok(last),
+            Err(WimlibError::Code { code, .. }) if code == ERR_ABORTED_BY_PROGRESS => {
+                Err(CoreError::Cancelled)
+            }
+            Err(error) => Err(map_error(&self.path, error)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +536,36 @@ mod tests {
         for index in [0, 2, 99] {
             let err = wim
                 .extract(index, &out, &mut sink)
+                .expect_err(&format!("index {index} must not extract"));
+            assert!(
+                matches!(err, CoreError::InvalidInput { .. }),
+                "index {index} must be InvalidInput, got {err}"
+            );
+            let text = err.to_string();
+            assert!(text.contains(&index.to_string()), "{text}");
+        }
+        assert!(
+            sink.reports.is_empty(),
+            "refused indices must never reach the progress callback"
+        );
+    }
+
+    #[test]
+    fn extract_ntfs_out_of_range_index_is_invalid_input() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_sample_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let dev = Path::new("/dev/nonexistent_fake_device");
+        let mut sink = Sink {
+            reports: Vec::new(),
+            cancel: false,
+        };
+        for index in [0, 2, 99] {
+            let err = wim
+                .extract_ntfs(index, dev, &mut sink)
                 .expect_err(&format!("index {index} must not extract"));
             assert!(
                 matches!(err, CoreError::InvalidInput { .. }),

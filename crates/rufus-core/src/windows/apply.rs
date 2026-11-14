@@ -292,6 +292,92 @@ pub fn apply(
     Ok(Applied { bytes, files })
 }
 
+/// Apply (extract) the 1-based `index` of `wim` directly to the raw NTFS block
+/// device in NTFS-volume mode, with progress, cancellation, and the refusal
+/// paths.
+///
+/// Unlike [`apply`], extraction targets a raw block device node instead of a
+/// mounted directory and preserves all NTFS metadata. Preflight checks `capacity`
+/// instead of mounted free space. Returns [`Applied`] directly from the summary
+/// counters (no directory tree walk).
+pub fn apply_ntfs(
+    device: &Path,
+    capacity: u64,
+    wim: &Wim,
+    index: u32,
+    reporter: &mut dyn Reporter,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Applied> {
+    // a. Image facts first: a malformed image refuses before the target
+    // is touched.
+    let info = wim.info()?;
+    // b. Free-space pre-flight against the uncompressed payload total.
+    let want = match wim.uncompressed_bytes(index)? {
+        Some(total) => total,
+        None => {
+            let size = info.total_bytes;
+            reporter.event(Event::Message {
+                level: "warn",
+                text: format!(
+                    "image {index} reports no uncompressed total: using the WIM file size {size} for the free-space check, which may pass a short target"
+                ),
+            });
+            size
+        }
+    };
+    if want > capacity {
+        return Err(CoreError::invalid(format!(
+            "apply needs {want} bytes but the destination reports {capacity} free: refusing before any write",
+        )));
+    }
+    // A set probe refuses before extraction starts.
+    if cancelled() {
+        return Err(CoreError::Cancelled);
+    }
+    // c. One info line naming the image; the name is best effort.
+    let name: Option<String> = wim
+        .images()
+        .ok()
+        .and_then(|images| {
+            images
+                .into_iter()
+                .find(|image| image.index == index)
+                .map(|image| image.name)
+        })
+        .filter(|name| !name.is_empty());
+    let opening = match name {
+        Some(name) => format!(
+            "applying image {index} (\"{name}\") to NTFS volume '{}'",
+            device.display()
+        ),
+        None => format!(
+            "applying image {index} to NTFS volume '{}'",
+            device.display()
+        ),
+    };
+    reporter.event(Event::Message {
+        level: "info",
+        text: opening,
+    });
+    // d. Extract through the throttled bridge using NTFS-volume mode.
+    let summary = {
+        let mut progress = ApplyProgress::new(&mut *reporter, cancelled);
+        wim.extract_ntfs(index, device, &mut progress)?
+    };
+    // e. One final info line from the reported summary counts.
+    reporter.event(Event::Message {
+        level: "info",
+        text: format!(
+            "applied {} entries ({} bytes)",
+            summary.files, summary.bytes
+        ),
+    });
+    Ok(Applied {
+        bytes: summary.bytes,
+        files: summary.files,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -591,6 +677,57 @@ mod tests {
         let count = fs::read_dir(&target).expect("target must list").count();
         assert_eq!(count, 0, "the refused target must stay empty");
         assert_eq!(mounted.releases, 0, "a refused apply never releases");
+    }
+
+    #[test]
+    fn apply_ntfs_short_capacity_refuses_on_the_uncompressed_total() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_big_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let uncompressed = wim
+            .uncompressed_bytes(1)
+            .expect("TOTALBYTES must read")
+            .expect("the LZX image must report TOTALBYTES");
+        let compressed = wim.info().expect("info must report").total_bytes;
+        assert!(
+            uncompressed > compressed,
+            "the LZX fixture must prove the compressed size is not used: uncompressed {uncompressed} vs WIM size {compressed}"
+        );
+        let capacity = uncompressed.saturating_sub(1);
+        let dev = Path::new("/dev/nonexistent_fake_device");
+        let mut reporter = VecReporter::new();
+        let err = apply_ntfs(dev, capacity, &wim, 1, &mut reporter, &|| false)
+            .expect_err("a short capacity must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "short capacity must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains(&uncompressed.to_string()), "{text}");
+        assert!(text.contains(&capacity.to_string()), "{text}");
+        assert!(text.contains("refusing before any write"), "{text}");
+        assert!(text.is_ascii(), "{text}");
+    }
+
+    #[test]
+    fn apply_ntfs_pre_set_probe_refuses_before_extraction_starts() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_three_file_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let dev = Path::new("/dev/nonexistent_fake_device");
+        let mut reporter = VecReporter::new();
+        let err = apply_ntfs(dev, u64::MAX, &wim, 1, &mut reporter, &|| true)
+            .expect_err("an already-set probe must refuse");
+        assert!(
+            matches!(err, CoreError::Cancelled),
+            "an already-set probe must be Cancelled, got {err}"
+        );
     }
 
     #[test]
