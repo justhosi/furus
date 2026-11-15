@@ -69,20 +69,22 @@ use crate::pipeline::write::RateEma;
 use crate::pipeline::write::emit_progress_to;
 use crate::windows::wim::Wim;
 
-/// What one [`apply`] laid down, from the reporting tree walk: the
-/// count of regular-file directory entries and their apparent byte
-/// total.
+/// What one [`apply`] or [`apply_ntfs`] laid down: file and byte totals.
 ///
-/// `files` counts names, not inodes: a hard link is a separate entry.
-/// `bytes` sums each name's `metadata.len()`, so hard-linked data is
-/// counted once per name and reparse data is never counted. These are
-/// `du --apparent-size`-style numbers for display and tests, not a
-/// checksum and not a verification of the source.
+/// For [`apply`], numbers come from a reporting tree walk of the mounted
+/// target: `files` counts regular-file directory entries and `bytes` sums each
+/// entry's `metadata.len()`. For [`apply_ntfs`], numbers come from wimlib's
+/// terminal progress sample (`ExtractFlags::ntfs()`).
+///
+/// In both cases, these are best-effort numbers for display and tests, not a
+/// checksum, not a verification of the source, and must not be used for strict
+/// equality across different producers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Applied {
-    /// Regular-file directory entries under the mount after extraction.
+    /// Regular-file directory entries (directory apply) or processed files
+    /// (NTFS apply).
     pub files: u64,
-    /// Apparent byte total: the sum of those entries' `metadata.len()`.
+    /// Apparent byte total (directory apply) or payload bytes (NTFS apply).
     pub bytes: u64,
 }
 
@@ -300,6 +302,10 @@ pub fn apply(
 /// mounted directory and preserves all NTFS metadata. Preflight checks `capacity`
 /// instead of mounted free space. Returns [`Applied`] directly from the summary
 /// counters (no directory tree walk).
+///
+/// Note: in production `device` is a raw block device node (e.g.
+/// `partition_path()`), but wimlib NTFS mode also accepts an unmounted volume
+/// image file, so test seams may pass a scratch image file.
 pub fn apply_ntfs(
     device: &Path,
     capacity: u64,
@@ -327,7 +333,7 @@ pub fn apply_ntfs(
     };
     if want > capacity {
         return Err(CoreError::invalid(format!(
-            "apply needs {want} bytes but the destination reports {capacity} free: refusing before any write",
+            "apply needs {want} bytes but the destination reports {capacity} total bytes: refusing before any write",
         )));
     }
     // A set probe refuses before extraction starts.

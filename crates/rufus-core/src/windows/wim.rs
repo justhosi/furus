@@ -15,8 +15,8 @@
 //! returns [`CoreError::Cancelled`] — never a wimlib message, so a
 //! cancelled apply reads as cancelled in every log.
 //!
-//! Not here yet: integrity-checked opens, NTFS-mode extraction, and
-//! split-WIM handling (see the [`crate::windows`] module docs).
+//! Not here yet: integrity-checked opens and split-WIM handling (see the
+//! [`crate::windows`] module docs).
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -313,6 +313,9 @@ impl Wim {
     /// even asking the library, since indices start at 1). Unlike [`Wim::extract`],
     /// `device` is not checked for being a directory since it is a raw block
     /// device node (e.g. `/dev/sdb1`).
+    /// Note: in production `device` is a raw block device node (e.g.
+    /// `partition_path()`), but wimlib NTFS mode also accepts an unmounted
+    /// volume image file, so test seams may pass a scratch image file.
     pub fn extract_ntfs(
         &self,
         index: u32,

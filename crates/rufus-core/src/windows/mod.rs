@@ -23,9 +23,9 @@
 //! header and XML for inspection without the library. Anything that
 //! needs the bytes out of an image comes here instead.
 //!
-//! Not here yet: ESD solid resources, integrity-checked opens, the
-//! NTFS-volume extraction mode, pipeline wiring for the BCD stores,
-//! and the S21 VBR-fix hook of PLAN lines 948-949.
+//! Not here yet: ESD solid resources, integrity-checked opens,
+//! pipeline wiring for the BCD stores, and the S21 VBR-fix hook of PLAN
+//! lines 948-949.
 
 /// Apply one WIM image onto the mounted data partition.
 pub mod apply;

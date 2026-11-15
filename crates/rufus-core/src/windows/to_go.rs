@@ -55,6 +55,7 @@ use crate::error::CoreError;
 use crate::error::Result;
 use crate::pipeline::MountedPartition;
 use crate::pipeline::event::Reporter;
+use crate::windows::apply::Applied;
 use crate::windows::bcd;
 use crate::windows::boot_files;
 
@@ -218,38 +219,33 @@ pub struct Installed {
     pub files: Vec<PathBuf>,
 }
 
-/// Lay a Windows To Go USB onto two already-mounted partitions: apply
-/// the WIM image onto `data`, build both BCD stores from the applied
-/// image's own `BCD-Template`, disable recovery on each, copy the boot
-/// files onto the ESP (UEFI) and `data` (BIOS), and set the offline SAN
-/// policy on the applied `SYSTEM` hive in place.
+/// Lay a Windows To Go USB onto two already-mounted partitions from an
+/// already-applied image: build both BCD stores from the applied image's own
+/// `BCD-Template`, disable recovery on each, copy the boot files onto the ESP
+/// (UEFI) and `data` (BIOS), and set the offline SAN policy on the applied
+/// `SYSTEM` hive in place.
 ///
 /// The contract, in order:
-/// 0. Refuse when both mount roots are the same path, before the WIM
-///    is opened or applied ([`boot_files::install`] only catches the
-///    shared root after the apply).
-/// 1. Open the WIM with [`crate::windows::wim::Wim::open`] and apply
-///    the image with [`crate::windows::apply::apply`] (progress and
-///    cancellation included; a set probe refuses before touching the
-///    target).
-/// 2. Read `<data>/Windows/System32/config/BCD-Template`; refuse with
+/// 0. Refuse when both mount roots are the same path, before either mount
+///    is touched ([`boot_files::install`] only catches the shared root later).
+/// 1. Read `<data>/Windows/System32/config/BCD-Template`; refuse with
 ///    [`CoreError::InvalidInput`] naming the path when it is absent or
 ///    unreadable (a WIM that is not a Windows image). A symlink at the
 ///    template path refuses without being followed: a crafted WIM
 ///    could otherwise redirect the read outside the mount roots.
-/// 3. Build both stores with [`bcd::build`]: UEFI first (with
+/// 2. Build both stores with [`bcd::build`]: UEFI first (with
 ///    `identity`), BIOS second.
-/// 4. [`disable_recovery`] on each store with [`bcd::default_object`].
-/// 5. [`boot_files::install`] the UEFI store (ESP plus `data` as the
+/// 3. [`disable_recovery`] on each store with [`bcd::default_object`].
+/// 4. [`boot_files::install`] the UEFI store (ESP plus `data` as the
 ///    image root), then the BIOS store with the BIOS install.
-/// 6. [`offline_san_policy`] on `<data>/Windows/System32/config/SYSTEM`,
+/// 5. [`offline_san_policy`] on `<data>/Windows/System32/config/SYSTEM`,
 ///    written back atomically (a temporary file in the same directory
 ///    renamed over the original, removed on failure); refuse with
 ///    [`CoreError::InvalidInput`] naming the path when the hive is
 ///    absent. A symlink at the hive path refuses without being
 ///    followed, on the read and on the write back alike: a crafted
 ///    WIM could otherwise redirect either outside the mount roots.
-/// 7. Return the apply counts plus the union of placed files (UEFI
+/// 6. Return the apply counts plus the union of placed files (UEFI
 ///    then BIOS, in the order the installs return them).
 ///
 /// Partial failure leaves partial writes: a failure after a step
@@ -268,16 +264,18 @@ pub fn install(
     data: &mut dyn MountedPartition,
     esp: &mut dyn MountedPartition,
     request: &Request<'_>,
+    applied: Applied,
     reporter: &mut dyn Reporter,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Installed> {
+    let _ = (reporter, cancelled);
     // Clone the mount roots once so no borrow of the guards crosses
     // the calls below; every path written later hangs off these two.
     let data_root: PathBuf = data.path().to_path_buf();
     let esp_root: PathBuf = esp.path().to_path_buf();
     // 0. Distinct filesystems first: sharing one root would mix the
-    // UEFI and BIOS placements, so refuse before the WIM is opened or
-    // applied rather than after the apply like the boot-file layer.
+    // UEFI and BIOS placements, so refuse before either mount is
+    // touched rather than after the BCD build like the boot-file layer.
     if data_root == esp_root {
         return Err(CoreError::invalid(format!(
             "esp path {} must differ from the data path {}: they are separate filesystems",
@@ -285,12 +283,7 @@ pub fn install(
             data_root.display()
         )));
     }
-    // 1. The image first: a malformed WIM refuses before either mount
-    // is touched, and a set probe refuses before extraction starts.
-    let wim = crate::windows::wim::Wim::open(request.wim)?;
-    let applied =
-        crate::windows::apply::apply(data, &wim, request.image_index, reporter, cancelled)?;
-    // 2. The applied image's own template: absent or unreadable means
+    // 1. The applied image's own template: absent or unreadable means
     // the WIM was not a Windows image at all. A symlink refuses
     // without being followed (see above).
     let template_path = data_root.join("Windows/System32/config/BCD-Template");
@@ -304,7 +297,7 @@ pub fn install(
             )));
         }
     };
-    // 3. Both stores from the same template, UEFI first.
+    // 2. Both stores from the same template, UEFI first.
     let uefi_request = bcd::StoreRequest {
         firmware: bcd::Firmware::Uefi,
         identity: request.identity,
@@ -317,10 +310,10 @@ pub fn install(
     };
     let uefi_store = bcd::build(&template, &uefi_request)?;
     let bios_store = bcd::build(&template, &bios_request)?;
-    // 4. Recovery off on each store's default loader.
+    // 3. Recovery off on each store's default loader.
     let uefi_store = disable_recovery(&uefi_store, bcd::default_object(bcd::Firmware::Uefi))?;
     let bios_store = disable_recovery(&bios_store, bcd::default_object(bcd::Firmware::Bios))?;
-    // 5. Boot files: the UEFI set onto the ESP, the BIOS set onto the
+    // 4. Boot files: the UEFI set onto the ESP, the BIOS set onto the
     // data partition itself.
     let uefi = boot_files::install(
         &data_root,
@@ -336,7 +329,7 @@ pub fn install(
         &bios_store,
         request.use_2023_bootloaders,
     )?;
-    // 6. The SAN policy on the applied SYSTEM hive, staged beside
+    // 5. The SAN policy on the applied SYSTEM hive, staged beside
     // the original and renamed over it. Both the read and the write
     // back refuse a symlink without following it (see above).
     let system_path = data_root.join("Windows/System32/config/SYSTEM");
@@ -353,7 +346,7 @@ pub fn install(
     };
     let patched = offline_san_policy(&system)?;
     replace_system_hive(&system_path, &patched)?;
-    // 7. The apply counts plus both placements, UEFI then BIOS.
+    // 6. The apply counts plus both placements, UEFI then BIOS.
     let mut files = uefi.files;
     files.extend(bios.files);
     Ok(Installed { applied, files })
@@ -1000,56 +993,9 @@ mod tests {
     }
 
     #[test]
-    fn install_refuses_a_missing_wim() {
-        // No assets and no backend: opening the WIM fails before either
-        // mount is touched, with or without libwim linked.
-        let root = tempfile::tempdir().expect("scratch dir must create");
-        let data_path = root.path().join("data");
-        let esp_path = root.path().join("esp");
-        std::fs::create_dir_all(&data_path).expect("data dir must create");
-        std::fs::create_dir_all(&esp_path).expect("esp dir must create");
-        let mut data = FakeMount::new(data_path.clone(), u64::MAX);
-        let mut esp = FakeMount::new(esp_path.clone(), u64::MAX);
-        let missing = root.path().join("no-such.wim");
-        let request = Request {
-            wim: &missing,
-            image_index: 1,
-            identity: test_identity(),
-            description: None,
-            use_2023_bootloaders: false,
-        };
-        let mut reporter = VecReporter::new();
-        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
-            .expect_err("a missing WIM must refuse");
-        assert!(err.to_string().is_ascii(), "{err}");
-        assert_eq!(
-            data.releases, 0,
-            "a refused install never releases the data mount"
-        );
-        assert_eq!(
-            esp.releases, 0,
-            "a refused install never releases the esp mount"
-        );
-        assert_eq!(
-            std::fs::read_dir(&data_path)
-                .expect("data must list")
-                .count(),
-            0,
-            "a refused install writes nothing to data"
-        );
-        assert_eq!(
-            std::fs::read_dir(&esp_path).expect("esp must list").count(),
-            0,
-            "a refused install writes nothing to the esp"
-        );
-    }
-
-    #[test]
-    fn install_refuses_identical_mount_roots_before_opening_the_wim() {
+    fn install_refuses_identical_mount_roots_before_reading_the_template() {
         // One directory mounted twice: the shared root refuses before
-        // the WIM is opened or applied (today `boot_files::install`
-        // only catches it after the apply), so neither mount is
-        // touched and nothing is written.
+        // the template is read or either mount is written to.
         let root = tempfile::tempdir().expect("scratch dir must create");
         let shared = root.path().join("shared");
         std::fs::create_dir_all(&shared).expect("shared dir must create");
@@ -1064,8 +1010,16 @@ mod tests {
             use_2023_bootloaders: false,
         };
         let mut reporter = VecReporter::new();
-        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
-            .expect_err("a shared mount root must refuse");
+        let applied = Applied { bytes: 0, files: 0 };
+        let err = install(
+            &mut data,
+            &mut esp,
+            &request,
+            applied,
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a shared mount root must refuse");
         assert!(
             matches!(err, CoreError::InvalidInput { .. }),
             "must be InvalidInput, got {err}"
@@ -1247,8 +1201,22 @@ mod tests {
         };
         let mut reporter = VecReporter::new();
         let template_path = data_path.join("Windows/System32/config/BCD-Template");
-        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
-            .expect_err("a symlinked template must refuse");
+        // Pre-populate the data mount with the applied tree so the BCD-template
+        // read sees the symlink we crafted. The WIM apply is now owned by the
+        // pipeline, so this test seeds the mount itself. `copy_tree` copies
+        // regular files only and skips links, so recreate the crafted link at
+        // the destination the way the real apply would have laid it down.
+        copy_tree(&src, &data_path);
+        std::os::unix::fs::symlink(&outside, &template_path).expect("symlink must create");
+        let err = install(
+            &mut data,
+            &mut esp,
+            &request,
+            Applied { bytes: 0, files: 0 },
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a symlinked template must refuse");
         assert!(
             matches!(err, CoreError::InvalidInput { .. }),
             "must be InvalidInput, got {err}"
@@ -1330,8 +1298,22 @@ mod tests {
         };
         let mut reporter = VecReporter::new();
         let system_path = data_path.join("Windows/System32/config/SYSTEM");
-        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
-            .expect_err("a symlinked SYSTEM hive must refuse");
+        // Pre-populate the data mount with the applied tree so the SYSTEM hive
+        // read sees the symlink we crafted. The WIM apply is now owned by the
+        // pipeline, so this test seeds the mount itself. `copy_tree` copies
+        // regular files only and skips links, so recreate the crafted link at
+        // the destination the way the real apply would have laid it down.
+        copy_tree(&src, &data_path);
+        std::os::unix::fs::symlink(&outside, &system_path).expect("symlink must create");
+        let err = install(
+            &mut data,
+            &mut esp,
+            &request,
+            Applied { bytes: 0, files: 0 },
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a symlinked SYSTEM hive must refuse");
         assert!(
             matches!(err, CoreError::InvalidInput { .. }),
             "must be InvalidInput, got {err}"
@@ -1399,8 +1381,15 @@ mod tests {
         };
         let mut reporter = VecReporter::new();
         let template_path = data_path.join("Windows/System32/config/BCD-Template");
-        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
-            .expect_err("a WIM without a Windows template must refuse");
+        let err = install(
+            &mut data,
+            &mut esp,
+            &request,
+            Applied { bytes: 0, files: 0 },
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("a WIM without a Windows template must refuse");
         assert!(
             matches!(err, CoreError::InvalidInput { .. }),
             "must be InvalidInput, got {err}"
@@ -1463,8 +1452,19 @@ mod tests {
         };
         let mut reporter = VecReporter::new();
         let system_path = data_path.join("Windows/System32/config/SYSTEM");
-        let err = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
-            .expect_err("an image without SYSTEM must refuse");
+        // Pre-populate the data mount with the applied tree so the SYSTEM hive
+        // read sees the missing file we crafted. The WIM apply is now owned by
+        // the pipeline, so this test seeds the mount itself.
+        copy_tree(&src, &data_path);
+        let err = install(
+            &mut data,
+            &mut esp,
+            &request,
+            Applied { bytes: 0, files: 0 },
+            &mut reporter,
+            &|| false,
+        )
+        .expect_err("an image without SYSTEM must refuse");
         assert!(
             matches!(err, CoreError::InvalidInput { .. }),
             "must be InvalidInput, got {err}"
@@ -1573,11 +1573,25 @@ mod tests {
             description: None,
             use_2023_bootloaders: false,
         };
-        let mut reporter = VecReporter::new();
-        let installed = install(&mut data, &mut esp, &request, &mut reporter, &|| false)
-            .expect("the fake windows image must install");
-        // The applied tree carries the fake Windows files.
         let loader_bytes = std::fs::read(&loader_source).expect("real loader must read");
+        // Pre-populate the data mount with the applied tree so the BCD-template,
+        // SYSTEM hive and boot-file reads see the crafted files. The WIM apply
+        // is now owned by the pipeline, so this test seeds the mount itself.
+        copy_tree(&src, data_dir.path());
+        let mut reporter = VecReporter::new();
+        let installed = install(
+            &mut data,
+            &mut esp,
+            &request,
+            Applied {
+                bytes: loader_bytes.len() as u64,
+                files: 1,
+            },
+            &mut reporter,
+            &|| false,
+        )
+        .expect("the fake windows image must install");
+        // The applied tree carries the fake Windows files.
         assert_eq!(
             std::fs::read(data_dir.path().join("Windows/Boot/EFI/bootmgfw.efi"))
                 .expect("applied loader must read"),
@@ -1712,6 +1726,7 @@ mod tests {
             &mut fresh_data_mount,
             &mut fresh_esp_mount,
             &request,
+            Applied { bytes: 0, files: 0 },
             &mut cancelled_reporter,
             &|| true,
         )

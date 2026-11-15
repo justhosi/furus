@@ -1423,22 +1423,9 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
     // nodes, and an open exclusive whole-disk handle makes that claim
     // fail with EBUSY (see `release_device`).
     ctx.release_device()?;
-    let mut data = ctx.opener.mount_partition(&Filesystem::Ntfs)?;
-    let mut esp = match ctx.opener.mount_esp() {
-        Ok(esp) => esp,
-        Err(mount_error) => {
-            if let Err(release_error) = data.release() {
-                ctx.reporter.event(Event::Message {
-                    level: "warn",
-                    text: format!(
-                        "mount release failed after the ESP mount (data): {release_error}; reporting the earlier error"
-                    ),
-                });
-            }
-            return Err(mount_error);
-        }
-    };
     let installed = (|| -> Result<crate::windows::to_go::Installed> {
+        let device_path = ctx.opener.partition_path()?;
+        let capacity = ctx.opener.partition()?.total_bytes();
         let path = Path::new(&image.path);
         let wim = crate::windows::wim::Wim::open(path)?;
         let info = wim.info()?;
@@ -1446,6 +1433,29 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
             info.boot_index
         } else {
             1
+        };
+        let applied = crate::windows::apply::apply_ntfs(
+            &device_path,
+            capacity,
+            &wim,
+            image_index,
+            &mut *ctx.reporter,
+            cancelled,
+        )?;
+        let mut data = ctx.opener.mount_partition(&Filesystem::Ntfs)?;
+        let mut esp = match ctx.opener.mount_esp() {
+            Ok(esp) => esp,
+            Err(mount_error) => {
+                if let Err(release_error) = data.release() {
+                    ctx.reporter.event(Event::Message {
+                        level: "warn",
+                        text: format!(
+                            "mount release failed after the ESP mount (data): {release_error}; reporting the earlier error"
+                        ),
+                    });
+                }
+                return Err(mount_error);
+            }
         };
         let request = crate::windows::to_go::Request {
             wim: path,
@@ -1455,37 +1465,39 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
             use_2023_bootloaders: false,
         };
         let cancelled = ctx.cancelled;
-        crate::windows::to_go::install(
+        let outcome = crate::windows::to_go::install(
             data.as_mut(),
             esp.as_mut(),
             &request,
+            applied,
             &mut *ctx.reporter,
             cancelled,
-        )
-    })();
-    let installed = match installed {
-        Ok(installed) => installed,
-        Err(error) => {
-            release_both_after_failure(ctx, data.as_mut(), esp.as_mut(), "the windows install");
-            return Err(error);
+        );
+        let installed = match outcome {
+            Ok(installed) => installed,
+            Err(error) => {
+                release_both_after_failure(ctx, data.as_mut(), esp.as_mut(), "the windows install");
+                return Err(error);
+            }
+        };
+        let data_result = data.release();
+        let esp_result = esp.release();
+        match (data_result, esp_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(first), Ok(())) => return Err(first),
+            (Ok(()), Err(second)) => return Err(second),
+            (Err(first), Err(second)) => {
+                ctx.reporter.event(Event::Message {
+                    level: "warn",
+                    text: format!(
+                        "mount release failed for both partitions (data: {first}; esp: {second}); reporting the data error"
+                    ),
+                });
+                return Err(first);
+            }
         }
-    };
-    let data_result = data.release();
-    let esp_result = esp.release();
-    match (data_result, esp_result) {
-        (Ok(()), Ok(())) => {}
-        (Err(first), Ok(())) => return Err(first),
-        (Ok(()), Err(second)) => return Err(second),
-        (Err(first), Err(second)) => {
-            ctx.reporter.event(Event::Message {
-                level: "warn",
-                text: format!(
-                    "mount release failed for both partitions (data: {first}; esp: {second}); reporting the data error"
-                ),
-            });
-            return Err(first);
-        }
-    }
+        Ok(installed)
+    })()?;
     ctx.reporter.event(Event::Message {
         level: "info",
         text: format!(
@@ -2343,6 +2355,10 @@ mod tests {
         root: Rc<tempfile::TempDir>,
         releases: Rc<Cell<usize>>,
         fail_release: bool,
+        /// When the data mount is a real FUSE NTFS mount over the raw
+        /// image, `release` must also unmount it so the writes flush back
+        /// into the image before the test inspects it.
+        unmount: bool,
     }
 
     impl crate::pipeline::opener::MountedPartition for CountingMount {
@@ -2358,6 +2374,24 @@ mod tests {
             self.releases.set(self.releases.get() + 1);
             if self.fail_release {
                 return Err(CoreError::invalid("test mount release fails".to_string()));
+            }
+            if self.unmount {
+                let run = std::process::Command::new("fusermount3")
+                    .arg("-u")
+                    .arg(self.root.path())
+                    .output();
+                match run {
+                    Ok(output) if output.status.success() => {}
+                    Ok(output) => {
+                        return Err(CoreError::invalid(format!(
+                            "test mount unmount fails: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        )));
+                    }
+                    Err(source) => {
+                        return Err(CoreError::io(self.root.path(), source));
+                    }
+                }
             }
             Ok(())
         }
@@ -2380,10 +2414,23 @@ mod tests {
         fail_esp_mount: bool,
         fail_data_release: bool,
         fail_esp_release: bool,
+        /// The raw NTFS image `partition_path` hands back. It lives in its
+        /// own temp dir, separate from `data_root`, because `data_root` is
+        /// the *mount point* for that image in the success test, not the
+        /// directory that holds it. The `Rc` keeps the directory alive for
+        /// the whole run; `partition_node()` names the file inside it.
+        image_dir: Rc<tempfile::TempDir>,
+        partition_capacity: u64,
+        /// When true, `mount_partition` performs a real FUSE NTFS mount of
+        /// the raw image onto `data_root` instead of returning a bare
+        /// directory. The success test flips this on so `to_go::install`
+        /// reads what `apply_ntfs` actually wrote.
+        mount_data: bool,
     }
 
     impl WindowsOpener {
         fn new(target: VecTarget) -> Self {
+            let image_dir = Rc::new(tempfile::tempdir().expect("the image dir allocates"));
             Self {
                 target,
                 data_root: Rc::new(tempfile::tempdir().expect("the data mount allocates")),
@@ -2394,7 +2441,15 @@ mod tests {
                 fail_esp_mount: false,
                 fail_data_release: false,
                 fail_esp_release: false,
+                image_dir,
+                partition_capacity: 256 * 1024 * 1024,
+                mount_data: false,
             }
+        }
+
+        /// The path of the raw NTFS image inside `image_dir`.
+        fn partition_node(&self) -> std::path::PathBuf {
+            self.image_dir.path().join("ntfs.img")
         }
     }
 
@@ -2405,13 +2460,14 @@ mod tests {
         }
 
         fn partition(&self) -> TestResult<Box<dyn Volume>> {
-            Err(CoreError::invalid(
-                "test opener has no partition".to_string(),
+            Ok(Box::new(
+                crate::fs::VecVolume::new(self.partition_capacity, 512)
+                    .expect("the test partition volume allocates"),
             ))
         }
 
         fn partition_path(&self) -> TestResult<std::path::PathBuf> {
-            Err(CoreError::invalid("test opener has no node".to_string()))
+            Ok(self.partition_node())
         }
 
         fn release(&self) -> TestResult<()> {
@@ -2424,10 +2480,32 @@ mod tests {
             _filesystem: &rufus_proto::Filesystem,
         ) -> TestResult<Box<dyn crate::pipeline::opener::MountedPartition>> {
             self.events.borrow_mut().push("mount_data");
+            let mut unmount = false;
+            if self.mount_data {
+                let run = std::process::Command::new("ntfs-3g")
+                    .arg("-o")
+                    .arg("noallow_other,no_def_opts")
+                    .arg(self.partition_node())
+                    .arg(self.data_root.path())
+                    .output();
+                match run {
+                    Ok(output) if output.status.success() => unmount = true,
+                    Ok(output) => {
+                        return Err(CoreError::invalid(format!(
+                            "test data mount fails: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        )));
+                    }
+                    Err(source) => {
+                        return Err(CoreError::io(self.partition_node(), source));
+                    }
+                }
+            }
             Ok(Box::new(CountingMount {
                 root: Rc::clone(&self.data_root),
                 releases: Rc::clone(&self.data_releases),
                 fail_release: self.fail_data_release,
+                unmount,
             }))
         }
 
@@ -2440,6 +2518,7 @@ mod tests {
                 root: Rc::clone(&self.esp_root),
                 releases: Rc::clone(&self.esp_releases),
                 fail_release: self.fail_esp_release,
+                unmount: false,
             }))
         }
     }
@@ -2569,10 +2648,10 @@ mod tests {
     #[test]
     fn windows_install_failure_releases_both_mounts_once() {
         // The full `run` with a WIM path that does not exist: the ESP
-        // formats and the identity reads, then the install refuses —
-        // and both mounts still release exactly once each, with the
-        // install error (never a teardown error) reported and no
-        // release-failure warn logged.
+        // formats and the identity reads, then the raw NTFS apply refuses
+        // before either mount is opened — so neither mount releases. The
+        // install error (never a teardown error) still reports the WIM
+        // and no release-failure warn logs.
         let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
         let opener = WindowsOpener::new(target.clone());
         let mut reporter = Recorder::default();
@@ -2600,13 +2679,13 @@ mod tests {
         assert!(text.is_ascii(), "stays ASCII: {text}");
         assert_eq!(
             opener.data_releases.get(),
-            1,
-            "the data mount releases exactly once"
+            0,
+            "the data mount never opens when the raw apply refuses"
         );
         assert_eq!(
             opener.esp_releases.get(),
-            1,
-            "the esp mount releases exactly once"
+            0,
+            "the esp mount never opens when the raw apply refuses"
         );
         let warns: Vec<&str> = reporter
             .events
@@ -2629,12 +2708,11 @@ mod tests {
 
     #[test]
     fn windows_esp_mount_failure_releases_the_data_mount_once() {
-        // Two phases over fresh openers. First the ESP mount refuses
-        // while the data release succeeds: the data mount releases once
-        // and the ESP error returns with no teardown warn. Then the data
-        // release fails too: the release still runs once, the ESP error
-        // is still the one reported, and a warn names both the data
-        // release and the earlier ESP-mount failure.
+        // Two phases over fresh openers. The raw NTFS apply runs before
+        // either mount, so a missing WIM refuses before the ESP mount is
+        // attempted and before the data mount opens. Both phases now
+        // expect zero releases and the WIM-open error instead of the
+        // ESP-mount failure (the pipeline never reaches the mount step).
         for fail_data_release in [false, true] {
             let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
             let mut opener = WindowsOpener::new(target.clone());
@@ -2652,19 +2730,19 @@ mod tests {
             .expect_err("a failing ESP mount refuses");
             let text = error.to_string();
             assert!(
-                text.contains("test esp mount fails"),
-                "phase {fail_data_release}: the ESP error reports: {text}"
+                text.contains("missing.wim") || text.contains("wimlib"),
+                "phase {fail_data_release}: the WIM error reports: {text}"
             );
             assert!(text.is_ascii(), "stays ASCII: {text}");
             assert_eq!(
                 opener.data_releases.get(),
-                1,
-                "phase {fail_data_release}: the data mount releases exactly once"
+                0,
+                "phase {fail_data_release}: the data mount never opens when the raw apply refuses"
             );
             assert_eq!(
                 opener.esp_releases.get(),
                 0,
-                "phase {fail_data_release}: the ESP mount never lived to release"
+                "phase {fail_data_release}: the ESP mount never opens when the raw apply refuses"
             );
             let warns: Vec<&str> = reporter
                 .events
@@ -2677,29 +2755,10 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            if fail_data_release {
-                assert_eq!(
-                    warns.len(),
-                    1,
-                    "phase {fail_data_release}: the failed release warns once: {warns:?}"
-                );
-                assert!(
-                    warns[0].contains("data"),
-                    "phase {fail_data_release}: the warn names the data mount: {}",
-                    warns[0]
-                );
-                assert!(
-                    warns[0].contains("ESP mount"),
-                    "phase {fail_data_release}: the warn names the earlier ESP failure: {}",
-                    warns[0]
-                );
-                assert!(warns[0].is_ascii(), "stays ASCII: {}", warns[0]);
-            } else {
-                assert!(
-                    warns.is_empty(),
-                    "phase {fail_data_release}: a clean release warns nothing: {warns:?}"
-                );
-            }
+            assert!(
+                warns.is_empty(),
+                "phase {fail_data_release}: no teardown warn fires when neither mount opens: {warns:?}"
+            );
         }
     }
 
@@ -2710,9 +2769,9 @@ mod tests {
         // with EBUSY: `run_windows` releases the disk after the last
         // raw read (the BCD identity) and before the first mount, and
         // the opener reopens lazily on the next use. The run below
-        // fails later at the missing WIM, which is past both mounts,
-        // so the event log pins the order: exactly one release, ahead
-        // of either mount.
+        // fails at the missing WIM during the raw NTFS apply, which is
+        // before either mount opens, so the event log pins the order:
+        // exactly one release, ahead of either mount attempt.
         let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
         let opener = WindowsOpener::new(target.clone());
         let mut reporter = Recorder::default();
@@ -2724,7 +2783,7 @@ mod tests {
             &rufus_proto::Filesystem::Ntfs,
             None,
         )
-        .expect_err("a missing WIM refuses after the mounts");
+        .expect_err("a missing WIM refuses before the mounts");
         let text = error.to_string();
         assert!(
             text.contains("missing.wim") || text.contains("wimlib"),
@@ -2741,21 +2800,17 @@ mod tests {
             .iter()
             .position(|event| *event == "release")
             .expect("the release is logged");
-        let mount_data = events
-            .iter()
-            .position(|event| *event == "mount_data")
-            .expect("the data mount is logged");
-        let mount_esp = events
-            .iter()
-            .position(|event| *event == "mount_esp")
-            .expect("the ESP mount is logged");
         assert!(
-            release < mount_data,
-            "the disk releases before the data mount: {events:?}"
+            !events.contains(&"mount_data"),
+            "the data mount never opens when the raw apply refuses: {events:?}"
         );
         assert!(
-            release < mount_esp,
-            "the disk releases before the ESP mount: {events:?}"
+            !events.contains(&"mount_esp"),
+            "the ESP mount never opens when the raw apply refuses: {events:?}"
+        );
+        assert!(
+            release < events.len(),
+            "the disk releases before the run ends: {events:?}"
         );
     }
 
@@ -3013,6 +3068,54 @@ mod tests {
         false
     }
 
+    /// Skip gate for the success path's NTFS round-trip: it needs a real
+    /// formatter (`mkntfs`/`mkfs.ntfs`) to build the scratch image, `ntfs-3g`
+    /// to mount it (unprivileged FUSE), and `fusermount3` to release it.
+    fn skip_without_ntfs_formatter() -> bool {
+        if crate::fs::ntfs::find_tool().is_err() {
+            eprintln!(
+                "skip: the windows success install needs mkntfs/mkfs.ntfs, which this host does not ship"
+            );
+            return true;
+        }
+        if std::process::Command::new("ntfs-3g")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skip: the windows success install needs ntfs-3g to mount the applied image");
+            return true;
+        }
+        if std::process::Command::new("fusermount3")
+            .arg("--help")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "skip: the windows success install needs fusermount3 to release the applied image"
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Read one file out of the raw NTFS image with `ntfscat`, so the
+    /// success test can inspect what `apply_ntfs` actually wrote without a
+    /// live mount.
+    fn ntfs_read(image: &std::path::Path, path: &str) -> Vec<u8> {
+        let run = std::process::Command::new("ntfscat")
+            .arg(image)
+            .arg(path)
+            .output()
+            .expect("ntfscat spawns past the skip gate");
+        assert!(
+            run.status.success(),
+            "ntfscat {path} failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        run.stdout
+    }
+
     #[test]
     fn windows_success_releases_both_mounts_once() {
         // The full `run` against a synthetic WIM the installer accepts:
@@ -3022,13 +3125,33 @@ mod tests {
         // carries the offline SAN policy. Needs no root and no real
         // device: the disk is a stamped `VecTarget`, the mounts are temp
         // dirs, the WIM is captured at test time.
-        if skip_without_wim_backend() {
+        if skip_without_wim_backend() || skip_without_ntfs_formatter() {
             return;
         }
         let scratch = tempfile::tempdir().expect("scratch dir fits");
         let wim = capture_windows_wim(scratch.path());
         let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
-        let opener = WindowsOpener::new(target.clone());
+        let mut opener = WindowsOpener::new(target.clone());
+        // Build a real NTFS volume the raw apply writes into, then mount it
+        // over the data root so `to_go::install` sees the files `apply_ntfs`
+        // actually laid down. The capacity matches the stamped layout.
+        opener.mount_data = true;
+        let partition_node = opener.partition_node();
+        let image = std::fs::File::create(&partition_node).expect("the scratch ntfs image creates");
+        image
+            .set_len(opener.partition_capacity)
+            .expect("the scratch ntfs image sizes");
+        let format = std::process::Command::new("mkntfs")
+            .arg("-F")
+            .arg("-Q")
+            .arg(&partition_node)
+            .output()
+            .expect("mkntfs spawns past the skip gate");
+        assert!(
+            format.status.success(),
+            "mkntfs failed: {}",
+            String::from_utf8_lossy(&format.stderr)
+        );
         let mut reporter = Recorder::default();
         let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
         run(
@@ -3075,24 +3198,20 @@ mod tests {
                 .is_file(),
             "the UEFI store lands on the ESP"
         );
-        assert!(
-            opener.data_root.path().join("bootmgr").is_file(),
+        assert_eq!(
+            ntfs_read(&partition_node, "bootmgr"),
+            b"fake-windows-bios-loader",
             "the BIOS boot manager lands on data"
         );
-        assert!(
-            opener.data_root.path().join("boot/boot.sdi").is_file(),
+        assert_eq!(
+            ntfs_read(&partition_node, "boot/boot.sdi"),
+            b"fake-windows-boot-sdi",
             "boot.sdi lands on data"
         );
         // The SAN policy in the applied SYSTEM is offline (4).
         use crate::windows::regf::Hive;
         use crate::windows::regf::REG_DWORD;
-        let system = std::fs::read(
-            opener
-                .data_root
-                .path()
-                .join("Windows/System32/config/SYSTEM"),
-        )
-        .expect("the applied SYSTEM reads");
+        let system = ntfs_read(&partition_node, "Windows/System32/config/SYSTEM");
         let hive = Hive::parse(&system).expect("the applied SYSTEM re-parses");
         let root = hive.root();
         let control = hive
