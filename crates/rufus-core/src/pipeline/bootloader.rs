@@ -1339,22 +1339,26 @@ fn release_both_after_failure(
     }
 }
 
-/// Run the Windows arm: GPT-only, ESP-first, then the WIM onto the
-/// mounted partitions.
+/// Run the Windows arm: GPT-only, ESP-first, the WIM onto the raw NTFS
+/// partition before any mount, then the post-apply customization.
 ///
 /// The layout is GPT-only, so a non-GPT recorded table refuses up
 /// front naming what is needed. The ESP formats as FAT32 through the
 /// existing formatter (fresh serial, hidden sectors from the stamped
 /// window), then the stamped GPT is re-read for the BCD identity. The
 /// whole-disk handle releases next (the mounts need the partition
-/// nodes, and the next `device` reopens from scratch), then the data
-/// partition mounts as NTFS and the ESP mounts (an ESP mount
-/// failure releases the data mount first), the WIM's boot index
-/// selects the image (1 unless the WIM reports a non-zero one), and
-/// [`crate::windows::to_go::install`] applies it. Both mounts release
-/// on every path: the earlier error wins and a release failure only
-/// warns, naming both. One info line reports the applied file/byte
-/// counts plus the placed file count.
+/// nodes, and the next `device` reopens from scratch), then the WIM's
+/// boot index selects the image (1 unless the WIM reports a non-zero
+/// one) and [`crate::windows::apply::apply_ntfs`] applies it to the raw
+/// NTFS partition — before anything mounts, so the apply owns the
+/// filesystem it writes. The data partition then mounts as NTFS and the
+/// ESP mounts (an ESP mount failure releases the data mount first), and
+/// [`crate::windows::to_go::install`] runs the post-apply customization
+/// on the mounted tree: both BCD stores, the boot files, disabled
+/// recovery and the offline SAN policy. Both mounts release on every
+/// path: the earlier error wins and a release failure only warns,
+/// naming both. One info line reports the applied file/byte counts
+/// plus the placed file count.
 fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
     let cancelled = ctx.cancelled;
     if cancelled() {
@@ -1458,21 +1462,12 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
             }
         };
         let request = crate::windows::to_go::Request {
-            wim: path,
-            image_index,
             identity,
             description: None,
             use_2023_bootloaders: false,
         };
-        let cancelled = ctx.cancelled;
-        let outcome = crate::windows::to_go::install(
-            data.as_mut(),
-            esp.as_mut(),
-            &request,
-            applied,
-            &mut *ctx.reporter,
-            cancelled,
-        );
+        let outcome =
+            crate::windows::to_go::install(data.as_mut(), esp.as_mut(), &request, applied);
         let installed = match outcome {
             Ok(installed) => installed,
             Err(error) => {

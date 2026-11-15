@@ -30,12 +30,13 @@
 //! boot acceptance is slices 10-11. The `SYSTEM` shape above is from the
 //! Windows 11 24H2 WinPE `SYSTEM` (root `ROOT`, `Select\Current` DWORD `1`).
 //!
-//! Slice 10 adds the executor ([`install`]): it applies one WIM image onto
-//! the mounted data partition, builds and disables recovery on both BCD
-//! stores, lays the boot files onto the ESP (UEFI) and the data partition
-//! (BIOS), and sets the offline SAN policy on the applied `SYSTEM` hive,
-//! in that order. The caller owns both mounts throughout: [`install`]
-//! never mounts and never releases either one.
+//! Slice 10 adds the executor ([`install`]): on an already-applied image
+//! it builds and disables recovery on both BCD stores, lays the boot
+//! files onto the ESP (UEFI) and the data partition (BIOS), and sets the
+//! offline SAN policy on the applied `SYSTEM` hive, in that order (the
+//! WIM itself is applied by [`super::apply`] before either mount). The
+//! caller owns both mounts throughout: [`install`] never mounts and
+//! never releases either one.
 //!
 //! Partial failure is sticky, not transactional: a failure after a step
 //! leaves the earlier steps' writes on the target — there is no
@@ -54,7 +55,6 @@ use super::regf::REG_DWORD;
 use crate::error::CoreError;
 use crate::error::Result;
 use crate::pipeline::MountedPartition;
-use crate::pipeline::event::Reporter;
 use crate::windows::apply::Applied;
 use crate::windows::bcd;
 use crate::windows::boot_files;
@@ -189,14 +189,10 @@ pub fn disable_recovery(store: &[u8], default_object: &str) -> Result<Vec<u8>> {
     Ok(hive.into_bytes())
 }
 
-/// What [`install`] needs: the source WIM and image, the disk identity
-/// the BCD device elements encode (already stamped by `Mkpart`), and
-/// the boot-loader flavour.
+/// What [`install`] needs: the disk identity the BCD device elements
+/// encode (already stamped by `Mkpart`), the edition description the
+/// loaders carry, and the boot-loader flavour.
 pub struct Request<'a> {
-    /// The source `install.wim`.
-    pub wim: &'a Path,
-    /// The 1-based image index to apply.
-    pub image_index: u32,
     /// Disk identity already stamped by `Mkpart`.
     pub identity: bcd::DeviceIdentity,
     /// Edition description for the loader, when known.
@@ -265,10 +261,7 @@ pub fn install(
     esp: &mut dyn MountedPartition,
     request: &Request<'_>,
     applied: Applied,
-    reporter: &mut dyn Reporter,
-    cancelled: &dyn Fn() -> bool,
 ) -> Result<Installed> {
-    let _ = (reporter, cancelled);
     // Clone the mount roots once so no borrow of the guards crosses
     // the calls below; every path written later hangs off these two.
     let data_root: PathBuf = data.path().to_path_buf();
@@ -416,7 +409,6 @@ fn replace_system_hive(path: &Path, patched: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::event::VecReporter;
     use crate::windows::bcd::DeviceIdentity;
     use crate::windows::bcd::Firmware;
     use crate::windows::bcd::OBJECT_BOOTMGR;
@@ -973,25 +965,6 @@ mod tests {
         false
     }
 
-    /// Capture the scratch tree at `src` into `dir/cap.wim` with image
-    /// name `testimg`. Returns the WIM path.
-    fn capture_tree(dir: &Path, src: &std::path::Path) -> PathBuf {
-        let wim = dir.join("cap.wim");
-        let run = std::process::Command::new("wimlib-imagex")
-            .arg("capture")
-            .arg(src)
-            .arg(&wim)
-            .arg("testimg")
-            .output()
-            .expect("wimlib-imagex capture must spawn past the skip gate");
-        assert!(
-            run.status.success(),
-            "capture failed: {}",
-            String::from_utf8_lossy(&run.stderr)
-        );
-        wim
-    }
-
     #[test]
     fn install_refuses_identical_mount_roots_before_reading_the_template() {
         // One directory mounted twice: the shared root refuses before
@@ -1001,25 +974,14 @@ mod tests {
         std::fs::create_dir_all(&shared).expect("shared dir must create");
         let mut data = FakeMount::new(shared.clone(), u64::MAX);
         let mut esp = FakeMount::new(shared.clone(), u64::MAX);
-        let missing = root.path().join("no-such.wim");
         let request = Request {
-            wim: &missing,
-            image_index: 1,
             identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
-        let mut reporter = VecReporter::new();
         let applied = Applied { bytes: 0, files: 0 };
-        let err = install(
-            &mut data,
-            &mut esp,
-            &request,
-            applied,
-            &mut reporter,
-            &|| false,
-        )
-        .expect_err("a shared mount root must refuse");
+        let err = install(&mut data, &mut esp, &request, applied)
+            .expect_err("a shared mount root must refuse");
         assert!(
             matches!(err, CoreError::InvalidInput { .. }),
             "must be InvalidInput, got {err}"
@@ -1185,7 +1147,6 @@ mod tests {
         std::fs::write(src.join("a.txt"), b"not windows\n").expect("scratch file must write");
         std::os::unix::fs::symlink(&outside, config.join("BCD-Template"))
             .expect("symlink must create");
-        let wim_path = capture_tree(root.path(), &src);
         let data_path = root.path().join("data");
         let esp_path = root.path().join("esp");
         std::fs::create_dir_all(&data_path).expect("data dir must create");
@@ -1193,13 +1154,10 @@ mod tests {
         let mut data = FakeMount::new(data_path.clone(), u64::MAX);
         let mut esp = FakeMount::new(esp_path, u64::MAX);
         let request = Request {
-            wim: &wim_path,
-            image_index: 1,
             identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
-        let mut reporter = VecReporter::new();
         let template_path = data_path.join("Windows/System32/config/BCD-Template");
         // Pre-populate the data mount with the applied tree so the BCD-template
         // read sees the symlink we crafted. The WIM apply is now owned by the
@@ -1213,8 +1171,6 @@ mod tests {
             &mut esp,
             &request,
             Applied { bytes: 0, files: 0 },
-            &mut reporter,
-            &|| false,
         )
         .expect_err("a symlinked template must refuse");
         assert!(
@@ -1282,7 +1238,6 @@ mod tests {
             .expect("bios loader must write");
         std::fs::write(src.join("Windows/Boot/PCAT/boot.sdi"), b"fake-boot-sdi")
             .expect("boot.sdi must write");
-        let wim_path = capture_tree(root.path(), &src);
         let data_path = root.path().join("data");
         let esp_path = root.path().join("esp");
         std::fs::create_dir_all(&data_path).expect("data dir must create");
@@ -1290,13 +1245,10 @@ mod tests {
         let mut data = FakeMount::new(data_path.clone(), u64::MAX);
         let mut esp = FakeMount::new(esp_path, u64::MAX);
         let request = Request {
-            wim: &wim_path,
-            image_index: 1,
             identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
-        let mut reporter = VecReporter::new();
         let system_path = data_path.join("Windows/System32/config/SYSTEM");
         // Pre-populate the data mount with the applied tree so the SYSTEM hive
         // read sees the symlink we crafted. The WIM apply is now owned by the
@@ -1310,8 +1262,6 @@ mod tests {
             &mut esp,
             &request,
             Applied { bytes: 0, files: 0 },
-            &mut reporter,
-            &|| false,
         )
         .expect_err("a symlinked SYSTEM hive must refuse");
         assert!(
@@ -1365,7 +1315,6 @@ mod tests {
         let src = root.path().join("src");
         std::fs::create_dir_all(&src).expect("scratch tree must create");
         std::fs::write(src.join("a.txt"), b"not windows\n").expect("scratch file must write");
-        let wim_path = capture_tree(root.path(), &src);
         let data_path = root.path().join("data");
         let esp_path = root.path().join("esp");
         std::fs::create_dir_all(&data_path).expect("data dir must create");
@@ -1373,21 +1322,16 @@ mod tests {
         let mut data = FakeMount::new(data_path.clone(), u64::MAX);
         let mut esp = FakeMount::new(esp_path, u64::MAX);
         let request = Request {
-            wim: &wim_path,
-            image_index: 1,
             identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
-        let mut reporter = VecReporter::new();
         let template_path = data_path.join("Windows/System32/config/BCD-Template");
         let err = install(
             &mut data,
             &mut esp,
             &request,
             Applied { bytes: 0, files: 0 },
-            &mut reporter,
-            &|| false,
         )
         .expect_err("a WIM without a Windows template must refuse");
         assert!(
@@ -1436,7 +1380,6 @@ mod tests {
             .expect("bios loader must write");
         std::fs::write(src.join("Windows/Boot/PCAT/boot.sdi"), b"fake-boot-sdi")
             .expect("boot.sdi must write");
-        let wim_path = capture_tree(root.path(), &src);
         let data_path = root.path().join("data");
         let esp_path = root.path().join("esp");
         std::fs::create_dir_all(&data_path).expect("data dir must create");
@@ -1444,13 +1387,10 @@ mod tests {
         let mut data = FakeMount::new(data_path.clone(), u64::MAX);
         let mut esp = FakeMount::new(esp_path, u64::MAX);
         let request = Request {
-            wim: &wim_path,
-            image_index: 1,
             identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
-        let mut reporter = VecReporter::new();
         let system_path = data_path.join("Windows/System32/config/SYSTEM");
         // Pre-populate the data mount with the applied tree so the SYSTEM hive
         // read sees the missing file we crafted. The WIM apply is now owned by
@@ -1461,8 +1401,6 @@ mod tests {
             &mut esp,
             &request,
             Applied { bytes: 0, files: 0 },
-            &mut reporter,
-            &|| false,
         )
         .expect_err("an image without SYSTEM must refuse");
         assert!(
@@ -1560,15 +1498,12 @@ mod tests {
         std::fs::create_dir_all(&config).expect("config dir must create");
         std::fs::copy(&template_source, config.join("BCD-Template")).expect("template must copy");
         std::fs::copy(&system_source, config.join("SYSTEM")).expect("system must copy");
-        let wim_path = capture_tree(work.path(), &src);
 
         let data_dir = tempfile::tempdir().expect("data scratch must create");
         let esp_dir = tempfile::tempdir().expect("esp scratch must create");
         let mut data = FakeMount::new(data_dir.path().to_path_buf(), u64::MAX);
         let mut esp = FakeMount::new(esp_dir.path().to_path_buf(), u64::MAX);
         let request = Request {
-            wim: &wim_path,
-            image_index: 1,
             identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
@@ -1578,7 +1513,6 @@ mod tests {
         // SYSTEM hive and boot-file reads see the crafted files. The WIM apply
         // is now owned by the pipeline, so this test seeds the mount itself.
         copy_tree(&src, data_dir.path());
-        let mut reporter = VecReporter::new();
         let installed = install(
             &mut data,
             &mut esp,
@@ -1587,8 +1521,6 @@ mod tests {
                 bytes: loader_bytes.len() as u64,
                 files: 1,
             },
-            &mut reporter,
-            &|| false,
         )
         .expect("the fake windows image must install");
         // The applied tree carries the fake Windows files.
@@ -1715,33 +1647,6 @@ mod tests {
             installed.files.last().expect("files must exist"),
             &bios_bcd,
             "the bios store is the last file placed"
-        );
-        // A pre-cancelled run refuses as cancelled on fresh mounts.
-        let fresh_data = tempfile::tempdir().expect("fresh data must create");
-        let fresh_esp = tempfile::tempdir().expect("fresh esp must create");
-        let mut fresh_data_mount = FakeMount::new(fresh_data.path().to_path_buf(), u64::MAX);
-        let mut fresh_esp_mount = FakeMount::new(fresh_esp.path().to_path_buf(), u64::MAX);
-        let mut cancelled_reporter = VecReporter::new();
-        let err = install(
-            &mut fresh_data_mount,
-            &mut fresh_esp_mount,
-            &request,
-            Applied { bytes: 0, files: 0 },
-            &mut cancelled_reporter,
-            &|| true,
-        )
-        .expect_err("a pre-cancelled run must refuse");
-        assert!(
-            matches!(err, CoreError::Cancelled),
-            "a pre-cancelled run must be Cancelled, got {err}"
-        );
-        assert_eq!(
-            fresh_data_mount.releases, 0,
-            "a cancelled run never releases"
-        );
-        assert_eq!(
-            fresh_esp_mount.releases, 0,
-            "a cancelled run never releases"
         );
     }
 }

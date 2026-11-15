@@ -15,8 +15,10 @@
 //! opt-in), the memory diagnostics, the fonts and the built stores
 //! onto the ESP and the data partition, and [`to_go`]
 //! applies the offline SAN policy and disabled-recovery tweaks host-side
-//! (plus the [`install`](to_go::install) executor that applies one WIM
-//! image and lays out both firmwares' boot files);
+//! (plus the [`install`](to_go::install) post-apply executor that builds
+//! both BCD stores, places the boot files, disables recovery and sets the
+//! offline SAN policy on an already-applied image — [`apply`] and
+//! [`apply::apply_ntfs`] are what apply the WIM);
 //! the hive writers share the small in-crate `regf` editor.
 //!
 //! The reader side stays where it is: [`crate::wim`] (S16) parses the
