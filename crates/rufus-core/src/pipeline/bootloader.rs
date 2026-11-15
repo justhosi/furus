@@ -2642,23 +2642,28 @@ mod tests {
 
     #[test]
     fn windows_install_failure_releases_both_mounts_once() {
-        // The full `run` with a WIM path that does not exist: the ESP
-        // formats and the identity reads, then the raw NTFS apply refuses
-        // before either mount is opened — so neither mount releases. The
-        // install error (never a teardown error) still reports the WIM
-        // and no release-failure warn logs.
+        if skip_without_wim_backend() || skip_without_ntfs_formatter() {
+            return;
+        }
+        let scratch = tempfile::tempdir().expect("scratch dir fits");
+        let wim = capture_windows_wim_without_bcd_template(scratch.path());
         let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
-        let opener = WindowsOpener::new(target.clone());
+        let mut opener = WindowsOpener::new(target.clone());
+        // Format the scratch image so the raw apply succeeds; the install
+        // still mounts both partitions and releases them cleanly, so this
+        // phase wants the real mounted data tree.
+        format_ntfs_scratch(&mut opener);
+        opener.mount_data = true;
         let mut reporter = Recorder::default();
         let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
         let error = run(
             &mut ctx,
             &BootloaderMode::Windows,
-            &image_ref("missing.wim", rufus_proto::ImageKind::Wim),
+            &image_ref(&wim.display().to_string(), rufus_proto::ImageKind::Wim),
             &rufus_proto::Filesystem::Ntfs,
             None,
         )
-        .expect_err("a missing WIM refuses");
+        .expect_err("a WIM without a BCD template refuses");
         assert!(
             !matches!(
                 error,
@@ -2668,19 +2673,19 @@ mod tests {
         );
         let text = error.to_string();
         assert!(
-            text.contains("missing.wim") || text.contains("wimlib"),
-            "the install error reports the WIM: {text}"
+            text.contains("BCD template") && text.contains("not a Windows image"),
+            "the install error reports the refusal: {text}"
         );
         assert!(text.is_ascii(), "stays ASCII: {text}");
         assert_eq!(
             opener.data_releases.get(),
-            0,
-            "the data mount never opens when the raw apply refuses"
+            1,
+            "the data mount releases once on an install failure"
         );
         assert_eq!(
             opener.esp_releases.get(),
-            0,
-            "the esp mount never opens when the raw apply refuses"
+            1,
+            "the esp mount releases once on an install failure"
         );
         let warns: Vec<&str> = reporter
             .events
@@ -2697,47 +2702,54 @@ mod tests {
             warns
                 .iter()
                 .all(|line| !line.contains("mount release failed")),
-            "no teardown warn fires on clean releases: {warns:?}"
+            "clean releases fire no teardown warn: {warns:?}"
         );
     }
 
     #[test]
     fn windows_esp_mount_failure_releases_the_data_mount_once() {
-        // Two phases over fresh openers. The raw NTFS apply runs before
-        // either mount, so a missing WIM refuses before the ESP mount is
-        // attempted and before the data mount opens. Both phases now
-        // expect zero releases and the WIM-open error instead of the
-        // ESP-mount failure (the pipeline never reaches the mount step).
+        if skip_without_wim_backend() || skip_without_ntfs_formatter() {
+            return;
+        }
         for fail_data_release in [false, true] {
+            let scratch = tempfile::tempdir().expect("scratch dir fits");
+            // The ESP mount fails before `to_go::install` ever reads the
+            // data tree, so the WIM only has to survive `apply_ntfs`: the
+            // cheap template-less capture is enough here.
+            let wim = capture_windows_wim_without_bcd_template(scratch.path());
             let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
             let mut opener = WindowsOpener::new(target.clone());
             opener.fail_esp_mount = true;
             opener.fail_data_release = fail_data_release;
+            // Format the image so the raw apply succeeds, but leave
+            // `mount_data` false: no FUSE mount is opened, so a failing
+            // `release` cannot strand one past the test.
+            format_ntfs_scratch(&mut opener);
             let mut reporter = Recorder::default();
             let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
             let error = run(
                 &mut ctx,
                 &BootloaderMode::Windows,
-                &image_ref("missing.wim", rufus_proto::ImageKind::Wim),
+                &image_ref(&wim.display().to_string(), rufus_proto::ImageKind::Wim),
                 &rufus_proto::Filesystem::Ntfs,
                 None,
             )
             .expect_err("a failing ESP mount refuses");
             let text = error.to_string();
             assert!(
-                text.contains("missing.wim") || text.contains("wimlib"),
-                "phase {fail_data_release}: the WIM error reports: {text}"
+                text.contains("esp mount fails"),
+                "phase {fail_data_release}: the install error reports the ESP mount: {text}"
             );
             assert!(text.is_ascii(), "stays ASCII: {text}");
             assert_eq!(
                 opener.data_releases.get(),
-                0,
-                "phase {fail_data_release}: the data mount never opens when the raw apply refuses"
+                1,
+                "phase {fail_data_release}: the data mount releases exactly once after the ESP mount fails"
             );
             assert_eq!(
                 opener.esp_releases.get(),
                 0,
-                "phase {fail_data_release}: the ESP mount never opens when the raw apply refuses"
+                "phase {fail_data_release}: the ESP mount never opens"
             );
             let warns: Vec<&str> = reporter
                 .events
@@ -2750,10 +2762,21 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert!(
-                warns.is_empty(),
-                "phase {fail_data_release}: no teardown warn fires when neither mount opens: {warns:?}"
-            );
+            if fail_data_release {
+                assert_eq!(
+                    warns
+                        .iter()
+                        .filter(|line| line.contains("mount release failed"))
+                        .count(),
+                    1,
+                    "phase {fail_data_release}: the data-release failure is reported exactly once: {warns:?}"
+                );
+            } else {
+                assert!(
+                    warns.is_empty(),
+                    "phase {fail_data_release}: clean releases fire no teardown warn: {warns:?}"
+                );
+            }
         }
     }
 
@@ -3041,6 +3064,53 @@ mod tests {
         wim
     }
 
+    /// Capture a synthetic Windows-shaped tree into a WIM with no
+    /// `Windows/System32/config/BCD-Template`, so `apply_ntfs` succeeds
+    /// but `to_go::install` then refuses "not a Windows image".
+    fn capture_windows_wim_without_bcd_template(dir: &std::path::Path) -> std::path::PathBuf {
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).expect("the src dir creates");
+        std::fs::write(src.join("a.txt"), b"not windows\n").expect("the file writes");
+        let wim = dir.join("windows-no-template.wim");
+        let run = std::process::Command::new("wimlib-imagex")
+            .arg("capture")
+            .arg(&src)
+            .arg(&wim)
+            .arg("testimg")
+            .output()
+            .expect("wimlib-imagex capture spawns past the skip gate");
+        assert!(
+            run.status.success(),
+            "capture failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        wim
+    }
+
+    /// Build a real NTFS volume the raw apply writes into and return the
+    /// raw image path. This only formats the image; it leaves `mount_data`
+    /// alone, so a caller that needs the image mounted over the data root
+    /// has to set `mount_data` itself before the run.
+    fn format_ntfs_scratch(opener: &mut WindowsOpener) -> std::path::PathBuf {
+        let partition_node = opener.partition_node();
+        let image = std::fs::File::create(&partition_node).expect("the scratch ntfs image creates");
+        image
+            .set_len(opener.partition_capacity)
+            .expect("the scratch ntfs image sizes");
+        let format = std::process::Command::new("mkntfs")
+            .arg("-F")
+            .arg("-Q")
+            .arg(&partition_node)
+            .output()
+            .expect("mkntfs spawns past the skip gate");
+        assert!(
+            format.status.success(),
+            "mkntfs failed: {}",
+            String::from_utf8_lossy(&format.stderr)
+        );
+        partition_node
+    }
+
     /// Skip gate (the `skip:` convention): the library probe first,
     /// then the `wimlib-imagex` presence probe.
     fn skip_without_wim_backend() -> bool {
@@ -3130,23 +3200,8 @@ mod tests {
         // Build a real NTFS volume the raw apply writes into, then mount it
         // over the data root so `to_go::install` sees the files `apply_ntfs`
         // actually laid down. The capacity matches the stamped layout.
+        let partition_node = format_ntfs_scratch(&mut opener);
         opener.mount_data = true;
-        let partition_node = opener.partition_node();
-        let image = std::fs::File::create(&partition_node).expect("the scratch ntfs image creates");
-        image
-            .set_len(opener.partition_capacity)
-            .expect("the scratch ntfs image sizes");
-        let format = std::process::Command::new("mkntfs")
-            .arg("-F")
-            .arg("-Q")
-            .arg(&partition_node)
-            .output()
-            .expect("mkntfs spawns past the skip gate");
-        assert!(
-            format.status.success(),
-            "mkntfs failed: {}",
-            String::from_utf8_lossy(&format.stderr)
-        );
         let mut reporter = Recorder::default();
         let mut ctx = run_context_table(&opener, &mut reporter, Some(TableKind::Gpt));
         run(
