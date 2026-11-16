@@ -83,11 +83,12 @@ fn zero_partition(ctx: &RunContext<'_>, partition: &mut dyn Volume) -> Result<()
 }
 
 /// The data partition's first sector, in units of the device's sector
-/// size: the value the FAT32 BPB's hidden-sectors field carries. The
-/// window is the one `Mkpart` stamped ([`RunContext::partitioned`]),
+/// size: the value the FAT32 BPB's hidden-sectors field carries and the
+/// start passed to `mkntfs -p` (which lands in the NTFS VBR at 0x1C).
+/// The window is the one `Mkpart` stamped ([`RunContext::partitioned`]),
 /// read back through the same [`data_window`] the platform opener uses,
 /// so the field cannot drift from the table on the disk. Refuses by
-/// name when the start does not fit the field's `u32`.
+/// name when the start does not fit the `u32` both formats can encode.
 fn partition_start_lba(ctx: &mut RunContext<'_>) -> Result<u32> {
     let (table, layout) = ctx.partitioned.ok_or_else(|| {
         CoreError::invalid("no partition was created to format (run mkpart first)")
@@ -100,7 +101,7 @@ fn partition_start_lba(ctx: &mut RunContext<'_>) -> Result<u32> {
         .ok_or_else(|| CoreError::invalid("sector size is zero: no partition start lba"))?;
     u32::try_from(lba).map_err(|_| {
         CoreError::invalid(format!(
-            "partition start lba {lba} does not fit the u32 fat32 hidden-sectors field"
+            "partition start lba {lba} does not fit the u32 hidden-sectors field (fat32 bpb / ntfs vbr)"
         ))
     })
 }
@@ -176,10 +177,14 @@ pub(crate) fn run(
             Ok(())
         }
         Filesystem::Ntfs => {
+            // Read the start while the device handle is still open: the
+            // helper needs it, and `release_device` below forgets it.
+            let partition_start = partition_start_lba(ctx)?;
             let mut options = ntfs::Options::new(label.clone());
             if let Some(bytes) = cluster_bytes {
                 options = options.with_cluster_bytes(*bytes)?;
             }
+            options = options.with_partition_start(partition_start)?;
             // Release first: the tool wants its own exclusive claim on
             // the partition node (see `release_device`).
             ctx.release_device()?;
@@ -243,4 +248,76 @@ fn format_ext(
         ext::format(path, &options, logger)?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::Level;
+    use crate::part::TableKind;
+    use crate::part::plan::LayoutKind;
+    use crate::pipeline::event::VecReporter;
+    use crate::pipeline::opener::Opener;
+    use crate::pipeline::target::{Target, VecTarget};
+
+    /// A minimal opener serving one [`VecTarget`] as the whole disk. The
+    /// helper under test only needs the device's size and sector size,
+    /// so the partition and node seams refuse like the locator fixture
+    /// in `write.rs` does.
+    struct DeviceOpener {
+        target: VecTarget,
+    }
+
+    impl Opener for DeviceOpener {
+        fn device(&self) -> Result<Box<dyn Target>> {
+            Ok(Box::new(self.target.clone()))
+        }
+
+        fn partition(&self) -> Result<Box<dyn Volume>> {
+            Err(CoreError::invalid("test opener has no partition"))
+        }
+
+        fn partition_path(&self) -> Result<std::path::PathBuf> {
+            Err(CoreError::invalid("test opener has no partition node"))
+        }
+    }
+
+    #[test]
+    fn partition_start_lba_returns_the_planned_data_start_in_sectors() {
+        // The value `mkntfs -p` and the FAT32 BPB both carry comes from
+        // the same `data_window` the opener resolves: pin it against the
+        // planner's own window, never a literal, so a layout change
+        // cannot silently pass with a stale expectation.
+        const LEN: u64 = 64 * 1024 * 1024;
+        let opener = DeviceOpener {
+            target: VecTarget::new(LEN, 512).expect("fixture target fits"),
+        };
+        let mut reporter = VecReporter::new();
+        let never = || false;
+        let mut ctx = RunContext {
+            opener: &opener,
+            target: None,
+            table: Some(TableKind::Mbr),
+            partitioned: Some((TableKind::Mbr, LayoutKind::Single)),
+            logger: Logger::new(Level::Info),
+            reporter: &mut reporter,
+            cancelled: &never,
+            options: crate::pipeline::RunOptions {
+                verify: false,
+                badblocks: false,
+                retries: 3,
+                retry_delay: std::time::Duration::ZERO,
+                reset_usb: false,
+            },
+        };
+        let (offset, _) = data_window(LayoutKind::Single, TableKind::Mbr, 512, LEN)
+            .expect("the single data window plans");
+        let expected = u32::try_from(offset / 512).expect("the start fits a u32");
+        assert_eq!(expected, 2048, "the single layout starts at LBA 2048");
+        assert_eq!(
+            partition_start_lba(&mut ctx).expect("the start resolves"),
+            expected,
+            "the helper returns the planned data start in sectors"
+        );
+    }
 }
