@@ -51,6 +51,16 @@ const MAX_CLUSTER_BYTES: u32 = 65536;
 /// Cluster size [`Options::new`] defaults to, in bytes.
 const DEFAULT_CLUSTER_BYTES: u32 = 4096;
 
+/// Partition geometry `mkntfs` needs to write a Windows-bootable VBR.
+///
+/// Unless it is told the partition start sector, the sectors per track and
+/// the number of heads, `mkntfs` writes zeroes into those VBR fields and
+/// reports that "Windows will not be able to boot from this device". 63
+/// sectors per track and 255 heads are the canonical large-disk values, the
+/// same ones `crates/rufus-core/src/fs/fat32/bpb.rs` uses.
+const SECTORS_PER_TRACK: u16 = 63;
+const HEADS: u16 = 255;
+
 /// Smallest `$MFT` record size the VBR shaping admits, in bytes (the
 /// negative-exponent encoding 0xF6 = 2^10 shapes exactly this).
 const MIN_MFT_RECORD_BYTES: u32 = 1024;
@@ -108,13 +118,18 @@ fn missing_tool_error() -> CoreError {
     CoreError::invalid(MISSING_TOOL_HINT)
 }
 
-/// The write-side options of [`format`]: the label and the cluster size.
+/// The write-side options of [`format`]: the label, the cluster size and
+/// (optionally) the partition geometry.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Volume label passed as `mkntfs -L`; `None` omits the flag entirely.
     pub label: Option<String>,
     /// Cluster size in bytes; see [`Options::with_cluster_bytes`].
     pub cluster_bytes: u32,
+    /// Partition start sector passed as `mkntfs -p`; `None` omits the
+    /// geometry flags (`-p`/`-H`/`-S`) entirely, which is only correct for
+    /// targets that are not a whole numbered partition.
+    pub partition_start: Option<u32>,
 }
 
 impl Options {
@@ -123,6 +138,7 @@ impl Options {
         Self {
             label,
             cluster_bytes: DEFAULT_CLUSTER_BYTES,
+            partition_start: None,
         }
     }
 
@@ -139,6 +155,23 @@ impl Options {
             )));
         }
         self.cluster_bytes = cluster_bytes;
+        Ok(self)
+    }
+
+    /// Options with the partition start sector passed as `mkntfs -p`,
+    /// alongside the canonical `-H`/`-S` geometry flags.
+    ///
+    /// A start sector of `0` is refused: it means the caller does not know
+    /// the partition geometry, and `mkntfs` would then write a VBR that
+    /// Windows cannot boot from.
+    pub fn with_partition_start(mut self, start: u32) -> Result<Self> {
+        if start == 0 {
+            return Err(CoreError::invalid(
+                "partition start sector 0 means the geometry is unknown: \
+                 mkntfs would write a VBR Windows cannot boot from",
+            ));
+        }
+        self.partition_start = Some(start);
         Ok(self)
     }
 }
@@ -321,10 +354,11 @@ fn shape_mft_record_bytes(vbr: &[u8; 512], cluster_bytes: u32) -> Result<u32> {
 
 /// Format `target` as NTFS with the external formatter.
 ///
-/// Runs `mkntfs -f [-L <label>] -c <cluster> <target>` (the target path is
-/// always the last argument) as a bounded capture — both streams piped and
-/// drained via `output()`, `LC_ALL=C` in the child environment — then reads
-/// back bytes 0..512 and verifies them with [`boot_sector`], and reads the
+/// Runs `mkntfs -f [-L <label>] -c <cluster> [-p <start> -H 255 -S 63]
+/// <target>` (the target path is always the last argument) as a bounded
+/// capture — both streams piped and drained via `output()`, `LC_ALL=C` in
+/// the child environment — then reads back bytes 0..512 and verifies them
+/// with [`boot_sector`], and reads the
 /// volume name of `$MFT` record 3 with [`volume_label`]. Every non-empty
 /// captured line (stdout then stderr, each through the one device-text
 /// sanitiser) is logged verbatim at `Info` under the `ntfs` target; a
@@ -334,6 +368,11 @@ fn shape_mft_record_bytes(vbr: &[u8; 512], cluster_bytes: u32) -> Result<u32> {
 /// format is not trusted); it is logged at `Error` before the error is
 /// returned. On success the summary is the snapshot's final line and the
 /// verified boot plus label come back as an [`NtfsVolume`].
+///
+/// Without the geometry flags `mkntfs` refuses to produce a Windows-bootable
+/// VBR — in its own words, "Windows will not be able to boot from this
+/// device" — because the hidden-sector, sectors-per-track and head fields
+/// would all be written as zero.
 pub fn format(target: &Path, options: &Options, logger: &Logger) -> Result<NtfsVolume> {
     let (tool, tool_path) = find_tool_in(&tool::path_dirs())?;
     format_with(target, options, logger, tool, &tool_path)
@@ -364,10 +403,20 @@ fn format_with(
     if let Some(label) = options.label.as_deref() {
         command.arg("-L").arg(label);
     }
-    command
-        .arg("-c")
-        .arg(options.cluster_bytes.to_string())
-        .arg(target);
+    command.arg("-c").arg(options.cluster_bytes.to_string());
+    if let Some(start) = options.partition_start {
+        // mkntfs only writes a Windows-bootable VBR when it is told the
+        // partition geometry; the canonical large-disk CHS values match
+        // the FAT32 side's BPB. The target path stays the last argument.
+        command
+            .arg("-p")
+            .arg(start.to_string())
+            .arg("-H")
+            .arg(HEADS.to_string())
+            .arg("-S")
+            .arg(SECTORS_PER_TRACK.to_string());
+    }
+    command.arg(target);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1210,6 +1259,57 @@ mod tests {
         assert!(summary.contains("exit status: 0"), "{summary}");
         assert!(summary.contains("512"), "{summary}");
         assert!(summary.contains("4096"), "{summary}");
+    }
+
+    #[test]
+    fn format_passes_partition_geometry() {
+        // With a start sector supplied, mkntfs must be told the partition
+        // geometry so it writes a Windows-bootable VBR. The stub echoes its
+        // own argv; pin the exact flag order and the target in last place.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let tool_path = write_stub(
+            scratch.path(),
+            "mkntfs",
+            "#!/bin/sh\nprintf 'got: %s\\n' \"$*\"\nexit 0\n",
+        );
+        let target = write_target(scratch.path(), &synthetic_record(&RUFUS_NTFS_UNITS));
+        let logger = Logger::new(Level::Trace);
+        let options = Options::new(Some("TESTLABEL".to_string()))
+            .with_cluster_bytes(4096)
+            .expect("4096 is valid")
+            .with_partition_start(239616)
+            .expect("a non-zero start is accepted");
+
+        format_with(&target, &options, &logger, "mkntfs", &tool_path).expect("the stub exits 0");
+        let messages: Vec<String> = logger
+            .snapshot()
+            .iter()
+            .map(|record| record.message.clone())
+            .collect();
+        let expected = format!(
+            "got: -f -L TESTLABEL -c 4096 -p 239616 -H 255 -S 63 {}",
+            target.display()
+        );
+        assert!(messages.contains(&expected), "{messages:?}");
+        // The echoed argv ends with the target: the geometry flags precede
+        // it and never become the final argument.
+        let got = messages
+            .iter()
+            .find(|message| message.starts_with("got: "))
+            .expect("the stub echoed its argv");
+        assert!(got.ends_with(&target.display().to_string()), "{got}");
+    }
+
+    #[test]
+    fn partition_start_zero_is_refused() {
+        // A start sector of 0 means the caller does not know the geometry:
+        // mkntfs would write a VBR Windows cannot boot from.
+        let error = Options::new(None)
+            .with_partition_start(0)
+            .expect_err("a zero start sector is refused");
+        let text = error.to_string();
+        assert!(text.contains("0"), "{text}");
+        assert!(text.contains("geometry"), "{text}");
     }
 
     #[test]
