@@ -1347,7 +1347,9 @@ fn release_both_after_failure(
 /// existing formatter (fresh serial, hidden sectors from the stamped
 /// window), then the stamped GPT is re-read for the BCD identity. The
 /// whole-disk handle releases next (the mounts need the partition
-/// nodes, and the next `device` reopens from scratch), then the WIM's
+/// nodes, and the next `device` reopens from scratch; nothing in
+/// between reopens it, so the apply's capacity comes from the stamped
+/// data window rather than the partition volume), then the WIM's
 /// boot index selects the image (1 unless the WIM reports a non-zero
 /// one) and [`crate::windows::apply::apply_ntfs`] applies it to the raw
 /// NTFS partition — before anything mounts, so the apply owns the
@@ -1429,7 +1431,14 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
     ctx.release_device()?;
     let installed = (|| -> Result<crate::windows::to_go::Installed> {
         let device_path = ctx.opener.partition_path()?;
-        let capacity = ctx.opener.partition()?.total_bytes();
+        // The data partition's byte length comes from the stamped plan
+        // geometry (the same `data_window` the opener's window and the
+        // BCD identity above use), not from opening the partition
+        // volume: opening it would re-cache the O_EXCL whole-disk
+        // handle `release_device` just dropped, and the partition mount
+        // below would then fail with EBUSY.
+        let (_data_offset, capacity) =
+            data_window(LayoutKind::WindowsToGo, TableKind::Gpt, sector_size, size)?;
         let path = Path::new(&image.path);
         let wim = crate::windows::wim::Wim::open(path)?;
         let info = wim.info()?;
@@ -2397,7 +2406,10 @@ mod tests {
     /// data and ESP mounts are [`CountingMount`] doubles over distinct
     /// temp dirs. The three knobs pin the three teardown paths: a
     /// failing ESP mount, a failing data release, a failing ESP
-    /// release.
+    /// release. Every opener call is logged to `events` in order, so a
+    /// test can prove which calls the arm never makes — `partition`
+    /// among them: opening it re-caches the whole-disk handle the arm
+    /// just released.
     #[derive(Debug)]
     struct WindowsOpener {
         target: VecTarget,
@@ -2455,6 +2467,7 @@ mod tests {
         }
 
         fn partition(&self) -> TestResult<Box<dyn Volume>> {
+            self.events.borrow_mut().push("partition");
             Ok(Box::new(
                 crate::fs::VecVolume::new(self.partition_capacity, 512)
                     .expect("the test partition volume allocates"),
@@ -2789,7 +2802,10 @@ mod tests {
         // the opener reopens lazily on the next use. The run below
         // fails at the missing WIM during the raw NTFS apply, which is
         // before either mount opens, so the event log pins the order:
-        // exactly one release, ahead of either mount attempt.
+        // exactly one release, ahead of either mount attempt, and no
+        // partition-volume open at all (that open re-caches the
+        // whole-disk handle the release dropped, so the data mount
+        // would then fail with EBUSY).
         let (target, _plan) = stamp_windows_gpt(256 * 1024 * 1024);
         let opener = WindowsOpener::new(target.clone());
         let mut reporter = Recorder::default();
@@ -2813,6 +2829,15 @@ mod tests {
             events.iter().filter(|event| **event == "release").count(),
             1,
             "the disk releases exactly once: {events:?}"
+        );
+        // The capacity the raw apply needs comes from the stamped plan
+        // geometry, so the partition volume never opens: opening it
+        // re-caches the whole-disk handle the release above dropped,
+        // and the first mount would then fail with EBUSY (the reported
+        // bug).
+        assert!(
+            !events.contains(&"partition"),
+            "the data partition volume never opens, only its node name: {events:?}"
         );
         let release = events
             .iter()
