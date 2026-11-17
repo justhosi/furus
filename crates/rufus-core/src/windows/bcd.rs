@@ -75,8 +75,18 @@
 //! this builder sets `{bootmgr}\12000002` explicitly to `\bootmgr`
 //! for BIOS (a shorter string than the template's EFI path, so the
 //! in-place shrink path is used) and keeps the template's
-//! `\EFI\Microsoft\Boot\bootmgfw.efi` for UEFI; nothing is ever
-//! deleted, so there is no delete primitive.
+//! `\EFI\Microsoft\Boot\bootmgfw.efi` for UEFI.
+//!
+//! Finally, like `bcdboot`, the builder strips every class-0x4
+//! "template element" (the setup-time directives `42000002`,
+//! `45000001`, `46000004`, `47000005`, `47000006`, ...) from the four
+//! objects it recreates — `{bootmgr}`, the selected loader, the resume
+//! object and `{memdiag}` — before recomputing the checksum. They are
+//! not runtime boot elements; leaving them on the active boot path is
+//! what makes winload fail with `0xc0000001`. Inactive template objects
+//! keep theirs. This needs a regf delete primitive: `regf::Hive` can
+//! now unlink a named subkey, compact its parent's subkey list and free
+//! the key cell, which is the inverse of its insert path.
 //!
 //! Allocator and space: the editor allocates new cells from the hive's
 //! own free cells first (first fit, splitting a larger free cell,
@@ -517,6 +527,80 @@ pub fn partition_device(identity: DeviceIdentity) -> [u8; 88] {
     device
 }
 
+/// True when `id` belongs to datatype class `0x4`, the BCD "template"
+/// class. Per the BCD element reference those ids (`42000002`,
+/// `45000001`, `46000004`, `47000005`, `47000006`, ...) are setup-time
+/// directives, not runtime boot elements; `bcdboot` strips all of them
+/// from the objects it recreates. Class is the top nibble of the top
+/// byte, so test the masked byte, not the raw id (0x42 and 0x45 both
+/// belong to class 0x4).
+fn is_template_element(id: u32) -> bool {
+    element_class(id) & 0xF0 == 0x40
+}
+
+/// Parse an `Elements\{id}` subkey name (8 hex digits) to its `u32`, or
+/// `None` when `name` is not exactly 8 hex digits. Accepts both cases so
+/// a template with lowercase element names is still recognised.
+fn parse_element_name(name: &[u8]) -> Option<u32> {
+    if name.len() != 8 {
+        return None;
+    }
+    let mut id = 0u32;
+    for &byte in name {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        id = (id << 4) | u32::from(digit);
+    }
+    Some(id)
+}
+
+/// The ids of every `Elements\{id}` subkey under `elements`, read from
+/// the subkey list with the regf list-walk primitives. Names that are
+/// not 8 hex digits are skipped (they are not BCD element keys). The
+/// caller collects the result before mutating the hive so removal can
+/// compact the list without disturbing the iteration.
+fn element_ids(hive: &Hive, elements: usize) -> Result<Vec<u32>> {
+    let nsub = hive.nk_u32(elements, 0x14, "element count")?;
+    if nsub == 0 {
+        return Ok(Vec::new());
+    }
+    let list = hive.nk_u32(elements, 0x1C, "element list")?;
+    if list == NONE {
+        return Err(CoreError::invalid(format!(
+            "bcd Elements key at offset {elements:#x} counts {nsub} elements but has no list"
+        )));
+    }
+    let list = list as usize;
+    let (count, _, _, _) = hive.list_head(list)?;
+    let mut ids = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let Some(child) = hive.list_child(list, index)? else {
+            return Err(CoreError::invalid(format!(
+                "bcd Elements list at offset {list:#x} lost entry {index}"
+            )));
+        };
+        let (name, _) = hive.nk_name(child)?;
+        if let Some(id) = parse_element_name(&name) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Remove the `Elements\{id}` subkey under `elements` when it exists;
+/// a no-op when it is absent. Element subkey names are the 8 uppercase
+/// hex digits from `element_name`, the same shape `set_element` uses to
+/// create them.
+fn remove_element(hive: &mut Hive, elements: usize, id: u32) -> Result<()> {
+    let name = element_name(id);
+    hive.remove_child(elements, &name)?;
+    Ok(())
+}
+
 /// Build a complete BCD store from a template hive.
 ///
 /// The template is the applied image's `Windows/System32/config/BCD-Template`
@@ -685,6 +769,30 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
     hive.set_element_sz(bootmgr_elements, ELEMENT_RESUME_OBJECT, &resume_guid)?;
     hive.set_element_binary(memdiag_elements, ELEMENT_DEVICE, &boot_device())?;
     hive.set_element_sz(memdiag_elements, ELEMENT_PATH, memdiag_path(firmware))?;
+
+    // bcdboot strips every class-0x4 "template element" — the
+    // setup-time directives (42000002, 45000001, 46000004, 47000005,
+    // 47000006, ...) — from each object it recreates: they are not
+    // runtime boot elements, and leaving them on the active boot path is
+    // what makes winload fail with 0xc0000001. Strip them from the four
+    // objects we wire, leaving the inactive template objects untouched.
+    // This runs after all the reads and writes above (including the
+    // 42000002 flavour check and every element we add) and before the
+    // checksum. `disable_recovery`'s later 16000009 is class 0x16 and
+    // would be kept even if it were set here, so it is never disturbed.
+    for elements in [
+        bootmgr_elements,
+        loader_elements,
+        resume_elements,
+        memdiag_elements,
+    ] {
+        for id in element_ids(&hive, elements)? {
+            if is_template_element(id) {
+                remove_element(&mut hive, elements, id)?;
+            }
+        }
+    }
+
     hive.update_checksum()?;
     Ok(Store {
         bytes: hive.into_bytes(),
@@ -1093,6 +1201,10 @@ mod tests {
             &utf16_nul("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"),
         );
         add_element(&mut hive, bootmgr_el, "25000004", REG_BINARY, &[0x1e]);
+        // Template-class setup elements bcdboot strips from the active
+        // boot path. Their presence in the fixture proves the strip.
+        add_element(&mut hive, bootmgr_el, "45000001", REG_BINARY, &[0x01]);
+        add_element(&mut hive, bootmgr_el, "47000006", REG_BINARY, &[0x10]);
 
         for (loader, suffix) in [
             (uefi, "\\system32\\winload.efi"),
@@ -1114,6 +1226,9 @@ mod tests {
                 REG_SZ,
                 &utf16_nul(TEST_RESUME_GUID),
             );
+            add_element(&mut hive, elements, "45000001", REG_BINARY, &[0x02]);
+            add_element(&mut hive, elements, "47000005", REG_BINARY, &[0x01]);
+            add_element(&mut hive, elements, "47000006", REG_BINARY, &[0x10]);
         }
 
         let resume_el = add_key(&mut hive, resume, b"Elements");
@@ -1124,6 +1239,7 @@ mod tests {
             REG_SZ,
             &utf16_nul("\\system32\\winresume.efi"),
         );
+        add_element(&mut hive, resume_el, "45000001", REG_BINARY, &[0x02]);
 
         let memdiag_el = add_key(&mut hive, memdiag, b"Elements");
         add_element(
@@ -1140,6 +1256,8 @@ mod tests {
             REG_SZ,
             &utf16_nul("en-US"),
         );
+        add_element(&mut hive, memdiag_el, "45000001", REG_BINARY, &[0x01]);
+        add_element(&mut hive, memdiag_el, "47000005", REG_BINARY, &[0x01]);
 
         hive.update_checksum().expect("fixture checksum must store");
         hive.into_bytes()
@@ -1593,6 +1711,118 @@ mod tests {
         assert_eq!(decode_sz(&data).expect("guid text"), TEST_RESUME_GUID);
     }
 
+    /// Enumerate the element ids under `object`'s `Elements` key in a
+    /// parsed hive, using the same list-walk helper as the strip step.
+    fn object_element_ids(hive: &Hive, object: &str) -> Vec<u32> {
+        let objects = hive
+            .find_child(hive.root(), b"Objects")
+            .expect("find Objects")
+            .expect("Objects key");
+        let obj = hive
+            .find_child(objects, object.as_bytes())
+            .expect("find object")
+            .expect("object key");
+        let elements = hive
+            .find_child(obj, b"Elements")
+            .expect("find Elements")
+            .expect("Elements key");
+        element_ids(hive, elements).expect("element ids")
+    }
+
+    #[test]
+    fn template_class_elements_are_stripped_from_boot_path() {
+        let gpt = DeviceIdentity::Gpt {
+            disk_guid: [0x01; 16],
+            partition_guid: [0x0A; 16],
+        };
+        for firmware in [Firmware::Uefi, Firmware::Bios] {
+            let template = template_fixture();
+            let loader = default_object(firmware);
+
+            // Pre-condition: every object the build wires really does
+            // carry at least one template-class element in the fixture,
+            // otherwise the strip assertions below would be vacuous.
+            {
+                let fixture = Hive::parse(&template).expect("fixture parses");
+                for object in [OBJECT_BOOTMGR, loader, TEST_RESUME_GUID, OBJECT_MEMDIAG] {
+                    let ids = object_element_ids(&fixture, object);
+                    assert!(
+                        ids.iter().any(|&id| is_template_element(id)),
+                        "{object} fixture must carry a template element before build"
+                    );
+                }
+            }
+
+            let out = build(
+                &template,
+                &StoreRequest {
+                    firmware,
+                    identity: gpt,
+                    description: Some("Windows 11 Pro"),
+                },
+            )
+            .expect("build must succeed");
+            assert_tiling(&out);
+            let hive = Hive::parse(&out).expect("output must re-parse");
+
+            // No template-class element survives on any of the four
+            // active boot-path objects. Inactive template objects (the
+            // other loaders, {legacy}, ...) are left untouched.
+            for object in [OBJECT_BOOTMGR, loader, TEST_RESUME_GUID, OBJECT_MEMDIAG] {
+                for id in object_element_ids(&hive, object) {
+                    assert!(
+                        !is_template_element(id),
+                        "{object} must have no template element, found {id:#010x}"
+                    );
+                }
+            }
+
+            // The runtime elements are all still there.
+            let bootmgr_ids = object_element_ids(&hive, OBJECT_BOOTMGR);
+            for id in [
+                ELEMENT_DEFAULT_OBJECT,
+                ELEMENT_BOOT_DISPLAY_ORDER,
+                ELEMENT_TOOLS_DISPLAY_ORDER,
+                ELEMENT_PATH,
+                ELEMENT_TIMEOUT,
+                ELEMENT_RESUME_OBJECT,
+            ] {
+                assert!(
+                    bootmgr_ids.contains(&id),
+                    "bootmgr must keep runtime element {id:#010x}"
+                );
+            }
+            let loader_ids = object_element_ids(&hive, loader);
+            for id in [
+                ELEMENT_DEVICE,
+                ELEMENT_OS_DEVICE,
+                ELEMENT_PATH,
+                ELEMENT_OS_LOCATE_PATH,
+                ELEMENT_DEFAULT_OBJECT,
+                ELEMENT_DESCRIPTION,
+            ] {
+                assert!(
+                    loader_ids.contains(&id),
+                    "loader must keep runtime element {id:#010x}"
+                );
+            }
+            let resume_ids = object_element_ids(&hive, TEST_RESUME_GUID);
+            for id in [ELEMENT_DEVICE, ELEMENT_PATH] {
+                assert!(
+                    resume_ids.contains(&id),
+                    "resume object must keep runtime element {id:#010x}"
+                );
+            }
+            let memdiag_ids = object_element_ids(&hive, OBJECT_MEMDIAG);
+            for id in [ELEMENT_DEVICE, ELEMENT_PATH, ELEMENT_LOCALE] {
+                assert!(
+                    memdiag_ids.contains(&id),
+                    "memdiag must keep runtime element {id:#010x}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn refusals_name_what_is_wrong() {
         let gpt = DeviceIdentity::Gpt {
@@ -1998,6 +2228,24 @@ mod tests {
             );
             let hive = Hive::parse(&out).expect("output must re-parse");
             let loader = default_object(firmware);
+
+            // Real-hive coverage for the strip: no class-0x4 template
+            // element survives on any of the four active boot-path
+            // objects. Resolve the resume object from the loader's own
+            // 23000003 reference (its GUID is per-template).
+            let (_, resume_bytes) = hive
+                .element_data(loader, ELEMENT_DEFAULT_OBJECT)
+                .expect("read loader resume ref")
+                .expect("loader 23000003");
+            let resume_guid = decode_sz(&resume_bytes).expect("resume guid text");
+            for object in [OBJECT_BOOTMGR, loader, resume_guid.as_str(), OBJECT_MEMDIAG] {
+                for id in object_element_ids(&hive, object) {
+                    assert!(
+                        !is_template_element(id),
+                        "{object} must have no template element, found {id:#010x}"
+                    );
+                }
+            }
 
             let (_, data) = hive
                 .element_data(OBJECT_BOOTMGR, ELEMENT_DEFAULT_OBJECT)

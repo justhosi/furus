@@ -1774,6 +1774,76 @@ impl Hive {
         Ok(())
     }
 
+    /// Unlink the subkey `name` from `parent` and release its `nk` cell.
+    ///
+    /// Returns `false` when `parent` has no such subkey, which is a
+    /// no-op. The subkey list is rewritten in place with the matching
+    /// entry removed: remaining entries are compacted toward the front
+    /// and the list `count` (and the parent's subkey count) is
+    /// decremented. Removing an entry always leaves the used bytes
+    /// smaller than the cell, so the list keeps its allocated size and
+    /// no grow/allocate path is needed. Entries are walked with the same
+    /// `list_head`/`list_child` convention as [`Self::list_insert`]
+    /// (lf/lh 8-byte `[offset, hash]` pairs, li/ri 4-byte offsets), and
+    /// rewritten with [`Self::write_subkey_list`].
+    pub(crate) fn remove_child(&mut self, parent: usize, name: &[u8]) -> Result<bool> {
+        let Some(child) = self.find_child(parent, name)? else {
+            return Ok(false);
+        };
+        let nsub = self.nk_u32(parent, 0x14, "subkey count")?;
+        let list = self.nk_u32(parent, 0x1C, "subkey list")?;
+        if nsub == 0 || list == NONE {
+            return Err(CoreError::invalid(format!(
+                "bcd key at offset {parent:#x} counts {nsub} subkeys but has no subkey list"
+            )));
+        }
+        let list = list as usize;
+        let tag = self.cell_tag(list)?;
+        let (count, entry_size, entries_off, hashed) = self.list_head(list)?;
+        if count != nsub {
+            return Err(CoreError::invalid(format!(
+                "bcd key at offset {parent:#x} counts {nsub} subkeys but its list holds {count}"
+            )));
+        }
+        let mut entries: Vec<(Vec<u8>, u32, u32)> = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let at = (index as usize)
+                .checked_mul(entry_size)
+                .and_then(|n| entries_off.checked_add(n))
+                .ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "bcd subkey list at offset {list:#x} entry {index} overflows"
+                    ))
+                })?;
+            let off = self.read_u32(at, "subkey list entry")? as usize;
+            let hash = if hashed {
+                self.read_u32(
+                    at.checked_add(4).ok_or_else(|| {
+                        CoreError::invalid(format!(
+                            "bcd subkey list at offset {list:#x} entry {index} overflows"
+                        ))
+                    })?,
+                    "subkey list hash",
+                )?
+            } else {
+                0
+            };
+            let (stored, _) = self.nk_name(off)?;
+            entries.push((stored, off as u32, hash));
+        }
+        entries.retain(|(_, off, _)| *off as usize != child);
+        let new_nsub = nsub.checked_sub(1).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bcd key at offset {parent:#x} has no subkey to remove"
+            ))
+        })?;
+        let file = Self::cell_file(list, "subkey list")?;
+        self.write_subkey_list(file, &tag, &entries)?;
+        self.store_u32_cell(parent, 0x14, new_nsub, "subkey count")?;
+        self.free_cell(child)?;
+        Ok(true)
+    }
+
     /// Grow a tag-bearing subkey list in place (same neighbour rules
     /// as value lists).
     pub(crate) fn try_grow_subkey_list(
