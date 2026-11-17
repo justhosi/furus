@@ -1076,10 +1076,8 @@ impl Hive {
         old_total: usize,
         new_total: usize,
     ) -> Result<bool> {
-        if new_total < old_total {
-            return Err(CoreError::invalid(format!(
-                "bcd list at file offset {file:#x} cannot shrink from {old_total} to {new_total} bytes"
-            )));
+        if new_total <= old_total {
+            return Ok(true);
         }
         let extra = new_total.saturating_sub(old_total);
         if extra == 0 {
@@ -1837,8 +1835,35 @@ impl Hive {
                 "bcd key at offset {parent:#x} has no subkey to remove"
             ))
         })?;
-        let file = Self::cell_file(list, "subkey list")?;
-        self.write_subkey_list(file, &tag, &entries)?;
+        if new_nsub == 0 {
+            self.store_u32_cell(parent, 0x1C, NONE, "subkey list")?;
+            self.free_cell(list)?;
+        } else {
+            let file = Self::cell_file(list, "subkey list")?;
+            self.write_subkey_list(file, &tag, &entries)?;
+            let old_raw = self.read_i32(file, "subkey list size")?;
+            let old_total = old_raw.unsigned_abs() as usize;
+            let written = (entries.len())
+                .checked_mul(entry_size)
+                .and_then(|n| n.checked_add(LIST_ENTRIES))
+                .ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "bcd subkey list at offset {list:#x} overflows written size"
+                    ))
+                })?;
+            let body_len = old_total.saturating_sub(4);
+            if written < body_len {
+                let slack_start = file
+                    .checked_add(4)
+                    .and_then(|b| b.checked_add(written))
+                    .ok_or_else(|| {
+                        CoreError::invalid(format!(
+                            "bcd subkey list at offset {list:#x} overflows slack zeroing"
+                        ))
+                    })?;
+                self.zero_range(slack_start, body_len - written)?;
+            }
+        }
         self.store_u32_cell(parent, 0x14, new_nsub, "subkey count")?;
         self.free_cell(child)?;
         Ok(true)
@@ -1852,10 +1877,8 @@ impl Hive {
         old_total: usize,
         new_total: usize,
     ) -> Result<bool> {
-        if new_total < old_total {
-            return Err(CoreError::invalid(format!(
-                "bcd subkey list at file offset {file:#x} cannot shrink"
-            )));
+        if new_total <= old_total {
+            return Ok(true);
         }
         let extra = new_total.saturating_sub(old_total);
         if extra == 0 {
@@ -2182,5 +2205,92 @@ mod tests {
         );
         hive.update_checksum().expect("checksum must store");
         Hive::parse(&hive.to_bytes()).expect("appended hive must re-parse");
+    }
+
+    /// Removing subkeys leaves the allocated subkey list cell with
+    /// spare capacity; a subsequent child insertion where the new
+    /// requirement is <= the existing cell size must succeed in place
+    /// rather than refusing with "cannot shrink". Removing all children
+    /// must release the list cell and reset the subkey list pointer to
+    /// `NONE`.
+    #[test]
+    fn subkey_list_retains_capacity_and_allows_reinsert_after_removal() {
+        let mut buf = vec![0u8; 0x200];
+        buf[0..4].copy_from_slice(b"regf");
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x18..0x1C].copy_from_slice(&3u32.to_le_bytes());
+        buf[HDR_ROOT..HDR_ROOT + 4].copy_from_slice(&0x20u32.to_le_bytes());
+        buf[HDR_BIN_LENGTH..HDR_BIN_LENGTH + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        buf.resize(0x3000, 0);
+        buf[0x1000..0x1004].copy_from_slice(b"hbin");
+        buf[0x1004..0x1008].copy_from_slice(&0u32.to_le_bytes());
+        buf[0x1008..0x100C].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[0x2000..0x2004].copy_from_slice(b"hbin");
+        buf[0x2004..0x2008].copy_from_slice(&0u32.to_le_bytes());
+        buf[0x2008..0x200C].copy_from_slice(&0x1000u32.to_le_bytes());
+        let root_file = 0x1020usize;
+        buf[root_file..root_file + 4].copy_from_slice(&(-88i32).to_le_bytes());
+        buf[root_file + 4..root_file + 6].copy_from_slice(b"nk");
+        buf[root_file + 6..root_file + 8].copy_from_slice(&NK_COMPRESSED.to_le_bytes());
+        buf[root_file + 0x14..root_file + 0x18].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x20..root_file + 0x24].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x2C..root_file + 0x30].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x34..root_file + 0x38].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x4C..root_file + 0x4E].copy_from_slice(&4u16.to_le_bytes());
+        buf[root_file + 0x50..root_file + 0x54].copy_from_slice(b"ROOT");
+        let free_file = root_file + 88;
+        let free_size = 0x1000u32 - 0x20 - 88;
+        buf[free_file..free_file + 4].copy_from_slice(&(free_size as i32).to_le_bytes());
+        let free2 = 0x2020usize;
+        buf[free2..free2 + 4].copy_from_slice(&(HBIN_USABLE as i32).to_le_bytes());
+        let checksum = Hive::header_checksum(&buf).expect("fixture header must checksum");
+        buf[HDR_CHECKSUM..HDR_CHECKSUM + 4].copy_from_slice(&checksum.to_le_bytes());
+        let mut hive = Hive::parse(&buf).expect("hand-built fixture must parse");
+
+        let root = hive.root();
+        // Add 5 children so the subkey list is allocated for 5 entries.
+        for name in [b"sub1", b"sub2", b"sub3", b"sub4", b"sub5"] {
+            hive.add_child_key(root, name, None).expect("add child");
+        }
+        assert_eq!(hive.nk_u32(root, 0x14, "nsub").expect("nsub"), 5);
+
+        // Remove two children so count is 3. The allocated list cell size
+        // stays sized for 5 entries.
+        assert!(hive.remove_child(root, b"sub2").expect("remove sub2"));
+        assert!(hive.remove_child(root, b"sub4").expect("remove sub4"));
+        assert_eq!(hive.nk_u32(root, 0x14, "nsub").expect("nsub"), 3);
+
+        // Inserting a new child (nsub 3 -> 4) needs fewer bytes than the
+        // cell already holds (sized for 5). This previously raised "cannot shrink".
+        hive.add_child_key(root, b"sub6", None)
+            .expect("insert sub6 into shrunk list");
+        assert_eq!(hive.nk_u32(root, 0x14, "nsub").expect("nsub"), 4);
+
+        assert!(hive.find_child(root, b"sub1").expect("find").is_some());
+        assert!(hive.find_child(root, b"sub2").expect("find").is_none());
+        assert!(hive.find_child(root, b"sub3").expect("find").is_some());
+        assert!(hive.find_child(root, b"sub4").expect("find").is_none());
+        assert!(hive.find_child(root, b"sub5").expect("find").is_some());
+        assert!(hive.find_child(root, b"sub6").expect("find").is_some());
+
+        // Remove all remaining children: list must be released to NONE.
+        for name in [b"sub1", b"sub3", b"sub5", b"sub6"] {
+            assert!(hive.remove_child(root, name).expect("remove"));
+        }
+        assert_eq!(hive.nk_u32(root, 0x14, "nsub").expect("nsub"), 0);
+        assert_eq!(hive.nk_u32(root, 0x1C, "list").expect("list"), NONE);
+
+        // Can insert again from 0 subkeys.
+        hive.add_child_key(root, b"fresh", None)
+            .expect("add fresh child");
+        assert_eq!(hive.nk_u32(root, 0x14, "nsub").expect("nsub"), 1);
+        assert!(hive.find_child(root, b"fresh").expect("find").is_some());
+
+        hive.update_checksum().expect("checksum");
+        let bytes = hive.to_bytes();
+        let reparsed = Hive::parse(&bytes).expect("reparse");
+        reparsed.check_bins().expect("bins tile");
     }
 }
