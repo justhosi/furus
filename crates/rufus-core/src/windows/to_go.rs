@@ -671,9 +671,14 @@ mod tests {
             .expect("fixture element must allocate");
     }
 
+    /// The resume object the template's loaders point at; `bcd::build`
+    /// now requires it so it can wire the device and winresume path.
+    const TEST_RESUME_GUID: &str = "{0c334284-9a41-4de1-99b3-a7e87e8ff07e}";
+
     /// Build a template-shaped fixture: `System\Objects` with
-    /// `{bootmgr}`, both winload loaders and `{memdiag}`, each with an
-    /// `Elements` key holding the elements `bcd::build` reads.
+    /// `{bootmgr}`, both winload loaders, the resume object they point
+    /// at and `{memdiag}`, each with an `Elements` key holding the
+    /// elements `bcd::build` reads.
     fn template_fixture() -> Vec<u8> {
         use crate::windows::regf::REG_BINARY;
         use crate::windows::regf::REG_SZ;
@@ -720,6 +725,7 @@ mod tests {
         let bootmgr = add_key(&mut hive, objects, OBJECT_BOOTMGR.as_bytes());
         let uefi = add_key(&mut hive, objects, TEMPLATE_LOADER_B012.as_bytes());
         let bios = add_key(&mut hive, objects, TEMPLATE_LOADER_A194.as_bytes());
+        let resume = add_key(&mut hive, objects, TEST_RESUME_GUID.as_bytes());
         let memdiag = add_key(&mut hive, objects, OBJECT_MEMDIAG.as_bytes());
 
         let bootmgr_el = add_key(&mut hive, bootmgr, b"Elements");
@@ -752,7 +758,23 @@ mod tests {
                 &utf16_nul("\\windows"),
             );
             add_element(&mut hive, elements, "42000002", REG_SZ, &utf16_nul(suffix));
+            add_element(
+                &mut hive,
+                elements,
+                "23000003",
+                REG_SZ,
+                &utf16_nul(TEST_RESUME_GUID),
+            );
         }
+
+        let resume_el = add_key(&mut hive, resume, b"Elements");
+        add_element(
+            &mut hive,
+            resume_el,
+            "42000002",
+            REG_SZ,
+            &utf16_nul("\\system32\\winresume.efi"),
+        );
 
         let memdiag_el = add_key(&mut hive, memdiag, b"Elements");
         add_element(

@@ -216,6 +216,15 @@ pub const ELEMENT_OS_LOCATE_PATH: u32 = 0x2200_0002;
 /// no such element to update.
 pub const ELEMENT_DEFAULT_OBJECT: u32 = 0x2300_0003;
 
+/// `0x23000006` (class `0x23`): the resume-object element on
+/// `{bootmgr}`, a `REG_SZ` GUID string naming the resume object that
+/// `bcdboot` wires with a device (`11000001`) and a full winresume
+/// application path (`12000002`). Absent from the template; [`build`]
+/// adds it. Note the loader's *own* resume-object reference is also
+/// `0x23000003` ([`ELEMENT_DEFAULT_OBJECT`], read here under the
+/// loader), which the template already carries and [`build`] follows.
+pub const ELEMENT_RESUME_OBJECT: u32 = 0x2300_0006;
+
 /// `0x24000001` (class `0x24`, GUID list): the boot-manager display
 /// order on `{bootmgr}`, a single-entry `REG_MULTI_SZ` holding the
 /// chosen loader. Absent from the template; [`build`] adds it.
@@ -435,6 +444,16 @@ fn winload_full_path(firmware: Firmware) -> &'static str {
     }
 }
 
+/// The winresume path written as the resume object's `12000002`, per
+/// firmware: the full application path `bcdboot` puts on the resume
+/// object, not the template's relative `42000002`.
+fn winresume_full_path(firmware: Firmware) -> &'static str {
+    match firmware {
+        Firmware::Uefi => "\\windows\\system32\\winresume.efi",
+        Firmware::Bios => "\\windows\\system32\\winresume.exe",
+    }
+}
+
 /// The `42000002` value the chosen loader must already carry, per
 /// firmware. [`build`] confirms it live before patching.
 fn expected_loader_suffix(firmware: Firmware) -> &'static str {
@@ -505,10 +524,13 @@ pub fn partition_device(identity: DeviceIdentity) -> [u8; 88] {
 /// firmware-selected loader (see [`default_object`]) gains
 /// `11000001`/`21000001` partition devices, `12000002`, and the
 /// edition description when given; `{bootmgr}` is repointed at it
-/// (plus `\bootmgr` at its `12000002` for [`Firmware::Bios`});
-/// `{memdiag}` gains the boot device and the per-firmware
-/// application path (see [`memdiag_path`]); the header checksum is
-/// recomputed. Refuses with [`CoreError::InvalidInput`] naming what is
+/// (plus `\bootmgr` at its `12000002` for [`Firmware::Bios`]);
+/// the resume object named by the loader's `23000003` gains the same
+/// partition device and a full winresume application path, and
+/// `{bootmgr}` gains a `23000006` pointing at it; `{memdiag}` gains the
+/// boot device and the per-firmware application path (see
+/// [`memdiag_path`]); the header checksum is recomputed. Refuses with
+/// [`CoreError::InvalidInput`] naming what is
 /// wrong when the template is not a `regf` hive, is truncated, lacks
 /// `System\Objects`, `{bootmgr}`, the required loader or
 /// `{memdiag}`, or lacks an element the build has to update.
@@ -633,6 +655,34 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
     if let Some(description) = request.description {
         hive.set_element_sz(loader_elements, ELEMENT_DESCRIPTION, description)?;
     }
+    // Wire the resume object the way bcdboot does. The loader's own
+    // `23000003` names it; the template's relative `42000002` is not
+    // enough to boot, so the resume object also needs the data-partition
+    // device and the full winresume application path, and {bootmgr} must
+    // point at it with `23000006`.
+    let resume_guid = match hive.element_value(loader_elements, ELEMENT_DEFAULT_OBJECT)? {
+        Some((_, data)) => decode_sz(&data)?,
+        None => {
+            return Err(CoreError::invalid(format!(
+                "bcd template loader {loader_guid} has no 23000003 resume object to wire"
+            )));
+        }
+    };
+    let resume = hive
+        .find_child(objects, resume_guid.as_bytes())?
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bcd template is missing the resume object {resume_guid}"
+            ))
+        })?;
+    let resume_elements = hive.find_child(resume, b"Elements")?.ok_or_else(|| {
+        CoreError::invalid(format!(
+            "bcd template resume object {resume_guid} has no Elements key"
+        ))
+    })?;
+    hive.set_element_binary(resume_elements, ELEMENT_DEVICE, &partition)?;
+    hive.set_element_sz(resume_elements, ELEMENT_PATH, winresume_full_path(firmware))?;
+    hive.set_element_sz(bootmgr_elements, ELEMENT_RESUME_OBJECT, &resume_guid)?;
     hive.set_element_binary(memdiag_elements, ELEMENT_DEVICE, &boot_device())?;
     hive.set_element_sz(memdiag_elements, ELEMENT_PATH, memdiag_path(firmware))?;
     hive.update_checksum()?;
@@ -681,7 +731,7 @@ mod tests {
         // Every documented element id as a literal, pinned against its
         // constant plus the class the module docs promise: a typo or a
         // changed constant fails here instead of staying green.
-        let table: [(u32, u32, u8); 26] = [
+        let table: [(u32, u32, u8); 27] = [
             (0x1100_0001, ELEMENT_DEVICE, 0x11),
             (0x1200_0002, ELEMENT_PATH, 0x12),
             (0x1200_0004, ELEMENT_DESCRIPTION, 0x12),
@@ -695,6 +745,7 @@ mod tests {
             (0x2100_0001, ELEMENT_OS_DEVICE, 0x21),
             (0x2200_0002, ELEMENT_OS_LOCATE_PATH, 0x22),
             (0x2300_0003, ELEMENT_DEFAULT_OBJECT, 0x23),
+            (0x2300_0006, ELEMENT_RESUME_OBJECT, 0x23),
             (0x2400_0001, ELEMENT_BOOT_DISPLAY_ORDER, 0x24),
             (0x2400_0010, ELEMENT_TOOLS_DISPLAY_ORDER, 0x24),
             (0x2500_0004, ELEMENT_TIMEOUT, 0x25),
@@ -1008,9 +1059,14 @@ mod tests {
             .expect("fixture element must allocate");
     }
 
+    /// The resume object the template's loaders reference: `bcdboot`
+    /// wires this object with a device and a full winresume path.
+    const TEST_RESUME_GUID: &str = "{0c334284-9a41-4de1-99b3-a7e87e8ff07e}";
+
     /// Build a template-shaped fixture: `System\Objects` with
-    /// `{bootmgr}`, both winload loaders and `{memdiag}`, each with an
-    /// `Elements` key holding the elements [`build`] reads.
+    /// `{bootmgr}`, both winload loaders, the resume object they point
+    /// at and `{memdiag}`, each with an `Elements` key holding the
+    /// elements [`build`] reads.
     fn template_fixture() -> Vec<u8> {
         let mut hive = empty_hive();
         let root = hive.root();
@@ -1018,6 +1074,7 @@ mod tests {
         let bootmgr = add_key(&mut hive, objects, OBJECT_BOOTMGR.as_bytes());
         let uefi = add_key(&mut hive, objects, TEMPLATE_LOADER_B012.as_bytes());
         let bios = add_key(&mut hive, objects, TEMPLATE_LOADER_A194.as_bytes());
+        let resume = add_key(&mut hive, objects, TEST_RESUME_GUID.as_bytes());
         let memdiag = add_key(&mut hive, objects, OBJECT_MEMDIAG.as_bytes());
 
         let bootmgr_el = add_key(&mut hive, bootmgr, b"Elements");
@@ -1050,7 +1107,23 @@ mod tests {
                 &utf16_nul("\\windows"),
             );
             add_element(&mut hive, elements, "42000002", REG_SZ, &utf16_nul(suffix));
+            add_element(
+                &mut hive,
+                elements,
+                "23000003",
+                REG_SZ,
+                &utf16_nul(TEST_RESUME_GUID),
+            );
         }
+
+        let resume_el = add_key(&mut hive, resume, b"Elements");
+        add_element(
+            &mut hive,
+            resume_el,
+            "42000002",
+            REG_SZ,
+            &utf16_nul("\\system32\\winresume.efi"),
+        );
 
         let memdiag_el = add_key(&mut hive, memdiag, b"Elements");
         add_element(
@@ -1465,6 +1538,62 @@ mod tests {
     }
 
     #[test]
+    fn resume_object_is_wired_like_bcdboot() {
+        let template = template_fixture();
+        let out = build(
+            &template,
+            &StoreRequest {
+                firmware: Firmware::Uefi,
+                identity: DeviceIdentity::Gpt {
+                    disk_guid: [0x01; 16],
+                    partition_guid: [0x0A; 16],
+                },
+                description: None,
+            },
+        )
+        .expect("build must succeed");
+        let hive = Hive::parse(&out).expect("output must re-parse");
+        let loader = default_object(Firmware::Uefi);
+
+        // (a) the resume object's device is the same partition device
+        // the loader got, byte for byte.
+        let (vtype, resume_device) = hive
+            .element_data(TEST_RESUME_GUID, ELEMENT_DEVICE)
+            .expect("read resume device")
+            .expect("resume 11000001 must exist");
+        assert_eq!(vtype, REG_BINARY);
+        let (_, loader_device) = hive
+            .element_data(loader, ELEMENT_DEVICE)
+            .expect("read loader device")
+            .expect("loader 11000001 must exist");
+        assert_eq!(resume_device, loader_device);
+
+        // (b) the full winresume application path, not the template's
+        // relative 42000002.
+        let (vtype, data) = hive
+            .element_data(TEST_RESUME_GUID, ELEMENT_PATH)
+            .expect("read resume path")
+            .expect("resume 12000002 must exist");
+        assert_eq!(vtype, REG_SZ);
+        assert_eq!(
+            decode_sz(&data).expect("path text"),
+            winresume_full_path(Firmware::Uefi)
+        );
+        assert_eq!(
+            decode_sz(&data).expect("path text"),
+            "\\windows\\system32\\winresume.efi"
+        );
+
+        // (c) bootmgr points at the resume object with 23000006.
+        let (vtype, data) = hive
+            .element_data(OBJECT_BOOTMGR, ELEMENT_RESUME_OBJECT)
+            .expect("read resume object ref")
+            .expect("bootmgr 23000006 must exist");
+        assert_eq!(vtype, REG_SZ);
+        assert_eq!(decode_sz(&data).expect("guid text"), TEST_RESUME_GUID);
+    }
+
+    #[test]
     fn refusals_name_what_is_wrong() {
         let gpt = DeviceIdentity::Gpt {
             disk_guid: [0u8; 16],
@@ -1547,6 +1676,15 @@ mod tests {
             REG_SZ,
             &utf16_nul("\\system32\\winload.efi"),
         );
+        add_element(
+            &mut minimal,
+            uefi_el,
+            "23000003",
+            REG_SZ,
+            &utf16_nul(TEST_RESUME_GUID),
+        );
+        let resume = add_key(&mut minimal, objects, TEST_RESUME_GUID.as_bytes());
+        add_key(&mut minimal, resume, b"Elements");
         let memdiag = add_key(&mut minimal, objects, OBJECT_MEMDIAG.as_bytes());
         let memdiag_el = add_key(&mut minimal, memdiag, b"Elements");
         add_element(
@@ -1733,6 +1871,48 @@ mod tests {
         hive.update_checksum().expect("checksum");
         let err = build(&hive.into_bytes(), &uefi).expect_err("no memdiag path must refuse");
         assert!(err.to_string().contains("12000002"), "{err}");
+
+        // Missing resume object: the loader has no 23000003 to name one.
+        let mut hive = empty_hive();
+        let root = hive.root();
+        let objects = add_key(&mut hive, root, b"Objects");
+        let bootmgr = add_key(&mut hive, objects, OBJECT_BOOTMGR.as_bytes());
+        let bootmgr_el = add_key(&mut hive, bootmgr, b"Elements");
+        add_element(
+            &mut hive,
+            bootmgr_el,
+            "23000003",
+            REG_SZ,
+            &utf16_nul(TEMPLATE_LOADER_CBD9),
+        );
+        let loader = add_key(&mut hive, objects, TEMPLATE_LOADER_B012.as_bytes());
+        let loader_el = add_key(&mut hive, loader, b"Elements");
+        add_element(
+            &mut hive,
+            loader_el,
+            "22000002",
+            REG_SZ,
+            &utf16_nul("\\windows"),
+        );
+        add_element(
+            &mut hive,
+            loader_el,
+            "42000002",
+            REG_SZ,
+            &utf16_nul("\\system32\\winload.efi"),
+        );
+        let memdiag = add_key(&mut hive, objects, OBJECT_MEMDIAG.as_bytes());
+        let memdiag_el = add_key(&mut hive, memdiag, b"Elements");
+        add_element(
+            &mut hive,
+            memdiag_el,
+            "12000002",
+            REG_SZ,
+            &utf16_nul("\\boot\\memtest.exe"),
+        );
+        hive.update_checksum().expect("checksum");
+        let err = build(&hive.into_bytes(), &uefi).expect_err("no resume object must refuse");
+        assert!(err.to_string().contains("resume object"), "{err}");
 
         // A description longer than one cell can hold refuses naming
         // the needed bytes and the free space.

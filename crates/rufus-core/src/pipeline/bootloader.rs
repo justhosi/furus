@@ -2948,6 +2948,10 @@ mod tests {
             .expect("fixture element must allocate");
     }
 
+    /// The resume object the template's loaders point at; `bcd::build`
+    /// now requires it so it can wire the device and winresume path.
+    const TEST_RESUME_GUID: &str = "{0c334284-9a41-4de1-99b3-a7e87e8ff07e}";
+
     /// A synthetic BCD template the builder accepts for both firmwares:
     /// the same objects and elements the `to_go` fixture carries,
     /// duplicated here because that helper is private to its tests
@@ -2987,6 +2991,7 @@ mod tests {
         let bootmgr = windows_add_key(&mut hive, objects, OBJECT_BOOTMGR.as_bytes());
         let uefi = windows_add_key(&mut hive, objects, TEMPLATE_LOADER_B012.as_bytes());
         let bios = windows_add_key(&mut hive, objects, TEMPLATE_LOADER_A194.as_bytes());
+        let resume = windows_add_key(&mut hive, objects, TEST_RESUME_GUID.as_bytes());
         let memdiag = windows_add_key(&mut hive, objects, OBJECT_MEMDIAG.as_bytes());
         let bootmgr_el = windows_add_key(&mut hive, bootmgr, b"Elements");
         windows_add_element(
@@ -3017,7 +3022,22 @@ mod tests {
                 &utf16_nul("\\windows"),
             );
             windows_add_element(&mut hive, elements, "42000002", REG_SZ, &utf16_nul(suffix));
+            windows_add_element(
+                &mut hive,
+                elements,
+                "23000003",
+                REG_SZ,
+                &utf16_nul(TEST_RESUME_GUID),
+            );
         }
+        let resume_el = windows_add_key(&mut hive, resume, b"Elements");
+        windows_add_element(
+            &mut hive,
+            resume_el,
+            "42000002",
+            REG_SZ,
+            &utf16_nul("\\system32\\winresume.efi"),
+        );
         let memdiag_el = windows_add_key(&mut hive, memdiag, b"Elements");
         windows_add_element(
             &mut hive,
