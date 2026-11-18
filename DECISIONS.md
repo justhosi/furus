@@ -82,3 +82,25 @@ prerequisites, not runtime dependencies.
 The header's "No implementation has started" sentence describes S00 at the
 time it was written; slices S01 onward are implemented and are described in
 `README.md`.
+
+### 2026-11-18 - S22 amendments (no A1–A12 value changes)
+
+These clarify implementation details of existing decisions; none of the A1–A12
+values above is changed.
+
+* **A5 (C libraries)**: `wimlib-sys` gains an opt-in `strict-link` Cargo feature
+  that turns a missing system `libwim` (or `WIMLIB_SYS_FORCE_UNLINKED`) from a
+  silent unbound stub into a compile error. It is default-off: default builds
+  are unchanged and no dependency is added.
+* **A11 (Locales) — BCD only**: BCD store locale handling is now dynamic — a
+  locale supplied from the applied tree (`.mui` detection) → the BCD-Template's
+  `12000005` → `en-us`, written verbatim to all four locale sites. This is a BCD
+  implementation detail; the A11 GUI locale policy (`rufus.loc`, English
+  fallback) is unchanged.
+* **A5/WIM apply**: the apply pre-flight reserves NTFS overhead —
+  `required + max(64 MiB, required / 50)` — on both free-space checks before any
+  write, because exact NTFS metadata/compression overhead cannot be predicted
+  from the WIM.
+* **Testing**: a deterministic regf mutation property test (500 sequences × 20
+  ops, reparse + checksum + `check_bins` after every step) was added with no new
+  dependency.
