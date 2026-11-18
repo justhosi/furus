@@ -191,8 +191,8 @@ pub fn run(
     reporter: &mut dyn Reporter,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<RunReport> {
-    // `badblocks` is carried for slice 9; the write step reads
-    // `verify` today.
+    // `Wipe` reads `badblocks` (the surface scan, see
+    // `pipeline::badblocks`); the write step reads `verify`.
     let run_started = Instant::now();
     let total = plan.steps.len();
     let mut ctx = steps::RunContext {
@@ -3663,6 +3663,114 @@ mod tests {
             badblocks_progress(&reporter).is_empty(),
             "no badblocks progress without the flag: {:?}",
             reporter.events()
+        );
+    }
+
+    #[test]
+    fn full_format_zeroes_without_scanning_and_scan_rides_in_wipe() {
+        // A full surface format (`quick == false`) and the optional
+        // surface scan are independent knobs: the zero pass belongs to
+        // mkfs alone, while the scan is the wipe's `"badblocks"`
+        // pseudo-step. Full format, flag off: the partition zeroes and
+        // nothing scans.
+        let full_format = || Step::Mkfs {
+            filesystem: Filesystem::Fat32,
+            label: None,
+            cluster_bytes: None,
+            quick: false,
+        };
+        let plan = || {
+            test_plan(vec![
+                Step::Wipe,
+                Step::Mklabel {
+                    scheme: Scheme::Mbr,
+                },
+                Step::Mkpart {
+                    scheme: Scheme::Mbr,
+                    layout: Layout::Single,
+                },
+                full_format(),
+            ])
+        };
+
+        let (_scratch, opener) = layout_opener();
+        prefill(&opener, 0xAA);
+        let mut reporter = VecReporter::new();
+        run(&plan(), &opener, &run_options(), &mut reporter, &|| false)
+            .expect("a full format runs without the scan");
+        let texts = messages(&reporter);
+        assert!(
+            texts.iter().any(|text| text.contains("mkfs: zeroing")),
+            "the full format zeroes the partition: {texts:?}"
+        );
+        assert!(
+            badblocks_progress(&reporter).is_empty(),
+            "a full format alone does not scan: {:?}",
+            reporter.events()
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("badblocks pass")),
+            "no scan messages without the flag: {texts:?}"
+        );
+        let bytes = opener.target.bytes().expect("bytes read back");
+        let probe = (PART_BASE + MIB) as usize;
+        assert!(
+            bytes[probe..probe + MIB as usize]
+                .iter()
+                .all(|&byte| byte == 0),
+            "the zero pass overwrites the prefill"
+        );
+
+        // Same full format with the flag: the scan reports through its
+        // own pseudo-step and finishes before the format step starts,
+        // whose zero pass still runs afterwards.
+        let (_scratch, opener) = layout_opener();
+        prefill(&opener, 0xAA);
+        let mut reporter = VecReporter::new();
+        run(
+            &plan(),
+            &opener,
+            &badblocks_options(),
+            &mut reporter,
+            &|| false,
+        )
+        .expect("a full format with the scan runs");
+        let events = reporter.events();
+        assert!(
+            !badblocks_progress(&reporter).is_empty(),
+            "the scan reports its own progress: {events:?}"
+        );
+        let last_scan = events
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    Event::Progress {
+                        step: "badblocks",
+                        ..
+                    }
+                )
+            })
+            .expect("the scan reports progress");
+        let mkfs_start = events
+            .iter()
+            .position(|event| matches!(event, Event::StepStarted { step: "mkfs", .. }))
+            .expect("the format step starts");
+        assert!(
+            last_scan < mkfs_start,
+            "the scan finishes before mkfs starts: {events:?}"
+        );
+        let texts = messages(&reporter);
+        assert!(
+            texts.iter().any(|text| text.contains("mkfs: zeroing")),
+            "the full format still zeroes after the scan: {texts:?}"
+        );
+        let bytes = opener.target.bytes().expect("bytes read back");
+        assert!(
+            bytes[probe..probe + MIB as usize]
+                .iter()
+                .all(|&byte| byte == 0),
+            "the zero pass follows the scan's pattern writes"
         );
     }
 

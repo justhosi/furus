@@ -10,11 +10,24 @@
 //! `quick == false` is a full surface format (the Rufus "quick format"
 //! distinction): the partition zeroes first, in cancellable 1 MiB
 //! pieces with a `Message` naming the bytes; `quick == true` writes
-//! metadata only. Bad-block scanning during a full format arrives in
-//! slice 9. Cancellation is checked before zeroing and before the
-//! formatter call; a formatter in flight cannot be interrupted (one
-//! external tool call or one tight metadata write) — honest, and slice
-//! 9 owns the long scan.
+//! metadata only. The zero pass emits no `Progress` samples: its one
+//! `Message` is the whole report, and the step's `StepStarted` /
+//! `StepFinished` pair frames it. Cancellation is checked before
+//! zeroing, between zero pieces and before the formatter call; a
+//! formatter in flight cannot be interrupted (one external tool call
+//! or one tight metadata write).
+//!
+//! A full format does not scan for bad blocks: zeroing is all
+//! `quick == false` adds. The surface scan is a separate, opt-in
+//! pass — [`badblocks`](super::badblocks) — that runs at the end of
+//! [`Wipe`](super::wipe::run) when
+//! [`RunOptions::badblocks`](super::RunOptions::badblocks) is set,
+//! before any table, partition or format step, and reports through the
+//! event-level `"badblocks"` pseudo-step (`Progress` samples plus its
+//! pass and summary `Message` lines). The two are independent: either
+//! can run without the other, and with both the scan finishes before
+//! this step starts (that order is what the destructive scan relies
+//! on: mkfs rewrites the surface the last scan pass left behind).
 //!
 //! Engine mapping, exhaustive: FAT32 and exFAT format natively against
 //! the partition volume (serial from a fresh v4 UUID, non-zero refused
