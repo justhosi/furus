@@ -2132,6 +2132,7 @@ pub(crate) fn write_field<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// A valid hive with trailing zero padding (like a real `SYSTEM` hive)
     /// must parse at its declared bin extent, not at the padded buffer
@@ -2292,5 +2293,484 @@ mod tests {
         let bytes = hive.to_bytes();
         let reparsed = Hive::parse(&bytes).expect("reparse");
         reparsed.check_bins().expect("bins tile");
+    }
+
+    /// Deterministic xorshift64* stream. No OS, thread, clock or address
+    /// entropy is read, so a fixed seed yields the exact same operations and
+    /// payload bytes on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            assert_ne!(seed, 0, "xorshift seed must be non-zero");
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            debug_assert!(n > 0);
+            self.next_u64() % n
+        }
+
+        fn range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + self.below((hi - lo + 1) as u64) as usize
+        }
+    }
+
+    /// A data cell may not span hive bins: `alloc` refuses a cell whose
+    /// total exceeds `HBIN_USABLE`. 4056 B is the largest payload that fits
+    /// one 4 KiB page with a granule of margin, so payloads are varied from
+    /// 4 B up to this ceiling and many of them (plus explicit bin appends)
+    /// force allocations across bin boundaries.
+    const MAX_PAYLOAD: usize = HBIN_USABLE - 8;
+
+    fn payload(rng: &mut Rng) -> Vec<u8> {
+        let len = match rng.below(4) {
+            0 => rng.range(4, 8),
+            1 => rng.range(9, 256),
+            2 => rng.range(257, 2048),
+            _ => rng.range(2049, MAX_PAYLOAD),
+        };
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            data.push(rng.next_u64() as u8);
+        }
+        data
+    }
+
+    /// The same two-bin synthetic fixture used by the tests above, returned
+    /// as a freshly parsed hive rooted at `ROOT`.
+    fn two_bin_hive() -> Hive {
+        let mut buf = vec![0u8; HDR_MIN_LEN];
+        buf[0..4].copy_from_slice(b"regf");
+        buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        buf[0x18..0x1C].copy_from_slice(&3u32.to_le_bytes());
+        buf[HDR_ROOT..HDR_ROOT + 4].copy_from_slice(&0x20u32.to_le_bytes());
+        buf[HDR_BIN_LENGTH..HDR_BIN_LENGTH + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        buf.resize(BIN_BASE + 0x2000, 0);
+        buf[0x1000..0x1004].copy_from_slice(b"hbin");
+        buf[0x1008..0x100C].copy_from_slice(&(BIN_SIZE as u32).to_le_bytes());
+        buf[0x2000..0x2004].copy_from_slice(b"hbin");
+        buf[0x2008..0x200C].copy_from_slice(&(BIN_SIZE as u32).to_le_bytes());
+        let root_file = BIN_BASE + HBIN_HEAD;
+        buf[root_file..root_file + 4].copy_from_slice(&(-88i32).to_le_bytes());
+        buf[root_file + 4..root_file + 6].copy_from_slice(b"nk");
+        buf[root_file + 6..root_file + 8].copy_from_slice(&NK_COMPRESSED.to_le_bytes());
+        buf[root_file + 0x14..root_file + 0x18].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x20..root_file + 0x24].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x2C..root_file + 0x30].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x34..root_file + 0x38].copy_from_slice(&NONE.to_le_bytes());
+        buf[root_file + 0x4C..root_file + 0x4E].copy_from_slice(&4u16.to_le_bytes());
+        buf[root_file + 0x50..root_file + 0x54].copy_from_slice(b"ROOT");
+        let tail = root_file + 88;
+        buf[tail..tail + 4].copy_from_slice(&((HBIN_USABLE - 88) as i32).to_le_bytes());
+        let tail2 = BIN_BASE + BIN_SIZE + HBIN_HEAD;
+        buf[tail2..tail2 + 4].copy_from_slice(&(HBIN_USABLE as i32).to_le_bytes());
+        let checksum = Hive::header_checksum(&buf).expect("fixture header must checksum");
+        buf[HDR_CHECKSUM..HDR_CHECKSUM + 4].copy_from_slice(&checksum.to_le_bytes());
+        Hive::parse(&buf).expect("two-bin synthetic hive must parse")
+    }
+
+    fn child_names(hive: &Hive, parent: usize) -> BTreeSet<Vec<u8>> {
+        let mut out = BTreeSet::new();
+        let nsub = hive
+            .nk_u32(parent, 0x14, "subkey count")
+            .expect("subkey count");
+        if nsub == 0 {
+            return out;
+        }
+        let list = hive
+            .nk_u32(parent, 0x1C, "subkey list")
+            .expect("subkey list") as usize;
+        for index in 0..nsub {
+            let child = hive
+                .list_child(list, index)
+                .expect("list entry")
+                .expect("child must exist");
+            let (name, _) = hive.nk_name(child).expect("child name");
+            out.insert(name);
+        }
+        out
+    }
+
+    fn value_names(hive: &Hive, key: usize) -> BTreeSet<Vec<u8>> {
+        let mut out = BTreeSet::new();
+        for vk in hive.value_list(key).expect("value list") {
+            let file = Hive::cell_file(vk, "value name").expect("cell file") + 4;
+            let len = hive
+                .read_u16(file + 2, "value name length")
+                .expect("name len") as usize;
+            let flags = hive
+                .read_u16(file + 0x10, "value flags")
+                .expect("value flags");
+            assert_ne!(flags & VK_LATIN1, 0, "test value names stay latin-1");
+            let at = file + VK_FIXED;
+            let name = hive
+                .buf
+                .get(at..at + len)
+                .expect("value name bytes")
+                .to_vec();
+            out.insert(name);
+        }
+        out
+    }
+
+    fn pick(rng: &mut Rng, set: &BTreeSet<Vec<u8>>) -> Option<Vec<u8>> {
+        if set.is_empty() {
+            return None;
+        }
+        set.iter()
+            .nth(rng.below(set.len() as u64) as usize)
+            .cloned()
+    }
+
+    fn pick_element(rng: &mut Rng, elements: &BTreeMap<u32, Vec<u8>>) -> Option<u32> {
+        if elements.is_empty() {
+            return None;
+        }
+        elements
+            .keys()
+            .nth(rng.below(elements.len() as u64) as usize)
+            .copied()
+    }
+
+    /// Expected contents of the seeded key/value tree.
+    #[derive(Default)]
+    struct Shadow {
+        root_keys: BTreeSet<Vec<u8>>,
+        nested_keys: BTreeSet<Vec<u8>>,
+        churn_keys: BTreeSet<Vec<u8>>,
+        elements: BTreeMap<u32, Vec<u8>>,
+        values: BTreeMap<Vec<u8>, (u32, Vec<u8>)>,
+    }
+
+    const FIXED_ROOT_KEYS: [&[u8]; 4] = [b"Elements", b"Values", b"Apps", b"Churn"];
+
+    /// Full post-step check: checksum, structural parse, idempotent
+    /// round-trip and agreement with the shadow model on a fresh re-parse.
+    fn verify(hive: &mut Hive, shadow: &Shadow) {
+        hive.update_checksum().expect("checksum must update");
+        let bytes = hive.to_bytes();
+        let reparsed = Hive::parse(&bytes).expect("hive must re-parse after mutation");
+        reparsed.check_bins().expect("reparsed bins must tile");
+        assert_eq!(
+            reparsed
+                .read_u32(HDR_CHECKSUM, "header checksum")
+                .expect("stored checksum"),
+            Hive::header_checksum(&bytes).expect("computed checksum"),
+            "stored header checksum must equal recomputed checksum"
+        );
+        Hive::parse(&reparsed.to_bytes()).expect("idempotent round-trip must re-parse");
+
+        let root = reparsed.root();
+        let mut expected_root: BTreeSet<Vec<u8>> =
+            FIXED_ROOT_KEYS.iter().map(|name| name.to_vec()).collect();
+        expected_root.extend(shadow.root_keys.iter().cloned());
+        assert_eq!(
+            child_names(&reparsed, root),
+            expected_root,
+            "root children disagree with shadow"
+        );
+        for name in FIXED_ROOT_KEYS {
+            assert!(
+                reparsed
+                    .find_child(root, name)
+                    .expect("find fixed key")
+                    .is_some(),
+                "fixed root key {:?} vanished",
+                name
+            );
+        }
+        for name in &shadow.root_keys {
+            assert!(
+                reparsed
+                    .find_child(root, name)
+                    .expect("find root key")
+                    .is_some(),
+                "tracked root key {:?} vanished",
+                name
+            );
+        }
+
+        let apps = reparsed
+            .find_child(root, b"Apps")
+            .expect("find Apps")
+            .expect("Apps present");
+        assert_eq!(
+            child_names(&reparsed, apps),
+            shadow.nested_keys,
+            "nested children disagree with shadow"
+        );
+        let churn = reparsed
+            .find_child(root, b"Churn")
+            .expect("find Churn")
+            .expect("Churn present");
+        assert_eq!(
+            child_names(&reparsed, churn),
+            shadow.churn_keys,
+            "churn children disagree with shadow"
+        );
+
+        let elements_cell = reparsed
+            .find_child(root, b"Elements")
+            .expect("find Elements")
+            .expect("Elements present");
+        let expected_elements: BTreeSet<Vec<u8>> = shadow
+            .elements
+            .keys()
+            .map(|id| element_name(*id).to_vec())
+            .collect();
+        assert_eq!(
+            child_names(&reparsed, elements_cell),
+            expected_elements,
+            "element keys disagree with shadow"
+        );
+        for (&id, data) in &shadow.elements {
+            let got = reparsed
+                .element_value(elements_cell, id)
+                .expect("element_value");
+            assert_eq!(
+                got.as_ref()
+                    .map(|(vtype, bytes)| (*vtype, bytes.as_slice())),
+                Some((REG_BINARY, data.as_slice())),
+                "element {id:#010x} bytes disagree"
+            );
+        }
+
+        let values_cell = reparsed
+            .find_child(root, b"Values")
+            .expect("find Values")
+            .expect("Values present");
+        assert_eq!(
+            value_names(&reparsed, values_cell),
+            shadow.values.keys().cloned().collect(),
+            "value names disagree with shadow"
+        );
+        for (name, &(vtype, ref data)) in &shadow.values {
+            assert!(
+                reparsed
+                    .find_value(values_cell, name)
+                    .expect("find value")
+                    .is_some(),
+                "tracked value {:?} vanished",
+                name
+            );
+            let got = reparsed.read_value(values_cell, name).expect("read_value");
+            assert_eq!(
+                got.as_ref().map(|(kind, bytes)| (*kind, bytes.as_slice())),
+                Some((vtype, data.as_slice())),
+                "value {:?} bytes disagree",
+                name
+            );
+        }
+    }
+
+    /// 500 deterministic sequences of randomized key/value/element mutations
+    /// on a two-bin hive. Every single step is followed by a checksum update,
+    /// a parse + `check_bins` + idempotent round-trip, and a shadow-model
+    /// comparison that catches silent data loss as well as structural damage.
+    #[test]
+    fn prop_hive_mutations() {
+        const SEQUENCES: usize = 500;
+        const OPS: usize = 20;
+        const SEED: u64 = 0x243F_6A88_85A3_08D3;
+        const ROOT_NAMES: [&[u8]; 8] = [b"k0", b"k1", b"k2", b"k3", b"k4", b"k5", b"k6", b"k7"];
+        const NESTED_NAMES: [&[u8]; 8] = [b"n0", b"n1", b"n2", b"n3", b"n4", b"n5", b"n6", b"n7"];
+        const CHURN_NAMES: [&[u8]; 4] = [b"c0", b"c1", b"c2", b"c3"];
+        const ELEMENT_IDS: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+        let mut rng = Rng::new(SEED);
+        let mut steps = 0usize;
+        let mut max_bins = 0usize;
+
+        for seq in 0..SEQUENCES {
+            let mut hive = two_bin_hive();
+            let root = hive.root();
+            let elements = hive
+                .add_child_key(root, b"Elements", None)
+                .expect("Elements key");
+            let values = hive
+                .add_child_key(root, b"Values", None)
+                .expect("Values key");
+            let apps = hive.add_child_key(root, b"Apps", None).expect("Apps key");
+            let churn = hive.add_child_key(root, b"Churn", None).expect("Churn key");
+            hive.add_value(values, b"blob", REG_BINARY, &[0xA5; 4])
+                .expect("initial blob value");
+
+            let mut shadow = Shadow::default();
+            shadow
+                .values
+                .insert(b"blob".to_vec(), (REG_BINARY, vec![0xA5; 4]));
+            verify(&mut hive, &shadow);
+
+            for _ in 0..OPS {
+                match rng.below(10) {
+                    0 => {
+                        // Add a key directly under the root, with a model on
+                        // some steps and `None` on others.
+                        let name = ROOT_NAMES[rng.below(ROOT_NAMES.len() as u64) as usize];
+                        if !shadow.root_keys.contains(name) {
+                            let model = if shadow.root_keys.is_empty() {
+                                None
+                            } else {
+                                Some(apps)
+                            };
+                            hive.add_child_key(root, name, model).expect("add root key");
+                            shadow.root_keys.insert(name.to_vec());
+                        }
+                    }
+                    1 => {
+                        // Remove a root key, or prove a missing one is a no-op.
+                        if let Some(name) = pick(&mut rng, &shadow.root_keys) {
+                            assert!(
+                                hive.remove_child(root, &name).expect("remove root key"),
+                                "remove_child must report a removed root key"
+                            );
+                            shadow.root_keys.remove(&name);
+                        } else {
+                            assert!(!hive.remove_child(root, b"absent").expect("remove absent"));
+                        }
+                    }
+                    2 => {
+                        // Add a nested key under Apps.
+                        let name = NESTED_NAMES[rng.below(NESTED_NAMES.len() as u64) as usize];
+                        if !shadow.nested_keys.contains(name) {
+                            let model = if shadow.nested_keys.is_empty() {
+                                None
+                            } else {
+                                Some(apps)
+                            };
+                            hive.add_child_key(apps, name, model)
+                                .expect("add nested key");
+                            shadow.nested_keys.insert(name.to_vec());
+                        }
+                    }
+                    3 => {
+                        // Remove a nested key (or assert the absent no-op).
+                        if let Some(name) = pick(&mut rng, &shadow.nested_keys) {
+                            assert!(
+                                hive.remove_child(apps, &name).expect("remove nested key"),
+                                "remove_child must report a removed nested key"
+                            );
+                            shadow.nested_keys.remove(&name);
+                        } else {
+                            assert!(!hive.remove_child(apps, b"absent").expect("remove absent"));
+                        }
+                    }
+                    4 => {
+                        // Create or overwrite an element with a payload that
+                        // ranges from 4 B to nearly a whole hbin page.
+                        let id = ELEMENT_IDS[rng.below(ELEMENT_IDS.len() as u64) as usize];
+                        let data = payload(&mut rng);
+                        hive.set_element(elements, id, REG_BINARY, &data)
+                            .expect("set element");
+                        shadow.elements.insert(id, data);
+                    }
+                    5 => {
+                        // Overwrite an existing element with a tiny payload so
+                        // the inline-data and shrink-in-place paths are hit.
+                        if let Some(id) = pick_element(&mut rng, &shadow.elements) {
+                            let len = rng.range(4, 8);
+                            let mut data = Vec::with_capacity(len);
+                            for _ in 0..len {
+                                data.push(rng.next_u64() as u8);
+                            }
+                            hive.set_element(elements, id, REG_BINARY, &data)
+                                .expect("overwrite element");
+                            shadow.elements.insert(id, data);
+                        }
+                    }
+                    6 => {
+                        // Remove an element subkey; the returned bool must
+                        // agree with the shadow exactly.
+                        let id = ELEMENT_IDS[rng.below(ELEMENT_IDS.len() as u64) as usize];
+                        let expected = shadow.elements.remove(&id).is_some();
+                        let removed = hive
+                            .remove_child(elements, &element_name(id))
+                            .expect("remove element");
+                        assert_eq!(
+                            removed, expected,
+                            "remove_child bool for element {id:#010x}"
+                        );
+                    }
+                    7 => {
+                        // Overwrite the seeded value with a fresh payload.
+                        let data = payload(&mut rng);
+                        hive.set_value(values, b"blob", REG_BINARY, &data)
+                            .expect("overwrite value");
+                        shadow.values.insert(b"blob".to_vec(), (REG_BINARY, data));
+                    }
+                    8 => {
+                        // Force whole-bin growth explicitly as well as via
+                        // the allocator's own append path.
+                        hive.append_hbin().expect("append hbin");
+                    }
+                    _ => {
+                        // Churn a dedicated child list, alternating between
+                        // modelled and unmodelled inserts.
+                        let name = CHURN_NAMES[rng.below(CHURN_NAMES.len() as u64) as usize];
+                        if shadow.churn_keys.contains(name) {
+                            assert!(
+                                hive.remove_child(churn, name).expect("remove churn"),
+                                "remove_child must report a removed churn key"
+                            );
+                            shadow.churn_keys.remove(name);
+                        } else {
+                            let model = if seq % 2 == 0 { Some(apps) } else { None };
+                            hive.add_child_key(churn, name, model)
+                                .expect("add churn key");
+                            shadow.churn_keys.insert(name.to_vec());
+                        }
+                    }
+                }
+                verify(&mut hive, &shadow);
+                steps += 1;
+                max_bins = max_bins.max(hive.buf.len() / BIN_SIZE - 1);
+            }
+
+            // Shrink the churn subkey list to zero and re-insert, reusing the
+            // shape of `subkey_list_retains_capacity_and_allows_reinsert_after_removal`.
+            for &name in &CHURN_NAMES {
+                if shadow.churn_keys.contains(name) {
+                    assert!(hive.remove_child(churn, name).expect("drain churn"));
+                    shadow.churn_keys.remove(name);
+                    verify(&mut hive, &shadow);
+                }
+            }
+            assert_eq!(
+                hive.nk_u32(churn, 0x14, "churn subkey count")
+                    .expect("churn subkey count"),
+                0,
+                "sequence {seq}: churn list must be empty"
+            );
+            assert_eq!(
+                hive.nk_u32(churn, 0x1C, "churn subkey list")
+                    .expect("churn list"),
+                NONE,
+                "sequence {seq}: empty churn list must be released"
+            );
+            hive.add_child_key(churn, b"c0", None)
+                .expect("re-insert into emptied churn list");
+            shadow.churn_keys.insert(b"c0".to_vec());
+            verify(&mut hive, &shadow);
+        }
+
+        assert!(
+            steps >= SEQUENCES * OPS,
+            "every mutation step must be verified"
+        );
+        eprintln!(
+            "prop_hive_mutations: {SEQUENCES} sequences, {steps} verified steps, max {max_bins} hbin bins"
+        );
     }
 }
