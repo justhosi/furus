@@ -1,8 +1,9 @@
 # Handoff — S23 Slice 1/1 (planner extraction, bootloader split, bad-blocks docs)
 
 ## Status
-Complete and reviewed. Four commits on top of `3545058` (S22 docs tip), NOT pushed.
-Working tree clean after the review commits.
+Complete, reviewed and published. Five commits on top of `3545058` (S22 docs tip),
+pushed to `origin/main` at `f12be17` by the publisher (S23 publish permission was
+given explicitly). Working tree clean after the review commits.
 
 ## Scope
 Slice instruction: `s23_shared_planner_and_bootloader_modularization.md` (S23-T1/T2/T3).
@@ -15,8 +16,8 @@ on-disk bootloader behaviour, no exit-code change.
 | `06b8e26` | `refactor: extract the shared plan builder into rufus-core` (S23-T1) |
 | `254f866` | `refactor: split the bootloader pipeline into arm submodules` (S23-T2) |
 | `ef2cbfa` | `docs: reconcile bad-blocks with the full-format path` (S23-T3) |
-| review fix (on top of `ef2cbfa`) | `fix: restore the bootloader module tree and drop the empty test module` |
-| review docs (tip) | `docs: record S23 and correct the stale bootloader paths` |
+| `c7832cd` | `fix: restore the bootloader module tree and drop the empty test module` (review fix, on top of `ef2cbfa`) |
+| `f12be17` | `docs: record S23 and correct the stale bootloader paths` (review docs) |
 
 ## What was done
 
@@ -113,8 +114,8 @@ that finishes before table/partition/format. Pinned by
   phase must not perform.
 
 ## Next steps
-1. Publish only on the user's explicit go-ahead (`publisher` phase); the review
-   phase never pushes.
+1. Published: `main` pushed to `origin` at `f12be17` by the publisher under the
+   user's explicit S23 publish permission.
 2. S24 (Slint GUI) can now call `rufus_core::planner` directly:
    `Options` + `BootloaderOpt` from the form, `rufus_linux::plan_device_ref` for
    a selected `Device` (or `probe_device` for a typed path), and
