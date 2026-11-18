@@ -18,15 +18,19 @@ ignore = [
     # gate that bump).
     # chrono via i-slint-core.
     { id = "RUSTSEC-2026-0543", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
-    # ttf-parser via i-slint-core (embedded font parsing).
+    # ttf-parser via owned_ttf_parser/ab_glyph via sctk-adwaita via winit
+    # via i-slint-backend-winit (font fallback for client-side decorations).
     { id = "RUSTSEC-2026-0192", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
-    # zvariant via zbus via i-slint-backend-winit (desktop portal/clipboard).
+    # zvariant via zbus 5.19.0 via i-slint-backend-winit (desktop portal).
+    # Only reachable through Slint's older zbus: rufus-helper already uses
+    # zbus 6.2.0, where zvariant is a module rather than a standalone crate.
     { id = "RUSTSEC-2026-0370", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
     # zbus_names via zbus via i-slint-backend-winit.
     { id = "RUSTSEC-2026-0371", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
     # zvariant_derive via zbus via i-slint-backend-winit.
     { id = "RUSTSEC-2026-0372", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
-    # pin-utils via spin_on via slint-macros / slint-build / renderer-skia.
+    # pin-utils via spin_on via slint-macros (proc-macro) and slint-build
+    # (build dependency); renderer-skia is locked but never enabled.
     { id = "RUSTSEC-2026-0441", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
 ]
 

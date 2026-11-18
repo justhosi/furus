@@ -132,3 +132,53 @@ changed and no dependency is added.
   pseudo-step (`RunOptions::badblocks`), independent of full format
   (`quick == false`, which only zeroes). Documentation now matches that; the
   previous "arrives in slice 9" note was stale.
+
+### 2026-11-18 - S24 amendments (no A1–A12 value changes)
+
+These record how the S24 GUI enforces the contract's hard constraints; none of
+the A1–A12 values above is changed and no new front-end dependency beyond the
+A7-mandated toolkit is added.
+
+* **A7 realized as an exact pin**: `slint` and `slint-build` are pinned to
+  `=1.19.0` with `default-features = false` and only `std`, `compat-1-2`,
+  `backend-winit`, `renderer-software`; `rustix` is pinned to `=1.1.6`
+  (`std`, `process`) purely to read the effective uid for A9, because `std`
+  cannot do it without `unsafe`. Consequence accepted with the pin: the lock
+  grows 102 → 567 packages and duplicates crates that cannot unify across
+  majors (`zbus` 5.19.0 for Slint next to `zbus` 6.2.0 for `rufus-helper`,
+  `rustix` 0.38.44/1.1.6, `thiserror` 1/2, `toml` 0.8/1.x), and the winit
+  backend drags in async plumbing (`zbus`'s `async-io`) that no `rufus-gui`
+  code calls — there is still no `tokio`, no `async-std` and no `async` code in
+  the crate, so A8 stands for our own code.
+* **Licence (A1 direction)**: Slint crates are tri-licensed; `deny.toml`
+  accepts **only** the `GPL-3.0-only` branch, through per-crate
+  `[[licenses.exceptions]]` pinned to `@=1.19.0` so a Slint bump forces a
+  re-review. The `LicenseRef-Slint-*` proprietary branches are never accepted.
+  `BSL-1.0` is allowed only for `clipboard-win`/`error-code`, which are
+  Windows-only and provably absent from the Linux graph. Six RUSTSEC
+  advisories are scoped-ignored; all six are `informational = "unmaintained"`
+  with `patched = []`, so no ignore hides a fixable vulnerability.
+* **No unsafe (contract 0.4.4), clarified**: `crates/rufus-gui/src/lib.rs`
+  keeps `#![forbid(unsafe_code)]`; the binary target uses
+  `#![deny(unsafe_code)]` because `slint::include_modules!()` emits
+  `#[allow(unsafe_code)]` inside generated vtables and an `allow` under a
+  crate-level `forbid` is a hard error (E0453). This is a narrowing of how the
+  constraint is spelled, not of what it guarantees: there is no `unsafe` block
+  and no `#[allow(unsafe_code)]` in hand-written `rufus-gui` source, and the
+  workspace `unsafe_code = "deny"` still rejects any that appears. Isolating
+  `include_modules!()` in a second internal crate was rejected — it relocates
+  the generated unsafe outside the audited crate and adds a workspace member
+  without deleting any unsafe code.
+* **GUI never root (A9)**: `startup_refusal(euid)` is a pure function, unit
+  tested through the euid, naming the unprivileged-GUI / privileged-helper
+  split; there is no override flag or environment variable. `--version`,
+  `--help`/`-h` short-circuit before both the Slint and the euid check, so they
+  still work with no display (contract 0.4.6).
+* **Size (contract 0.4.8)**: no budget changed. Measured `rufus-gui` 284,008 →
+  11,541,312 bytes (budget 12,000,000) and `rufus-helper` 1,385,080 →
+  1,405,992. The helper delta is cargo feature unification, established by
+  measurement rather than assumed: the same tree built with
+  `-p rufus-helper` alone is 1,384,904 bytes, under `--workspace` 1,405,992,
+  because `rustix` 1.1.6 is one package instance shared with the Slint/winit
+  tree and gains `mm`, `shm`, `system` there. `size-baseline.json` was
+  refreshed with the measured values only.

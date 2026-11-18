@@ -185,8 +185,14 @@ write side is the most complete part:
   test compares the BIOS (Boot/BCD) store's required elements and loader
   description with the UEFI store. No fresh SeaBIOS Windows boot was run
   in this environment, so no Legacy BIOS boot is claimed as verified.
-* The GUI is still a stub: it prints version/help and otherwise reports
-  "GUI arrives in S24".
+* The GUI is being built in S24 and is no longer a stub: `rufus-gui` opens a
+  Slint window over the headless `GuiState` (device, boot selection, image
+  option, partition scheme, target system, file system, cluster size, labels,
+  quick format, bad blocks; START reports the plan or its refusal and CLOSE
+  quits), refuses to run as root, and never writes to a device. Hotplug
+  watching and the background image analyzer (S24 C3/C4) are not wired yet, and
+  the window has not been rendered on a real display — see `TECHNICAL.md`
+  section 3.7 for exactly what is and is not verified.
 
 There is no production-readiness claim here. Open acceptance items (for
 example a real 32 GB Windows installer boot) are documented as such in
@@ -237,7 +243,8 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
   never does.
 * `rufus-cli` - the `rufus` command-line front end: version, checksum,
   analyze, plan, list, write.
-* `rufus-gui` - the Slint desktop front end (currently the S01 stub).
+* `rufus-gui` - the Slint desktop front end (S24: the window plus the
+  headless `GuiState` it renders; planning only, no writes).
 * `xtask` - repo maintenance: asset-manifest check, parity check, the
   per-binary size gate, CI ordering.
 
