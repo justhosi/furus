@@ -189,9 +189,11 @@ write side is the most complete part:
   Slint window over the headless `GuiState` (device, boot selection, image
   option, partition scheme, target system, file system, cluster size, labels,
   quick format, bad blocks; START reports the plan or its refusal and CLOSE
-  quits), refuses to run as root, and never writes to a device. Hotplug
-  watching and the background image analyzer (S24 C3/C4) are not wired yet, and
-  the window has not been rendered on a real display — see `TECHNICAL.md`
+  quits), refuses to run as root, and never writes to a device. Live hotplug
+  watching keeps the device list current (S24 C3: a watcher thread whose
+  snapshots are published to the event loop, with the selection held by stable
+  device identity); the background image analyzer (S24 C4) is not wired yet,
+  and the window has not been rendered on a real display — see `TECHNICAL.md`
   section 3.7 for exactly what is and is not verified.
 
 There is no production-readiness claim here. Open acceptance items (for
