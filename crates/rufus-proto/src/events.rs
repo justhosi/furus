@@ -254,6 +254,79 @@ pub enum Event {
     Done(Completion),
 }
 
+/// Failure to parse one helper JSONL line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineError {
+    /// The line was empty after removing the line ending and ASCII whitespace.
+    Empty,
+    /// The line was not a valid event JSON object.
+    Json(String),
+    /// The event kind is not part of this stream version.
+    UnknownKind(String),
+    /// The completion advertises an unsupported future stream version.
+    VersionTooHigh { found: u32, supported: u32 },
+}
+
+impl fmt::Display for LineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("empty JSONL event line"),
+            Self::Json(message) => write!(formatter, "invalid JSON event: {message}"),
+            Self::UnknownKind(kind) => {
+                write!(formatter, "unknown event kind '{}'", kind.escape_debug())
+            }
+            Self::VersionTooHigh { found, supported } => write!(
+                formatter,
+                "event stream version {found} is newer than supported version {supported}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LineError {}
+
+impl Completion {
+    /// Refuse event streams newer than the schema this crate understands.
+    pub fn check_version(&self) -> Result<(), LineError> {
+        if self.version > EVENT_STREAM_VERSION {
+            Err(LineError::VersionTooHigh {
+                found: self.version,
+                supported: EVENT_STREAM_VERSION,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Parse one JSONL event line using the shared helper wire contract.
+///
+/// A trailing carriage return and surrounding ASCII whitespace are removed
+/// before parsing. Unknown event tags are reported by name rather than as
+/// serde's generic enum error, and future stream versions fail closed.
+pub fn from_jsonl_line(line: &str) -> Result<Event, LineError> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let line = line.trim_matches(|character: char| character.is_ascii_whitespace());
+    if line.is_empty() {
+        return Err(LineError::Empty);
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|error| LineError::Json(error.to_string()))?;
+    if let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str)
+        && !matches!(kind, "progress" | "log" | "done")
+    {
+        return Err(LineError::UnknownKind(kind.to_string()));
+    }
+
+    let event: Event =
+        serde_json::from_value(value).map_err(|error| LineError::Json(error.to_string()))?;
+    if let Event::Done(completion) = &event {
+        completion.check_version()?;
+    }
+    Ok(event)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +611,108 @@ mod tests {
                 "steps",
                 "version"
             ]
+        );
+    }
+
+    #[test]
+    fn jsonl_line_parser_trims_and_parses_an_event() {
+        let line = concat!(
+            " \t{\"kind\":\"progress\",\"session\":\"s-1\",\"step\":0,",
+            "\"op\":\"wipe\",\"done\":0,\"total\":null,\"percent\":null} \r"
+        );
+        assert_eq!(
+            from_jsonl_line(line).expect("whitespace around an event is ignored"),
+            Event::Progress(Progress::new(TEST_SESSION, 0, "wipe", 0, None))
+        );
+    }
+
+    #[test]
+    fn jsonl_line_parser_names_empty_invalid_unknown_and_future_versions() {
+        assert_eq!(
+            from_jsonl_line(" \t\r"),
+            Err(LineError::Empty),
+            "an ASCII-whitespace-only line is empty"
+        );
+        assert!(matches!(from_jsonl_line("{"), Err(LineError::Json(_))));
+        assert_eq!(
+            from_jsonl_line(r#"{"kind":"future","session":"s-1"}"#),
+            Err(LineError::UnknownKind("future".to_string()))
+        );
+        assert_eq!(
+            from_jsonl_line(
+                r#"{"kind":"done","session":"s-1","version":2,"outcome":{"outcome":"ok"}}"#
+            ),
+            Err(LineError::VersionTooHigh {
+                found: 2,
+                supported: EVENT_STREAM_VERSION,
+            })
+        );
+
+        assert!(matches!(
+            from_jsonl_line("{\"kind\":\"log\"}\n{\"kind\":\"log\"}"),
+            Err(LineError::Json(_))
+        ));
+        assert!(matches!(from_jsonl_line("\u{0}"), Err(LineError::Json(_))));
+
+        let large_message = "x".repeat(8 * 1024 * 1024);
+        let large_line = format!(
+            r#"{{"kind":"log","session":"s-1","level":"info","message":"{large_message}"}}"#
+        );
+        assert!(from_jsonl_line(&large_line).is_ok());
+
+        let nested_payload = format!(
+            r#"{{"kind":"log","session":"s-1","level":"info","message":{}}}"#,
+            "[".repeat(4_096)
+        );
+        assert!(matches!(
+            from_jsonl_line(&nested_payload),
+            Err(LineError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn jsonl_parser_accepts_every_serialized_event_variant() {
+        let events = [
+            Event::Progress(Progress::new(TEST_SESSION, 0, "wipe", 1, Some(2))),
+            Event::Log(LogLine {
+                session: TEST_SESSION.to_string(),
+                level: LogLevel::Info,
+                message: "starting".to_string(),
+            }),
+            Event::Done(Completion {
+                session: TEST_SESSION.to_string(),
+                version: EVENT_STREAM_VERSION,
+                outcome: Outcome::Ok,
+            }),
+        ];
+
+        for event in events {
+            let line = serde_json::to_string(&event).expect("event serialises");
+            assert_eq!(from_jsonl_line(&line), Ok(event));
+        }
+    }
+
+    #[test]
+    fn line_errors_have_pinned_display_strings() {
+        assert_eq!(LineError::Empty.to_string(), "empty JSONL event line");
+        assert_eq!(
+            LineError::Json("bad token".to_string()).to_string(),
+            "invalid JSON event: bad token"
+        );
+        assert_eq!(
+            LineError::UnknownKind("future".to_string()).to_string(),
+            "unknown event kind 'future'"
+        );
+        let rendered = LineError::UnknownKind("bad\u{1b}\nkind".to_string()).to_string();
+        assert!(!rendered.chars().any(char::is_control), "{rendered:?}");
+
+        assert_eq!(
+            LineError::VersionTooHigh {
+                found: 9,
+                supported: 1,
+            }
+            .to_string(),
+            "event stream version 9 is newer than supported version 1"
         );
     }
 

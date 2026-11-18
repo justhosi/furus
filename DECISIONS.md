@@ -195,3 +195,37 @@ A7-mandated toolkit is added.
   leaving 397,760 bytes of headroom, and `rufus` moved 1,810,200 → 1,809,576
   (−624) against the same lock refresh. `BINARY_BUDGETS` (3,000,000 /
   2,500,000 / 12,000,000) is unchanged.
+
+### 2026-11-19 - S25 amendments (no A1–A12 value changes)
+
+These record where the client half of the helper wire contract lives; none of
+the A1–A12 values above is changed and no dependency is added.
+
+* **A9 (privilege split) — client-side wire parsing lives in `rufus-proto`**:
+  the helper emits one JSONL `Event` per line (`--plan … --progress jsonl`) and
+  the same three events as D-Bus signals (`org.rufuslinux.Helper1`:
+  `Execute`/`Cancel` plus `progress`/`log`/`done`), so *reading* that stream is
+  a client concern while its *contract* is shared by both halves of the split.
+  `events::from_jsonl_line` and `events::LineError` therefore live in
+  `rufus-proto` next to the types they parse, re-exported from its crate root
+  (`rufus_proto::{from_jsonl_line, LineError}`), instead of being re-implemented
+  in `rufus-gui` or owned by the privileged helper: the client keeps no tag list
+  of its own, so the two halves cannot disagree about what a valid line is.
+  Adding an `Event` variant remains a schema change that bumps
+  `EVENT_STREAM_VERSION`, and `Completion::check_version` is the single home of
+  that rule (the shared parser applies it to every `Done` line; only newer
+  streams are refused).
+* **A8 (threads + channels, no async runtime), restated for the seam**:
+  `rufus-gui::ipc` exposes a sync `HelperTransport::start` returning a blocking
+  `Iterator` of events plus a `CancelHandle`, so both intended transports fit
+  with no executor — the pkexec child's stdout is read on a plain
+  `std::thread`, and a zbus 6 client (async-only, no blocking API) drives its
+  proxy with `zbus::block_on` on its own thread and feeds the same iterator.
+  No crate names a runtime; zbus still brings the one it needs.
+* **Cancel is one-shot and sticky**: `CancelHandle` runs its action at most once
+  across clones and caches the first result, so repeating a cancel can never
+  turn a failed cancel into a reported success.
+* **Not renumbered**: no new A-number is introduced. An `A13` would extend the
+  S00 plan-decision set whose values still await user confirmation (sections 1
+  and 3); this slice settles placement *inside* the A9 split rather than adding
+  a plan default, which is how the S22–S24 amendments were recorded as well.

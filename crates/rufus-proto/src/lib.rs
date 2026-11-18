@@ -82,7 +82,10 @@ use sha2::Sha256;
 // The re-exports below are the names user code references.
 pub mod events;
 
-pub use events::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, LogLine, Outcome, Progress};
+pub use events::{
+    Completion, EVENT_STREAM_VERSION, Event, LineError, LogLevel, LogLine, Outcome, Progress,
+    from_jsonl_line,
+};
 
 /// Schema version of [`Plan`]. v6 added the `windows`
 /// [`BootloaderMode`] variant, and refuses v1/v2/v3/v4/v5 plans,
