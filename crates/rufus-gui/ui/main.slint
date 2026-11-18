@@ -1,0 +1,243 @@
+// Rufus single-window form shell — slice S24-C C2 (S24-T2).
+//
+// This file is presentation only. Every model list, selection, enabled
+// flag and visibility flag is a Rust-provided property (bound to
+// `GuiState` in `src/main.rs`), and every interaction is forwarded to a
+// callback that mutates `GuiState` in Rust. There are ZERO business
+// rules here: no scheme/target/filesystem compatibility logic, no
+// defaults, no conditional policy — the `.slint` file only renders what
+// Rust hands it (contract 0.4.7, S24-T2).
+//
+// Static captions ("Device", "START", …) are layout chrome; every
+// *value* string (combo models, status text, volume label, device info)
+// comes from Rust.
+
+import { Button, CheckBox, ComboBox, LineEdit, ProgressIndicator } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "Rufus";
+    preferred-width: 700px;
+    preferred-height: 640px;
+    min-width: 560px;
+    min-height: 520px;
+
+    // ---- Rust -> UI (rendered from GuiState on every state change) ----
+    in property <[string]> device-model;
+    in-out property <string> device-current;
+    in property <string> device-info;
+    in property <[string]> boot-model;
+    in-out property <string> boot-current;
+    in property <bool> select-enabled;
+    in property <bool> image-option-visible;
+    in property <[string]> image-option-model;
+    in-out property <string> image-option-current;
+    in property <[string]> scheme-model;
+    in-out property <string> scheme-current;
+    in property <[string]> target-model;
+    in-out property <string> target-current;
+    in property <[string]> fs-model;
+    in-out property <string> fs-current;
+    in property <bool> fs-enabled;
+    in property <[string]> cluster-model;
+    in-out property <string> cluster-current;
+    in-out property <string> volume-label;
+    in-out property <bool> extended-label-checked;
+    in-out property <bool> quick-format-checked;
+    in-out property <bool> bad-blocks-checked;
+    in property <[string]> passes-model;
+    in-out property <string> passes-current;
+    in property <bool> passes-enabled;
+    in property <float> progress-value;
+    in property <string> status-text;
+    in property <bool> start-enabled;
+
+    // ---- UI -> Rust (every state change goes back through GuiState) ----
+    callback device-selected(string);
+    callback boot-selected(string);
+    callback select-clicked();
+    callback image-option-selected(string);
+    callback scheme-selected(string);
+    callback target-selected(string);
+    callback fs-selected(string);
+    callback cluster-selected(string);
+    callback label-edited(string);
+    callback extended-label-toggled();
+    callback quick-format-toggled();
+    callback bad-blocks-toggled();
+    callback passes-selected(string);
+    callback start-clicked();
+    callback close-clicked();
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Device";
+                vertical-alignment: center;
+                width: 110px;
+            }
+            device-combo := ComboBox {
+                model: root.device-model;
+                current-value <=> root.device-current;
+                selected(value) => { root.device-selected(value); }
+            }
+        }
+
+        Text {
+            text: root.device-info;
+            overflow: elide;
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Boot selection";
+                vertical-alignment: center;
+                width: 110px;
+            }
+            boot-combo := ComboBox {
+                model: root.boot-model;
+                current-value <=> root.boot-current;
+                selected(value) => { root.boot-selected(value); }
+            }
+            Button {
+                text: "SELECT";
+                enabled: root.select-enabled;
+                clicked => { root.select-clicked(); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            visible: root.image-option-visible;
+            Text {
+                text: "Image option";
+                vertical-alignment: center;
+                width: 110px;
+            }
+            ComboBox {
+                model: root.image-option-model;
+                current-value <=> root.image-option-current;
+                selected(value) => { root.image-option-selected(value); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Partition scheme";
+                vertical-alignment: center;
+                width: 110px;
+            }
+            ComboBox {
+                model: root.scheme-model;
+                current-value <=> root.scheme-current;
+                selected(value) => { root.scheme-selected(value); }
+            }
+            Text {
+                text: "Target system";
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: root.target-model;
+                current-value <=> root.target-current;
+                selected(value) => { root.target-selected(value); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "File system";
+                vertical-alignment: center;
+                width: 110px;
+            }
+            ComboBox {
+                model: root.fs-model;
+                current-value <=> root.fs-current;
+                enabled: root.fs-enabled;
+                selected(value) => { root.fs-selected(value); }
+            }
+            Text {
+                text: "Cluster size";
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: root.cluster-model;
+                current-value <=> root.cluster-current;
+                selected(value) => { root.cluster-selected(value); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Volume label";
+                vertical-alignment: center;
+                width: 110px;
+            }
+            LineEdit {
+                text <=> root.volume-label;
+                edited(value) => { root.label-edited(value); }
+            }
+        }
+
+        CheckBox {
+            text: "Create extended label and icon files";
+            checked <=> root.extended-label-checked;
+            toggled => { root.extended-label-toggled(); }
+        }
+
+        CheckBox {
+            text: "Quick format";
+            checked <=> root.quick-format-checked;
+            toggled => { root.quick-format-toggled(); }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            bad-blocks-check := CheckBox {
+                text: "Check device for bad blocks";
+                checked <=> root.bad-blocks-checked;
+                toggled => { root.bad-blocks-toggled(); }
+            }
+            Text {
+                text: "passes";
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: root.passes-model;
+                current-value <=> root.passes-current;
+                enabled: root.passes-enabled;
+                selected(value) => { root.passes-selected(value); }
+            }
+        }
+
+        ProgressIndicator {
+            progress: root.progress-value;
+        }
+
+        Text {
+            text: root.status-text;
+            wrap: word-wrap;
+            vertical-stretch: 1;
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Button {
+                text: "START";
+                enabled: root.start-enabled;
+                clicked => { root.start-clicked(); }
+            }
+            Button {
+                text: "CLOSE";
+                clicked => { root.close-clicked(); }
+            }
+        }
+    }
+}
