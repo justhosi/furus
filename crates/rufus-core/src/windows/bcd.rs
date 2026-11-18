@@ -41,8 +41,9 @@
 //! gets its `11000001`/`21000001` partition device elements plus
 //! `12000002` (the winload path) and, when the caller names one, the
 //! `12000004` edition description; `{bootmgr}` is repointed at that
-//! loader (`23000003`, `24000001`, `24000010`); `{memdiag}` gets the
-//! `11000001` boot device and a per-firmware `12000002` path
+//! loader (`23000003`, `24000001`, `24000010`) and gets its own
+//! `11000001` partition device (the ESP on UEFI, the system/data
+//! partition on BIOS); `{memdiag}` gets the `11000001` boot device and a per-firmware `12000002` path
 //! (`\EFI\Microsoft\Boot\memtest.efi` for UEFI, `\boot\memtest.exe`
 //! for BIOS, matching where the boot files land). No other bytes
 //! change except the header
@@ -66,8 +67,11 @@
 //! `12000002` = `\EFI\Microsoft\Boot\bootmgfw.efi`, the `23000003`
 //! default object as a `REG_SZ` GUID string, `25000004` = 30 inline,
 //! and no `24000001`/`24000010` yet. The real install-media stores
-//! prove the encodings the template cannot show: `{bootmgr}` needs no
-//! device element, `23000003` is a `REG_SZ`
+//! prove the encodings the template cannot show: `{bootmgr}` does carry
+//! its own `11000001` partition device (pointing at the ESP on UEFI,
+//! the system/data partition on BIOS) — its absence on a fresh image
+//! is what makes the boot fail with `0xc0000001`, so [`build`] writes
+//! it too. `23000003` is a `REG_SZ`
 //! GUID string, `24000001`/`24000010` are single-entry `REG_MULTI_SZ`
 //! GUID lists, and `{memdiag}\11000001` is an 88-byte `REG_BINARY`
 //! boot device. The BIOS install-media store carries no `12000002` on
@@ -199,11 +203,12 @@ pub const TEMPLATE_LOADER_B012: &str = "{b012b84d-c47c-4ed5-b722-c0c42163e569}";
 /// placeholder default, repointed by [`build`]).
 pub const TEMPLATE_LOADER_CBD9: &str = "{cbd971bf-b7b8-4885-951a-fa03044f5d71}";
 
-/// `0x11000001` (class `0x11`, device): the boot-device element
-/// `bcdboot` adds to `{bootmgr}` per machine; absent from the template.
-/// [`build`] writes it on the chosen loader and on `{memdiag}` as an
-/// 88-byte `REG_BINARY` partition or boot device (see
-/// [`partition_device`] and [`boot_device`]).
+/// `0x11000001` (class `0x11`, device): a partition/boot device element
+/// `bcdboot` adds per machine; absent from the template. [`build`]
+/// writes it on the chosen loader, on `{bootmgr}` (the ESP on UEFI, the
+/// system/data partition on BIOS) and on `{memdiag}` as an 88-byte
+/// `REG_BINARY` partition or boot device (see [`partition_device`] and
+/// [`boot_device`]).
 pub const ELEMENT_DEVICE: u32 = 0x1100_0001;
 
 /// `0x21000001` (class `0x21`, device): the os-device element `bcdboot`
@@ -417,8 +422,14 @@ pub enum DeviceIdentity {
 pub struct StoreRequest<'a> {
     /// Which firmware path the store is for.
     pub firmware: Firmware,
-    /// The target disk identity the device elements encode.
+    /// The target disk identity the device elements encode: the data
+    /// (Windows) partition on GPT, the system partition on MBR/BIOS.
     pub identity: DeviceIdentity,
+    /// The ESP identity for `{bootmgr}\11000001` on UEFI. `bcdboot`
+    /// points the boot manager at the ESP (UEFI) or the system partition
+    /// (BIOS); on BIOS paths the build uses [`StoreRequest::identity`]
+    /// and this value is ignored.
+    pub esp_identity: DeviceIdentity,
     /// Edition description for the loader's `12000004`, when known.
     pub description: Option<&'a str>,
 }
@@ -608,8 +619,9 @@ fn remove_element(hive: &mut Hive, elements: usize, id: u32) -> Result<()> {
 /// firmware-selected loader (see [`default_object`]) gains
 /// `11000001`/`21000001` partition devices, `12000002`, and the
 /// edition description when given; `{bootmgr}` is repointed at it
-/// (plus `\bootmgr` at its `12000002` for [`Firmware::Bios`]);
-/// the resume object named by the loader's `23000003` gains the same
+/// (plus `\bootmgr` at its `12000002` for [`Firmware::Bios`]) and gains
+/// its own `11000001` partition device (the ESP on UEFI, the system
+/// partition on BIOS); the resume object named by the loader's `23000003` gains the same
 /// partition device and a full winresume application path, and
 /// `{bootmgr}` gains a `23000006` pointing at it; `{memdiag}` gains the
 /// boot device and the per-firmware application path (see
@@ -733,6 +745,16 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
     if firmware == Firmware::Bios {
         hive.set_element_sz(bootmgr_elements, ELEMENT_PATH, "\\bootmgr")?;
     };
+    // bcdboot writes `{bootmgr}\11000001` as a partition device pointing
+    // at the ESP on UEFI (the system partition on BIOS). Its absence on a
+    // freshly written UEFI image is what lands the boot in a Recovery
+    // screen with 0xc0000001, so add it here with the ESP identity; on
+    // BIOS the boot manager shares the system partition with the loader.
+    let bootmgr_device = match firmware {
+        Firmware::Uefi => partition_device(request.esp_identity),
+        Firmware::Bios => partition,
+    };
+    hive.set_element_binary(bootmgr_elements, ELEMENT_DEVICE, &bootmgr_device)?;
     hive.set_element_binary(loader_elements, ELEMENT_DEVICE, &partition)?;
     hive.set_element_binary(loader_elements, ELEMENT_OS_DEVICE, &partition)?;
     hive.set_element_sz(loader_elements, ELEMENT_PATH, winload_full_path(firmware))?;
@@ -1519,6 +1541,10 @@ mod tests {
                 0xFF, 0x00,
             ],
         };
+        let esp = DeviceIdentity::Gpt {
+            disk_guid: [0x0E; 16],
+            partition_guid: [0x5E; 16],
+        };
         let mbr = DeviceIdentity::Mbr {
             disk_signature: [0x78, 0x56, 0x34, 0x12],
             partition_start_bytes: 0x0010_0000,
@@ -1533,6 +1559,7 @@ mod tests {
             let request = StoreRequest {
                 firmware,
                 identity,
+                esp_identity: esp,
                 description,
             };
             let out = build(&template, &request).expect("synthetic build must succeed");
@@ -1656,6 +1683,64 @@ mod tests {
     }
 
     #[test]
+    fn bootmgr_device_points_at_esp_on_uefi_and_system_partition_on_bios() {
+        // bcdboot writes `{bootmgr}\11000001` as a partition device aimed
+        // at the ESP on UEFI (the system/data partition on BIOS). Its
+        // absence on a fresh UEFI image is the 0xc0000001 root cause, so
+        // pin both its presence and the exact bytes, and keep the two
+        // identities distinct so the assertions cannot pass by accident.
+        let data = DeviceIdentity::Gpt {
+            disk_guid: [0x01; 16],
+            partition_guid: [0x0A; 16],
+        };
+        let esp = DeviceIdentity::Gpt {
+            disk_guid: [0x01; 16],
+            partition_guid: [0x0B; 16],
+        };
+        assert_ne!(data, esp, "the fixture identities must be distinct");
+
+        for (firmware, want, wrong) in [
+            (
+                Firmware::Uefi,
+                partition_device(esp),
+                partition_device(data),
+            ),
+            (
+                Firmware::Bios,
+                partition_device(data),
+                partition_device(esp),
+            ),
+        ] {
+            let out = build(
+                &template_fixture(),
+                &StoreRequest {
+                    firmware,
+                    identity: data,
+                    esp_identity: esp,
+                    description: None,
+                },
+            )
+            .expect("build must succeed");
+            let hive = Hive::parse(&out).expect("output must re-parse");
+            let (vtype, bytes) = hive
+                .element_data(OBJECT_BOOTMGR, ELEMENT_DEVICE)
+                .expect("read bootmgr device")
+                .expect("bootmgr 11000001 must exist");
+            assert_eq!(vtype, REG_BINARY);
+            assert_eq!(
+                bytes,
+                want.to_vec(),
+                "bootmgr device bytes for {firmware:?}"
+            );
+            assert_ne!(
+                bytes,
+                wrong.to_vec(),
+                "bootmgr must not point at the other partition on {firmware:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resume_object_is_wired_like_bcdboot() {
         let template = template_fixture();
         let out = build(
@@ -1665,6 +1750,10 @@ mod tests {
                 identity: DeviceIdentity::Gpt {
                     disk_guid: [0x01; 16],
                     partition_guid: [0x0A; 16],
+                },
+                esp_identity: DeviceIdentity::Gpt {
+                    disk_guid: [0x01; 16],
+                    partition_guid: [0x0B; 16],
                 },
                 description: None,
             },
@@ -1758,6 +1847,7 @@ mod tests {
                 &StoreRequest {
                     firmware,
                     identity: gpt,
+                    esp_identity: gpt,
                     description: Some("Windows 11 Pro"),
                 },
             )
@@ -1832,6 +1922,7 @@ mod tests {
         let uefi = StoreRequest {
             firmware: Firmware::Uefi,
             identity: gpt,
+            esp_identity: gpt,
             description: None,
         };
         // Not a hive at all.
@@ -1874,6 +1965,7 @@ mod tests {
         let bios_request = StoreRequest {
             firmware: Firmware::Bios,
             identity: gpt,
+            esp_identity: gpt,
             description: None,
         };
         // The fixture has both loaders, so BIOS succeeds; prove the
@@ -1934,6 +2026,7 @@ mod tests {
             &StoreRequest {
                 firmware: Firmware::Uefi,
                 identity: gpt,
+                esp_identity: gpt,
                 description: None,
             },
         )
@@ -2152,6 +2245,7 @@ mod tests {
             &StoreRequest {
                 firmware: Firmware::Uefi,
                 identity: gpt,
+                esp_identity: gpt,
                 description: Some(&long_description),
             },
         )
@@ -2202,6 +2296,7 @@ mod tests {
                 &StoreRequest {
                     firmware,
                     identity,
+                    esp_identity: gpt,
                     description,
                 },
             )

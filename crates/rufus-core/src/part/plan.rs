@@ -78,7 +78,7 @@ const GPT_ARRAY_BYTES: u64 = 128 * 128;
 
 /// EFI System Partition type GUID (`c12a7328-f81f-11d2-ba4b-...`) in
 /// the on-disk mixed-endian byte order the entry format stores.
-const EFI_SYSTEM_GUID: [u8; 16] = [
+pub(crate) const EFI_SYSTEM_GUID: [u8; 16] = [
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
 ];
 /// Microsoft Reserved type GUID (`e3c9e316-0b5c-4db8-...`) on-disk.

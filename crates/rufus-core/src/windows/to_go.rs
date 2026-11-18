@@ -189,12 +189,14 @@ pub fn disable_recovery(store: &[u8], default_object: &str) -> Result<Vec<u8>> {
     Ok(hive.into_bytes())
 }
 
-/// What [`install`] needs: the disk identity the BCD device elements
+/// What [`install`] needs: the disk identities the BCD device elements
 /// encode (already stamped by `Mkpart`), the edition description the
 /// loaders carry, and the boot-loader flavour.
 pub struct Request<'a> {
-    /// Disk identity already stamped by `Mkpart`.
+    /// Data/Windows partition identity already stamped by `Mkpart`.
     pub identity: bcd::DeviceIdentity,
+    /// ESP identity for `{bootmgr}\11000001` in the UEFI store.
+    pub esp_identity: bcd::DeviceIdentity,
     /// Edition description for the loader, when known.
     pub description: Option<&'a str>,
     /// Opt into the 2023-signed `_EX` boot loaders (see
@@ -229,8 +231,8 @@ pub struct Installed {
 ///    unreadable (a WIM that is not a Windows image). A symlink at the
 ///    template path refuses without being followed: a crafted WIM
 ///    could otherwise redirect the read outside the mount roots.
-/// 2. Build both stores with [`bcd::build`]: UEFI first (with
-///    `identity`), BIOS second.
+/// 2. Build both stores with [`bcd::build`]: UEFI first (the loader gets
+///    `identity`, `{bootmgr}` gets `esp_identity`), BIOS second.
 /// 3. [`disable_recovery`] on each store with [`bcd::default_object`].
 /// 4. [`boot_files::install`] the UEFI store (ESP plus `data` as the
 ///    image root), then the BIOS store with the BIOS install.
@@ -294,11 +296,13 @@ pub fn install(
     let uefi_request = bcd::StoreRequest {
         firmware: bcd::Firmware::Uefi,
         identity: request.identity,
+        esp_identity: request.esp_identity,
         description: request.description,
     };
     let bios_request = bcd::StoreRequest {
         firmware: bcd::Firmware::Bios,
         identity: request.identity,
+        esp_identity: request.esp_identity,
         description: request.description,
     };
     let uefi_store = bcd::build(&template, &uefi_request)?;
@@ -816,6 +820,10 @@ mod tests {
                 disk_guid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
                 partition_guid: [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
             },
+            esp_identity: DeviceIdentity::Gpt {
+                disk_guid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                partition_guid: [0xAA; 16],
+            },
             description: None,
         };
         let store =
@@ -909,6 +917,10 @@ mod tests {
                 disk_guid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
                 partition_guid: [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
             },
+            esp_identity: DeviceIdentity::Gpt {
+                disk_guid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                partition_guid: [0xAA; 16],
+            },
             description: None,
         };
         let store =
@@ -998,6 +1010,7 @@ mod tests {
         let mut esp = FakeMount::new(shared.clone(), u64::MAX);
         let request = Request {
             identity: test_identity(),
+            esp_identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
@@ -1177,6 +1190,7 @@ mod tests {
         let mut esp = FakeMount::new(esp_path, u64::MAX);
         let request = Request {
             identity: test_identity(),
+            esp_identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
@@ -1268,6 +1282,7 @@ mod tests {
         let mut esp = FakeMount::new(esp_path, u64::MAX);
         let request = Request {
             identity: test_identity(),
+            esp_identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
@@ -1345,6 +1360,7 @@ mod tests {
         let mut esp = FakeMount::new(esp_path, u64::MAX);
         let request = Request {
             identity: test_identity(),
+            esp_identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
@@ -1410,6 +1426,7 @@ mod tests {
         let mut esp = FakeMount::new(esp_path, u64::MAX);
         let request = Request {
             identity: test_identity(),
+            esp_identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };
@@ -1527,6 +1544,7 @@ mod tests {
         let mut esp = FakeMount::new(esp_dir.path().to_path_buf(), u64::MAX);
         let request = Request {
             identity: test_identity(),
+            esp_identity: test_identity(),
             description: None,
             use_2023_bootloaders: false,
         };

@@ -1155,20 +1155,31 @@ fn u64_at(buf: &[u8], at: usize, field: &str) -> Result<u64> {
     Ok(u64::from_le_bytes(unit))
 }
 
-/// Re-read the stamped GPT from the target and build the BCD device
-/// identity: the disk GUID from the primary header plus the unique
-/// GUID of the entry whose LBA span is the planner's data window
-/// (never a positional guess).
+/// The two GPT partition identities [`windows_identity`] reads back from
+/// the stamped table. `data` is the Windows partition the loader and
+/// resume objects point at; `esp` is the EFI System Partition that
+/// `{bootmgr}` points at on UEFI.
+#[derive(Debug)]
+struct WindowsIdentities {
+    data: bcd::DeviceIdentity,
+    esp: bcd::DeviceIdentity,
+}
+
+/// Re-read the stamped GPT from the target and build both BCD device
+/// identities from it: the disk GUID from the primary header, plus the
+/// unique GUID of the entry whose LBA span is the planner's data window
+/// (`data`, never a positional guess) and of the entry whose type is the
+/// EFI System GUID (`esp`).
 ///
 /// Every failure is [`CoreError::InvalidInput`] naming the problem:
 /// an unreadable header or entry array, a missing signature, a
-/// missing array location, an unparsable table, or no data entry at
-/// the planned span.
+/// missing array location, an unparsable table, no data entry at the
+/// planned span, or no ESP entry in the table.
 fn windows_identity(
     target: &mut dyn Target,
     sector_size: u32,
     size: u64,
-) -> Result<bcd::DeviceIdentity> {
+) -> Result<WindowsIdentities> {
     let (data_offset, data_len) =
         data_window(LayoutKind::WindowsToGo, TableKind::Gpt, sector_size, size)?;
     let sector_u64 = u64::from(sector_size);
@@ -1267,6 +1278,8 @@ fn windows_identity(
             range.count
         ))
     })?;
+    let mut data_identity: Option<bcd::DeviceIdentity> = None;
+    let mut esp_identity: Option<bcd::DeviceIdentity> = None;
     let mut index = 0usize;
     while index < count {
         let base = index.checked_mul(stride).ok_or_else(|| {
@@ -1288,6 +1301,17 @@ fn windows_identity(
             index = index.saturating_add(1);
             continue;
         }
+        // The ESP is found by its partition type GUID (the same bytes
+        // the planner stamps, from `part::plan::EFI_SYSTEM_GUID`), never
+        // by its position in the table. Its unique GUID at entry offset
+        // 16 is what `{bootmgr}\11000001` must encode on UEFI.
+        if kind == crate::part::plan::EFI_SYSTEM_GUID.as_slice() {
+            let partition_guid = guid_at(entry, 16, "ESP partition GUID")?;
+            esp_identity = Some(bcd::DeviceIdentity::Gpt {
+                disk_guid,
+                partition_guid,
+            });
+        }
         let first_lba = u64_at(entry, 32, "partition start")?;
         let last_lba = u64_at(entry, 40, "partition end")?;
         let Some(sectors) = last_lba
@@ -1299,16 +1323,25 @@ fn windows_identity(
         };
         if first_lba == data_start_lba && sectors == data_sectors {
             let partition_guid = guid_at(entry, 16, "partition GUID")?;
-            return Ok(bcd::DeviceIdentity::Gpt {
+            data_identity = Some(bcd::DeviceIdentity::Gpt {
                 disk_guid,
                 partition_guid,
             });
         }
         index = index.saturating_add(1);
     }
-    Err(CoreError::invalid(format!(
-        "stamped GPT has no data partition at offset {data_offset} length {data_len}: refusing"
-    )))
+    let data = data_identity.ok_or_else(|| {
+        CoreError::invalid(format!(
+            "stamped GPT has no data partition at offset {data_offset} length {data_len}: refusing"
+        ))
+    })?;
+    let esp = esp_identity.ok_or_else(|| {
+        CoreError::invalid(
+            "stamped GPT has no EFI System partition (ESP) entry for the boot manager: refusing"
+                .to_string(),
+        )
+    })?;
+    Ok(WindowsIdentities { data, esp })
 }
 
 /// Release both mounts after a failed Windows install step: a
@@ -1421,7 +1454,7 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
     if cancelled() {
         return Err(CoreError::Cancelled);
     }
-    let identity = {
+    let identities = {
         let device = ctx.device()?;
         windows_identity(device, sector_size, size)?
     };
@@ -1471,7 +1504,8 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
             }
         };
         let request = crate::windows::to_go::Request {
-            identity,
+            identity: identities.data,
+            esp_identity: identities.esp,
             description: None,
             use_2023_bootloaders: false,
         };
@@ -2570,12 +2604,12 @@ mod tests {
         // parsed entry at the planned data window — found by its LBA
         // span, never by its table position.
         let (mut target, plan) = stamp_windows_gpt(WINDOWS_DISK_BYTES);
-        let identity =
+        let identities =
             windows_identity(&mut target, 512, WINDOWS_DISK_BYTES).expect("the identity reads");
         let bcd::DeviceIdentity::Gpt {
             disk_guid,
             partition_guid,
-        } = identity
+        } = identities.data
         else {
             panic!("a GPT table reports the GPT identity");
         };
@@ -2588,6 +2622,30 @@ mod tests {
         assert_eq!(
             partition_guid, data.unique_guid,
             "the partition GUID is the data entry's"
+        );
+        // The ESP identity is found by the entry's type GUID, not by its
+        // position, and carries the ESP's own unique GUID with the same
+        // disk GUID as the data identity.
+        let bcd::DeviceIdentity::Gpt {
+            disk_guid: esp_disk_guid,
+            partition_guid: esp_guid,
+        } = identities.esp
+        else {
+            panic!("the ESP identity is GPT");
+        };
+        let esp = plan
+            .partitions
+            .iter()
+            .find(|partition| partition.role == "esp")
+            .expect("the plan holds an ESP");
+        assert_eq!(esp_disk_guid, plan.disk_guid, "ESP carries the disk GUID");
+        assert_eq!(
+            esp_guid, esp.unique_guid,
+            "the ESP GUID is the planned ESP entry's"
+        );
+        assert_ne!(
+            esp_guid, partition_guid,
+            "ESP and data are distinct entries"
         );
         // The same GUID through the parser: read the stamped header and
         // entry array back and find the entry whose span is the planned
@@ -2650,6 +2708,34 @@ mod tests {
             .expect_err("a span-less table refuses");
         let text = error.to_string();
         assert!(text.contains("no data partition"), "names the miss: {text}");
+        assert!(text.is_ascii(), "stays ASCII: {text}");
+    }
+
+    #[test]
+    fn windows_identity_refuses_without_an_esp_entry() {
+        // Clear the ESP entry's type GUID so no entry carries the EFI
+        // System type. The table still parses (an entry-array CRC
+        // mismatch is only a warning), but the boot manager has no
+        // partition to point at, so the identity refuses naming it.
+        let (mut target, plan) = stamp_windows_gpt(WINDOWS_DISK_BYTES);
+        let slot = plan
+            .partitions
+            .iter()
+            .position(|partition| partition.role == "esp")
+            .expect("the plan holds an ESP");
+        // The type GUID is the first 16 bytes of a 128-byte entry; the
+        // primary array starts at LBA 2 (see `write_gpt`).
+        let at = 2 * 512 + slot as u64 * 128;
+        target
+            .write_all_at(at, &[0u8; 16])
+            .expect("the ESP type clears");
+        let error = windows_identity(&mut target, 512, WINDOWS_DISK_BYTES)
+            .expect_err("an ESP-less table refuses");
+        let text = error.to_string();
+        assert!(
+            text.contains("no EFI System partition"),
+            "names the miss: {text}"
+        );
         assert!(text.is_ascii(), "stays ASCII: {text}");
     }
 
