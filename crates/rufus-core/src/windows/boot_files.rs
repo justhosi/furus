@@ -45,6 +45,12 @@
 //! side but has not been observed on the 24H2 media (only `EFI_EX`
 //! was): it is looked up, not presumed present.
 //!
+//! Locale detection is a separate, best-effort read: [`locale_from_tree`]
+//! inspects `<data>/Windows/Boot/EFI/<locale>/*.mui` so
+//! [`to_go::install`](super::to_go::install) can pass the applied image's
+//! UI locale to the BCD builder ([`is_valid_locale_tag`] is the shared
+//! validator). Unreadable trees, symlinks and malformed tags are ignored.
+//!
 //! Limitations, stated plainly: the firmware fallback name is always
 //! `BOOTX64.EFI`; ARM64 (`BOOTAA64.EFI`) and 32-bit (`BOOTIA32.EFI`)
 //! media are not distinguished yet.
@@ -55,6 +61,7 @@ use std::path::PathBuf;
 use crate::error::CoreError;
 use crate::error::Result;
 use crate::windows::bcd::Firmware;
+use crate::windows::bcd::is_valid_locale_tag;
 
 /// What one [`install`] wrote onto the target, in write order.
 ///
@@ -294,6 +301,77 @@ fn read_fonts(fonts_dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
         fonts.push((name.clone(), bytes));
     }
     Ok(fonts)
+}
+
+/// Detect the applied image's UI locale from its `.mui` language packs.
+///
+/// Windows keeps per-locale boot resources under
+/// `Windows/Boot/EFI/<locale>/`; a directory holding at least one `.mui`
+/// entry names a locale worth using for the BCD store. Detection is
+/// best-effort: a missing or unreadable tree yields `None`, symlinks are
+/// never followed anywhere on the path (a crafted WIM must not make us
+/// read outside the mount), and a directory name must pass
+/// [`is_valid_locale_tag`] before it is trusted. When several locales
+/// qualify the byte-wise smallest name wins, so the result is
+/// deterministic.
+#[must_use]
+pub fn locale_from_tree(data_root: &Path) -> Option<String> {
+    let efi = data_root.join("Windows/Boot/EFI");
+    // Check every component, not just the locale directories: a
+    // symlinked `Windows/Boot` (or `EFI`) would otherwise redirect the
+    // read outside the mount even though the leaf looks like a plain
+    // directory.
+    for dir in [
+        data_root.join("Windows"),
+        data_root.join("Windows/Boot"),
+        efi.clone(),
+    ] {
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            _ => return None,
+        }
+    }
+    let locales = std::fs::read_dir(efi).ok()?;
+    let mut best: Option<String> = None;
+    for entry in locales {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let Some(tag) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_valid_locale_tag(&tag) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        let has_mui = entries.into_iter().any(|mui| {
+            let Ok(mui) = mui else { return false };
+            let Ok(mui_meta) = std::fs::symlink_metadata(mui.path()) else {
+                return false;
+            };
+            !mui_meta.file_type().is_symlink()
+                && mui
+                    .file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .ends_with(".mui")
+        });
+        if has_mui
+            && best
+                .as_ref()
+                .is_none_or(|current| tag.as_str() < current.as_str())
+        {
+            best = Some(tag);
+        }
+    }
+    best
 }
 
 /// Copy the Windows boot manager, its support files and the built BCD
@@ -1227,5 +1305,108 @@ mod tests {
             names.len(),
             "bios must copy every real font"
         );
+    }
+
+    // -- Locale discovery from the applied tree (S22-T1) -----------------
+
+    /// Create `<data>/Windows/Boot/EFI` with one directory per locale,
+    /// each holding the given entry names as empty files.
+    fn locale_tree(locales: &[(&str, &[&str])]) -> tempfile::TempDir {
+        let data = tempfile::tempdir().expect("locale scratch must create");
+        let efi = data.path().join("Windows/Boot/EFI");
+        std::fs::create_dir_all(&efi).expect("EFI dir must create");
+        for (locale, entries) in locales {
+            let dir = efi.join(locale);
+            std::fs::create_dir_all(&dir).expect("locale dir must create");
+            for entry in *entries {
+                std::fs::write(dir.join(entry), b"mui").expect("mui file must write");
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn locale_from_tree_finds_a_single_de_de_locale() {
+        let data = locale_tree(&[("de-DE", &["bootmgr.exe.mui"])]);
+        assert_eq!(locale_from_tree(data.path()).as_deref(), Some("de-DE"));
+    }
+
+    #[test]
+    fn locale_from_tree_picks_the_bytewise_smallest_locale() {
+        let data = locale_tree(&[
+            ("ja-JP", &["bootmgr.exe.mui"]),
+            ("de-DE", &["bootmgr.exe.mui"]),
+        ]);
+        assert_eq!(locale_from_tree(data.path()).as_deref(), Some("de-DE"));
+        // The `.mui` suffix check is case-insensitive.
+        let upper = locale_tree(&[("fr-FR", &["BOOTMGR.EXE.MUI"])]);
+        assert_eq!(locale_from_tree(upper.path()).as_deref(), Some("fr-FR"));
+    }
+
+    #[test]
+    fn locale_from_tree_ignores_missing_non_mui_and_malformed_entries() {
+        let bare = tempfile::tempdir().expect("bare scratch must create");
+        assert_eq!(locale_from_tree(bare.path()), None);
+
+        let no_mui = locale_tree(&[("de-DE", &["readme.txt"])]);
+        assert_eq!(locale_from_tree(no_mui.path()), None);
+
+        let malformed = locale_tree(&[
+            ("e", &["bootmgr.exe.mui"]),
+            ("english", &["bootmgr.exe.mui"]),
+            ("en-US-x", &["bootmgr.exe.mui"]),
+            ("en_US", &["bootmgr.exe.mui"]),
+            ("123", &["bootmgr.exe.mui"]),
+        ]);
+        assert_eq!(locale_from_tree(malformed.path()), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn locale_from_tree_skips_symlinked_locales_and_mui_files() {
+        let data = locale_tree(&[("de-DE", &["bootmgr.exe.mui"])]);
+        let efi = data.path().join("Windows/Boot/EFI");
+        // A symlinked locale directory is never considered, even when
+        // its target holds a plausible .mui file.
+        let target = data.path().join("outside");
+        std::fs::create_dir_all(&target).expect("symlink target must create");
+        std::fs::write(target.join("x.mui"), b"x").expect("target mui must write");
+        std::os::unix::fs::symlink(&target, efi.join("ja-JP")).expect("locale symlink must create");
+        // A symlinked .mui entry inside an otherwise valid locale is
+        // ignored too, so de-DE no longer qualifies.
+        let valid = efi.join("de-DE/bootmgr.exe.mui");
+        std::fs::remove_file(&valid).expect("real mui must be removed");
+        std::os::unix::fs::symlink(target.join("x.mui"), &valid).expect("mui symlink must create");
+        assert_eq!(locale_from_tree(data.path()), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn locale_from_tree_refuses_a_symlinked_path_component() {
+        let outside = tempfile::tempdir().expect("outside scratch must create");
+        let outside_efi = outside.path().join("EFI");
+        std::fs::create_dir_all(&outside_efi).expect("outside EFI must create");
+        let locale = outside_efi.join("de-DE");
+        std::fs::create_dir_all(&locale).expect("outside locale must create");
+        std::fs::write(locale.join("bootmgr.exe.mui"), b"mui").expect("outside mui must write");
+
+        let data = tempfile::tempdir().expect("scratch must create");
+        let boot = data.path().join("Windows/Boot");
+        std::fs::create_dir_all(&boot).expect("Boot dir must create");
+        std::os::unix::fs::symlink(&outside_efi, boot.join("EFI"))
+            .expect("EFI symlink must create");
+        assert_eq!(
+            locale_from_tree(data.path()),
+            None,
+            "a symlinked EFI component must never be followed"
+        );
+
+        // A symlinked `Windows/Boot` itself is refused too, even when
+        // its target holds a perfectly plausible locale tree.
+        let data2 = tempfile::tempdir().expect("scratch must create");
+        std::fs::create_dir_all(data2.path().join("Windows")).expect("Windows must create");
+        std::os::unix::fs::symlink(outside.path(), data2.path().join("Windows/Boot"))
+            .expect("Boot symlink must create");
+        assert_eq!(locale_from_tree(data2.path()), None);
     }
 }

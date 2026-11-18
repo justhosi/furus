@@ -43,13 +43,14 @@
 //! template keys so they inherit the security descriptor, `Description`
 //! key and `14000006`/`16000060`/`17000077` values. The fresh loader
 //! gets the per-machine `11000001`/`21000001` partition devices, the
-//! full winload `12000002`, `en-us`, the edition `12000004` when given,
-//! `22000002` `\windows` and bcdboot's 8-byte `25000020`/`250000c2`;
-//! the fresh resume gets the same device, the full winresume path and
-//! an 8-byte `25000008`. `{bootmgr}` is repointed at the fresh objects
-//! (`23000003`, `23000006`, `24000001`), gets `en-us` and its own
-//! `11000001` partition device (the ESP on UEFI, the system/data
-//! partition on BIOS); `{memdiag}` gets that same device, `en-us`, a
+//! full winload `12000002`, the resolved locale (see below), the edition
+//! `12000004` when given, `22000002` `\windows` and bcdboot's 8-byte
+//! `25000020`/`250000c2`; the fresh resume gets the same device, the
+//! full winresume path, the same locale and an 8-byte `25000008`.
+//! `{bootmgr}` is repointed at the fresh objects (`23000003`,
+//! `23000006`, `24000001`), gets that locale and its own `11000001`
+//! partition device (the ESP on UEFI, the system/data partition on
+//! BIOS); `{memdiag}` gets that same device and locale, a
 //! description and a per-firmware `12000002` path
 //! (`\EFI\Microsoft\Boot\memtest.efi` for UEFI, `\boot\memtest.exe`
 //! for BIOS, matching where the boot files land), and loses the
@@ -59,6 +60,12 @@
 //! bytes change except the header checksum (and, when the template's
 //! own free space runs out, one appended hive bin plus the header
 //! length that describes it, see below).
+//!
+//! Locale precedence for those four objects: the locale supplied by the
+//! caller ([`build_with_locale`], wired from the applied tree by
+//! [`super::to_go::install`]), else the template's own validated
+//! `12000005` ([`locale_in_template`]), else `en-us`. No object gets a
+//! hardcoded locale any more.
 //!
 //! What slice 6 confirmed against a live template read (the slice-5
 //! summary is superseded wherever it differs): every object is
@@ -169,6 +176,8 @@
 //! then calls `disable_recovery`, which deliberately still adds
 //! `16000009 = 00` to the fresh loader (the known-good store has none).
 
+use std::borrow::Cow;
+
 use super::regf::*;
 use crate::error::CoreError;
 use crate::error::Result;
@@ -223,6 +232,27 @@ pub const TEMPLATE_LOADER_B012: &str = "{b012b84d-c47c-4ed5-b722-c0c42163e569}";
 /// default. Never picked as the OS loader (it is the template's
 /// placeholder default, repointed by [`build`]).
 pub const TEMPLATE_LOADER_CBD9: &str = "{cbd971bf-b7b8-4885-951a-fa03044f5d71}";
+
+/// The `Description\Type` DWORD on a template OS loader object. A
+/// `BCD-Template` whose loader uses a non-default GUID is still a usable
+/// clone source: when the fixed GUID is absent, [`find_template_object`]
+/// falls back to scanning `Objects\*` for this type.
+///
+/// Provenance: `0x10200003` is the well-known BCD object type for a
+/// Windows OS loader (`0x10200000 | 3`), the value Windows writes into
+/// `Description\Type`. No real template is checked into this repo, so
+/// the constant is a documented assumption of the BCD schema; the
+/// ignored `real_template_builds_both_variants` test confirms both
+/// constants against a supplied `BCD-Template` (the normal build path
+/// takes the fixed-GUID fast path and would never exercise them).
+const OBJECT_TYPE_OS_LOADER: u32 = 0x1020_0003;
+
+/// The `Description\Type` DWORD on a template resume object; the fallback
+/// counterpart of [`OBJECT_TYPE_OS_LOADER`] (`0x10200004` is the BCD
+/// resume-application type, `0x10200000 | 4`). Same provenance: a
+/// schema assumption confirmed by `real_template_builds_both_variants`
+/// when a real template is supplied.
+const OBJECT_TYPE_RESUME: u32 = 0x1020_0004;
 
 /// Fresh UEFI OS loader created by `bcdboot`, and the `{default}` a
 /// built UEFI store points at (see [`default_object`]). Its last group
@@ -444,6 +474,39 @@ pub const BIOS_STORE_PATH: &str = "\\boot\\bcd";
 pub fn element_class(id: u32) -> u8 {
     // A shift, not an index: no failure mode, no panic path.
     (id >> 24) as u8
+}
+
+/// Conservative BCP-47-like locale tag validation: 2-3 ASCII letters,
+/// optionally followed by one or more `-` plus 2-8 ASCII alphanumerics.
+/// Deliberately stricter than BCP-47 (no single-letter extensions, no
+/// non-ASCII): a tag can come from a WIM-supplied directory name or hive
+/// value, so only plain, predictable tags are trusted. No regex
+/// dependency. Shared with [`super::boot_files::locale_from_tree`].
+#[must_use]
+pub(crate) fn is_valid_locale_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && i < 3 && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if !(2..=3).contains(&i) {
+        return false;
+    }
+    while i < bytes.len() {
+        // Each subtag starts with `-` and is 2-8 ASCII alphanumerics.
+        if bytes[i] != b'-' {
+            return false;
+        }
+        i += 1;
+        let start = i;
+        while i < bytes.len() && i - start < 8 && bytes[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        if !(2..=8).contains(&(i - start)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Which firmware path a store is for; selects the template loader it
@@ -765,6 +828,161 @@ fn clone_object(
     Ok(fresh_elements)
 }
 
+/// Read the `Description\Type` DWORD of an object key, when present.
+fn description_type(hive: &Hive, object: usize) -> Option<u32> {
+    let description = hive.find_child(object, b"Description").ok().flatten()?;
+    let (vtype, data) = hive.read_value(description, b"Type").ok().flatten()?;
+    if vtype != REG_DWORD || data.len() != 4 {
+        return None;
+    }
+    Some(u32::from_le_bytes(data[..4].try_into().ok()?))
+}
+
+/// Resolve a template object by its well-known GUID first, then by its
+/// `Description\Type` when that GUID is absent. Some images ship a
+/// `BCD-Template` whose loader/resume GUIDs differ from the 24H2 ones
+/// pinned above; scanning by the BCD object type still finds the right
+/// clone source. A real template carries several objects of the loader
+/// type (the minimal ntldr loader and the install-media loader are boot
+/// applications too), so the scan returns the byte-wise smallest name
+/// *that `accept` approves*: for the loader the caller checks the very
+/// same `22000002`/`42000002` values [`build`] later requires, so an
+/// unusable object cannot hide a usable one. `accept` never weakens a
+/// check — the caller still validates the chosen object.
+///
+/// The scan is best-effort: a malformed list or sibling key must not
+/// abort the build, and the byte-wise ordering keeps it deterministic.
+/// In particular the untrusted `Objects` subkey count is cross-checked
+/// against the list's own count (as [`Hive::find_child`] does) before
+/// any iteration, so a crafted count cannot make us loop billions of
+/// times. Callers keep today's "missing object" messages when this
+/// returns `Ok(None)`.
+fn find_template_object(
+    hive: &Hive,
+    objects: usize,
+    fixed_guid: &str,
+    object_type: u32,
+    accept: impl Fn(&Hive, usize) -> bool,
+) -> Result<Option<usize>> {
+    // The fixed-GUID lookup is best-effort too: a corrupt count makes
+    // `find_child` fail, and the guarded scan below then reports the
+    // familiar "missing object" result instead of an internal error.
+    if let Some(key) = hive
+        .find_child(objects, fixed_guid.as_bytes())
+        .ok()
+        .flatten()
+    {
+        return Ok(Some(key));
+    }
+    let Ok(nsub) = hive.nk_u32(objects, 0x14, "object count") else {
+        return Ok(None);
+    };
+    if nsub == 0 {
+        return Ok(None);
+    }
+    let Ok(list) = hive.nk_u32(objects, 0x1C, "object list") else {
+        return Ok(None);
+    };
+    if list == NONE {
+        return Ok(None);
+    }
+    let Ok((count, _, _, _)) = hive.list_head(list as usize) else {
+        return Ok(None);
+    };
+    if count != nsub {
+        return Ok(None);
+    }
+    let mut best: Option<(Vec<u8>, usize)> = None;
+    for index in 0..count {
+        // A forged list entry (or a list that ends early) stops the
+        // best-effort scan; it must never turn into a blind `continue`.
+        let child = match hive.list_child(list as usize, index) {
+            Ok(Some(child)) => child,
+            Ok(None) | Err(_) => break,
+        };
+        if description_type(hive, child) != Some(object_type) {
+            continue;
+        }
+        let Ok((name, _)) = hive.nk_name(child) else {
+            continue;
+        };
+        if !accept(hive, child) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_name, _)| name.as_slice() < best_name.as_slice())
+        {
+            best = Some((name, child));
+        }
+    }
+    Ok(best.map(|(_, child)| child))
+}
+
+/// Read and validate the locale element under one `Elements` key.
+fn locale_from_elements(hive: &Hive, elements: usize) -> Option<String> {
+    let (_, data) = hive
+        .element_value(elements, ELEMENT_LOCALE)
+        .ok()
+        .flatten()?;
+    let tag = decode_sz(&data).ok()?;
+    is_valid_locale_tag(&tag).then_some(tag)
+}
+
+/// Best-effort locale detection from a parsed template hive: `{bootmgr}`
+/// first, then the firmware template loaders resolved by GUID or type.
+fn locale_from_hive(hive: &Hive) -> Option<String> {
+    // `{memdiag}`'s own 12000005 is deliberately not consulted: the
+    // applied tree (locale_from_tree) and then `{bootmgr}`/the template
+    // loader are the locale authorities, so a diagnostic object must not
+    // be allowed to steer the build. Do not "fix" this by adding it.
+    let objects = hive.find_child(hive.root(), b"Objects").ok().flatten()?;
+    let bootmgr = hive
+        .find_child(objects, OBJECT_BOOTMGR.as_bytes())
+        .ok()
+        .flatten()?;
+    if let Some(elements) = hive.find_child(bootmgr, b"Elements").ok().flatten()
+        && let Some(tag) = locale_from_elements(hive, elements)
+    {
+        return Some(tag);
+    }
+    for firmware in [Firmware::Uefi, Firmware::Bios] {
+        let Some(loader) = find_template_object(
+            hive,
+            objects,
+            template_object(firmware),
+            OBJECT_TYPE_OS_LOADER,
+            |hive, child| {
+                hive.find_child(child, b"Elements")
+                    .ok()
+                    .flatten()
+                    .is_some_and(|elements| locale_from_elements(hive, elements).is_some())
+            },
+        )
+        .ok()
+        .flatten() else {
+            continue;
+        };
+        let Some(elements) = hive.find_child(loader, b"Elements").ok().flatten() else {
+            continue;
+        };
+        if let Some(tag) = locale_from_elements(hive, elements) {
+            return Some(tag);
+        }
+    }
+    None
+}
+
+/// Best-effort locale detection from an applied image's `BCD-Template`
+/// bytes: a validated tag from `{bootmgr}` or the firmware template
+/// loader, or `None` on any parse, decode or validation failure. This is
+/// never an error path; callers fall back to `"en-us"`.
+#[must_use]
+pub fn locale_in_template(template: &[u8]) -> Option<String> {
+    let hive = Hive::parse(template).ok()?;
+    locale_from_hive(&hive)
+}
+
 /// Build a complete BCD store from a template hive.
 ///
 /// The template is the applied image's `Windows/System32/config/BCD-Template`
@@ -775,22 +993,24 @@ fn clone_object(
 /// real `bcdboot` writes onto them:
 ///
 /// - fresh loader: `11000001`/`21000001` partition devices, the full
-///   winload `12000002`, `en-us` `12000005`, the edition `12000004`
-///   when given, `14000006`/`16000060`/`17000077` inherited from the
-///   template loader, `23000003` naming the fresh resume, `22000002`
-///   `\windows`, 8-byte `25000020` (all zero) and `250000c2`
-///   (`0100000000000000`), and no class-0x4 or `16000009` elements;
+///   winload `12000002`, `12000005` with the resolved locale (supplied →
+///   template → `en-us`), the edition `12000004` when given,
+///   `14000006`/`16000060`/`17000077` inherited from the template
+///   loader, `23000003` naming the fresh resume, `22000002` `\windows`,
+///   8-byte `25000020` (all zero) and `250000c2` (`0100000000000000`),
+///   and no class-0x4 or `16000009` elements;
 /// - fresh resume: the same partition device, the full winresume
-///   `12000002`, `Windows Resume Application` `12000004`, `en-us`
-///   `12000005`, the three inherited values from the template resume,
-///   `22000002` `\hiberfil.sys` and 8-byte `25000008`
+///   `12000002`, `Windows Resume Application` `12000004`, `12000005`
+///   with the same resolved locale, the three inherited values from the
+///   template resume, `22000002` `\hiberfil.sys` and 8-byte `25000008`
 ///   (`0100000000000000`);
 /// - `{bootmgr}`: `23000003`, `23000006` and `24000001` repointed at the
-///   fresh objects, `12000005` `en-us`, and its own `11000001` partition
-///   device (the ESP on UEFI, the system partition on BIOS);
-/// - `{memdiag}`: the ESP/system device as `11000001`, `en-us`
-///   `12000005`, `Windows Memory Diagnostic` `12000004`, the
-///   per-firmware `12000002`, and no `1600000B`.
+///   fresh objects, `12000005` with the same resolved locale, and its
+///   own `11000001` partition device (the ESP on UEFI, the system
+///   partition on BIOS);
+/// - `{memdiag}`: the ESP/system device as `11000001`, `12000005` with
+///   the same resolved locale, `Windows Memory Diagnostic` `12000004`,
+///   the per-firmware `12000002`, and no `1600000B`.
 ///
 /// Class-0x4 template elements are stripped from these four active
 /// objects; inactive template objects are left untouched. The header
@@ -799,12 +1019,39 @@ fn clone_object(
 /// truncated, lacks `System\Objects`, `{bootmgr}`, the firmware
 /// template loader, the template resume object or `{memdiag}`, or
 /// lacks an element the build has to read.
+///
+/// The locale written to all four active objects is the one passed to
+/// [`build_with_locale`] when given, else the template's own validated
+/// `12000005` from `{bootmgr}` or the firmware template loader, else
+/// `"en-us"` ([`locale_in_template`] shares that detection).
 pub fn build(template: &[u8], request: &StoreRequest<'_>) -> Result<Vec<u8>> {
-    Ok(build_store(template, request)?.bytes)
+    build_with_locale(template, request, None)
+}
+
+/// Build a store with an explicit locale, falling back to the template's
+/// own locale and then to `"en-us"`.
+///
+/// A supplied `locale` must pass [`is_valid_locale_tag`]; an invalid one
+/// is refused with [`CoreError::InvalidInput`] naming it before the hive
+/// is parsed or mutated, so it can never be written into the store.
+/// Everything else is identical to [`build`].
+pub fn build_with_locale(
+    template: &[u8],
+    request: &StoreRequest<'_>,
+    locale: Option<&str>,
+) -> Result<Vec<u8>> {
+    if let Some(locale) = locale
+        && !is_valid_locale_tag(locale)
+    {
+        return Err(CoreError::invalid(format!(
+            "invalid bcd locale {locale}: expected 2-3 ASCII letters optionally followed by -XX subtags of 2-8 ASCII alphanumerics"
+        )));
+    }
+    Ok(build_store(template, request, locale)?.bytes)
 }
 
 /// The [`build`] body, keeping the written metadata next to the bytes.
-fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
+fn build_store(template: &[u8], request: &StoreRequest<'_>, locale: Option<&str>) -> Result<Store> {
     let firmware = request.firmware;
     let template_guid = template_object(firmware);
     let loader_guid = default_object(firmware);
@@ -814,6 +1061,16 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
         Firmware::Bios => "BIOS",
     };
     let mut hive = Hive::parse(template)?;
+    // Locale precedence: explicit argument, then the template's own
+    // (already validated) locale element, then en-us. The Cow borrows in
+    // the common cases and only allocates for a detected tag.
+    let effective_locale: Cow<'_, str> = match locale {
+        Some(locale) => Cow::Borrowed(locale),
+        None => match locale_from_hive(&hive) {
+            Some(tag) => Cow::Owned(tag),
+            None => Cow::Borrowed("en-us"),
+        },
+    };
     let (root_name, _) = hive.nk_name(hive.root())?;
     if root_name != b"System" {
         return Err(CoreError::invalid(
@@ -832,13 +1089,38 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
         })?;
     // The template loader is only validated and used as the model for
     // the fresh objects; the built store's {default} is loader_guid.
-    let template_loader = hive
-        .find_child(objects, template_guid.as_bytes())?
-        .ok_or_else(|| {
-            CoreError::invalid(format!(
-                "bcd template is missing the {firmware_name} loader object {template_guid}"
-            ))
-        })?;
+    // A template without the fixed 24H2 GUID falls back to a scan by
+    // Description\Type so non-default object GUIDs still clone. Several
+    // real objects carry that type, so the scan only accepts a candidate
+    // that passes the very same 22000002/42000002 checks applied below:
+    // the minimal ntldr loader and the install-media loader are boot
+    // applications too, and must not hide the usable winload loader.
+    let expected_suffix = expected_loader_suffix(firmware);
+    let template_loader = find_template_object(
+        &hive,
+        objects,
+        template_guid,
+        OBJECT_TYPE_OS_LOADER,
+        |hive, child| {
+            let Some(elements) = hive.find_child(child, b"Elements").ok().flatten() else {
+                return false;
+            };
+            let ok_root = matches!(
+                hive.element_value(elements, ELEMENT_OS_LOCATE_PATH),
+                Ok(Some((REG_SZ, data))) if decode_sz(&data).is_ok_and(|s| s == "\\windows")
+            );
+            let ok_loader = matches!(
+                hive.element_value(elements, ELEMENT_LOADER_PATH),
+                Ok(Some((REG_SZ, data))) if decode_sz(&data).is_ok_and(|s| s == expected_suffix)
+            );
+            ok_root && ok_loader
+        },
+    )?
+    .ok_or_else(|| {
+        CoreError::invalid(format!(
+            "bcd template is missing the {firmware_name} loader object {template_guid}"
+        ))
+    })?;
     let memdiag = hive
         .find_child(objects, OBJECT_MEMDIAG.as_bytes())?
         .ok_or_else(|| {
@@ -885,7 +1167,6 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
             )));
         }
     }
-    let expected_suffix = expected_loader_suffix(firmware);
     match hive.element_value(loader_elements, ELEMENT_LOADER_PATH)? {
         Some((REG_SZ, data)) if decode_sz(&data)? == expected_suffix => {}
         Some((_, data)) => {
@@ -919,13 +1200,21 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
             )));
         }
     };
-    let template_resume = hive
-        .find_child(objects, template_resume_guid.as_bytes())?
-        .ok_or_else(|| {
-            CoreError::invalid(format!(
-                "bcd template is missing the resume object {template_resume_guid}"
-            ))
-        })?;
+    // Several objects might carry the resume type too; keep the first
+    // that has the `Elements` key the build reads below. The 23000003
+    // GUID still wins whenever it resolves, as before.
+    let template_resume = find_template_object(
+        &hive,
+        objects,
+        &template_resume_guid,
+        OBJECT_TYPE_RESUME,
+        |hive, child| hive.find_child(child, b"Elements").ok().flatten().is_some(),
+    )?
+    .ok_or_else(|| {
+        CoreError::invalid(format!(
+            "bcd template is missing the resume object {template_resume_guid}"
+        ))
+    })?;
     let template_resume_elements =
         hive.find_child(template_resume, b"Elements")?
             .ok_or_else(|| {
@@ -950,10 +1239,10 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
         Firmware::Bios => partition,
     };
 
-    // Repoint {bootmgr} at the fresh objects and lowercase its locale.
+    // Repoint {bootmgr} at the fresh objects and write the resolved locale.
     // 24000010, 25000004, 12000002 and 12000004 are left alone.
     hive.set_element_sz(bootmgr_elements, ELEMENT_DEFAULT_OBJECT, loader_guid)?;
-    hive.set_element_sz(bootmgr_elements, ELEMENT_LOCALE, "en-us")?;
+    hive.set_element_sz(bootmgr_elements, ELEMENT_LOCALE, effective_locale.as_ref())?;
     hive.set_element_sz(bootmgr_elements, ELEMENT_RESUME_OBJECT, resume_guid)?;
     hive.set_element_multisz(bootmgr_elements, ELEMENT_BOOT_DISPLAY_ORDER, &[loader_guid])?;
     hive.set_element_multisz(
@@ -988,7 +1277,11 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
     if let Some(description) = request.description {
         hive.set_element_sz(fresh_loader_elements, ELEMENT_DESCRIPTION, description)?;
     }
-    hive.set_element_sz(fresh_loader_elements, ELEMENT_LOCALE, "en-us")?;
+    hive.set_element_sz(
+        fresh_loader_elements,
+        ELEMENT_LOCALE,
+        effective_locale.as_ref(),
+    )?;
     write_inherited(&mut hive, fresh_loader_elements, &loader_inherited)?;
     hive.set_element_sz(fresh_loader_elements, ELEMENT_DEFAULT_OBJECT, resume_guid)?;
     hive.set_element_binary(fresh_loader_elements, ELEMENT_25000020, &[0u8; 8])?;
@@ -1021,7 +1314,11 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
         ELEMENT_DESCRIPTION,
         "Windows Resume Application",
     )?;
-    hive.set_element_sz(fresh_resume_elements, ELEMENT_LOCALE, "en-us")?;
+    hive.set_element_sz(
+        fresh_resume_elements,
+        ELEMENT_LOCALE,
+        effective_locale.as_ref(),
+    )?;
     write_inherited(&mut hive, fresh_resume_elements, &resume_inherited)?;
     hive.set_element_binary(
         fresh_resume_elements,
@@ -1034,10 +1331,10 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
         "\\hiberfil.sys",
     )?;
 
-    // {memdiag}: ESP/system device, lowercase locale, a description,
+    // {memdiag}: ESP/system device, the resolved locale, a description,
     // the per-firmware path, and drop the template's 1600000B.
     hive.set_element_binary(memdiag_elements, ELEMENT_DEVICE, &bootmgr_device)?;
-    hive.set_element_sz(memdiag_elements, ELEMENT_LOCALE, "en-us")?;
+    hive.set_element_sz(memdiag_elements, ELEMENT_LOCALE, effective_locale.as_ref())?;
     hive.set_element_sz(
         memdiag_elements,
         ELEMENT_DESCRIPTION,
@@ -2582,6 +2879,44 @@ mod tests {
         };
         let template = std::fs::read(&path).expect("template must read");
         assert_eq!(&template[0..4], b"regf");
+        // The normal build path uses the fixed GUIDs, so it never proves
+        // the OBJECT_TYPE_* constants. Confirm them directly against a
+        // real template here when one is supplied: the OS loader's
+        // Description\Type and the resume object it names.
+        {
+            let template_hive = Hive::parse(&template).expect("template must parse");
+            let objects = template_hive
+                .find_child(template_hive.root(), b"Objects")
+                .expect("find")
+                .expect("objects");
+            let loader = template_hive
+                .find_child(objects, TEMPLATE_LOADER_B012.as_bytes())
+                .expect("find")
+                .expect("uefi template loader");
+            assert_eq!(
+                description_type(&template_hive, loader),
+                Some(OBJECT_TYPE_OS_LOADER),
+                "real template OS loader Description\\Type must match the constant"
+            );
+            let loader_elements = template_hive
+                .find_child(loader, b"Elements")
+                .expect("find")
+                .expect("loader Elements");
+            let (_, resume_ref) = template_hive
+                .element_value(loader_elements, ELEMENT_DEFAULT_OBJECT)
+                .expect("read")
+                .expect("loader 23000003");
+            let resume_guid = decode_sz(&resume_ref).expect("resume guid text");
+            let resume = template_hive
+                .find_child(objects, resume_guid.as_bytes())
+                .expect("find")
+                .expect("resume object");
+            assert_eq!(
+                description_type(&template_hive, resume),
+                Some(OBJECT_TYPE_RESUME),
+                "real template resume Description\\Type must match the constant"
+            );
+        }
         let gpt = DeviceIdentity::Gpt {
             disk_guid: [
                 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18, 0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E,
@@ -3006,6 +3341,426 @@ mod tests {
             decode_sz(&uefi_desc).expect("description"),
             bios_description,
             "BIOS and UEFI loaders must carry the same description"
+        );
+    }
+
+    // -- Locale and fallback-object hardening (S22-T1) ------------------
+
+    fn uefi_request(description: Option<&str>) -> StoreRequest<'_> {
+        let identity = DeviceIdentity::Gpt {
+            disk_guid: [1u8; 16],
+            partition_guid: [2u8; 16],
+        };
+        StoreRequest {
+            firmware: Firmware::Uefi,
+            identity,
+            esp_identity: identity,
+            description,
+        }
+    }
+
+    /// Add a `12000005` locale element to `{bootmgr}` of the standard
+    /// fixture, for locale-detection tests.
+    fn template_with_bootmgr_locale(locale: &str) -> Vec<u8> {
+        let mut hive = Hive::parse(&template_fixture()).expect("fixture parses");
+        let objects = hive
+            .find_child(hive.root(), b"Objects")
+            .expect("find")
+            .expect("objects");
+        let bootmgr = hive
+            .find_child(objects, OBJECT_BOOTMGR.as_bytes())
+            .expect("find")
+            .expect("bootmgr");
+        let elements = hive
+            .find_child(bootmgr, b"Elements")
+            .expect("find")
+            .expect("bootmgr elements");
+        add_element(&mut hive, elements, "12000005", REG_SZ, &utf16_nul(locale));
+        hive.update_checksum().expect("checksum");
+        hive.into_bytes()
+    }
+
+    /// Locale values on the four active objects of a built store.
+    fn built_locales(bytes: &[u8], firmware: Firmware) -> [String; 4] {
+        let hive = Hive::parse(bytes).expect("built store must re-parse");
+        [
+            OBJECT_BOOTMGR,
+            default_object(firmware),
+            default_resume_object(firmware),
+            OBJECT_MEMDIAG,
+        ]
+        .map(|object| {
+            let (_, data) = hive
+                .element_data(object, ELEMENT_LOCALE)
+                .expect("read locale")
+                .expect("built object must carry a locale element");
+            decode_sz(&data).expect("locale text")
+        })
+    }
+
+    #[test]
+    fn locale_in_template_reads_valid_tags_and_refuses_invalid_ones() {
+        assert_eq!(
+            locale_in_template(&template_with_bootmgr_locale("de-DE")).as_deref(),
+            Some("de-DE"),
+            "a valid de-DE tag on bootmgr must be returned"
+        );
+        assert_eq!(
+            locale_in_template(&template_fixture()).as_deref(),
+            None,
+            "a fixture with no locale element must detect nothing"
+        );
+        assert_eq!(
+            locale_in_template(&template_with_bootmgr_locale("../evil")).as_deref(),
+            None,
+            "an invalid tag must never be returned"
+        );
+        assert_eq!(locale_in_template(b"not a hive").as_deref(), None);
+    }
+
+    #[test]
+    fn build_with_locale_writes_the_locale_to_all_four_objects() {
+        let template = template_fixture();
+        let request = uefi_request(Some("Windows 11 Pro"));
+
+        let explicit = build_with_locale(&template, &request, Some("de-DE"))
+            .expect("explicit de-DE locale must build");
+        assert_eq!(built_locales(&explicit, Firmware::Uefi), ["de-DE"; 4]);
+
+        // `build` still writes en-us when the template has no detectable
+        // locale, and propagates a valid one when the template carries it.
+        let default = build(&template, &request).expect("default build must succeed");
+        assert_eq!(built_locales(&default, Firmware::Uefi), ["en-us"; 4]);
+        let templated = template_with_bootmgr_locale("fr-FR");
+        let detected = build(&templated, &request).expect("templated locale must build");
+        assert_eq!(built_locales(&detected, Firmware::Uefi), ["fr-FR"; 4]);
+    }
+
+    #[test]
+    fn build_with_locale_refuses_an_invalid_supplied_locale() {
+        let template = template_fixture();
+        let request = uefi_request(None);
+        for bad in ["../evil", "e", "english", "en-", "en-x"] {
+            let err = build_with_locale(&template, &request, Some(bad))
+                .expect_err("invalid locale must refuse");
+            assert!(
+                matches!(err, CoreError::InvalidInput { .. }),
+                "must be InvalidInput, got {err}"
+            );
+            assert!(err.to_string().contains(bad), "must name {bad}: {err}");
+        }
+    }
+
+    const CUSTOM_LOADER_GUID: &str = "{1a2b3c4d-1111-2222-3333-444455556666}";
+    const CUSTOM_RESUME_GUID: &str = "{1a2b3c4d-7777-8888-9999-000011112222}";
+    const DANGLING_RESUME_GUID: &str = "{1a2b3c4d-aaaa-bbbb-cccc-ddddeeeeffff}";
+
+    /// A template whose loader and resume use non-default GUIDs and carry
+    /// `Description\Type` DWORDs instead of the pinned 24H2 GUIDs, so a
+    /// build can only succeed through the type-based fallback. Note the
+    /// fixture writes the two `OBJECT_TYPE_*` constants into its own
+    /// cells, so it proves the fallback wiring but not the constants'
+    /// values; `real_template_builds_both_variants` confirms those
+    /// against a real template when one is supplied.
+    fn custom_guid_template() -> Vec<u8> {
+        custom_guid_template_with_resume_ref(CUSTOM_RESUME_GUID)
+    }
+
+    /// `resume_ref` is what the loader's `23000003` names. Passing a GUID
+    /// that is absent from `Objects` forces the resume type fallback.
+    fn custom_guid_template_with_resume_ref(resume_ref: &str) -> Vec<u8> {
+        let mut hive = empty_hive();
+        let root = hive.root();
+        let objects = add_key(&mut hive, root, b"Objects");
+
+        let bootmgr = add_key(&mut hive, objects, OBJECT_BOOTMGR.as_bytes());
+        let bootmgr_el = add_key(&mut hive, bootmgr, b"Elements");
+        add_element(
+            &mut hive,
+            bootmgr_el,
+            "23000003",
+            REG_SZ,
+            &utf16_nul(TEMPLATE_LOADER_CBD9),
+        );
+        add_element(
+            &mut hive,
+            bootmgr_el,
+            "12000002",
+            REG_SZ,
+            &utf16_nul("\\EFI\\Microsoft\\Boot\\bootmgfw.efi"),
+        );
+
+        let loader = add_key(&mut hive, objects, CUSTOM_LOADER_GUID.as_bytes());
+        let loader_desc = add_key(&mut hive, loader, b"Description");
+        hive.add_value(
+            loader_desc,
+            b"Type",
+            REG_DWORD,
+            &OBJECT_TYPE_OS_LOADER.to_le_bytes(),
+        )
+        .expect("loader Type must allocate");
+        let loader_el = add_key(&mut hive, loader, b"Elements");
+        add_element(
+            &mut hive,
+            loader_el,
+            "22000002",
+            REG_SZ,
+            &utf16_nul("\\windows"),
+        );
+        add_element(
+            &mut hive,
+            loader_el,
+            "42000002",
+            REG_SZ,
+            &utf16_nul("\\system32\\winload.efi"),
+        );
+        add_element(
+            &mut hive,
+            loader_el,
+            "23000003",
+            REG_SZ,
+            &utf16_nul(resume_ref),
+        );
+
+        let resume = add_key(&mut hive, objects, CUSTOM_RESUME_GUID.as_bytes());
+        let resume_desc = add_key(&mut hive, resume, b"Description");
+        hive.add_value(
+            resume_desc,
+            b"Type",
+            REG_DWORD,
+            &OBJECT_TYPE_RESUME.to_le_bytes(),
+        )
+        .expect("resume Type must allocate");
+        let resume_el = add_key(&mut hive, resume, b"Elements");
+        add_element(
+            &mut hive,
+            resume_el,
+            "42000002",
+            REG_SZ,
+            &utf16_nul("\\system32\\winresume.efi"),
+        );
+
+        let memdiag = add_key(&mut hive, objects, OBJECT_MEMDIAG.as_bytes());
+        let memdiag_el = add_key(&mut hive, memdiag, b"Elements");
+        add_element(
+            &mut hive,
+            memdiag_el,
+            "12000002",
+            REG_SZ,
+            &utf16_nul("\\EFI\\Microsoft\\Boot\\memtest.efi"),
+        );
+
+        hive.update_checksum().expect("checksum");
+        hive.into_bytes()
+    }
+
+    #[test]
+    fn build_uses_the_type_fallback_for_non_default_template_guids() {
+        let template = custom_guid_template();
+        let request = uefi_request(Some("Windows 11 Pro"));
+        let out = build(&template, &request).expect("custom GUID template must build");
+        let hive = Hive::parse(&out).expect("built store must re-parse");
+        let objects = hive
+            .find_child(hive.root(), b"Objects")
+            .expect("find")
+            .expect("objects");
+
+        // The custom objects were cloned from, but the fresh objects keep
+        // the standard bcdboot GUIDs and carry the required elements.
+        for guid in [OS_LOADER_UEFI, RESUME_UEFI] {
+            assert!(
+                hive.find_child(objects, guid.as_bytes())
+                    .expect("find")
+                    .is_some(),
+                "fresh object must use the standard GUID {guid}"
+            );
+        }
+        let ids = object_element_ids(&hive, OS_LOADER_UEFI);
+        for id in [ELEMENT_DESCRIPTION, ELEMENT_DEVICE, ELEMENT_OS_DEVICE] {
+            assert!(ids.contains(&id), "fresh loader must carry {id:#010x}");
+        }
+        let (_, default) = hive
+            .element_data(OBJECT_BOOTMGR, ELEMENT_DEFAULT_OBJECT)
+            .expect("read")
+            .expect("bootmgr default object");
+        assert_eq!(decode_sz(&default).expect("guid text"), OS_LOADER_UEFI);
+    }
+
+    /// A 24H2-style template carries other objects with the OS-loader
+    /// type (the minimal ntldr loader and the install-media loader).
+    /// They sort before a custom loader GUID and carry no usable
+    /// `22000002`/`42000002`, so the fallback must skip them rather than
+    /// abort with a misleading "carries 42000002 ... expected ..." error.
+    #[test]
+    fn type_fallback_skips_unusable_loader_candidates() {
+        const DECOY_LOADER: &str = "{00000000-0000-0000-0000-000000000001}";
+        let mut hive = Hive::parse(&custom_guid_template()).expect("fixture parses");
+        let objects = hive
+            .find_child(hive.root(), b"Objects")
+            .expect("find")
+            .expect("objects");
+        let decoy = add_key(&mut hive, objects, DECOY_LOADER.as_bytes());
+        let description = add_key(&mut hive, decoy, b"Description");
+        hive.add_value(
+            description,
+            b"Type",
+            REG_DWORD,
+            &OBJECT_TYPE_OS_LOADER.to_le_bytes(),
+        )
+        .expect("decoy Type must allocate");
+        add_key(&mut hive, decoy, b"Elements"); // no 22000002 / 42000002
+        hive.update_checksum().expect("checksum");
+
+        let out = build(&hive.into_bytes(), &uefi_request(None))
+            .expect("a decoy must not hide a valid loader candidate");
+        let built = Hive::parse(&out).expect("built store must re-parse");
+        assert!(
+            built
+                .find_child(built.root(), b"Objects")
+                .expect("find")
+                .is_some()
+        );
+        let ids = object_element_ids(&built, OS_LOADER_UEFI);
+        assert!(
+            ids.contains(&ELEMENT_PATH),
+            "real winload path must land on the fresh loader"
+        );
+        let (_, data) = built
+            .element_data(OS_LOADER_UEFI, ELEMENT_PATH)
+            .expect("read path")
+            .expect("12000002 must exist");
+        assert_eq!(
+            decode_sz(&data).expect("path text"),
+            winload_full_path(Firmware::Uefi)
+        );
+    }
+
+    /// The resume fallback is reached when the loader's `23000003` names a
+    /// GUID absent from `Objects`: a resume-type object elsewhere must
+    /// still be cloned into the fresh resume object.
+    #[test]
+    fn build_uses_the_type_fallback_for_a_dangling_resume_reference() {
+        let template = custom_guid_template_with_resume_ref(DANGLING_RESUME_GUID);
+        assert!(!template.is_empty());
+        let out = build(&template, &uefi_request(None))
+            .expect("dangling resume ref must fall back to the resume type");
+        let hive = Hive::parse(&out).expect("built store must re-parse");
+        let objects = hive
+            .find_child(hive.root(), b"Objects")
+            .expect("find")
+            .expect("objects");
+        assert!(
+            hive.find_child(objects, RESUME_UEFI.as_bytes())
+                .expect("find")
+                .is_some(),
+            "the fresh resume object must exist even though the template ref dangled"
+        );
+        let (_, resume) = hive
+            .element_data(OBJECT_BOOTMGR, ELEMENT_RESUME_OBJECT)
+            .expect("read")
+            .expect("bootmgr resume object");
+        assert_eq!(decode_sz(&resume).expect("guid text"), RESUME_UEFI);
+    }
+
+    /// Pin the two user-visible "missing object" strings so a future
+    /// fallback refactor cannot silently replace them with an internal
+    /// error or a wrong GUID.
+    #[test]
+    fn build_pins_missing_loader_and_resume_messages() {
+        // No loader object and no loader-type object: the fixed GUID's
+        // message names TEMPLATE_LOADER_B012.
+        let mut hive = empty_hive();
+        let root = hive.root();
+        let objects = add_key(&mut hive, root, b"Objects");
+        let bootmgr = add_key(&mut hive, objects, OBJECT_BOOTMGR.as_bytes());
+        let bootmgr_el = add_key(&mut hive, bootmgr, b"Elements");
+        add_element(
+            &mut hive,
+            bootmgr_el,
+            "23000003",
+            REG_SZ,
+            &utf16_nul(TEMPLATE_LOADER_CBD9),
+        );
+        hive.update_checksum().expect("checksum");
+        let err = build(&hive.into_bytes(), &uefi_request(None))
+            .expect_err("a template without a loader must refuse");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid input: bcd template is missing the UEFI loader object {TEMPLATE_LOADER_B012}"
+            )
+        );
+
+        // A valid loader naming a dangling GUID, with the resume-type
+        // object removed: the message preserves the dangling GUID.
+        let mut hive = Hive::parse(&custom_guid_template_with_resume_ref(DANGLING_RESUME_GUID))
+            .expect("fixture parses");
+        let objects = hive
+            .find_child(hive.root(), b"Objects")
+            .expect("find")
+            .expect("objects");
+        assert!(
+            hive.remove_child(objects, CUSTOM_RESUME_GUID.as_bytes())
+                .expect("remove resume")
+        );
+        hive.update_checksum().expect("checksum");
+        let err = build(&hive.into_bytes(), &uefi_request(None))
+            .expect_err("a template without a resume object must refuse");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "invalid input: bcd template is missing the resume object {DANGLING_RESUME_GUID}"
+            )
+        );
+    }
+
+    /// A crafted `Objects` subkey count must never drive the type-scan
+    /// loop. `regf::find_child` refuses the count/list mismatch before
+    /// the fallback is consulted (so `build` fails promptly at the
+    /// bootmgr lookup), and the fallback itself returns `Ok(None)` at
+    /// once instead of iterating 0..0xFFFF_FFFF.
+    #[test]
+    fn objects_count_mismatch_refuses_promptly() {
+        let mut hive = Hive::parse(&template_fixture()).expect("fixture parses");
+        let objects = hive
+            .find_child(hive.root(), b"Objects")
+            .expect("find")
+            .expect("objects");
+        let count_at = Hive::cell_file(objects, "forged count").expect("cell") + 4 + 0x14;
+        hive.store_u32(count_at, u32::MAX, "forged object count")
+            .expect("patch count");
+        hive.update_checksum().expect("checksum");
+        let bytes = hive.into_bytes();
+
+        assert_eq!(
+            locale_in_template(&bytes),
+            None,
+            "locale detection must not scan a forged count"
+        );
+
+        let probe = Hive::parse(&bytes).expect("mismatch hive still parses");
+        let objects = probe
+            .find_child(probe.root(), b"Objects")
+            .expect("find")
+            .expect("objects");
+        assert!(
+            matches!(
+                find_template_object(
+                    &probe,
+                    objects,
+                    TEMPLATE_LOADER_B012,
+                    OBJECT_TYPE_OS_LOADER,
+                    |_, _| true,
+                ),
+                Ok(None)
+            ),
+            "the guarded scan must refuse a count/list mismatch at once"
+        );
+
+        let err = build(&bytes, &uefi_request(None)).expect_err("mismatch hive must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "must be InvalidInput, got {err}"
         );
     }
 }

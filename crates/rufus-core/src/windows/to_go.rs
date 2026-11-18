@@ -42,7 +42,10 @@
 //! offline SAN policy on the applied `SYSTEM` hive, in that order (the
 //! WIM itself is applied by [`super::apply`] before either mount). The
 //! caller owns both mounts throughout: [`install`] never mounts and
-//! never releases either one.
+//! never releases either one. The BCD locale is detected in the same
+//! order as [`bcd::build_with_locale`] documents: the applied tree's
+//! `.mui` locale directories first, then the BCD-Template's own locale
+//! element, then `en-us` when neither is present or valid.
 //!
 //! Partial failure is sticky, not transactional: a failure after a step
 //! leaves the earlier steps' writes on the target — there is no
@@ -237,8 +240,13 @@ pub struct Installed {
 ///    unreadable (a WIM that is not a Windows image). A symlink at the
 ///    template path refuses without being followed: a crafted WIM
 ///    could otherwise redirect the read outside the mount roots.
-/// 2. Build both stores with [`bcd::build`]: UEFI first (the loader gets
-///    `identity`, `{bootmgr}` gets `esp_identity`), BIOS second.
+/// 2. Detect the UI locale, in order: the applied tree's
+///    [`boot_files::locale_from_tree`] `.mui` directories, then the
+///    template's own `12000005` element via [`bcd::locale_in_template`],
+///    then `en-us` when neither yields a valid tag. Build both stores
+///    with [`bcd::build_with_locale`] using that locale: UEFI first (the
+///    loader gets `identity`, `{bootmgr}` gets `esp_identity`), BIOS
+///    second.
 /// 3. [`disable_recovery`] on each store with [`bcd::default_object`].
 /// 4. [`boot_files::install`] the UEFI store (ESP plus `data` as the
 ///    image root), then the BIOS store with the BIOS install.
@@ -298,6 +306,12 @@ pub fn install(
             )));
         }
     };
+    // 1a. Best-effort locale detection: the applied tree's .mui
+    // directories win, then the template's own 12000005 element; the
+    // builder falls back to en-us when neither yields a valid tag. A
+    // WIM-supplied name is validated before it can steer the build.
+    let locale =
+        boot_files::locale_from_tree(&data_root).or_else(|| bcd::locale_in_template(&template));
     // 2. Both stores from the same template, UEFI first.
     let uefi_request = bcd::StoreRequest {
         firmware: bcd::Firmware::Uefi,
@@ -311,8 +325,8 @@ pub fn install(
         esp_identity: request.esp_identity,
         description: request.description,
     };
-    let uefi_store = bcd::build(&template, &uefi_request)?;
-    let bios_store = bcd::build(&template, &bios_request)?;
+    let uefi_store = bcd::build_with_locale(&template, &uefi_request, locale.as_deref())?;
+    let bios_store = bcd::build_with_locale(&template, &bios_request, locale.as_deref())?;
     // 3. Recovery off on each store's default loader.
     let uefi_store = disable_recovery(&uefi_store, bcd::default_object(bcd::Firmware::Uefi))?;
     let bios_store = disable_recovery(&bios_store, bcd::default_object(bcd::Firmware::Bios))?;
@@ -1471,6 +1485,108 @@ mod tests {
             esp.releases, 0,
             "a refused install never releases the esp mount"
         );
+    }
+
+    /// The applied tree's `.mui` locale reaches both built stores and
+    /// beats the template's own locale: the template carries `fr-FR`,
+    /// the tree carries `de-DE`, and both stores must end up `de-DE`.
+    #[test]
+    fn install_uses_the_applied_tree_locale_for_both_stores() {
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let data_path = root.path().join("data");
+        let esp_path = root.path().join("esp");
+        let config = data_path.join("Windows/System32/config");
+        std::fs::create_dir_all(&config).expect("config dir must create");
+        // Give the template a locale the detector would happily read, so
+        // this test actually demonstrates precedence rather than just
+        // "tree wins because the template has none".
+        let mut template = Hive::parse(&template_fixture()).expect("fixture parses");
+        let objects = template
+            .find_child(template.root(), b"Objects")
+            .expect("find")
+            .expect("objects");
+        let bootmgr = template
+            .find_child(objects, OBJECT_BOOTMGR.as_bytes())
+            .expect("find")
+            .expect("bootmgr");
+        let bootmgr_el = template
+            .find_child(bootmgr, b"Elements")
+            .expect("find")
+            .expect("bootmgr Elements");
+        add_element(
+            &mut template,
+            bootmgr_el,
+            "12000005",
+            crate::windows::regf::REG_SZ,
+            &crate::windows::regf::utf16_nul("fr-FR"),
+        );
+        template.update_checksum().expect("checksum");
+        let template = template.into_bytes();
+        assert_eq!(
+            bcd::locale_in_template(&template).as_deref(),
+            Some("fr-FR"),
+            "the template must really carry a detectable locale"
+        );
+        std::fs::write(config.join("BCD-Template"), template).expect("template must write");
+        std::fs::write(
+            config.join("SYSTEM"),
+            system_fixture_with_sanpolicy(SAN_POLICY_OFFLINE),
+        )
+        .expect("system hive must write");
+
+        let efi = data_path.join("Windows/Boot/EFI");
+        let pcat = data_path.join("Windows/Boot/PCAT");
+        std::fs::create_dir_all(&efi).expect("efi dir must create");
+        std::fs::create_dir_all(&pcat).expect("pcat dir must create");
+        std::fs::write(efi.join("bootmgfw.efi"), b"efi loader").expect("efi loader must write");
+        std::fs::write(pcat.join("bootmgr"), b"bios loader").expect("bios loader must write");
+        std::fs::write(pcat.join("boot.sdi"), b"boot sdi").expect("boot.sdi must write");
+        let de = efi.join("de-DE");
+        std::fs::create_dir_all(&de).expect("de-DE dir must create");
+        std::fs::write(de.join("bootmgfw.efi.mui"), b"mui").expect("mui must write");
+        std::fs::create_dir_all(&esp_path).expect("esp must create");
+
+        let mut data = FakeMount::new(data_path.clone(), u64::MAX);
+        let mut esp = FakeMount::new(esp_path.clone(), u64::MAX);
+        let request = Request {
+            identity: test_identity(),
+            esp_identity: test_identity(),
+            description: None,
+            use_2023_bootloaders: false,
+        };
+        install(
+            &mut data,
+            &mut esp,
+            &request,
+            Applied { bytes: 0, files: 0 },
+        )
+        .expect("install must succeed");
+
+        // Both placed stores, not just the ESP one: the BIOS store in
+        // `data/boot/BCD` must carry the same resolved locale.
+        for (store_path, firmware) in [
+            (esp_path.join("EFI/Microsoft/Boot/BCD"), Firmware::Uefi),
+            (data_path.join("boot/bcd"), Firmware::Bios),
+        ] {
+            let store = std::fs::read(&store_path).expect("store must be placed");
+            let hive = Hive::parse(&store).expect("store must re-parse");
+            for object in [
+                OBJECT_BOOTMGR,
+                bcd::default_object(firmware),
+                bcd::default_resume_object(firmware),
+                OBJECT_MEMDIAG,
+            ] {
+                let (_, bytes) = hive
+                    .element_data(object, bcd::ELEMENT_LOCALE)
+                    .expect("read locale")
+                    .expect("locale element must exist");
+                assert_eq!(
+                    crate::windows::regf::decode_sz(&bytes).expect("locale text"),
+                    "de-DE",
+                    "{store_path:?} object {object} must carry the applied tree's locale, not the template's fr-FR"
+                );
+            }
+        }
     }
 
     /// Copy a directory tree (regular files and subdirectories only).
