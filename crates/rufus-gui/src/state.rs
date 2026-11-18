@@ -112,6 +112,13 @@ impl GuiState {
         self.last_error = None;
     }
 
+    /// Clear the selected device when a hotplug refresh removes it.
+    pub fn clear_device(&mut self) {
+        self.device = None;
+        self.status = "Selected device was disconnected.".to_string();
+        self.last_error = None;
+    }
+
     /// Inspect the selected image with the shared read-only image preamble.
     pub fn select_image(&mut self, path: &Path, is_windows: bool) -> Result<(), GuiError> {
         self.image = None;
@@ -491,6 +498,18 @@ mod tests {
             Step::Mkfs { filesystem, .. } => Some(filesystem),
             _ => None,
         })
+    }
+
+    #[test]
+    fn clearing_a_hot_unplugged_device_removes_it_from_planning_state() {
+        let mut state = GuiState::default();
+        state.select_device(&sample_device(), "not mounted");
+
+        state.clear_device();
+
+        assert!(state.device.is_none());
+        assert_eq!(state.status_text(), "Selected device was disconnected.");
+        assert!(matches!(state.build_plan(), Err(GuiError::NoDevice)));
     }
 
     #[test]

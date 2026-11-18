@@ -33,18 +33,28 @@
 //! sources); only Slint's macro expansions — which `forbid` cannot
 //! legally coexist with in any crate — are exempt. The alternative is
 //! moving `include_modules!` into a separate codegen-only crate.
+//!
+//! S24-C C3 adds the hotplug path: `src/devices.rs` (Slint-free, in the
+//! library) owns discovery, the candidate filter, the watcher worker and
+//! the epoch/sequence selection guard. This binary only marshals the
+//! worker's publications onto the event loop through
+//! `slint::invoke_from_event_loop`, so every `GuiState` and Slint
+//! mutation still happens on the UI thread, and joins both threads
+//! (`DeviceWorker::shutdown` + the dispatcher) after `ui.run()` returns.
 
 #![deny(unsafe_code)]
 
-use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::thread;
 
 use rufus_core::planner::BootloaderOpt;
 use rufus_core::report;
 use rufus_gui::state::{GuiState, WindowsImageOption};
 use rufus_linux::Device;
-use rufus_linux::sysfs::{self, Filter, SysfsRoot};
+use rufus_linux::sysfs::{self, SysfsRoot};
 use rufus_proto::{Filesystem, Plan, Scheme, Step, Target};
 use rustix::process;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
@@ -388,46 +398,85 @@ where
 // display-only extras (progress fraction, transient notes).
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct SessionHandle(Arc<Mutex<Session>>);
+
+impl SessionHandle {
+    fn new(session: Session) -> Self {
+        Self(Arc::new(Mutex::new(session)))
+    }
+
+    fn borrow(&self) -> MutexGuard<'_, Session> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn borrow_mut(&self) -> MutexGuard<'_, Session> {
+        self.borrow()
+    }
+}
+
 struct Session {
     state: GuiState,
-    devices: Vec<Device>,
+    device_list: rufus_gui::devices::DeviceListState,
     progress: f32,
     note: Option<String>,
 }
 
 impl Session {
-    fn new() -> Self {
-        // One-shot discovery at startup (read-only `/sys`). The hotplug
-        // watcher and selection-stability rules arrive with C3.
-        let devices = sysfs::enumerate(&SysfsRoot::new("/sys"))
-            .map(|found| sysfs::filter(found, Filter { show_all: false }))
-            .unwrap_or_default();
+    fn new(discovery: rufus_gui::devices::Discovery) -> Self {
+        let mut device_list =
+            rufus_gui::devices::DeviceListState::new(discovery.devices, discovery.warning);
+        let first = device_list.devices().first().cloned();
+        if let Some(device) = &first {
+            device_list.initialize_selection(Some(device.identity()));
+        }
+        let note = device_list.error().map(str::to_string);
         let mut session = Self {
             state: GuiState::default(),
-            devices,
+            device_list,
             progress: 0.0,
-            note: None,
+            note,
         };
-        // Present the first discovered device as the initial selection
-        // through `GuiState`, like Rufus auto-selects its first stick.
-        if let Some(first) = session.devices.first().cloned() {
+        if let Some(first) = first {
             let summary = mount_summary(&first);
             session.state.select_device(&first, summary);
         }
         session
     }
 
-    fn select_device(&mut self, label: &str) {
-        if let Some(device) = self
-            .devices
+    fn select_device(&mut self, label: &str) -> Option<u64> {
+        let device = self
+            .device_list
+            .devices()
             .iter()
             .find(|device| device_label(device) == label)
-            .cloned()
-        {
-            let summary = mount_summary(&device);
-            self.state.select_device(&device, summary);
-            self.note = None;
+            .cloned()?;
+        let epoch = self.device_list.user_selected(Some(device.identity()));
+        let summary = mount_summary(&device);
+        self.state.select_device(&device, summary);
+        self.note = None;
+        Some(epoch)
+    }
+
+    fn apply_devices(&mut self, update: rufus_gui::devices::DeviceUpdate) -> bool {
+        if !self.device_list.apply(update) {
+            return false;
         }
+        let selected = self.device_list.selected_identity().map(str::to_string);
+        match selected.and_then(|identity| {
+            self.device_list
+                .devices()
+                .iter()
+                .find(|device| device.identity() == identity)
+        }) {
+            Some(device) => self.state.select_device(device, mount_summary(device)),
+            None if self.state.device.is_some() => self.state.clear_device(),
+            None => {}
+        }
+        self.note = self.device_list.error().map(str::to_string);
+        true
     }
 
     fn select_image(&mut self) {
@@ -493,17 +542,29 @@ fn pick_image_path() -> Option<PathBuf> {
 // strings the window shows come from here.
 // ---------------------------------------------------------------------------
 
+fn status_with_device_warning(status: &str, note: Option<&str>, warning: Option<&str>) -> String {
+    [Some(status), note, warning]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn render(session: &Session, ui: &MainWindow) {
     let state = &session.state;
 
-    ui.set_device_model(model(session.devices.iter().map(device_label)));
+    ui.set_device_model(model(
+        session.device_list.devices().iter().map(device_label),
+    ));
     ui.set_device_current(SharedString::from(
         state
             .device
             .as_ref()
             .and_then(|selection| {
                 session
-                    .devices
+                    .device_list
+                    .devices()
                     .iter()
                     .find(|device| device.dev_path == selection.path)
             })
@@ -557,10 +618,11 @@ fn render(session: &Session, ui: &MainWindow) {
     )));
 
     ui.set_progress_value(session.progress);
-    ui.set_status_text(SharedString::from(match &session.note {
-        Some(note) => format!("{}\n{note}", state.status_text()),
-        None => state.status_text().to_string(),
-    }));
+    ui.set_status_text(SharedString::from(status_with_device_warning(
+        state.status_text(),
+        session.note.as_deref(),
+        session.device_list.warning(),
+    )));
     ui.set_start_enabled(state.clone().build_plan().is_ok());
 }
 
@@ -570,17 +632,60 @@ fn render(session: &Session, ui: &MainWindow) {
 
 fn run_gui() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
-    let session = Rc::new(RefCell::new(Session::new()));
+    let discovery = match sysfs::enumerate(&SysfsRoot::new("/sys")) {
+        Ok(found) => rufus_gui::devices::discover_candidates(found, false),
+        Err(error) => rufus_gui::devices::Discovery {
+            devices: Vec::new(),
+            warning: Some(format!("Device discovery failed: {error}")),
+        },
+    };
+    let session = SessionHandle::new(Session::new(discovery));
+    let epoch = Arc::new(AtomicU64::new(0));
+    let (updates_tx, updates_rx) = mpsc::channel();
+    let dispatcher_session = session.clone();
+    let dispatcher_weak = ui.as_weak();
+    let dispatcher = thread::spawn(move || {
+        while let Ok(update) = updates_rx.recv() {
+            let session = dispatcher_session.clone();
+            let weak = dispatcher_weak.clone();
+            if slint::invoke_from_event_loop(move || {
+                let mut session = session.borrow_mut();
+                if session.apply_devices(update)
+                    && let Some(ui) = weak.upgrade()
+                {
+                    render(&session, &ui);
+                }
+            })
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let worker = match rufus_gui::devices::start_live_watcher(false, Arc::clone(&epoch), {
+        move |update| updates_tx.send(update).is_ok()
+    }) {
+        Ok((_initial, worker)) => Some(worker),
+        Err(error) => {
+            session.borrow_mut().note =
+                Some(format!("Device hotplug watcher unavailable: {error}"));
+            None
+        }
+    };
 
     // Every callback: mutate `GuiState` through the session, then
     // re-render the whole form from `GuiState` (one-way display).
     {
         let session = session.clone();
+        let epoch = Arc::clone(&epoch);
         let weak = ui.as_weak();
         ui.on_device_selected(move |label| {
             if let Some(ui) = weak.upgrade() {
-                session.borrow_mut().select_device(&label);
-                render(&session.borrow(), &ui);
+                let mut session = session.borrow_mut();
+                if let Some(next_epoch) = session.select_device(&label) {
+                    epoch.store(next_epoch, Ordering::Release);
+                }
+                render(&session, &ui);
             }
         });
     }
@@ -754,12 +859,125 @@ fn run_gui() -> Result<(), slint::PlatformError> {
     });
 
     render(&session.borrow(), &ui);
-    ui.run()
+    let result = ui.run();
+    drop(worker.map(|worker| worker.shutdown()));
+    let _ = dispatcher.join();
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::startup_refusal;
+    use rufus_gui::devices::{DeviceUpdate, Discovery};
+    use rufus_gui::state::GuiError;
+    use rufus_linux::{Device, Partition, Transport};
+
+    use super::{Session, startup_refusal, status_with_device_warning};
+
+    fn fixture_device(name: &str) -> Device {
+        Device {
+            sysfs: format!("fixture/class/block/{name}"),
+            name: name.to_string(),
+            dev_path: format!("/dev/{name}"),
+            size_bytes: 8 * 1024 * 1024,
+            sector_size: 512,
+            physical_sector_size: 512,
+            removable: true,
+            read_only: false,
+            usb: true,
+            vendor: Some("Test".to_string()),
+            model: Some(format!("{name} test device")),
+            serial: Some(format!("serial-{name}")),
+            transport: Transport::Usb,
+            partition_table: None,
+            vid_pid: Some("1234:5678".to_string()),
+            port_path: Some(format!("usb-{name}")),
+            partitions: vec![Partition {
+                name: format!("{name}1"),
+                number: Some(1),
+                size_bytes: 4096,
+                fstype: Some("vfat".to_string()),
+            }],
+        }
+    }
+
+    /// The removal path end to end: `DeviceListState` clears its identity and
+    /// the session must clear the *planning* state too, so START cannot plan
+    /// against a stick that is no longer plugged in.
+    #[test]
+    fn unplugging_the_selected_device_clears_the_planning_state() {
+        let stick = fixture_device("sdb");
+        let mut session = Session::new(Discovery {
+            devices: vec![stick],
+            warning: None,
+        });
+        assert!(
+            session.state.device.is_some(),
+            "the first discovered device is auto-selected"
+        );
+
+        let applied = session.apply_devices(DeviceUpdate {
+            epoch: 0,
+            sequence: 1,
+            devices: Vec::new(),
+            warning: None,
+            error: None,
+        });
+
+        assert!(applied, "the removal snapshot is the newest one");
+        assert!(session.device_list.selected_identity().is_none());
+        assert!(session.state.device.is_none());
+        assert_eq!(
+            session.state.status_text(),
+            "Selected device was disconnected."
+        );
+        assert!(matches!(
+            session.state.build_plan(),
+            Err(GuiError::NoDevice)
+        ));
+    }
+
+    /// The other direction: a snapshot that still carries the selected device
+    /// must not clear it.
+    #[test]
+    fn a_snapshot_that_still_carries_the_selected_device_keeps_it_selected() {
+        let first = fixture_device("sdb");
+        let second = fixture_device("sdc");
+        let mut session = Session::new(Discovery {
+            devices: vec![first.clone()],
+            warning: None,
+        });
+
+        assert!(session.apply_devices(DeviceUpdate {
+            epoch: 0,
+            sequence: 1,
+            devices: vec![first.clone(), second],
+            warning: None,
+            error: None,
+        }));
+
+        let selected = session
+            .state
+            .device
+            .as_ref()
+            .expect("device stays selected");
+        assert_eq!(selected.path, first.dev_path);
+        assert_eq!(
+            session.device_list.selected_identity(),
+            Some(first.identity().as_str())
+        );
+    }
+
+    #[test]
+    fn show_all_warning_remains_in_rendered_status_without_a_transient_note() {
+        let status = status_with_device_warning(
+            "Select a device and boot image.",
+            None,
+            Some(rufus_gui::devices::INTERNAL_DISK_WARNING),
+        );
+        assert!(status.contains("Select a device"));
+        assert!(status.contains("WARNING: Show all exposes internal disks"));
+        assert!(status.contains("destroy its data"));
+    }
 
     #[test]
     fn root_is_refused_with_the_unprivileged_gui_privileged_helper_split() {
