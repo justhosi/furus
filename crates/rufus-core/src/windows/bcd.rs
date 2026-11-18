@@ -2867,4 +2867,145 @@ mod tests {
             "memdiag must drop 1600000B"
         );
     }
+
+    /// BIOS BCD parity: the BIOS store clones the `...123457` loader and
+    /// resume (distinct from UEFI's `...123456`), `{bootmgr}` carries its
+    /// own `11000001` partition device, and the fresh loader carries the
+    /// same required elements — `11000001`/`21000001` devices and the
+    /// `12000004` description — with the same description value as a UEFI
+    /// store built from an otherwise identical request. Class-0x4 setup
+    /// elements are stripped on both.
+    #[test]
+    fn bios_bcd_has_parity_with_uefi_bcd() {
+        let data = DeviceIdentity::Mbr {
+            disk_signature: [0xDE, 0xAD, 0xBE, 0xEF],
+            partition_start_bytes: 1_048_576,
+        };
+        // On BIOS the ESP identity is not used (bootmgr device = data
+        // partition); we pass the same value to satisfy the type.
+        let request = StoreRequest {
+            firmware: Firmware::Bios,
+            identity: data,
+            esp_identity: data,
+            description: Some("Windows 11 BIOS"),
+        };
+        let template = template_fixture();
+        let out = build(&template, &request).expect("BIOS build must succeed");
+        assert_tiling(&out);
+        let hive = Hive::parse(&out).expect("BIOS output must re-parse");
+
+        // Loader and resume GUIDs must be the BIOS variants, distinct
+        // from UEFI so both stores can coexist.
+        let loader = default_object(Firmware::Bios);
+        let resume = default_resume_object(Firmware::Bios);
+        assert_eq!(loader, OS_LOADER_BIOS);
+        assert_eq!(resume, RESUME_BIOS);
+        assert_ne!(loader, OS_LOADER_UEFI, "BIOS loader must differ from UEFI");
+        assert_ne!(resume, RESUME_UEFI, "BIOS resume must differ from UEFI");
+
+        // {bootmgr} must carry its own 11000001 partition device pointing
+        // at the data/system partition (BIOS path uses data identity).
+        let (vtype, got) = hive
+            .element_data(OBJECT_BOOTMGR, ELEMENT_DEVICE)
+            .expect("read")
+            .expect("{bootmgr} must have 11000001 on BIOS");
+        assert_eq!(vtype, REG_BINARY);
+        assert_eq!(
+            got,
+            partition_device(data).to_vec(),
+            "{{bootmgr}} device must equal the data-partition identity"
+        );
+
+        // {bootmgr} must point its 23000003 at the BIOS loader.
+        let (vtype, got) = hive
+            .element_data(OBJECT_BOOTMGR, ELEMENT_DEFAULT_OBJECT)
+            .expect("read")
+            .expect("{bootmgr} 23000003");
+        assert_eq!(vtype, REG_SZ);
+        assert_eq!(decode_sz(&got).expect("guid"), loader);
+
+        // Fresh BIOS loader: both partition devices (11000001 and
+        // 21000001) must be present and encode the data partition.
+        let expected_device = partition_device(data);
+        for id in [ELEMENT_DEVICE, ELEMENT_OS_DEVICE] {
+            let (vtype, got) = hive
+                .element_data(loader, id)
+                .expect("read")
+                .expect("BIOS loader must carry both partition devices");
+            assert_eq!(vtype, REG_BINARY);
+            assert_eq!(got, expected_device.to_vec());
+        }
+
+        // Fresh BIOS loader: 12000004 (description) must be set.
+        let (vtype, got) = hive
+            .element_data(loader, ELEMENT_DESCRIPTION)
+            .expect("read")
+            .expect("BIOS loader must carry 12000004 description");
+        assert_eq!(vtype, REG_SZ);
+        let bios_description = decode_sz(&got).expect("description");
+        assert_eq!(
+            bios_description, "Windows 11 BIOS",
+            "BIOS loader description must match the request"
+        );
+
+        // No class-0x4 template elements on the BIOS loader.
+        for id in object_element_ids(&hive, loader) {
+            assert!(
+                !is_template_element(id),
+                "BIOS loader must have no class-0x4 element, found {id:#010x}"
+            );
+        }
+
+        // Fresh resume must carry a device element.
+        let (_, got) = hive
+            .element_data(resume, ELEMENT_DEVICE)
+            .expect("read")
+            .expect("BIOS resume must have 11000001");
+        assert_eq!(got, partition_device(data).to_vec());
+
+        // Parity: build a UEFI store from an otherwise identical request
+        // (same identity, esp_identity and description; only firmware
+        // differs) and compare the required element set and the
+        // description on the two fresh loaders.
+        let uefi_request = StoreRequest {
+            firmware: Firmware::Uefi,
+            ..request
+        };
+        let uefi_out = build(&template, &uefi_request).expect("UEFI build must succeed");
+        let uefi_hive = Hive::parse(&uefi_out).expect("UEFI output must re-parse");
+        let uefi_loader = default_object(Firmware::Uefi);
+
+        let required = [ELEMENT_DEVICE, ELEMENT_OS_DEVICE, ELEMENT_DESCRIPTION];
+        let bios_ids = object_element_ids(&hive, loader);
+        let uefi_ids = object_element_ids(&uefi_hive, uefi_loader);
+        let bios_required: Vec<u32> = required
+            .iter()
+            .copied()
+            .filter(|id| bios_ids.contains(id))
+            .collect();
+        let uefi_required: Vec<u32> = required
+            .iter()
+            .copied()
+            .filter(|id| uefi_ids.contains(id))
+            .collect();
+        assert_eq!(
+            bios_required, uefi_required,
+            "BIOS and UEFI loaders must carry the same required elements"
+        );
+        assert_eq!(
+            bios_required,
+            required.to_vec(),
+            "both loaders must carry every required element"
+        );
+
+        let (_, uefi_desc) = uefi_hive
+            .element_data(uefi_loader, ELEMENT_DESCRIPTION)
+            .expect("read")
+            .expect("UEFI loader must carry 12000004 description");
+        assert_eq!(
+            decode_sz(&uefi_desc).expect("description"),
+            bios_description,
+            "BIOS and UEFI loaders must carry the same description"
+        );
+    }
 }
