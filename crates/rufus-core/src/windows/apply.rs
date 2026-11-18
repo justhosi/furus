@@ -17,11 +17,16 @@
 //!    path and the entry count. A missing or unreadable target reports
 //!    [`CoreError::Io`] naming the path, never invalid input.
 //! c. Free-space pre-flight: the image's uncompressed payload total from
-//!    [`Wim::uncompressed_bytes`] (`TOTALBYTES`); a short mount refuses
-//!    with `InvalidInput` in the copy arm's style. When the image
-//!    reports no uncompressed total the check falls back to
-//!    `info.total_bytes` (the WIM file's own size) with one `warn`
-//!    saying so, since that fallback may pass a short target.
+//!    [`Wim::uncompressed_bytes`] (`TOTALBYTES`), raised by a deliberately
+//!    conservative NTFS overhead reserve — the larger of a 64 MiB floor
+//!    and 2% of the payload (see `required_with_ntfs_overhead`). The
+//!    reserve is generous on purpose: exact NTFS metadata/compression
+//!    overhead cannot be predicted from the WIM alone. A mount that holds
+//!    less than payload plus reserve refuses with `InvalidInput` in the
+//!    copy arm's style. When the image reports no uncompressed total the
+//!    check falls back to `info.total_bytes` (the WIM file's own size)
+//!    with one `warn` saying so, since that fallback may pass a short
+//!    target.
 //! d. One `info` message naming the 1-based image index (plus the image
 //!    name when `images()` can supply one; a lookup failure only drops
 //!    the name, never the apply).
@@ -134,6 +139,18 @@ fn count_tree(root: &Path) -> Result<(u64, u64)> {
     Ok((files, bytes))
 }
 
+/// Conservative NTFS overhead added to the decoded uncompressed payload
+/// during free-space pre-flight: the larger of a 64 MiB floor and 2% of the
+/// payload. The reserve is deliberately generous — exact NTFS
+/// metadata/compression overhead cannot be predicted from the WIM alone —
+/// and saturating arithmetic keeps a near-`MAX` payload from panicking.
+fn required_with_ntfs_overhead(required: u64) -> u64 {
+    const FLOOR: u64 = 64 * 1024 * 1024;
+    const SLACK_DIVISOR: u64 = 50; // 2%
+    let reserve = FLOOR.max(required.saturating_div(SLACK_DIVISOR));
+    required.saturating_add(reserve)
+}
+
 /// The [`Progress`](crate::windows::wim::Progress) bridge to the run's
 /// event stream: every facade report becomes a step-`"write"`
 /// [`Progress`](Event::Progress) rated by the shared [`RateEma`] (no
@@ -200,6 +217,10 @@ impl crate::windows::wim::Progress for ApplyProgress<'_, '_> {
 /// mirroring the copy arm's rule. A successful return holds the
 /// reported counts (see step f); a failed or cancelled extraction leaves
 /// a partial tree the caller must reformat before retrying.
+///
+/// Free-space pre-flight compares the reported free bytes against the
+/// uncompressed payload plus a conservative NTFS overhead reserve (the
+/// larger of 64 MiB and 2% of the payload); see step c of the module doc.
 pub fn apply(
     mounted: &mut dyn MountedPartition,
     wim: &Wim,
@@ -240,9 +261,11 @@ pub fn apply(
         }
     };
     let free = mounted.free_bytes()?;
-    if want > free {
+    let need = required_with_ntfs_overhead(want);
+    if free < need {
+        let reserve = need.saturating_sub(want);
         return Err(CoreError::invalid(format!(
-            "apply needs {want} bytes but the destination reports {free} free: refusing before any write",
+            "apply needs {need} bytes ({want} uncompressed plus a conservative {reserve}-byte NTFS overhead reserve) but the destination reports {free} free: refusing before any write",
         )));
     }
     // A set probe refuses before extraction starts, so an apply whose
@@ -300,7 +323,9 @@ pub fn apply(
 ///
 /// Unlike [`apply`], extraction targets a raw block device node instead of a
 /// mounted directory and preserves all NTFS metadata. Preflight checks `capacity`
-/// instead of mounted free space. Returns [`Applied`] directly from the summary
+/// instead of mounted free space, comparing it against the uncompressed payload
+/// plus the same conservative NTFS overhead reserve as [`apply`] (the larger of
+/// 64 MiB and 2% of the payload). Returns [`Applied`] directly from the summary
 /// counters (no directory tree walk).
 ///
 /// Note: in production `device` is a raw block device node (e.g.
@@ -331,9 +356,11 @@ pub fn apply_ntfs(
             size
         }
     };
-    if want > capacity {
+    let need = required_with_ntfs_overhead(want);
+    if capacity < need {
+        let reserve = need.saturating_sub(want);
         return Err(CoreError::invalid(format!(
-            "apply needs {want} bytes but the destination reports {capacity} total bytes: refusing before any write",
+            "apply needs {need} bytes ({want} uncompressed plus a conservative {reserve}-byte NTFS overhead reserve) but the destination reports {capacity} total bytes: refusing before any write",
         )));
     }
     // A set probe refuses before extraction starts.
@@ -718,6 +745,210 @@ mod tests {
         assert!(text.is_ascii(), "{text}");
     }
 
+    /// Pre-flight only: an available byte count exactly equal to the
+    /// payload plus reserve must pass the check. A pre-set probe then
+    /// cancels before extraction, so a `Cancelled` result (and not the
+    /// free-space `InvalidInput`) proves the check accepted the exact fit
+    /// without ever touching the target.
+    #[test]
+    fn apply_exact_fit_passes_preflight() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_big_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let uncompressed = wim
+            .uncompressed_bytes(1)
+            .expect("TOTALBYTES must read")
+            .expect("the LZX image must report TOTALBYTES");
+        let need = required_with_ntfs_overhead(uncompressed);
+        assert!(
+            need > uncompressed,
+            "the reserve must make the need exceed the raw payload"
+        );
+
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("target dir must create");
+        let mut mounted = FakeMount::new(target.clone(), need);
+        let mut reporter = VecReporter::new();
+        let err = apply(&mut mounted, &wim, 1, &mut reporter, &|| true)
+            .expect_err("a pre-set probe must cancel after pre-flight passes");
+        assert!(
+            matches!(err, CoreError::Cancelled),
+            "an exact fit must pass pre-flight (probe then cancels), got {err}"
+        );
+        let count = fs::read_dir(&target).expect("target must list").count();
+        assert_eq!(count, 0, "an exact fit must not start extraction here");
+        assert_eq!(mounted.releases, 0, "apply never releases the mount");
+    }
+
+    /// One byte below payload plus reserve must refuse, and the refusal
+    /// must name both the raw payload and the required-with-overhead
+    /// total so it is actionable. `need - 1` is still far above the raw
+    /// payload, so this can only fail because of the new reserve.
+    #[test]
+    fn apply_under_margin_refuses_with_both_totals() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_big_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let uncompressed = wim
+            .uncompressed_bytes(1)
+            .expect("TOTALBYTES must read")
+            .expect("the LZX image must report TOTALBYTES");
+        let need = required_with_ntfs_overhead(uncompressed);
+        let available = need - 1;
+        assert!(
+            available > uncompressed,
+            "the under-margin value must exceed the raw payload"
+        );
+
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("target dir must create");
+        let mut mounted = FakeMount::new(target.clone(), available);
+        let mut reporter = VecReporter::new();
+        let err = apply(&mut mounted, &wim, 1, &mut reporter, &|| false)
+            .expect_err("one byte under the reserve must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "an under-margin target must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains(&uncompressed.to_string()), "{text}");
+        assert!(text.contains(&need.to_string()), "{text}");
+        assert!(text.contains(&available.to_string()), "{text}");
+        assert!(text.contains("refusing before any write"), "{text}");
+        assert!(text.is_ascii(), "{text}");
+
+        let count = fs::read_dir(&target).expect("target must list").count();
+        assert_eq!(count, 0, "the refused target must stay empty");
+        assert_eq!(mounted.releases, 0, "a refused apply never releases");
+    }
+
+    /// Ample space must pass pre-flight; a pre-set probe then cancels
+    /// before extraction, proving the check accepted the generous value.
+    #[test]
+    fn apply_ample_space_passes_preflight() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_big_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let need = required_with_ntfs_overhead(
+            wim.uncompressed_bytes(1)
+                .expect("TOTALBYTES must read")
+                .expect("the LZX image must report TOTALBYTES"),
+        );
+
+        let target = root.path().join("target");
+        fs::create_dir_all(&target).expect("target dir must create");
+        let mut mounted = FakeMount::new(target.clone(), need.saturating_add(1024 * 1024));
+        let mut reporter = VecReporter::new();
+        let err = apply(&mut mounted, &wim, 1, &mut reporter, &|| true)
+            .expect_err("a pre-set probe must cancel after pre-flight passes");
+        assert!(
+            matches!(err, CoreError::Cancelled),
+            "ample space must pass pre-flight (probe then cancels), got {err}"
+        );
+    }
+
+    /// NTFS path: capacity exactly equal to payload plus reserve passes
+    /// pre-flight; a pre-set probe cancels before the fake device is used.
+    #[test]
+    fn apply_ntfs_exact_fit_passes_preflight() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_big_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let uncompressed = wim
+            .uncompressed_bytes(1)
+            .expect("TOTALBYTES must read")
+            .expect("the LZX image must report TOTALBYTES");
+        let need = required_with_ntfs_overhead(uncompressed);
+        let dev = Path::new("/dev/nonexistent_fake_device");
+        let mut reporter = VecReporter::new();
+        let err = apply_ntfs(dev, need, &wim, 1, &mut reporter, &|| true)
+            .expect_err("a pre-set probe must cancel after pre-flight passes");
+        assert!(
+            matches!(err, CoreError::Cancelled),
+            "an exact capacity must pass pre-flight (probe then cancels), got {err}"
+        );
+    }
+
+    /// NTFS path: one byte below payload plus reserve refuses with an
+    /// actionable message naming both totals.
+    #[test]
+    fn apply_ntfs_under_margin_refuses_with_both_totals() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_big_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let uncompressed = wim
+            .uncompressed_bytes(1)
+            .expect("TOTALBYTES must read")
+            .expect("the LZX image must report TOTALBYTES");
+        let need = required_with_ntfs_overhead(uncompressed);
+        let capacity = need - 1;
+        assert!(
+            capacity > uncompressed,
+            "the under-margin capacity must exceed the raw payload"
+        );
+        let dev = Path::new("/dev/nonexistent_fake_device");
+        let mut reporter = VecReporter::new();
+        let err = apply_ntfs(dev, capacity, &wim, 1, &mut reporter, &|| false)
+            .expect_err("one byte under the reserve must refuse");
+        assert!(
+            matches!(err, CoreError::InvalidInput { .. }),
+            "an under-margin capacity must be InvalidInput, got {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains(&uncompressed.to_string()), "{text}");
+        assert!(text.contains(&need.to_string()), "{text}");
+        assert!(text.contains(&capacity.to_string()), "{text}");
+        assert!(text.contains("refusing before any write"), "{text}");
+        assert!(text.is_ascii(), "{text}");
+    }
+
+    /// NTFS path: ample capacity passes pre-flight; a pre-set probe then
+    /// cancels before the fake device is used.
+    #[test]
+    fn apply_ntfs_ample_space_passes_preflight() {
+        if skip_without_backend() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("scratch dir must create");
+        let wim_path = capture_big_wim(root.path());
+        let wim = Wim::open(&wim_path).expect("captured wim must open");
+        let need = required_with_ntfs_overhead(
+            wim.uncompressed_bytes(1)
+                .expect("TOTALBYTES must read")
+                .expect("the LZX image must report TOTALBYTES"),
+        );
+        let dev = Path::new("/dev/nonexistent_fake_device");
+        let mut reporter = VecReporter::new();
+        let err = apply_ntfs(
+            dev,
+            need.saturating_add(1024 * 1024),
+            &wim,
+            1,
+            &mut reporter,
+            &|| true,
+        )
+        .expect_err("a pre-set probe must cancel after pre-flight passes");
+        assert!(
+            matches!(err, CoreError::Cancelled),
+            "ample capacity must pass pre-flight (probe then cancels), got {err}"
+        );
+    }
+
     #[test]
     fn apply_ntfs_pre_set_probe_refuses_before_extraction_starts() {
         if skip_without_backend() {
@@ -912,5 +1143,43 @@ mod tests {
                 .is_some_and(|text| *text == "boom"),
             "the panic payload must survive the round trip"
         );
+    }
+
+    const FLOOR: u64 = 64 * 1024 * 1024;
+
+    /// The 64 MiB floor dominates for payloads below the 2% crossover
+    /// (payload < 3.2 GiB, since `floor * 50 == 3.2 GiB`).
+    #[test]
+    fn ntfs_overhead_applies_64_mib_floor() {
+        assert_eq!(required_with_ntfs_overhead(0), FLOOR);
+        assert_eq!(required_with_ntfs_overhead(1), 1 + FLOOR);
+        assert_eq!(
+            required_with_ntfs_overhead(1024 * 1024),
+            1024 * 1024 + FLOOR
+        );
+        // Just below the crossover the floor still wins.
+        let just_below = FLOOR * 50 - 1;
+        assert_eq!(required_with_ntfs_overhead(just_below), just_below + FLOOR);
+    }
+
+    /// At and above the crossover the 2% slack dominates. Expected values
+    /// are computed independently of the helper under test.
+    #[test]
+    fn ntfs_overhead_uses_two_percent_above_crossover() {
+        // required / 50 == FLOOR + 1, so the slack beats the floor.
+        let required = FLOOR * 50 + 50;
+        assert_eq!(required / 50, FLOOR + 1);
+        assert_eq!(required_with_ntfs_overhead(required), required + FLOOR + 1);
+        // Exactly at the crossover both branches give the 64 MiB floor.
+        let crossover = FLOOR * 50;
+        assert_eq!(required_with_ntfs_overhead(crossover), crossover + FLOOR);
+    }
+
+    /// Saturating arithmetic keeps a near-`MAX` payload from overflowing
+    /// into a panic; the result clamps to `u64::MAX`.
+    #[test]
+    fn ntfs_overhead_saturates() {
+        assert_eq!(required_with_ntfs_overhead(u64::MAX), u64::MAX);
+        assert_eq!(required_with_ntfs_overhead(u64::MAX - 1), u64::MAX);
     }
 }
