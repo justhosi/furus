@@ -10,9 +10,11 @@
 //! here: it needs a real 32 GB device and a Windows installer boot - a
 //! QEMU/VM or real-hardware run, real-device scale - which this
 //! environment cannot measure. It stays an open acceptance item and
-//! nothing in this file fakes it. The VBR-fix post-format hook is PLAN
-//! lines 948-949, deferred to S21 - no hook code exists and this file
-//! exercises none.
+//! nothing in this file fakes it. The post-format VBR `HiddenSectors`
+//! patch (u32 LE at offset `0x1C`) is no longer deferred: it now lives in
+//! `fs::ntfs::patch_hidden_sectors` and is asserted end-to-end by that
+//! module's unit tests, including a test that pins the patch call site
+//! inside `format_with`. This file exercises none of it.
 //!
 //! Skip convention (the one tests/exfat_format.rs and
 //! tests/fat32_format.rs carry): the host has NO ntfs tools (mkntfs,

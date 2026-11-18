@@ -26,9 +26,15 @@
 //! Both refuse non-`regf` input and missing keys with [`CoreError::InvalidInput`]
 //! and refuse honestly (no corruption) when the hive has no room.
 //!
-//! Limitations, stated plainly: no Windows To Go image has been booted yet;
-//! boot acceptance is slices 10-11. The `SYSTEM` shape above is from the
-//! Windows 11 24H2 WinPE `SYSTEM` (root `ROOT`, `Select\Current` DWORD `1`).
+//! Verification status: UEFI Windows To Go boot is confirmed in QEMU/OVMF
+//! as of commit `3adee7c`; the `0xc0000001` BCD boot-store bug is resolved
+//! (see `TECHNICAL.md` and `docs/handoffs/HANDOFF-windows-verification.md`).
+//! Legacy BIOS coverage is at BCD-parity unit-test level only: a dedicated
+//! test compares the BIOS (Boot/BCD) store's required elements and loader
+//! description with the UEFI store. No fresh SeaBIOS Windows boot was run
+//! in this environment, so no Legacy BIOS boot is claimed as verified.
+//! The `SYSTEM` shape above is from the Windows 11 24H2 WinPE `SYSTEM`
+//! (root `ROOT`, `Select\\Current` DWORD `1`).
 //!
 //! Slice 10 adds the executor ([`install`]): on an already-applied image
 //! it builds and disables recovery on both BCD stores, lays the boot

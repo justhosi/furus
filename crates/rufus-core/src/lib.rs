@@ -19,8 +19,10 @@
 //!   (boot region and its backup, checksum sector, FAT, allocation
 //!   bitmap, up-case table, root directory). The NTFS integration under
 //!   [`fs::ntfs`] (S11) probes and drives the external `mkntfs`/`mkfs.ntfs`
-//!   tool and verifies the VBR — a native writer is out of scope, and the
-//!   S21 VBR-fix hook of PLAN lines 948-949 ships no code here. The
+//!   tool, verifies the VBR, and guarantees the post-format VBR
+//!   `HiddenSectors` field (u32 LE at `0x1C`) through
+//!   [`patch_hidden_sectors`](fs::ntfs::patch_hidden_sectors); a native
+//!   writer remains out of scope. The
 //!   ext2/3/4 integration under [`fs::ext`] (S12) probes and drives the
 //!   external `mke2fs`/`mkfs.ext*` tool under the same A4 rule and
 //!   verifies the superblock fields the mandate pins (4096-byte blocks,

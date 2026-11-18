@@ -28,9 +28,9 @@ write side is the most complete part:
   `mkfs.ntfs` tool (the `ntfs-3g` package on Debian/Ubuntu, the
   separate `ntfsprogs` package on Arch), then verifying the VBR and
   reading the volume label back from `$MFT` record 3. A native NTFS
-  writer is out of scope, and the S21 post-format VBR-fix hook is
-  explicitly deferred - no hook code ships (see
-  `crates/rufus-core/src/fs/ntfs.rs`).
+  writer is out of scope. The post-format VBR `HiddenSectors` field is
+  now guaranteed by `patch_hidden_sectors` in
+  `crates/rufus-core/src/fs/ntfs.rs`.
 * ext2, ext3 and ext4 are written by detecting and driving the external
   `mke2fs` / `mkfs.ext*` tool (the `e2fsprogs` package); the flavour
   decides the journal bit and the fixed 4096-byte block / 256-byte inode
@@ -178,9 +178,13 @@ write side is the most complete part:
   Windows tools or Wine on the host), places boot manager, store, fonts, sets
   offline SAN policy 4, disables WinRE recovery and refuses any non-Windows
   image. The write path is verified end to end on real USB hardware;
-  UEFI boot acceptance is pending/parked because an un-specialized
-  Windows 11 deployment image halts in bootmgr with `0xc0000001` before
-  Setup's specialize pass runs.
+  UEFI Windows To Go boot is verified in QEMU/OVMF as of commit
+  `3adee7c` (the `0xc0000001` BCD boot-store bug is resolved; see
+  `TECHNICAL.md` and `docs/handoffs/HANDOFF-windows-verification.md`).
+  Legacy BIOS coverage is at BCD-parity unit-test level only: a dedicated
+  test compares the BIOS (Boot/BCD) store's required elements and loader
+  description with the UEFI store. No fresh SeaBIOS Windows boot was run
+  in this environment, so no Legacy BIOS boot is claimed as verified.
 * The GUI is still a stub: it prints version/help and otherwise reports
   "GUI arrives in S24".
 
@@ -307,7 +311,10 @@ ntfscp, unshare, ntfs-3g or the OVMF images are absent).
 * `DECISIONS.md` - frozen S00 planning decisions; implementation has
   since advanced (its section 4 records the post-S00 tool amendment).
 * `TECHNICAL.md` - technical notes and architectural decisions (including
-  the S21 Windows To Go design, registry tweaks, and hardware acceptance findings).
+  the S21 Windows To Go design, registry tweaks, and UEFI boot verification).
+* `docs/handoffs/` - archived handoff notes from earlier slices, including
+  `HANDOFF-windows-verification.md` (QEMU/OVMF UEFI boot acceptance) and
+  `HANDOFF-boot-c0000001.md` (the resolved `0xc0000001` BCD boot-store bug).
 * `LICENSES.md` - asset licence audit for the Rufus 4.15 resources the
   implementation reuses; the code licence is GPL-3.0-or-later (decision
   A1, still proposed).

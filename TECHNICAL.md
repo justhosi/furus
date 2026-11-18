@@ -106,6 +106,14 @@ During real hardware validation against real USB devices and loop images, severa
 4. **Stale Mount Eviction for Exclusive Open (`4bfa5b0`)**:
    - Reopening the disk exclusively when automounters immediately claim new partitions failed with `EBUSY`. `DeviceOpener::open` checks the mount table on busy errors, tears down any stale automounts matching the disk or its partitions, and executes a controlled retry.
 
+### 3.4 NTFS Post-Format VBR `HiddenSectors` Guarantee
+
+Windows recognises an NTFS partition as the system volume only when the VBR's `HiddenSectors` field (u32 LE at byte offset `0x1C`) holds the partition's start LBA. The NTFS formatter passes that geometry to the external `mkntfs` as `-p <start> -H 255 -S 63` (hidden sectors, heads, sectors per track) alongside `-f [-L <label>] -c <cluster>`, using the same large-disk CHS values the FAT32 side's BPB carries.
+
+Older `mkntfs` builds and cross-distro packages may silently ignore `-p` and leave `HiddenSectors` as zero, so the geometry flags alone are not trusted. After `mkntfs` completes and the VBR has been verified, `fs::ntfs::patch_hidden_sectors` reads the four-byte field, writes the requested partition start LBA when it differs, and re-reads it to confirm the write persisted. The operation is a single 4-byte `write_all_at` on a read+write handle the function opens itself, so it cannot corrupt the rest of the VBR; it is a no-op when geometry was not requested or the field is already correct. Unit tests cover the patch directly and pin its call site inside `format_with` (after a format through a stub formatter, the field equals the partition start LBA).
+
+The backup / alternate boot sector is intentionally out of scope: this guarantee covers the primary VBR only, which is the one Windows reads for the boot path.
+
 ---
 
 ## 4. Current Verification Status & Known Limitations
@@ -114,6 +122,7 @@ During real hardware validation against real USB devices and loop images, severa
 * **End-to-End Write Pipeline**: Tested and verified on physical USB 3.0/2.0 hardware (`/dev/sdb`, 32 GB flash drive). Successfully applied 111,760 entries (19,215,065,696 bytes), formatted ESP, written BCD stores, and finalized cleanly. A later quick-format run applied 152,980 entries (10,404,700,292 bytes) from `install.wim` in 39 boot files and finalized cleanly.
 * **Firmware Hand-off**: Firmware successfully loads `EFI/Boot/BOOTX64.EFI` from the ESP, passes execution to `bootmgfw.efi`, and invokes `winload.efi`.
 * **QEMU/OVMF Boot Verification**: A freshly written image boots under QEMU/OVMF, passes bootmgr with **no `0xc0000001`**, and proceeds into the Windows Setup ("Install Windows") screen across 20 consecutive screendumps. The written BCD was also verified byte-for-byte (fresh loader carries `12000004 = Windows 11 Enterprise Evaluation` and device GUIDs matching the stamped GPT layout).
+* **Legacy BIOS BCD parity (unit-test level)**: A dedicated unit test (`bios_bcd_has_parity_with_uefi_bcd`) builds a BIOS (Boot/BCD) store and compares it with a UEFI store built from an otherwise identical request: both loaders carry the required `11000001`/`21000001` devices and the `12000004` description with the same value, class-0x4 setup elements are stripped on both, and the BIOS variants use the distinct `...123457` loader/resume GUIDs. This is BCD-store parity only; no fresh SeaBIOS Windows boot was run in this environment, so no Legacy BIOS boot is claimed as verified.
 
 ### Resolved (`0xc0000001`):
 * **Windows First-Boot `0xc0000001`**: This was NOT a WIM-specialization limitation — it was a BCD bug. The generated UEFI store omitted the loader's `12000004` description element, which bootmgr requires; any store without it lands in Recovery with `0xc0000001`. An earlier note claiming "an identical `bcdboot` deployment fails identically" was wrong: a WinPE-regenerated `bcdboot` BCD on the same image boots past bootmgr, and a controlled A/B test isolated `12000004` as the deciding element. Fixed in `4d22a12` (caller always supplies a non-empty description), with the surrounding bcdboot-parity work in `44e8062`, `a3c2154`, `8e01ab0` and `296261b`.

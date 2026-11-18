@@ -363,8 +363,11 @@ fn shape_mft_record_bytes(vbr: &[u8; 512], cluster_bytes: u32) -> Result<u32> {
 /// <target>` (the target path is always the last argument) as a bounded
 /// capture — both streams piped and drained via `output()`, `LC_ALL=C` in
 /// the child environment — then reads back bytes 0..512 and verifies them
-/// with [`boot_sector`], and reads the
-/// volume name of `$MFT` record 3 with [`volume_label`]. Every non-empty
+/// with [`boot_sector`]. It then guarantees the VBR `HiddenSectors` field
+/// (u32 LE at offset `0x1C`) via [`patch_hidden_sectors`], which writes the
+/// requested partition start LBA there when `mkntfs` ignored `-p` and
+/// re-reads the field to confirm. Finally it reads the volume name of
+/// `$MFT` record 3 with [`volume_label`]. Every non-empty
 /// captured line (stdout then stderr, each through the one device-text
 /// sanitiser) is logged verbatim at `Info` under the `ntfs` target; a
 /// failing exit becomes a refusal naming the tool, the status and the

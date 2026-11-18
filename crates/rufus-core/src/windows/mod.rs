@@ -26,8 +26,7 @@
 //! needs the bytes out of an image comes here instead.
 //!
 //! Not here yet: ESD solid resources, integrity-checked opens,
-//! pipeline wiring for the BCD stores, and the S21 VBR-fix hook of PLAN
-//! lines 948-949.
+//! pipeline wiring for the BCD stores.
 
 /// Apply one WIM image onto the mounted data partition.
 pub mod apply;
