@@ -174,7 +174,7 @@ and `Recovery`.
    the BCD-Template's `{b012b84d}`/`{0c334284}` objects. Read `crates/rufus-core/src/windows/bcd.rs`
    (1897 lines): `build_store` (~line 575+), `StoreRequest`, `partition_device`, and the
    module doc (~lines 41-75, 192-205). Call site: `windows/to_go.rs` (~294-299) —
-   `Request.identity` comes from `pipeline/bootloader.rs::windows_identity` (~1160), using
+   `Request.identity` comes from `pipeline/bootloader/windows.rs::windows_identity`, using
    `esp_window`/`data_window` from `part/plan.rs`; the ESP GUID is available there.
 3. **Open the fix as `Slice 3/4`** (restate tag): give coder the exact diagnosis and scope
    (one command, `coder`→`reviewer`, no push, acceptance = green fmt/clippy/tests). Then

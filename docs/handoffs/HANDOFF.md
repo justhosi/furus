@@ -22,7 +22,7 @@ AND boot past 0xc0000001. Fixes found during testing still go through coder → 
 - Gates (all passed at last check): build, fmt, clippy `-D warnings`, 1261 tests (6 ignored).
 - **The fix is correct and committed**: NTFS-volume mode apply via wimlib (preserves security
   descriptors) runs BEFORE any mount; capacity comes from `data_window(LayoutKind::WindowsToGo,
-  TableKind::Gpt, sector_size, size)` in `run_windows` (bootloader.rs ~1432), NOT from
+  TableKind::Gpt, sector_size, size)` in `run_windows` (`pipeline/bootloader/windows.rs`), NOT from
   `ctx.opener.partition()?.total_bytes()` (which re-cached the `O_EXCL` handle → mount EBUSY).
 - `TECHNICAL.md` has ONE bullet from the EBUSY fix; it still needs the full decision/result record.
 

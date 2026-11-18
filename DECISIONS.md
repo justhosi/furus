@@ -104,3 +104,31 @@ values above is changed.
 * **Testing**: a deterministic regf mutation property test (500 sequences × 20
   ops, reparse + checksum + `check_bins` after every step) was added with no new
   dependency.
+
+### 2026-11-18 - S23 amendments (no A1–A12 value changes)
+
+These record where S23 put existing logic; none of the A1–A12 values above is
+changed and no dependency is added.
+
+* **Layering (A9/A7 support)**: provisional plan construction lives in
+  `rufus-core::planner`, not in a front end, so the CLI and the S24 Slint GUI
+  build the same `rufus_proto::Plan` from the same rules. `rufus-core` keeps its
+  hard boundary: it never depends on `rufus-linux` and never reads `/sys`.
+  Platform facts cross the boundary as pure data — a `planner::DeviceProbe`
+  filled by `rufus-linux::probe_device` (or `plan_device_ref` for a selected
+  `Device`), graded in core. `clap` stays a CLI-only concern: the CLI keeps a
+  `ValueEnum` twin of the selector and converts at the call site.
+* **Wire contract (A8 support)**: `PLAN_VERSION` stays 6 and the plan JSON,
+  the CLI flags and exit codes 0–7 are unchanged by the move; the builder's
+  refusals are classified as `planner::PlanError` (`Device` → exit 2, `Safety` →
+  3, `Usage` → 1, `Confirm` → 4/`json`) and mapped back in `rufus-cli`.
+* **Module layout**: `pipeline::bootloader` is a directory of private arm
+  submodules (`syslinux`, `grub2`, `grub4dos`, `dos_kolibri`, `uefi_ntfs`,
+  `windows`) behind an unchanged `pub(crate)` surface (`Installed`,
+  `install_tree`, `run`); no on-disk behaviour changed, and the release binary's
+  +1,184-byte reshuffle is recorded in the refreshed size baseline.
+* **Bad blocks**: there is no separate bad-block step and no plan field beyond
+  the existing one — the surface scan is the wipe's opt-in `"badblocks"`
+  pseudo-step (`RunOptions::badblocks`), independent of full format
+  (`quick == false`, which only zeroes). Documentation now matches that; the
+  previous "arrives in slice 9" note was stale.

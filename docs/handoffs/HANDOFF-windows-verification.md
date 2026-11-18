@@ -24,7 +24,7 @@ byte level and at runtime. See "Verification" below.
 The generated UEFI BCD's fresh OS-loader object `{3796cdc8-e33b-11f1-b950-525400123456}`
 was missing element **`12000004` (the loader description)**. `bcd::build_store`
 only writes `12000004` when `request.description` is `Some`, but the sole
-production caller in `pipeline/bootloader.rs` hardcoded `description: None`.
+production caller in `pipeline/bootloader/windows.rs` hardcoded `description: None`.
 A real `bcdboot`-generated store always carries a non-empty `12000004`.
 
 Decisive A/B experiment: taking our own written BCD and adding only `12000004`
@@ -43,7 +43,7 @@ load-bearing difference, and it was missing from day one.
 - `296261b` — clone the UEFI BCD loader objects the way `bcdboot` does
   (fresh loader + resume objects with byte-exact bcdboot element sets).
 - `4d22a12` — **emit a loader description in the To Go BCD** (the final root-cause
-  fix). `pipeline/bootloader.rs` derives the description from the WIM image name
+  fix). `pipeline/bootloader/windows.rs` derives the description from the WIM image name
   via `loader_description()` (name → description → `"Windows"` fallback); the
   real image yields `"Windows 11 Enterprise Evaluation"`, so `12000004` is now
   always emitted. A regression test reads the on-disk BCD and asserts the
