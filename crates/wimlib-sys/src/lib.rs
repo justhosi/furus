@@ -18,6 +18,11 @@
 //! symbol can be called; [`linked`] reports the outcome as a
 //! compile-time fact.
 //!
+//! By default an absent `libwim` is graceful: the crate still compiles
+//! without FFI. The opt-in `strict-link` feature turns that outcome into
+//! a compile-time error instead, for builds that must actually link
+//! wimlib. It changes nothing when the library is found.
+//!
 //! No other crate may declare wimlib symbols: every `wimlib_*` name
 //! lives here, behind this gate, and downstream crates use the
 //! re-exported items (or the S21 safe wrapper built on top of them).
@@ -31,6 +36,17 @@
 // the progress trampoline C calls back into). There must be no third
 // unsafe use anywhere: no crate-level `#![allow(unsafe_code)]`, no
 // other `#[allow(unsafe_code)]` attribute in this crate.
+
+// Opt-in hard failure for builds that must link wimlib. `build.rs` still
+// probes gracefully; this only rejects the outcome after the fact. Forced
+// unlinking counts as "not present", so it trips this guard too.
+#[cfg(all(feature = "strict-link", not(wimlib_present)))]
+compile_error!(
+    "wimlib-sys: feature `strict-link` requires libwim, but build.rs did not detect it. \
+     Install libwim-dev, set WIMLIB_LIB_DIR to a directory containing libwim, or disable the \
+     `strict-link` feature. Note that WIMLIB_SYS_FORCE_UNLINKED forces the unlinked path and \
+     will also trigger this error."
+);
 
 /// Error type for the safe facade (both build configurations).
 pub mod error;

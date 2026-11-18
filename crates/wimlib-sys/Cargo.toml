@@ -11,6 +11,12 @@ links = "wim"
 # src/safe/bound.rs (the linked facade calling them) — see those headers.
 workspace = true
 
+[features]
+# Opt-in: fail the build at compile time when libwim was not found by
+# build.rs (or was skipped via WIMLIB_SYS_FORCE_UNLINKED). Default builds
+# stay graceful: the crate still compiles without FFI (linked() == false).
+strict-link = []
+
 [dev-dependencies]
 # Scratch directories for the capture/apply roundtrip test (already a
 # workspace dependency, so no new crate).
