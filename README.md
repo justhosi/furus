@@ -192,9 +192,14 @@ write side is the most complete part:
   quits), refuses to run as root, and never writes to a device. Live hotplug
   watching keeps the device list current (S24 C3: a watcher thread whose
   snapshots are published to the event loop, with the selection held by stable
-  device identity); the background image analyzer (S24 C4) is not wired yet,
-  and the window has not been rendered on a real display — see `TECHNICAL.md`
-  section 3.7 for exactly what is and is not verified.
+  device identity); selecting an image now analyses it off the UI thread
+  (S24 C4: size/SHA-256/kind plus the Windows-ness, boot-mode, distro and WIM
+  facts, with a monotonic request id so a superseded result can never
+  overwrite a newer selection), the CHECKSUM button shows the digest that
+  analysis already computed without re-reading the file, and START stays
+  disabled until the shared planner accepts the current state. The window has
+  not been rendered on a real display — see `TECHNICAL.md` section 3.7 for
+  exactly what is and is not verified.
 
 There is no production-readiness claim here. Open acceptance items (for
 example a real 32 GB Windows installer boot) are documented as such in
