@@ -8,6 +8,28 @@
 # introduces a licence outside this list, `cargo deny check` fails and the
 # list must be reviewed deliberately — do not just append.
 
+[advisories]
+ignore = [
+    # S24-C C2: every entry below is pulled transitively by the A7-mandated
+    # Slint 1.19.0 tree. Each advisory is "unmaintained", not a
+    # vulnerability, and upstream states no safe upgrade exists; none of
+    # these crates is used directly by rufus-gui code. Re-review at every
+    # Slint version bump (the exact pins in crates/rufus-gui/Cargo.toml
+    # gate that bump).
+    # chrono via i-slint-core.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
+    # ttf-parser via i-slint-core (embedded font parsing).
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
+    # zvariant via zbus via i-slint-backend-winit (desktop portal/clipboard).
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
+    # zbus_names via zbus via i-slint-backend-winit.
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
+    # zvariant_derive via zbus via i-slint-backend-winit.
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
+    # pin-utils via spin_on via slint-macros / slint-build / renderer-skia.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
+]
+
 [licenses]
 confidence-threshold = 0.9
 allow = [
@@ -23,3 +45,86 @@ allow = [
     "MPL-2.0",
 ]
 private = { ignore = true }
+
+# --- S24-C C2: Slint 1.19.0 tree (S24-T1) -------------------------------
+#
+# A7 mandates Slint as the GUI toolkit. Every Slint-family crate is
+# tri-licensed `GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR
+# LicenseRef-Slint-Software-3.0`. These exceptions accept ONLY the
+# GPL-3.0-only branch — the copyleft branch, the closest match to A1
+# (GPL-3.0-or-later proposed) and the only one that keeps the combined
+# work free software. The two `LicenseRef-Slint-*` proprietary /
+# royalty-free branches are deliberately NOT accepted. Each exception
+# is scoped to one crate at the exact reviewed version (1.19.0, the
+# exact pin in crates/rufus-gui/Cargo.toml), never a blanket licence
+# addition: a Slint upgrade re-opens this list for review.
+
+[[licenses.exceptions]]
+# A7 (toolkit) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "slint@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit proc-macros) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "slint-macros@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit build-time compiler) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "slint-build@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit core) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "i-slint-core@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit core macros) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "i-slint-core-macros@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit shared code) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "i-slint-common@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit .slint compiler) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "i-slint-compiler@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit backend selection) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "i-slint-backend-selector@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit winit backend) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "i-slint-backend-winit@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit software renderer) / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "i-slint-renderer-software@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit skia renderer, locked but not enabled by our feature set)
+# / A1 (GPL-3.0-only branch of the Slint triple).
+crate = "i-slint-renderer-skia@=1.19.0"
+allow = ["GPL-3.0-only"]
+
+[[licenses.exceptions]]
+# A7 (toolkit clipboard support, transitive of i-slint-backend-winit).
+# BSL-1.0 is a permissive OSI-approved / FSF Free-Libre licence
+# (MIT-equivalent). Windows-only code (`cfg(windows)`), never compiled
+# into the Linux GUI binary.
+crate = "clipboard-win@=5.4.3"
+allow = ["BSL-1.0"]
+
+[[licenses.exceptions]]
+# A7 (toolkit clipboard support, transitive of clipboard-win).
+# BSL-1.0, same justification; Windows-only code, never compiled in.
+crate = "error-code@=3.4.0"
+allow = ["BSL-1.0"]
