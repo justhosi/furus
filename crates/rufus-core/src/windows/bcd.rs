@@ -24,32 +24,41 @@
 //! `Windows/Boot/EFI/bootmgr.efi`.
 //!
 //! Candidates:
-//! a. Write a store from scratch, rejected: the template already holds
-//!    every object and element a boot needs except the two per-machine
-//!    device elements, so generating a hive buys nothing.
-//! b. Ship the applied image's own `BCD-Template` and patch it with a
-//!    small in-crate `regf` editor, kept: minimal new code, no
-//!    dependency, and the template locates Windows by path, so the
-//!    patched store needs no GPT GUID and no MBR signature or offset,
-//!    which also keeps a To Go store portable.
+//! a. Write a store from scratch, rejected: generating a whole hive
+//!    would still need the template's settings objects and their GUID
+//!    lists, so a small editor on top of the real template is simpler.
+//! b. Use the applied image's own `BCD-Template` as a model and build
+//!    fresh objects with a small in-crate `regf` editor, kept: minimal
+//!    new code, no dependency, and the template supplies the settings
+//!    objects, inherited GUID lists and `Description\Type` values a
+//!    real `bcdboot` store carries.
 //! c. Run the image's `bcdboot`/`bcdedit` under Wine, rejected: Wine
 //!    is heavy, needs the user's permission, is untested on this host,
 //!    and PLAN calls it the last resort.
 //!
 //! Decision: candidate (b), implemented here. [`build`] copies the
-//! template hive and patches it: the firmware-selected loader object
-//! gets its `11000001`/`21000001` partition device elements plus
-//! `12000002` (the winload path) and, when the caller names one, the
-//! `12000004` edition description; `{bootmgr}` is repointed at that
-//! loader (`23000003`, `24000001`, `24000010`) and gets its own
+//! template hive and then *clones* the firmware-selected template
+//! loader and its resume object into fresh objects ([`OS_LOADER_UEFI`],
+//! [`RESUME_UEFI`] and their BIOS counterparts), modelled on the
+//! template keys so they inherit the security descriptor, `Description`
+//! key and `14000006`/`16000060`/`17000077` values. The fresh loader
+//! gets the per-machine `11000001`/`21000001` partition devices, the
+//! full winload `12000002`, `en-us`, the edition `12000004` when given,
+//! `22000002` `\windows` and bcdboot's 8-byte `25000020`/`250000c2`;
+//! the fresh resume gets the same device, the full winresume path and
+//! an 8-byte `25000008`. `{bootmgr}` is repointed at the fresh objects
+//! (`23000003`, `23000006`, `24000001`), gets `en-us` and its own
 //! `11000001` partition device (the ESP on UEFI, the system/data
-//! partition on BIOS); `{memdiag}` gets the `11000001` boot device and a per-firmware `12000002` path
+//! partition on BIOS); `{memdiag}` gets that same device, `en-us`, a
+//! description and a per-firmware `12000002` path
 //! (`\EFI\Microsoft\Boot\memtest.efi` for UEFI, `\boot\memtest.exe`
-//! for BIOS, matching where the boot files land). No other bytes
-//! change except the header
-//! checksum (and, when the template's own free space runs out, one
-//! appended hive bin plus the header length that describes it, see
-//! below).
+//! for BIOS, matching where the boot files land), and loses the
+//! template's `1600000B`. Class-0x4 setup elements are stripped from
+//! the four active objects. Inactive template objects (including the
+//! ones the fresh objects were cloned from) are left alone. No other
+//! bytes change except the header checksum (and, when the template's
+//! own free space runs out, one appended hive bin plus the header
+//! length that describes it, see below).
 //!
 //! What slice 6 confirmed against a live template read (the slice-5
 //! summary is superseded wherever it differs): every object is
@@ -72,20 +81,23 @@
 //! the system/data partition on BIOS) — its absence on a fresh image
 //! is what makes the boot fail with `0xc0000001`, so [`build`] writes
 //! it too. `23000003` is a `REG_SZ`
-//! GUID string, `24000001`/`24000010` are single-entry `REG_MULTI_SZ`
-//! GUID lists, and `{memdiag}\11000001` is an 88-byte `REG_BINARY`
-//! boot device. The BIOS install-media store carries no `12000002` on
-//! `{bootmgr}` at all (the firmware default `\bootmgr` applies), so
-//! this builder sets `{bootmgr}\12000002` explicitly to `\bootmgr`
-//! for BIOS (a shorter string than the template's EFI path, so the
-//! in-place shrink path is used) and keeps the template's
-//! `\EFI\Microsoft\Boot\bootmgfw.efi` for UEFI.
+//! GUID string and `24000001`/`24000010` are single-entry `REG_MULTI_SZ`
+//! GUID lists. The known-good `bcdboot` store proves the resume and
+//! diagnostic devices too: `{memdiag}\11000001` is the very same ESP
+//! partition device as `{bootmgr}\11000001`, not the template's locate
+//! path or the 88-byte no-disk [`boot_device`]. The BIOS install-media
+//! store carries no `12000002` on `{bootmgr}` at all (the firmware
+//! default `\bootmgr` applies), so this builder sets
+//! `{bootmgr}\12000002` explicitly to `\bootmgr` for BIOS (a shorter
+//! string than the template's EFI path, so the in-place shrink path is
+//! used) and keeps the template's `\EFI\Microsoft\Boot\bootmgfw.efi`
+//! for UEFI.
 //!
 //! Finally, like `bcdboot`, the builder strips every class-0x4
 //! "template element" (the setup-time directives `42000002`,
 //! `45000001`, `46000004`, `47000005`, `47000006`, ...) from the four
-//! objects it recreates — `{bootmgr}`, the selected loader, the resume
-//! object and `{memdiag}` — before recomputing the checksum. They are
+//! active objects it writes — `{bootmgr}`, the fresh loader, the fresh
+//! resume object and `{memdiag}` — before recomputing the checksum. They are
 //! not runtime boot elements; leaving them on the active boot path is
 //! what makes winload fail with `0xc0000001`. Inactive template objects
 //! keep theirs. This needs a regf delete primitive: `regf::Hive` can
@@ -97,10 +109,11 @@
 //! merging with free neighbours when freeing), grows a value or subkey
 //! list in place when the cell right after it is free and large enough,
 //! and otherwise moves the list to a bigger cell. The real 20 KiB
-//! template has a single 472-byte free cell while a full store needs
-//! about 1.4 KiB of new cells (six or seven element keys at 88-byte
-//! `nk` plus value list, `vk` and data cells each, plus three regrown
-//! subkey lists), so the free space alone cannot hold the store. When
+//! template's small free cells cannot hold the two freshly cloned
+//! objects (two object `nk` cells, their `Elements` and `Description`
+//! subkeys, a `Description\Type` value and roughly twenty element
+//! subkeys with their `vk` and data cells), so the free space alone
+//! cannot hold the store. When
 //! it runs out the editor appends whole 4 KiB `hbin` pages (header
 //! `hbin` with the same shape as the template's own, one free cell
 //! covering the rest) and adds their size to the header length at
@@ -140,21 +153,27 @@
 //! really is, while the boot-manager display order this builder writes
 //! is [`ELEMENT_BOOT_DISPLAY_ORDER`] (`0x24000001`).
 //!
-//! Limitations, stated plainly: no Windows image has been booted yet
-//! (the host has 7.6 GiB RAM with about 600 MiB free, so QEMU cannot
-//! run Windows now); boot acceptance is slices 10-11. The template
-//! above is from Windows 11 24H2; the Windows 10 template has not been
-//! inspected, so [`build`] verifies the loader's `42000002` flavour
-//! suffix and the `\windows` system root at build time and refuses
-//! rather than patching a store it does not recognise.
+//! Limitations, stated plainly: a store generated by the image's real
+//! `bcdboot c:\windows /s s: /f uefi /v` inside WinPE boots to OOBE
+//! under QEMU/OVMF, while the store this builder produced before the
+//! fresh-object rewrite always failed with `0xc0000001`. This slice
+//! changes only the store construction and does not re-run the image
+//! write or QEMU, so boot acceptance of the new bytes is still open.
+//! The template above is from Windows 11 24H2; the Windows 10 template
+//! has not been inspected, so [`build`] verifies the template loader's
+//! `42000002` flavour suffix and the `\windows` system root at build
+//! time and refuses rather than cloning from a store it does not
+//! recognise.
 //!
-//! Not here yet: pipeline wiring.
+//! Pipeline wiring is in [`super::to_go`]: it builds both stores and
+//! then calls `disable_recovery`, which deliberately still adds
+//! `16000009 = 00` to the fresh loader (the known-good store has none).
 
 use super::regf::*;
 use crate::error::CoreError;
 use crate::error::Result;
 
-/// `{bootmgr}`: the boot manager object both stores patch.
+/// `{bootmgr}`: the boot manager object both stores update.
 pub const OBJECT_BOOTMGR: &str = "{9dea862c-5cdd-4e70-acc1-f32b344d4795}";
 
 /// `{memdiag}`: the memory-diagnostic object, which gains the boot device.
@@ -186,14 +205,16 @@ pub const TEMPLATE_LOADER_466F: &str = "{466f5a88-0af2-4f76-9038-095b170dc21c}";
 /// applied-image path.
 pub const TEMPLATE_LOADER_7254: &str = "{7254a080-1510-4e85-ac0f-e7fb3d444736}";
 
-/// The BIOS loader (`a1943bbc-...`): `42000002` =
-/// `\system32\winload.exe`. [`build`] patches this object for
-/// [`Firmware::Bios`] after confirming the `42000002` suffix live.
+/// The template BIOS loader (`a1943bbc-...`): `42000002` =
+/// `\system32\winload.exe`. [`build`] validates this object's suffix
+/// and `\windows` root and clones it into the fresh BIOS loader (see
+/// [`OS_LOADER_BIOS`]); it is not the built store's `{default}`.
 pub const TEMPLATE_LOADER_A194: &str = "{a1943bbc-ea85-487c-97c7-c9ede908a38a}";
 
-/// The UEFI loader (`b012b84d-...`): `42000002` =
-/// `\system32\winload.efi`. [`build`] patches this object for
-/// [`Firmware::Uefi`] after confirming the `42000002` suffix live.
+/// The template UEFI loader (`b012b84d-...`): `42000002` =
+/// `\system32\winload.efi`. [`build`] validates this object's suffix
+/// and `\windows` root and clones it into the fresh UEFI loader (see
+/// [`OS_LOADER_UEFI`]); it is not the built store's `{default}`.
 pub const TEMPLATE_LOADER_B012: &str = "{b012b84d-c47c-4ed5-b722-c0c42163e569}";
 
 /// Template-only full loader (`cbd971bf-...`): a PE loader carrying
@@ -203,32 +224,56 @@ pub const TEMPLATE_LOADER_B012: &str = "{b012b84d-c47c-4ed5-b722-c0c42163e569}";
 /// placeholder default, repointed by [`build`]).
 pub const TEMPLATE_LOADER_CBD9: &str = "{cbd971bf-b7b8-4885-951a-fa03044f5d71}";
 
+/// Fresh UEFI OS loader created by `bcdboot`, and the `{default}` a
+/// built UEFI store points at (see [`default_object`]). Its last group
+/// is `123456`; the parallel BIOS loader ends in `123457` so the two
+/// stores cannot collide.
+pub const OS_LOADER_UEFI: &str = "{3796cdc8-e33b-11f1-b950-525400123456}";
+
+/// Fresh BIOS OS loader created by `bcdboot`, and the `{default}` a
+/// built BIOS store points at (see [`default_object`]). Its last group
+/// is `123457` so it cannot collide with [`OS_LOADER_UEFI`].
+pub const OS_LOADER_BIOS: &str = "{3796cdc8-e33b-11f1-b950-525400123457}";
+
+/// Fresh UEFI resume object created by `bcdboot`, wired by the fresh
+/// UEFI loader's `23000003` and by `{bootmgr}\23000006`.
+pub const RESUME_UEFI: &str = "{3796cdc7-e33b-11f1-b950-525400123456}";
+
+/// Fresh BIOS resume object created by `bcdboot`, wired by the fresh
+/// BIOS loader's `23000003` and by `{bootmgr}\23000006`. Its last group
+/// is `123457` so it cannot collide with [`RESUME_UEFI`].
+pub const RESUME_BIOS: &str = "{3796cdc7-e33b-11f1-b950-525400123457}";
+
 /// `0x11000001` (class `0x11`, device): a partition/boot device element
 /// `bcdboot` adds per machine; absent from the template. [`build`]
-/// writes it on the chosen loader, on `{bootmgr}` (the ESP on UEFI, the
-/// system/data partition on BIOS) and on `{memdiag}` as an 88-byte
-/// `REG_BINARY` partition or boot device (see [`partition_device`] and
-/// [`boot_device`]).
+/// writes it on both fresh objects (the data-partition device), on
+/// `{bootmgr}` (the ESP on UEFI, the system/data partition on BIOS) and
+/// on `{memdiag}` (the same device as `{bootmgr}`), always as a
+/// `REG_BINARY` partition device — see [`partition_device`]. The
+/// 88-byte no-disk [`boot_device`] is retained as a helper but is no
+/// longer written by the builder.
 pub const ELEMENT_DEVICE: u32 = 0x1100_0001;
 
 /// `0x21000001` (class `0x21`, device): the os-device element `bcdboot`
-/// adds to the chosen loader per machine; absent from the template.
+/// adds to the fresh loader per machine; absent from the template.
 /// [`build`] writes it as the same 88-byte partition device as
 /// `0x11000001`.
 pub const ELEMENT_OS_DEVICE: u32 = 0x2100_0001;
 
 /// `0x22000002` (class `0x22`, string): the os device the template
 /// loaders carry as a locate-by-path string (`REG_SZ` `\windows`).
-/// [`build`] keeps the template value and refuses when it is missing
-/// or different, since the written `12000002` hard-codes the
-/// `\windows` prefix.
+/// [`build`] validates that value on the template loader and writes
+/// `\windows` on the fresh loader and `\hiberfil.sys` on the fresh
+/// resume, matching the good `bcdboot` store.
 pub const ELEMENT_OS_LOCATE_PATH: u32 = 0x2200_0002;
 
 /// `0x23000003` (class `0x23`): the default-object element on
-/// `{bootmgr}` pointing at the chosen loader, a `REG_SZ` GUID string.
-/// The template carries it (pointing at the placeholder loader);
-/// [`build`] overwrites it in place and refuses a template that has
-/// no such element to update.
+/// `{bootmgr}` pointing at the fresh loader, a `REG_SZ` GUID string.
+/// The template carries it (pointing at the placeholder loader) and
+/// [`build`] refuses a template without it. The same id under the
+/// template loader names its resume object and is followed for the
+/// inherited values; the fresh loader gets a new `23000003` naming
+/// the fresh resume.
 pub const ELEMENT_DEFAULT_OBJECT: u32 = 0x2300_0003;
 
 /// `0x23000006` (class `0x23`): the resume-object element on
@@ -242,7 +287,7 @@ pub const ELEMENT_RESUME_OBJECT: u32 = 0x2300_0006;
 
 /// `0x24000001` (class `0x24`, GUID list): the boot-manager display
 /// order on `{bootmgr}`, a single-entry `REG_MULTI_SZ` holding the
-/// chosen loader. Absent from the template; [`build`] adds it.
+/// fresh loader. Absent from the template; [`build`] adds it.
 pub const ELEMENT_BOOT_DISPLAY_ORDER: u32 = 0x2400_0001;
 
 /// `0x24000010` (class `0x24`, GUID list): the tools display order on
@@ -250,18 +295,18 @@ pub const ELEMENT_BOOT_DISPLAY_ORDER: u32 = 0x2400_0001;
 /// Absent from the template; [`build`] adds it.
 pub const ELEMENT_TOOLS_DISPLAY_ORDER: u32 = 0x2400_0010;
 
-/// `0x12000002` (class `0x12`, string): the path element, the boot
-/// application path on `{bootmgr}` and on
-/// the minimal template loader. [`build`] adds it on the chosen
-/// loader as the full winload path, sets it to `\bootmgr` on
-/// `{bootmgr}` for [`Firmware::Bios`], keeps the template's EFI
-/// path on `{bootmgr}` for [`Firmware::Uefi`], and sets it on
-/// `{memdiag}` to [`memdiag_path`] per firmware.
+/// `0x12000002` (class `0x12`, string): the boot application path.
+/// [`build`] writes the full winload path on the fresh loader, the full
+/// winresume path on the fresh resume, sets it to `\bootmgr` on
+/// `{bootmgr}` for [`Firmware::Bios`] (keeping the template's EFI path
+/// for [`Firmware::Uefi`]), and sets it on `{memdiag}` to
+/// [`memdiag_path`] per firmware.
 pub const ELEMENT_PATH: u32 = 0x1200_0002;
 
-/// `0x12000004` (class `0x12`, string): the description element; [`build`]
-/// sets it to the edition on the chosen loader when the request names
-/// one.
+/// `0x12000004` (class `0x12`, string): the description element;
+/// [`build`] sets it to the edition on the fresh loader when the
+/// request names one, to `Windows Resume Application` on the fresh
+/// resume and to `Windows Memory Diagnostic` on `{memdiag}`.
 pub const ELEMENT_DESCRIPTION: u32 = 0x1200_0004;
 
 /// `0x12000005` (class `0x12`, string): the locale element.
@@ -272,7 +317,8 @@ pub const ELEMENT_LOCALE: u32 = 0x1200_0005;
 /// inherited-objects list (`BcdLibraryObjectList_InheritedObjects`), a
 /// `REG_MULTI_SZ` of GUIDs carried by nearly every object. The
 /// boot-manager display order is [`ELEMENT_BOOT_DISPLAY_ORDER`]
-/// (`0x24000001`) instead. [`build`] never touches this element.
+/// (`0x24000001`) instead. [`build`] copies this element's value type
+/// and bytes from each template object onto its fresh counterpart.
 pub const ELEMENT_DISPLAY_ORDER: u32 = 0x1400_0006;
 
 /// `0x25000004` (class `0x25`, integer): the timeout element on
@@ -319,9 +365,22 @@ pub const ELEMENT_1600000B: u32 = 0x1600_000B;
 /// template loaders; no finer role observed.
 pub const ELEMENT_17000077: u32 = 0x1700_0077;
 
-/// `0x25000020` (class `0x25`, integer): present on the full template
-/// loaders; no finer role observed.
+/// `0x25000020` (class `0x25`, integer): on the fresh OS loader the
+/// `bcdboot` store writes this as an 8-byte all-zero `REG_BINARY` (the
+/// template loaders carry a one-byte `00`); no finer role observed.
 pub const ELEMENT_25000020: u32 = 0x2500_0020;
+
+/// `0x25000008` (class `0x25`, integer): on the fresh resume object the
+/// `bcdboot` store writes this as the 8-byte `REG_BINARY`
+/// `0100000000000000` (the template resume carries a one-byte `01`);
+/// no finer role observed.
+pub const ELEMENT_25000008: u32 = 0x2500_0008;
+
+/// `0x250000C2` (class `0x25`, integer): on the fresh OS loader the
+/// `bcdboot` store writes this as the 8-byte `REG_BINARY`
+/// `0100000000000000` (the template loaders carry a one-byte `01`);
+/// no finer role observed.
+pub const ELEMENT_250000C2: u32 = 0x2500_00C2;
 
 /// `0x26000022` (class `0x26`, boolean): present on the full template
 /// loaders as a one-byte boolean (`01`); no finer role observed.
@@ -387,12 +446,15 @@ pub fn element_class(id: u32) -> u8 {
     (id >> 24) as u8
 }
 
-/// Which firmware path a store is for; selects the loader object and paths.
+/// Which firmware path a store is for; selects the template loader it
+/// clones from, the fresh loader object and the application paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Firmware {
-    /// UEFI: patch [`TEMPLATE_LOADER_B012`] (`\windows\system32\winload.efi`).
+    /// UEFI: clone [`TEMPLATE_LOADER_B012`] into [`OS_LOADER_UEFI`]
+    /// (`\windows\system32\winload.efi`).
     Uefi,
-    /// BIOS: patch [`TEMPLATE_LOADER_A194`] (`\windows\system32\winload.exe`).
+    /// BIOS: clone [`TEMPLATE_LOADER_A194`] into [`OS_LOADER_BIOS`]
+    /// (`\windows\system32\winload.exe`).
     Bios,
 }
 
@@ -446,11 +508,33 @@ pub struct Store {
     pub default_guid: &'static str,
 }
 
-/// Which template object the store uses as `{default}`: the UEFI
-/// loader for [`Firmware::Uefi`], the BIOS loader for
-/// [`Firmware::Bios`].
+/// The fresh loader object a built store uses as `{default}`: the
+/// `bcdboot`-style UEFI loader for [`Firmware::Uefi`], the parallel BIOS
+/// loader for [`Firmware::Bios`]. The store also carries the template
+/// loader it was modelled on, but `{bootmgr}` points at this one.
 #[must_use]
 pub fn default_object(firmware: Firmware) -> &'static str {
+    match firmware {
+        Firmware::Uefi => OS_LOADER_UEFI,
+        Firmware::Bios => OS_LOADER_BIOS,
+    }
+}
+
+/// The fresh resume object wired by [`default_object`]'s `23000003` and
+/// by `{bootmgr}\23000006`, per firmware.
+#[must_use]
+pub fn default_resume_object(firmware: Firmware) -> &'static str {
+    match firmware {
+        Firmware::Uefi => RESUME_UEFI,
+        Firmware::Bios => RESUME_BIOS,
+    }
+}
+
+/// The template loader used for validation and as the model for the
+/// fresh objects: the UEFI loader for [`Firmware::Uefi`], the BIOS
+/// loader for [`Firmware::Bios`]. This is *not* the built store's
+/// `{default}` (see [`default_object`]).
+fn template_object(firmware: Firmware) -> &'static str {
     match firmware {
         Firmware::Uefi => TEMPLATE_LOADER_B012,
         Firmware::Bios => TEMPLATE_LOADER_A194,
@@ -475,8 +559,8 @@ fn winresume_full_path(firmware: Firmware) -> &'static str {
     }
 }
 
-/// The `42000002` value the chosen loader must already carry, per
-/// firmware. [`build`] confirms it live before patching.
+/// The `42000002` value the template loader must already carry, per
+/// firmware. [`build`] confirms it live before cloning.
 fn expected_loader_suffix(firmware: Firmware) -> &'static str {
     match firmware {
         Firmware::Uefi => "\\system32\\winload.efi",
@@ -495,9 +579,13 @@ fn memdiag_path(firmware: Firmware) -> &'static str {
     }
 }
 
-/// The 88-byte boot device element for `{memdiag}\11000001`
-/// (`REG_BINARY`): 16 zero bytes, type 5 (`u32` at `0x10`), zero at
-/// `0x14`, length `0x48` (`u32` at `0x18`), zeros after.
+/// The 88-byte no-disk boot device (`REG_BINARY`): 16 zero bytes,
+/// type 5 (`u32` at `0x10`), zero at `0x14`, length `0x48` (`u32` at
+/// `0x18`), zeros after. This is the shape the install-media store
+/// puts on `{memdiag}\11000001`. The known-good `bcdboot` store
+/// instead uses the ESP partition device there, which is what
+/// [`build`] now writes, so this helper is retained for callers and
+/// tests but is no longer used by the builder.
 #[must_use]
 pub fn boot_device() -> [u8; 88] {
     let mut device = [0u8; 88];
@@ -612,24 +700,105 @@ fn remove_element(hive: &mut Hive, elements: usize, id: u32) -> Result<()> {
     Ok(())
 }
 
+/// The three runtime values a fresh object inherits from its template
+/// counterpart: `14000006` (inherited-object GUID list), `16000060`
+/// and `17000077`. Each is kept as the `(value type, bytes)` pair read
+/// from the template so a fresh object preserves the original encoding
+/// instead of a hard-coded guess. An `Option` is `None` when the
+/// template object lacks the element (synthetic fixtures do).
+#[derive(Default)]
+struct Inherited {
+    objects: Option<(u32, Vec<u8>)>,
+    flags: Option<(u32, Vec<u8>)>,
+    options: Option<(u32, Vec<u8>)>,
+}
+
+/// Read [`Inherited`] values from a template object's `Elements` key.
+fn read_inherited(hive: &Hive, elements: usize) -> Result<Inherited> {
+    Ok(Inherited {
+        objects: hive.element_value(elements, ELEMENT_DISPLAY_ORDER)?,
+        flags: hive.element_value(elements, ELEMENT_16000060)?,
+        options: hive.element_value(elements, ELEMENT_17000077)?,
+    })
+}
+
+/// Re-set the [`Inherited`] values onto a fresh object's `Elements`
+/// key. `14000006` and `17000077` keep the template's value type;
+/// `16000060` is a `REG_BINARY` byte in every template read so far and
+/// is written through [`Hive::set_element_binary`].
+fn write_inherited(hive: &mut Hive, elements: usize, inherited: &Inherited) -> Result<()> {
+    if let Some((vtype, data)) = &inherited.objects {
+        hive.set_element(elements, ELEMENT_DISPLAY_ORDER, *vtype, data)?;
+    }
+    if let Some((_, data)) = &inherited.flags {
+        hive.set_element_binary(elements, ELEMENT_16000060, data)?;
+    }
+    if let Some((vtype, data)) = &inherited.options {
+        hive.set_element(elements, ELEMENT_17000077, *vtype, data)?;
+    }
+    Ok(())
+}
+
+/// Clone a template object and its two subkeys into fresh keys under
+/// `objects`: the object key, its `Elements` key and its `Description`
+/// key all take the template key as their `nk` model (so the security
+/// descriptor and spare fields match), while `add_child_key` leaves the
+/// fresh keys empty. When the template `Description` carries a `Type`
+/// DWORD it is copied over as [`REG_DWORD`]. Returns the fresh
+/// `Elements` key so the caller can write the runtime elements.
+fn clone_object(
+    hive: &mut Hive,
+    objects: usize,
+    guid: &str,
+    template_object: usize,
+    template_elements: usize,
+    template_description: Option<usize>,
+) -> Result<usize> {
+    let fresh = hive.add_child_key(objects, guid.as_bytes(), Some(template_object))?;
+    let fresh_elements = hive.add_child_key(fresh, b"Elements", Some(template_elements))?;
+    if let Some(description) = template_description {
+        let fresh_description = hive.add_child_key(fresh, b"Description", Some(description))?;
+        if let Some((_, data)) = hive.read_value(description, b"Type")? {
+            hive.add_value(fresh_description, b"Type", REG_DWORD, &data)?;
+        }
+    }
+    Ok(fresh_elements)
+}
+
 /// Build a complete BCD store from a template hive.
 ///
 /// The template is the applied image's `Windows/System32/config/BCD-Template`
-/// bytes. On success returns the patched hive bytes: the
-/// firmware-selected loader (see [`default_object`]) gains
-/// `11000001`/`21000001` partition devices, `12000002`, and the
-/// edition description when given; `{bootmgr}` is repointed at it
-/// (plus `\bootmgr` at its `12000002` for [`Firmware::Bios`]) and gains
-/// its own `11000001` partition device (the ESP on UEFI, the system
-/// partition on BIOS); the resume object named by the loader's `23000003` gains the same
-/// partition device and a full winresume application path, and
-/// `{bootmgr}` gains a `23000006` pointing at it; `{memdiag}` gains the
-/// boot device and the per-firmware application path (see
-/// [`memdiag_path`]); the header checksum is recomputed. Refuses with
-/// [`CoreError::InvalidInput`] naming what is
-/// wrong when the template is not a `regf` hive, is truncated, lacks
-/// `System\Objects`, `{bootmgr}`, the required loader or
-/// `{memdiag}`, or lacks an element the build has to update.
+/// bytes. Rather than patch the template's objects in place, the build
+/// clones the firmware-selected template loader and the resume object it
+/// names into *fresh* objects (see [`default_object`] and
+/// [`default_resume_object`]) and writes the exact runtime element set
+/// real `bcdboot` writes onto them:
+///
+/// - fresh loader: `11000001`/`21000001` partition devices, the full
+///   winload `12000002`, `en-us` `12000005`, the edition `12000004`
+///   when given, `14000006`/`16000060`/`17000077` inherited from the
+///   template loader, `23000003` naming the fresh resume, `22000002`
+///   `\windows`, 8-byte `25000020` (all zero) and `250000c2`
+///   (`0100000000000000`), and no class-0x4 or `16000009` elements;
+/// - fresh resume: the same partition device, the full winresume
+///   `12000002`, `Windows Resume Application` `12000004`, `en-us`
+///   `12000005`, the three inherited values from the template resume,
+///   `22000002` `\hiberfil.sys` and 8-byte `25000008`
+///   (`0100000000000000`);
+/// - `{bootmgr}`: `23000003`, `23000006` and `24000001` repointed at the
+///   fresh objects, `12000005` `en-us`, and its own `11000001` partition
+///   device (the ESP on UEFI, the system partition on BIOS);
+/// - `{memdiag}`: the ESP/system device as `11000001`, `en-us`
+///   `12000005`, `Windows Memory Diagnostic` `12000004`, the
+///   per-firmware `12000002`, and no `1600000B`.
+///
+/// Class-0x4 template elements are stripped from these four active
+/// objects; inactive template objects are left untouched. The header
+/// checksum is recomputed. Refuses with [`CoreError::InvalidInput`]
+/// naming what is wrong when the template is not a `regf` hive, is
+/// truncated, lacks `System\Objects`, `{bootmgr}`, the firmware
+/// template loader, the template resume object or `{memdiag}`, or
+/// lacks an element the build has to read.
 pub fn build(template: &[u8], request: &StoreRequest<'_>) -> Result<Vec<u8>> {
     Ok(build_store(template, request)?.bytes)
 }
@@ -637,7 +806,9 @@ pub fn build(template: &[u8], request: &StoreRequest<'_>) -> Result<Vec<u8>> {
 /// The [`build`] body, keeping the written metadata next to the bytes.
 fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
     let firmware = request.firmware;
+    let template_guid = template_object(firmware);
     let loader_guid = default_object(firmware);
+    let resume_guid = default_resume_object(firmware);
     let firmware_name = match firmware {
         Firmware::Uefi => "UEFI",
         Firmware::Bios => "BIOS",
@@ -659,11 +830,13 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
                 "bcd template is missing the boot manager object {OBJECT_BOOTMGR}"
             ))
         })?;
-    let loader = hive
-        .find_child(objects, loader_guid.as_bytes())?
+    // The template loader is only validated and used as the model for
+    // the fresh objects; the built store's {default} is loader_guid.
+    let template_loader = hive
+        .find_child(objects, template_guid.as_bytes())?
         .ok_or_else(|| {
             CoreError::invalid(format!(
-                "bcd template is missing the {firmware_name} loader object {loader_guid}"
+                "bcd template is missing the {firmware_name} loader object {template_guid}"
             ))
         })?;
     let memdiag = hive
@@ -678,11 +851,13 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
             "bcd template object {OBJECT_BOOTMGR} has no Elements key"
         ))
     })?;
-    let loader_elements = hive.find_child(loader, b"Elements")?.ok_or_else(|| {
-        CoreError::invalid(format!(
-            "bcd template loader {loader_guid} has no Elements key"
-        ))
-    })?;
+    let loader_elements = hive
+        .find_child(template_loader, b"Elements")?
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bcd template loader {template_guid} has no Elements key"
+            ))
+        })?;
     let memdiag_elements = hive.find_child(memdiag, b"Elements")?.ok_or_else(|| {
         CoreError::invalid(format!(
             "bcd template object {OBJECT_MEMDIAG} has no Elements key"
@@ -701,12 +876,12 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
         Some((REG_SZ, data)) if decode_sz(&data)? == "\\windows" => {}
         Some(_) => {
             return Err(CoreError::invalid(format!(
-                "bcd template loader {loader_guid} has no \\\\windows 22000002 system root to keep"
+                "bcd template loader {template_guid} has no \\\\windows 22000002 system root to keep"
             )));
         }
         None => {
             return Err(CoreError::invalid(format!(
-                "bcd template loader {loader_guid} has no 22000002 element to keep"
+                "bcd template loader {template_guid} has no 22000002 element to keep"
             )));
         }
     }
@@ -716,12 +891,12 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
         Some((_, data)) => {
             let found = decode_sz(&data).unwrap_or_else(|_| "<not UTF-16>".to_string());
             return Err(CoreError::invalid(format!(
-                "bcd template loader {loader_guid} carries 42000002 {found}, expected {expected_suffix}"
+                "bcd template loader {template_guid} carries 42000002 {found}, expected {expected_suffix}"
             )));
         }
         None => {
             return Err(CoreError::invalid(format!(
-                "bcd template loader {loader_guid} has no 42000002 element to confirm"
+                "bcd template loader {template_guid} has no 42000002 element to confirm"
             )));
         }
     }
@@ -733,9 +908,53 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
             "bcd template object {OBJECT_MEMDIAG} has no 12000002 element to keep"
         )));
     }
+    // Follow the template loader's 23000003 to its resume object, then
+    // read the values the fresh objects inherit. All of this happens
+    // before any mutation so the cells stay put while we write.
+    let template_resume_guid = match hive.element_value(loader_elements, ELEMENT_DEFAULT_OBJECT)? {
+        Some((_, data)) => decode_sz(&data)?,
+        None => {
+            return Err(CoreError::invalid(format!(
+                "bcd template loader {template_guid} has no 23000003 resume object to wire"
+            )));
+        }
+    };
+    let template_resume = hive
+        .find_child(objects, template_resume_guid.as_bytes())?
+        .ok_or_else(|| {
+            CoreError::invalid(format!(
+                "bcd template is missing the resume object {template_resume_guid}"
+            ))
+        })?;
+    let template_resume_elements =
+        hive.find_child(template_resume, b"Elements")?
+            .ok_or_else(|| {
+                CoreError::invalid(format!(
+                    "bcd template resume object {template_resume_guid} has no Elements key"
+                ))
+            })?;
+    let loader_inherited = read_inherited(&hive, loader_elements)?;
+    let resume_inherited = read_inherited(&hive, template_resume_elements)?;
+    let template_loader_description = hive.find_child(template_loader, b"Description")?;
+    let template_resume_description = hive.find_child(template_resume, b"Description")?;
 
     let partition = partition_device(request.identity);
+    // bcdboot writes `{bootmgr}\11000001` as a partition device pointing
+    // at the ESP on UEFI (the system partition on BIOS). Its absence on a
+    // freshly written UEFI image is what lands the boot in a Recovery
+    // screen with 0xc0000001, so add it here with the ESP identity; on
+    // BIOS the boot manager shares the system partition with the loader.
+    // `{memdiag}` gets the very same device bytes.
+    let bootmgr_device = match firmware {
+        Firmware::Uefi => partition_device(request.esp_identity),
+        Firmware::Bios => partition,
+    };
+
+    // Repoint {bootmgr} at the fresh objects and lowercase its locale.
+    // 24000010, 25000004, 12000002 and 12000004 are left alone.
     hive.set_element_sz(bootmgr_elements, ELEMENT_DEFAULT_OBJECT, loader_guid)?;
+    hive.set_element_sz(bootmgr_elements, ELEMENT_LOCALE, "en-us")?;
+    hive.set_element_sz(bootmgr_elements, ELEMENT_RESUME_OBJECT, resume_guid)?;
     hive.set_element_multisz(bootmgr_elements, ELEMENT_BOOT_DISPLAY_ORDER, &[loader_guid])?;
     hive.set_element_multisz(
         bootmgr_elements,
@@ -745,67 +964,100 @@ fn build_store(template: &[u8], request: &StoreRequest<'_>) -> Result<Store> {
     if firmware == Firmware::Bios {
         hive.set_element_sz(bootmgr_elements, ELEMENT_PATH, "\\bootmgr")?;
     };
-    // bcdboot writes `{bootmgr}\11000001` as a partition device pointing
-    // at the ESP on UEFI (the system partition on BIOS). Its absence on a
-    // freshly written UEFI image is what lands the boot in a Recovery
-    // screen with 0xc0000001, so add it here with the ESP identity; on
-    // BIOS the boot manager shares the system partition with the loader.
-    let bootmgr_device = match firmware {
-        Firmware::Uefi => partition_device(request.esp_identity),
-        Firmware::Bios => partition,
-    };
     hive.set_element_binary(bootmgr_elements, ELEMENT_DEVICE, &bootmgr_device)?;
-    hive.set_element_binary(loader_elements, ELEMENT_DEVICE, &partition)?;
-    hive.set_element_binary(loader_elements, ELEMENT_OS_DEVICE, &partition)?;
-    hive.set_element_sz(loader_elements, ELEMENT_PATH, winload_full_path(firmware))?;
-    if let Some(description) = request.description {
-        hive.set_element_sz(loader_elements, ELEMENT_DESCRIPTION, description)?;
-    }
-    // Wire the resume object the way bcdboot does. The loader's own
-    // `23000003` names it; the template's relative `42000002` is not
-    // enough to boot, so the resume object also needs the data-partition
-    // device and the full winresume application path, and {bootmgr} must
-    // point at it with `23000006`.
-    let resume_guid = match hive.element_value(loader_elements, ELEMENT_DEFAULT_OBJECT)? {
-        Some((_, data)) => decode_sz(&data)?,
-        None => {
-            return Err(CoreError::invalid(format!(
-                "bcd template loader {loader_guid} has no 23000003 resume object to wire"
-            )));
-        }
-    };
-    let resume = hive
-        .find_child(objects, resume_guid.as_bytes())?
-        .ok_or_else(|| {
-            CoreError::invalid(format!(
-                "bcd template is missing the resume object {resume_guid}"
-            ))
-        })?;
-    let resume_elements = hive.find_child(resume, b"Elements")?.ok_or_else(|| {
-        CoreError::invalid(format!(
-            "bcd template resume object {resume_guid} has no Elements key"
-        ))
-    })?;
-    hive.set_element_binary(resume_elements, ELEMENT_DEVICE, &partition)?;
-    hive.set_element_sz(resume_elements, ELEMENT_PATH, winresume_full_path(firmware))?;
-    hive.set_element_sz(bootmgr_elements, ELEMENT_RESUME_OBJECT, &resume_guid)?;
-    hive.set_element_binary(memdiag_elements, ELEMENT_DEVICE, &boot_device())?;
-    hive.set_element_sz(memdiag_elements, ELEMENT_PATH, memdiag_path(firmware))?;
 
-    // bcdboot strips every class-0x4 "template element" — the
-    // setup-time directives (42000002, 45000001, 46000004, 47000005,
-    // 47000006, ...) — from each object it recreates: they are not
-    // runtime boot elements, and leaving them on the active boot path is
-    // what makes winload fail with 0xc0000001. Strip them from the four
-    // objects we wire, leaving the inactive template objects untouched.
-    // This runs after all the reads and writes above (including the
-    // 42000002 flavour check and every element we add) and before the
-    // checksum. `disable_recovery`'s later 16000009 is class 0x16 and
-    // would be kept even if it were set here, so it is never disturbed.
+    // Fresh OS loader: exactly the element set bcdboot writes, with the
+    // three inherited values copied from the template loader. No
+    // class-0x4 setup elements, no 16000009 (that would be added later
+    // by `disable_recovery`, which is deliberately left unchanged).
+    let fresh_loader_elements = clone_object(
+        &mut hive,
+        objects,
+        loader_guid,
+        template_loader,
+        loader_elements,
+        template_loader_description,
+    )?;
+    hive.set_element_binary(fresh_loader_elements, ELEMENT_DEVICE, &partition)?;
+    hive.set_element_binary(fresh_loader_elements, ELEMENT_OS_DEVICE, &partition)?;
+    hive.set_element_sz(
+        fresh_loader_elements,
+        ELEMENT_PATH,
+        winload_full_path(firmware),
+    )?;
+    if let Some(description) = request.description {
+        hive.set_element_sz(fresh_loader_elements, ELEMENT_DESCRIPTION, description)?;
+    }
+    hive.set_element_sz(fresh_loader_elements, ELEMENT_LOCALE, "en-us")?;
+    write_inherited(&mut hive, fresh_loader_elements, &loader_inherited)?;
+    hive.set_element_sz(fresh_loader_elements, ELEMENT_DEFAULT_OBJECT, resume_guid)?;
+    hive.set_element_binary(fresh_loader_elements, ELEMENT_25000020, &[0u8; 8])?;
+    hive.set_element_binary(
+        fresh_loader_elements,
+        ELEMENT_250000C2,
+        &[1, 0, 0, 0, 0, 0, 0, 0],
+    )?;
+    hive.set_element_sz(fresh_loader_elements, ELEMENT_OS_LOCATE_PATH, "\\windows")?;
+
+    // Fresh resume object, mirroring the template resume's inherited
+    // values but with bcdboot's runtime shapes (8-byte 25000008, full
+    // winresume path and description).
+    let fresh_resume_elements = clone_object(
+        &mut hive,
+        objects,
+        resume_guid,
+        template_resume,
+        template_resume_elements,
+        template_resume_description,
+    )?;
+    hive.set_element_binary(fresh_resume_elements, ELEMENT_DEVICE, &partition)?;
+    hive.set_element_sz(
+        fresh_resume_elements,
+        ELEMENT_PATH,
+        winresume_full_path(firmware),
+    )?;
+    hive.set_element_sz(
+        fresh_resume_elements,
+        ELEMENT_DESCRIPTION,
+        "Windows Resume Application",
+    )?;
+    hive.set_element_sz(fresh_resume_elements, ELEMENT_LOCALE, "en-us")?;
+    write_inherited(&mut hive, fresh_resume_elements, &resume_inherited)?;
+    hive.set_element_binary(
+        fresh_resume_elements,
+        ELEMENT_25000008,
+        &[1, 0, 0, 0, 0, 0, 0, 0],
+    )?;
+    hive.set_element_sz(
+        fresh_resume_elements,
+        ELEMENT_OS_LOCATE_PATH,
+        "\\hiberfil.sys",
+    )?;
+
+    // {memdiag}: ESP/system device, lowercase locale, a description,
+    // the per-firmware path, and drop the template's 1600000B.
+    hive.set_element_binary(memdiag_elements, ELEMENT_DEVICE, &bootmgr_device)?;
+    hive.set_element_sz(memdiag_elements, ELEMENT_LOCALE, "en-us")?;
+    hive.set_element_sz(
+        memdiag_elements,
+        ELEMENT_DESCRIPTION,
+        "Windows Memory Diagnostic",
+    )?;
+    hive.set_element_sz(memdiag_elements, ELEMENT_PATH, memdiag_path(firmware))?;
+    remove_element(&mut hive, memdiag_elements, ELEMENT_1600000B)?;
+
+    // Strip every class-0x4 "template element" — the setup-time
+    // directives (42000002, 45000001, 46000004, 47000005, 47000006,
+    // ...) — from the four active objects. They are not runtime boot
+    // elements; leaving them on the active boot path is what makes
+    // winload fail with 0xc0000001. Inactive template objects (including
+    // the loader and PE loader we modelled the fresh ones on) keep
+    // theirs, so we do not delete those objects: they are harmless and
+    // removing them risks breaking a live reference we did not check.
     for elements in [
         bootmgr_elements,
-        loader_elements,
-        resume_elements,
+        fresh_loader_elements,
+        fresh_resume_elements,
         memdiag_elements,
     ] {
         for id in element_ids(&hive, elements)? {
@@ -861,7 +1113,7 @@ mod tests {
         // Every documented element id as a literal, pinned against its
         // constant plus the class the module docs promise: a typo or a
         // changed constant fails here instead of staying green.
-        let table: [(u32, u32, u8); 27] = [
+        let table: [(u32, u32, u8); 29] = [
             (0x1100_0001, ELEMENT_DEVICE, 0x11),
             (0x1200_0002, ELEMENT_PATH, 0x12),
             (0x1200_0004, ELEMENT_DESCRIPTION, 0x12),
@@ -879,7 +1131,9 @@ mod tests {
             (0x2400_0001, ELEMENT_BOOT_DISPLAY_ORDER, 0x24),
             (0x2400_0010, ELEMENT_TOOLS_DISPLAY_ORDER, 0x24),
             (0x2500_0004, ELEMENT_TIMEOUT, 0x25),
+            (0x2500_0008, ELEMENT_25000008, 0x25),
             (0x2500_0020, ELEMENT_25000020, 0x25),
+            (0x2500_00C2, ELEMENT_250000C2, 0x25),
             (0x2500_00F3, ELEMENT_250000F3, 0x25),
             (0x2500_00F4, ELEMENT_250000F4, 0x25),
             (0x2500_00F5, ELEMENT_250000F5, 0x25),
@@ -923,6 +1177,10 @@ mod tests {
             OBJECT_HYPERVISOR_SETTINGS,
             OBJECT_EMS_SETTINGS,
             OBJECT_LEGACY,
+            OS_LOADER_UEFI,
+            OS_LOADER_BIOS,
+            RESUME_UEFI,
+            RESUME_BIOS,
         ];
         assert!(
             is_identifier_shape("{9dea862c-5cdd-4e70-acc1-f32b344d4795}"),
@@ -997,13 +1255,17 @@ mod tests {
             TEMPLATE_LOADER_CBD9,
             "{cbd971bf-b7b8-4885-951a-fa03044f5d71}"
         );
+        assert_eq!(OS_LOADER_UEFI, "{3796cdc8-e33b-11f1-b950-525400123456}");
+        assert_eq!(OS_LOADER_BIOS, "{3796cdc8-e33b-11f1-b950-525400123457}");
+        assert_eq!(RESUME_UEFI, "{3796cdc7-e33b-11f1-b950-525400123456}");
+        assert_eq!(RESUME_BIOS, "{3796cdc7-e33b-11f1-b950-525400123457}");
     }
 
     #[test]
     fn bootmgr_guid_bytes_render_as_the_bootmgr_identifier() {
         // The on-disk little-endian bytes of {bootmgr} through the
         // shared mixed-endian formatter must equal the constant the
-        // builder patches against.
+        // builder matches against.
         let raw: [u8; 16] = [
             0x2c, 0x86, 0xea, 0x9d, 0xdd, 0x5c, 0x70, 0x4e, 0xac, 0xc1, 0xf3, 0x2b, 0x34, 0x4d,
             0x47, 0x95,
@@ -1046,16 +1308,34 @@ mod tests {
     }
 
     #[test]
-    fn default_object_selects_the_winload_loader_per_firmware() {
-        assert_eq!(default_object(Firmware::Uefi), TEMPLATE_LOADER_B012);
-        assert_eq!(default_object(Firmware::Bios), TEMPLATE_LOADER_A194);
+    fn default_object_selects_the_fresh_loader_and_resume_per_firmware() {
+        // The built store's {default} is the fresh bcdboot-style loader,
+        // not the template object it was modelled on.
+        assert_eq!(default_object(Firmware::Uefi), OS_LOADER_UEFI);
+        assert_eq!(default_object(Firmware::Bios), OS_LOADER_BIOS);
+        assert_eq!(default_resume_object(Firmware::Uefi), RESUME_UEFI);
+        assert_eq!(default_resume_object(Firmware::Bios), RESUME_BIOS);
         assert_eq!(
             default_object(Firmware::Uefi),
-            "{b012b84d-c47c-4ed5-b722-c0c42163e569}"
+            "{3796cdc8-e33b-11f1-b950-525400123456}"
         );
         assert_eq!(
             default_object(Firmware::Bios),
-            "{a1943bbc-ea85-487c-97c7-c9ede908a38a}"
+            "{3796cdc8-e33b-11f1-b950-525400123457}"
+        );
+        // The two firmware stores cannot collide: their loader and
+        // resume GUIDs differ in the last hex digit.
+        assert_ne!(
+            default_object(Firmware::Uefi),
+            default_object(Firmware::Bios)
+        );
+        assert_ne!(
+            default_resume_object(Firmware::Uefi),
+            default_resume_object(Firmware::Bios)
+        );
+        assert_ne!(
+            default_object(Firmware::Uefi),
+            template_object(Firmware::Uefi)
         );
     }
 
@@ -1134,9 +1414,10 @@ mod tests {
     // through the production editor itself, so the tests exercise the
     // same allocation paths as a real build.
 
-    /// Start a minimal hive: header plus two bins holding a `System`
+    /// Start a minimal hive: header plus four bins holding a `System`
     /// root key and free space, so the fixture and the stores built
-    /// from it fit without appending bins.
+    /// from it (which now clone two fresh objects with their own
+    /// `Elements`/`Description` keys) fit without appending bins.
     fn empty_hive() -> Hive {
         let mut buf = vec![0u8; 0x200];
         buf[0..4].copy_from_slice(b"regf");
@@ -1145,14 +1426,13 @@ mod tests {
         buf[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
         buf[0x18..0x1C].copy_from_slice(&3u32.to_le_bytes());
         buf[HDR_ROOT..HDR_ROOT + 4].copy_from_slice(&0x20u32.to_le_bytes());
-        buf[HDR_BIN_LENGTH..HDR_BIN_LENGTH + 4].copy_from_slice(&0x2000u32.to_le_bytes());
-        buf.resize(0x3000, 0);
-        buf[0x1000..0x1004].copy_from_slice(b"hbin");
-        buf[0x1004..0x1008].copy_from_slice(&0u32.to_le_bytes());
-        buf[0x1008..0x100C].copy_from_slice(&0x1000u32.to_le_bytes());
-        buf[0x2000..0x2004].copy_from_slice(b"hbin");
-        buf[0x2004..0x2008].copy_from_slice(&0x1000u32.to_le_bytes());
-        buf[0x2008..0x200C].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[HDR_BIN_LENGTH..HDR_BIN_LENGTH + 4].copy_from_slice(&0x4000u32.to_le_bytes());
+        buf.resize(0x5000, 0);
+        for bin in [0x1000usize, 0x2000, 0x3000, 0x4000] {
+            buf[bin..bin + 4].copy_from_slice(b"hbin");
+            buf[bin + 4..bin + 8].copy_from_slice(&(bin as u32).wrapping_sub(0x1000).to_le_bytes());
+            buf[bin + 8..bin + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        }
         // Root `System` key at cell 0x20: 4 + 0x4C + 6 = 86, rounded 88.
         let root_file = 0x1020usize;
         buf[root_file..root_file + 4].copy_from_slice(&(-88i32).to_le_bytes());
@@ -1168,9 +1448,10 @@ mod tests {
         let free_file = root_file + 88;
         let free_size = 0x1000u32 - 0x20 - 88;
         buf[free_file..free_file + 4].copy_from_slice(&(free_size as i32).to_le_bytes());
-        // Second bin stays one free cell.
-        let free2 = 0x2020usize;
-        buf[free2..free2 + 4].copy_from_slice(&(HBIN_USABLE as i32).to_le_bytes());
+        // The other three bins each stay one free cell.
+        for free in [0x2020usize, 0x3020, 0x4020] {
+            buf[free..free + 4].copy_from_slice(&(HBIN_USABLE as i32).to_le_bytes());
+        }
         let checksum = Hive::header_checksum(&buf).expect("fixture header must checksum");
         buf[HDR_CHECKSUM..HDR_CHECKSUM + 4].copy_from_slice(&checksum.to_le_bytes());
         Hive::parse(&buf).expect("hand-built fixture must parse")
@@ -1667,7 +1948,19 @@ mod tests {
                 .expect("read memdiag device")
                 .expect("memdiag 11000001 must exist");
             assert_eq!(vtype, REG_BINARY);
-            assert_eq!(data, boot_device().to_vec());
+            // The good bcdboot store gives {memdiag} the same partition
+            // device as {bootmgr}: the ESP on UEFI, the system/data
+            // partition on BIOS.
+            let expected_boot_device = match firmware {
+                Firmware::Uefi => partition_device(esp),
+                Firmware::Bios => partition_device(identity),
+            };
+            assert_eq!(data, expected_boot_device.to_vec());
+            let (_, bootmgr_device) = hive
+                .element_data(OBJECT_BOOTMGR, ELEMENT_DEVICE)
+                .expect("read bootmgr device")
+                .expect("bootmgr 11000001 must exist");
+            assert_eq!(data, bootmgr_device, "memdiag and bootmgr share a device");
 
             // The memory-diagnostic application path is per firmware:
             // the UEFI diagnostics live on the ESP next to the boot
@@ -1761,11 +2054,12 @@ mod tests {
         .expect("build must succeed");
         let hive = Hive::parse(&out).expect("output must re-parse");
         let loader = default_object(Firmware::Uefi);
+        let resume = default_resume_object(Firmware::Uefi);
 
-        // (a) the resume object's device is the same partition device
-        // the loader got, byte for byte.
+        // (a) the fresh resume object's device is the same partition
+        // device the fresh loader got, byte for byte.
         let (vtype, resume_device) = hive
-            .element_data(TEST_RESUME_GUID, ELEMENT_DEVICE)
+            .element_data(resume, ELEMENT_DEVICE)
             .expect("read resume device")
             .expect("resume 11000001 must exist");
         assert_eq!(vtype, REG_BINARY);
@@ -1778,7 +2072,7 @@ mod tests {
         // (b) the full winresume application path, not the template's
         // relative 42000002.
         let (vtype, data) = hive
-            .element_data(TEST_RESUME_GUID, ELEMENT_PATH)
+            .element_data(resume, ELEMENT_PATH)
             .expect("read resume path")
             .expect("resume 12000002 must exist");
         assert_eq!(vtype, REG_SZ);
@@ -1791,13 +2085,20 @@ mod tests {
             "\\windows\\system32\\winresume.efi"
         );
 
-        // (c) bootmgr points at the resume object with 23000006.
+        // (c) both the loader and bootmgr point at the fresh resume.
+        let (vtype, data) = hive
+            .element_data(loader, ELEMENT_DEFAULT_OBJECT)
+            .expect("read loader resume ref")
+            .expect("loader 23000003 must exist");
+        assert_eq!(vtype, REG_SZ);
+        assert_eq!(decode_sz(&data).expect("guid text"), resume);
         let (vtype, data) = hive
             .element_data(OBJECT_BOOTMGR, ELEMENT_RESUME_OBJECT)
             .expect("read resume object ref")
             .expect("bootmgr 23000006 must exist");
         assert_eq!(vtype, REG_SZ);
-        assert_eq!(decode_sz(&data).expect("guid text"), TEST_RESUME_GUID);
+        assert_eq!(decode_sz(&data).expect("guid text"), resume);
+        assert_ne!(resume, TEST_RESUME_GUID, "the resume must be fresh");
     }
 
     /// Enumerate the element ids under `object`'s `Elements` key in a
@@ -1827,13 +2128,21 @@ mod tests {
         for firmware in [Firmware::Uefi, Firmware::Bios] {
             let template = template_fixture();
             let loader = default_object(firmware);
+            let resume = default_resume_object(firmware);
 
-            // Pre-condition: every object the build wires really does
-            // carry at least one template-class element in the fixture,
-            // otherwise the strip assertions below would be vacuous.
+            // Pre-condition: the template objects the build clones from
+            // really do carry at least one template-class element, and
+            // so do the two objects we strip in place ({bootmgr} and
+            // {memdiag}); otherwise the strip assertions are vacuous. The
+            // fresh objects start empty, so they are tested afterwards.
             {
                 let fixture = Hive::parse(&template).expect("fixture parses");
-                for object in [OBJECT_BOOTMGR, loader, TEST_RESUME_GUID, OBJECT_MEMDIAG] {
+                for object in [
+                    OBJECT_BOOTMGR,
+                    template_object(firmware),
+                    TEST_RESUME_GUID,
+                    OBJECT_MEMDIAG,
+                ] {
                     let ids = object_element_ids(&fixture, object);
                     assert!(
                         ids.iter().any(|&id| is_template_element(id)),
@@ -1858,7 +2167,7 @@ mod tests {
             // No template-class element survives on any of the four
             // active boot-path objects. Inactive template objects (the
             // other loaders, {legacy}, ...) are left untouched.
-            for object in [OBJECT_BOOTMGR, loader, TEST_RESUME_GUID, OBJECT_MEMDIAG] {
+            for object in [OBJECT_BOOTMGR, loader, resume, OBJECT_MEMDIAG] {
                 for id in object_element_ids(&hive, object) {
                     assert!(
                         !is_template_element(id),
@@ -1896,7 +2205,7 @@ mod tests {
                     "loader must keep runtime element {id:#010x}"
                 );
             }
-            let resume_ids = object_element_ids(&hive, TEST_RESUME_GUID);
+            let resume_ids = object_element_ids(&hive, resume);
             for id in [ELEMENT_DEVICE, ELEMENT_PATH] {
                 assert!(
                     resume_ids.contains(&id),
@@ -2302,8 +2611,8 @@ mod tests {
             )
             .expect("real template must build");
             assert_tiling(&out);
-            // The real template holds a single 472-byte free cell while
-            // a store needs about 1.4 KiB of new cells, so the build
+            // The real template's own free cells cannot hold the two
+            // freshly cloned objects and their elements, so the build
             // appends whole 4 KiB bins: the file stays a whole number of
             // bins and the header length tracks it.
             assert_eq!(out.len() % BIN_SIZE, 0, "output must stay bin-aligned");
@@ -2333,6 +2642,7 @@ mod tests {
                 .expect("read loader resume ref")
                 .expect("loader 23000003");
             let resume_guid = decode_sz(&resume_bytes).expect("resume guid text");
+            assert_eq!(resume_guid, default_resume_object(firmware));
             for object in [OBJECT_BOOTMGR, loader, resume_guid.as_str(), OBJECT_MEMDIAG] {
                 for id in object_element_ids(&hive, object) {
                     assert!(
@@ -2407,7 +2717,13 @@ mod tests {
                 .element_data(OBJECT_MEMDIAG, ELEMENT_DEVICE)
                 .expect("read")
                 .expect("memdiag device");
-            assert_eq!(data, boot_device().to_vec());
+            // bcdboot gives {memdiag} the same ESP/system partition
+            // device as {bootmgr}, not the 88-byte no-disk boot device.
+            let (_, bootmgr_device_bytes) = hive
+                .element_data(OBJECT_BOOTMGR, ELEMENT_DEVICE)
+                .expect("read")
+                .expect("bootmgr device");
+            assert_eq!(data, bootmgr_device_bytes);
 
             let (vtype, data) = hive
                 .element_data(OBJECT_MEMDIAG, ELEMENT_PATH)
@@ -2416,5 +2732,139 @@ mod tests {
             assert_eq!(vtype, REG_SZ);
             assert_eq!(decode_sz(&data).expect("path"), memdiag_path(firmware));
         }
+    }
+
+    /// Focused regression for the bcdboot-shaped store: the boot
+    /// manager points at fresh objects (not the template's), their
+    /// device/locale/integer elements have bcdboot's exact shapes, and
+    /// the recovery/template elements the known-good store lacks are
+    /// absent. `template_fixture` is the fixture the other build tests
+    /// use, so this runs in the ordinary test suite.
+    #[test]
+    fn fresh_objects_match_bcdboot_element_shapes() {
+        let data = DeviceIdentity::Gpt {
+            disk_guid: [0x01; 16],
+            partition_guid: [0x0A; 16],
+        };
+        let esp = DeviceIdentity::Gpt {
+            disk_guid: [0x01; 16],
+            partition_guid: [0x0B; 16],
+        };
+        assert_ne!(data, esp, "the fixture identities must be distinct");
+        let out = build(
+            &template_fixture(),
+            &StoreRequest {
+                firmware: Firmware::Uefi,
+                identity: data,
+                esp_identity: esp,
+                description: Some("Windows 11"),
+            },
+        )
+        .expect("build must succeed");
+        assert_tiling(&out);
+        let hive = Hive::parse(&out).expect("output must re-parse");
+        let loader = default_object(Firmware::Uefi);
+        let resume = default_resume_object(Firmware::Uefi);
+        assert_ne!(
+            loader,
+            template_object(Firmware::Uefi),
+            "{{default}} must be the fresh loader, not the template's"
+        );
+
+        // {bootmgr} points at both fresh objects.
+        for (id, want) in [
+            (ELEMENT_DEFAULT_OBJECT, loader),
+            (ELEMENT_RESUME_OBJECT, resume),
+        ] {
+            let (vtype, got) = hive
+                .element_data(OBJECT_BOOTMGR, id)
+                .expect("read")
+                .expect("bootmgr reference");
+            assert_eq!(vtype, REG_SZ);
+            assert_eq!(decode_sz(&got).expect("guid"), want);
+        }
+        let (vtype, got) = hive
+            .element_data(OBJECT_BOOTMGR, ELEMENT_BOOT_DISPLAY_ORDER)
+            .expect("read")
+            .expect("24000001");
+        assert_eq!(vtype, REG_MULTI_SZ);
+        assert_eq!(
+            decode_multisz(&got).expect("list"),
+            vec![loader.to_string()]
+        );
+
+        // Fresh loader: partition devices, en-us, 8-byte integers, no
+        // recovery element and no class-0x4 setup elements.
+        let expected = partition_device(data);
+        for id in [ELEMENT_DEVICE, ELEMENT_OS_DEVICE] {
+            let (vtype, got) = hive
+                .element_data(loader, id)
+                .expect("read")
+                .expect("loader device");
+            assert_eq!(vtype, REG_BINARY);
+            assert_eq!(got, expected.to_vec());
+        }
+        let (vtype, got) = hive
+            .element_data(loader, ELEMENT_LOCALE)
+            .expect("read")
+            .expect("12000005");
+        assert_eq!(vtype, REG_SZ);
+        assert_eq!(decode_sz(&got).expect("locale"), "en-us");
+        let (vtype, got) = hive
+            .element_data(loader, ELEMENT_25000020)
+            .expect("read")
+            .expect("25000020");
+        assert_eq!(vtype, REG_BINARY);
+        assert_eq!(got, vec![0u8; 8]);
+        let (vtype, got) = hive
+            .element_data(loader, ELEMENT_250000C2)
+            .expect("read")
+            .expect("250000c2");
+        assert_eq!(vtype, REG_BINARY);
+        assert_eq!(got, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+        let loader_ids = object_element_ids(&hive, loader);
+        assert!(
+            !loader_ids.contains(&0x1600_0009),
+            "fresh loader must not carry 16000009"
+        );
+        for id in loader_ids {
+            assert!(
+                !is_template_element(id),
+                "fresh loader must have no class-0x4 element, found {id:#010x}"
+            );
+        }
+
+        // Fresh resume: 8-byte 25000008 and the data-partition device.
+        let (vtype, got) = hive
+            .element_data(resume, ELEMENT_25000008)
+            .expect("read")
+            .expect("25000008");
+        assert_eq!(vtype, REG_BINARY);
+        assert_eq!(got, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+        let (_, got) = hive
+            .element_data(resume, ELEMENT_DEVICE)
+            .expect("read")
+            .expect("resume device");
+        assert_eq!(got, expected.to_vec());
+
+        // {memdiag}: ESP device, description, no 1600000B.
+        let (_, got) = hive
+            .element_data(OBJECT_MEMDIAG, ELEMENT_DEVICE)
+            .expect("read")
+            .expect("memdiag device");
+        assert_eq!(got, partition_device(esp).to_vec());
+        let (vtype, got) = hive
+            .element_data(OBJECT_MEMDIAG, ELEMENT_DESCRIPTION)
+            .expect("read")
+            .expect("12000004");
+        assert_eq!(vtype, REG_SZ);
+        assert_eq!(
+            decode_sz(&got).expect("description"),
+            "Windows Memory Diagnostic"
+        );
+        assert!(
+            !object_element_ids(&hive, OBJECT_MEMDIAG).contains(&ELEMENT_1600000B),
+            "memdiag must drop 1600000B"
+        );
     }
 }
