@@ -44,6 +44,7 @@ use rufus_core::hash::Algo;
 use rufus_core::part::plan::LayoutKind;
 use rufus_core::partition::TableKind;
 use rufus_core::pipeline::Event;
+use rufus_core::planner;
 use rufus_core::safety::SafetyVerdict;
 use rufus_core::text::device_text;
 use rufus_linux::MountTable;
@@ -149,6 +150,36 @@ impl Fail {
             kind: "json",
             message,
         }
+    }
+}
+
+/// Map a shared-planner refusal onto the CLI's exit table, keeping the
+/// pre-extraction class and `--json` kind for every case: a graded device
+/// error is exit 2 (`device`), an existing non-block target is exit 3
+/// (`safety`), option/pairing refusals are exit 1 (`usage`), and a failed
+/// confirm recompute stays the I/O-class `json` failure.
+fn fail_from_plan(err: planner::PlanError) -> Fail {
+    match err {
+        planner::PlanError::Device(message) => Fail {
+            exit: Exit::Device,
+            kind: "device",
+            message,
+        },
+        planner::PlanError::Safety(message) => Fail {
+            exit: Exit::Safety,
+            kind: "safety",
+            message,
+        },
+        planner::PlanError::Usage(message) => Fail {
+            exit: Exit::Usage,
+            kind: "usage",
+            message,
+        },
+        planner::PlanError::Confirm(message) => Fail {
+            exit: Exit::Io,
+            kind: "json",
+            message,
+        },
     }
 }
 
@@ -1167,15 +1198,22 @@ fn cmd_plan(
     image_path: &Path,
     device_path: &Path,
     sysfs: &SysfsRoot,
-    options: &plan::Options,
+    options: &planner::Options,
 ) -> Result<Exit, Fail> {
     // Safety first: grade the device (exit 2/3 without --dry-run), then the
     // image (exit 4/1), then assemble and seal the plan. The S04 facts
     // (size/serial/model/sysfs) ride along when the device is discoverable
     // on `sysfs`, and stay `None` otherwise.
-    let device = plan::device_ref(device_path, dry_run, sysfs)?;
+    let probe = rufus_linux::probe_device(device_path, sysfs);
+    let device = planner::device_ref(&probe, dry_run).map_err(fail_from_plan)?;
     let inspected = image::inspect(image_path).map_err(Fail::from_core)?;
-    let built = plan::build(device, inspected, options)?;
+    let image = rufus_proto::ImageRef {
+        path: inspected.path,
+        size_bytes: inspected.size_bytes,
+        sha256: inspected.sha256,
+        kind: inspected.kind,
+    };
+    let built = planner::build(device, image, options).map_err(fail_from_plan)?;
     if json {
         // `println!` keeps `plan --json` output line-oriented: scripts
         // and `jq` always see one complete line, never a cut-off value.
@@ -1771,12 +1809,12 @@ fn dispatch(cli: &Cli, paths: &HostPaths) -> Result<Exit, Fail> {
                 image,
                 device,
                 &paths.sysfs(),
-                &plan::Options {
+                &planner::Options {
                     scheme: scheme.clone(),
                     target: target.clone(),
                     filesystem: filesystem.clone(),
                     iso_mode: *iso_mode,
-                    bootloader: *bootloader,
+                    bootloader: (*bootloader).into(),
                     msdos_dir: msdos_dir.clone(),
                     label: label.clone(),
                     cluster_bytes,

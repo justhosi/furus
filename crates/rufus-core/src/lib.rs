@@ -73,7 +73,12 @@
 //!   digests (MD5/SHA-1/SHA-256/SHA-512) over a 1 MiB buffer.
 //! * [`image`] — container detection and header validation (S15, slice
 //!   3 of 4): magic probes over any [`Volume`](fs::Volume) plus the
-//!   VHD/VHDX/FFU/qcow2 header checks behind [`open_image`](image::open_image).
+//!   VHD/VHDX/FFU/qcow2 header checks behind [`open_image`](image::open_image),
+//!   and the shared [`inspect`](image::inspect) preamble.
+//! * [`planner`] — the shared provisional plan builder (S23): the
+//!   platform-agnostic device grading, image transfer mode,
+//!   partition/filesystem/bootloader selection rules and the sealed
+//!   [`Plan`](rufus_proto::Plan), used by both the CLI and the GUI.
 //! * [`part`] — write-side MBR and GPT table builders (S08): the
 //!   sector-0 MBR image and the full protective-MBR/primary/backup GPT
 //!   image, next to their parsers (which moved here from
@@ -140,6 +145,7 @@ pub mod part;
 pub mod partition;
 pub mod paths;
 pub mod pipeline;
+pub mod planner;
 pub mod report;
 pub mod safety;
 pub mod text;

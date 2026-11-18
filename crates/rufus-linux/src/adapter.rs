@@ -44,6 +44,7 @@
 //! and layouts without one (`Single`, `Persistence`) refuse instead
 //! of guessing `/dev/<disk>1`.
 
+use std::os::unix::fs::FileTypeExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -63,6 +64,9 @@ use rufus_core::part::plan::esp_window;
 use rufus_core::pipeline::MountedPartition;
 use rufus_core::pipeline::Opener;
 use rufus_core::pipeline::Target;
+use rufus_core::planner::DeviceFacts;
+use rufus_core::planner::DeviceProbe;
+use rufus_proto::DeviceRef;
 use rufus_proto::Filesystem;
 
 use crate::block::AlignedBuf;
@@ -75,6 +79,56 @@ use crate::sysfs::SysfsRoot;
 use crate::wipe::PARTITION_POLL_INTERVAL;
 use crate::wipe::PARTITION_POLL_TIMEOUT;
 use crate::wipe::wait_for_partitions;
+
+/// Probe one target path for the shared plan builder: `std::fs::metadata`
+/// decides existence and the block-device bit, and sysfs discovery fills
+/// the mapper facts when the path names a discovered disk.
+///
+/// This is the thin platform half of [`rufus_core::planner::device_ref`]:
+/// all grading rules stay in core, while this crate owns the `/sys` read
+/// and the `/dev` node facts. The GUI uses the same function for a path
+/// it received outside its device list, and [`plan_device_ref`] directly
+/// for a selected [`Device`] model.
+#[must_use]
+pub fn probe_device(path: &Path, sysfs: &SysfsRoot) -> DeviceProbe {
+    let (exists, block_device, error) = match std::fs::metadata(path) {
+        Ok(meta) => (true, meta.file_type().is_block_device(), None),
+        Err(source) => (false, false, Some(source.to_string())),
+    };
+    let shown = path.display().to_string();
+    let facts = crate::sysfs::enumerate(sysfs)
+        .ok()
+        .and_then(|devices| devices.into_iter().find(|known| known.dev_path == shown));
+    let facts = facts.map(|found| DeviceFacts {
+        size_bytes: found.size_bytes,
+        serial: found.serial,
+        model: found.model,
+        sysfs: found.sysfs,
+    });
+    DeviceProbe {
+        path: shown,
+        exists,
+        block_device,
+        error,
+        facts,
+    }
+}
+
+/// Convert a discovered [`Device`] into the plan's [`DeviceRef`], the
+/// straight mapping the S24 GUI needs for a selected device model: a
+/// discovered device is by construction a block device, and every mapper
+/// field comes from the same sysfs facts the CLI probe uses.
+#[must_use]
+pub fn plan_device_ref(device: &Device) -> DeviceRef {
+    DeviceRef {
+        path: device.dev_path.clone(),
+        block_device: true,
+        size_bytes: Some(device.size_bytes),
+        serial: device.serial.clone(),
+        model: device.model.clone(),
+        sysfs: Some(device.sysfs.clone()),
+    }
+}
 
 /// A core [`Target`] over any block [`Sink`]: buffered sinks delegate
 /// unchanged, while a direct sink (the kernel accepted `O_DIRECT`)

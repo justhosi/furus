@@ -346,6 +346,58 @@ pub fn open_image(path: &Path) -> Result<Image> {
     })
 }
 
+/// Everything a front end reports about one image before planning.
+///
+/// This is the platform-agnostic inspection preamble shared by the CLI's
+/// `analyze`/`plan` and the GUI's image picker: regular-file length,
+/// whole-file SHA-256 and the magic-only container kind. It mirrors
+/// [`rufus_proto::ImageRef`] field for field, so a caller converts with a
+/// straight construction and no rule lives in the front end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInfo {
+    /// Image path as presented by the caller.
+    pub path: String,
+    /// Regular-file length in bytes.
+    pub size_bytes: u64,
+    /// SHA-256 over the whole image, lowercase hex.
+    pub sha256: String,
+    /// Container kind (magic-only detection).
+    pub kind: ImageKind,
+}
+
+/// File size of a *regular* file (it must be an image, not a directory or
+/// device); other paths fail with a validation error naming the path.
+pub fn file_size(path: &Path) -> Result<u64> {
+    Ok(FileVolume::open(path)?.total_bytes())
+}
+
+/// Detect the container kind by magic only (see [`detect`]).
+///
+/// Never panics on short files: an empty file reports
+/// [`ImageKind::Unknown`], never an error.
+pub fn detect_file(path: &Path) -> Result<ImageKind> {
+    let size = file_size(path)?;
+    if size == 0 {
+        return Ok(ImageKind::Unknown);
+    }
+    let volume = FileVolume::open(path)?;
+    detect(&volume)
+}
+
+/// Measure, hash and sniff `path` in one pass — the common preamble of
+/// `analyze`, `plan` and the GUI's image selection.
+pub fn inspect(path: &Path) -> Result<ImageInfo> {
+    let size_bytes = file_size(path)?;
+    let sha256 = crate::hash::hash_file(path)?;
+    let kind = detect_file(path)?;
+    Ok(ImageInfo {
+        path: path.display().to_string(),
+        size_bytes,
+        sha256,
+        kind,
+    })
+}
+
 /// Read `len` bytes at absolute `offset` from `volume`: the window is
 /// bounds-checked against `total` with checked arithmetic before any
 /// I/O, and a window running past the volume end is refused naming

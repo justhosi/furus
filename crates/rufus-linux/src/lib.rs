@@ -96,6 +96,8 @@ pub use adapter::FileOpener;
 pub use adapter::FileTarget;
 pub use adapter::SinkTarget;
 pub use adapter::SinkVolume;
+pub use adapter::plan_device_ref;
+pub use adapter::probe_device;
 pub use block::{AlignedBuf, BlockDevice, MemorySink, Sink, SparseFile};
 pub use inspect::Inspected;
 pub use inspect::inspect;
