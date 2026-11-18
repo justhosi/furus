@@ -114,6 +114,14 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Serialise this plan using the helper's canonical JSON wire shape.
+    ///
+    /// The stored `confirm` value is written verbatim; this method does
+    /// not recompute or otherwise modify it.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
     /// Compute the confirm hash of this plan.
     ///
     /// The hash is `sha256:<hex>` where `<hex>` is the SHA-256 of the
@@ -526,6 +534,26 @@ mod tests {
             ],
             confirm: String::new(),
         }
+    }
+
+    #[test]
+    fn plan_to_json_round_trips_through_the_wire_type() {
+        let plan = sample();
+        let text = plan.to_json().expect("plan serialises");
+        assert_eq!(
+            serde_json::from_str::<Plan>(&text).expect("plan parses"),
+            plan
+        );
+    }
+
+    #[test]
+    fn plan_to_json_preserves_the_confirm_value_verbatim() {
+        let mut plan = sample();
+        plan.confirm = "sha256: caller supplied confirmation\nverbatim".to_string();
+        let text = plan.to_json().expect("plan serialises");
+        let round_trip: Plan = serde_json::from_str(&text).expect("plan parses");
+        assert_eq!(round_trip.confirm.as_bytes(), plan.confirm.as_bytes());
+        assert_eq!(round_trip, plan);
     }
 
     #[test]

@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use rufus_proto::{Event, LineError, Plan, from_jsonl_line};
 
+pub mod pkexec;
+pub use pkexec::PkexecTransport;
+
 /// Failure to start or communicate with the privileged helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcError {
@@ -140,6 +143,11 @@ impl Iterator for EventStream {
 /// A transport that starts one helper run for a plan.
 pub trait HelperTransport {
     /// Start the plan and return its session-scoped event stream.
+    ///
+    /// This may block until the helper's first non-blank event. In particular,
+    /// `pkexec` is silent while polkit authenticates, so this can legitimately
+    /// take the entire authorization budget; it returns an error if that
+    /// budget expires.
     fn start(&mut self, plan: &Plan) -> Result<Started, IpcError>;
 }
 

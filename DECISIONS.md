@@ -229,3 +229,35 @@ the A1–A12 values above is changed and no dependency is added.
   S00 plan-decision set whose values still await user confirmation (sections 1
   and 3); this slice settles placement *inside* the A9 split rather than adding
   a plan default, which is how the S22–S24 amendments were recorded as well.
+
+### 2026-11-19 - S25 slice-2 amendments (no A1–A12 value changes)
+
+These record the two contracts the shipped pkexec transport introduces; no
+A1–A12 value changes and no dependency is added.
+
+* **A8/A9 — the authorization wait is bounded, the run is not**: `pkexec` is
+  silent while polkit authenticates, so `HelperTransport::start` is documented
+  as blocking and carries one default budget of **120 s**
+  (`DEFAULT_AUTHORIZATION_TIMEOUT`). On expiry the transport kills **and reaps**
+  the child, removes the plan file and returns
+  `IpcError::Transport("no helper event within Ns; authorization not completed")`
+  instead of blocking for ever; a longer budget only delays a hung prompt, and a
+  shorter one cuts off a legitimate password entry. The budget covers the
+  authorization wait only — reads after `start()` are un-timed blocking reads,
+  so a long `wipe`/`verify` step is unaffected. Tests inject their own budget
+  through `with_command_and_authorization_timeout`; production construction
+  (`new()`/`Default`) always uses the constant.
+* **A9 — the plan file is user-private and swept narrowly**: the plan handed to
+  the privileged helper is written to `std::env::temp_dir()` as
+  `rufus-plan-<gui-pid>-<counter>-<nanos>.json`, created with `create_new(true)`
+  and mode `0600`, and removed on every exit path. Because it lives in a
+  world-writable directory, the constructor sweep deletes a file only when it
+  (a) parses as that canonical name, (b) is a regular file, not a symlink,
+  (c) is owned by the current user with mode exactly `0600`, and (d) names a pid
+  that `/proc/<pid>/stat` proves is gone or a zombie. Every other entry and
+  every error is ignored, so a pid reused by a live process leaks its stale file
+  instead of deleting a live run's plan, and another user's file is never a
+  candidate.
+* **Not renumbered**: for the same reason as the slice-1 entry above — these
+  settle contracts *inside* the A8/A9 decisions rather than adding a plan
+  default whose value would still await user confirmation.
