@@ -1372,6 +1372,26 @@ fn release_both_after_failure(
     }
 }
 
+/// Fallback loader description when a WIM image carries no usable name
+/// or description. A non-empty description is mandatory in the UEFI BCD:
+/// bootmgr rejects a store whose OS loader lacks the 12000004 element
+/// with 0xc0000001, so this cosmetic field must never come out blank.
+const FALLBACK_LOADER_DESCRIPTION: &str = "Windows";
+
+/// Pick the BCD loader description from a WIM image's metadata.
+///
+/// Prefers a non-empty image name, then a non-empty description, then
+/// [`FALLBACK_LOADER_DESCRIPTION`]. Whitespace-only counts as empty.
+fn loader_description(name: &str, description: Option<&str>) -> String {
+    if !name.trim().is_empty() {
+        return name.to_string();
+    }
+    if let Some(description) = description.filter(|value| !value.trim().is_empty()) {
+        return description.to_string();
+    }
+    FALLBACK_LOADER_DESCRIPTION.to_string()
+}
+
 /// Run the Windows arm: GPT-only, ESP-first, the WIM onto the raw NTFS
 /// partition before any mount, then the post-apply customization.
 ///
@@ -1488,6 +1508,16 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
             &mut *ctx.reporter,
             cancelled,
         )?;
+        // The UEFI BCD needs a non-empty loader description (element
+        // 12000004) or bootmgr fails with 0xc0000001. Derive it from the
+        // image being applied; a metadata read failure or a missing index
+        // falls back to "Windows" rather than failing the whole write.
+        let description = wim
+            .images()
+            .ok()
+            .and_then(|images| images.into_iter().find(|image| image.index == image_index))
+            .map(|candidate| loader_description(&candidate.name, candidate.description.as_deref()))
+            .unwrap_or_else(|| FALLBACK_LOADER_DESCRIPTION.to_string());
         let mut data = ctx.opener.mount_partition(&Filesystem::Ntfs)?;
         let mut esp = match ctx.opener.mount_esp() {
             Ok(esp) => esp,
@@ -1506,7 +1536,7 @@ fn run_windows(ctx: &mut RunContext<'_>, image: &ImageRef) -> Result<()> {
         let request = crate::windows::to_go::Request {
             identity: identities.data,
             esp_identity: identities.esp,
-            description: None,
+            description: Some(description.as_str()),
             use_2023_bootloaders: false,
         };
         let outcome =
@@ -2740,6 +2770,26 @@ mod tests {
     }
 
     #[test]
+    fn loader_description_prefers_name_then_description_then_windows() {
+        // The exact string produced for the real install.wim image 1.
+        assert_eq!(
+            loader_description("Windows 11 Enterprise Evaluation", None),
+            "Windows 11 Enterprise Evaluation"
+        );
+        // An unnamed image falls back to its non-empty description.
+        assert_eq!(
+            loader_description("", Some("A Windows description")),
+            "A Windows description"
+        );
+        // Neither present (or whitespace-only) means the literal fallback.
+        assert_eq!(loader_description("", None), "Windows");
+        assert_eq!(loader_description("   ", Some("  ")), "Windows");
+        // Whatever is chosen is always non-empty: the 12000004 element
+        // must be a real string or bootmgr fails with 0xc0000001.
+        assert!(!loader_description("", None).is_empty());
+    }
+
+    #[test]
     fn windows_install_failure_releases_both_mounts_once() {
         if skip_without_wim_backend() || skip_without_ntfs_formatter() {
             return;
@@ -3378,6 +3428,23 @@ mod tests {
                 .join("EFI/Microsoft/Boot/BCD")
                 .is_file(),
             "the UEFI store lands on the ESP"
+        );
+        // Regression guard: the To Go loader must carry 12000004 or
+        // bootmgr fails with 0xc0000001. Reverting the caller's
+        // `description: Some(...)` back to `None` must fail this test.
+        let bytes = std::fs::read(opener.esp_root.path().join("EFI/Microsoft/Boot/BCD"))
+            .expect("the uefi store reads");
+        let hive = crate::windows::regf::Hive::parse(&bytes).expect("the store re-parses");
+        let loader = crate::windows::bcd::default_object(crate::windows::bcd::Firmware::Uefi);
+        let (vtype, data) = hive
+            .element_data(loader, 0x1200_0004)
+            .expect("read the description element")
+            .expect("the To Go loader must carry 12000004 (bootmgr needs it)");
+        assert_eq!(vtype, crate::windows::regf::REG_SZ);
+        assert_eq!(
+            crate::windows::regf::decode_sz(&data).expect("description text"),
+            "testimg",
+            "the loader description comes from the applied WIM image"
         );
         assert_eq!(
             ntfs_read(&partition_node, "bootmgr"),
