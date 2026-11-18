@@ -1,8 +1,10 @@
 # DECISIONS.md — Rufus for Linux (Rust rewrite), slice S00
 
 Status of the plan: **approved in principle. Decision A4 is settled (approved
-2026-10-27): external tools are allowed. No implementation has started —
-anything beyond S00 waits for an explicit go-ahead.**
+2026-10-27): external tools are allowed.** Sections 1–3 are the S00 record as
+written then: in particular "no implementation has started" was true at S00
+and is **not current** — implementation has proceeded slice by slice since S01,
+and each slice's amendments are recorded in section 4.
 
 ## 1. Decisions A1–A12
 
@@ -46,6 +48,9 @@ config paths (`A10`), the helper D-Bus name, the asset directory and the
 desktop file — that is why it is frozen here, in S00, and not later.
 
 ## 3. Go/no-go
+
+*(S00 record, kept as written; superseded — implementation began at S01 and
+continues under the per-slice contracts recorded in section 4.)*
 
 **No implementation starts beyond S00 until the user gives an explicit
 go-ahead.** S00 delivers only this file, `LICENSES.md` and
@@ -149,7 +154,11 @@ A7-mandated toolkit is added.
   `rustix` 0.38.44/1.1.6, `thiserror` 1/2, `toml` 0.8/1.x), and the winit
   backend drags in async plumbing (`zbus`'s `async-io`) that no `rufus-gui`
   code calls — there is still no `tokio`, no `async-std` and no `async` code in
-  the crate, so A8 stands for our own code.
+  the crate, so A8 stands for our own code. The A7 planning estimate in
+  section 1 (~4–6 MB) proved low: with the mandated feature set the release
+  binary measures 11,602,240 bytes, inside the unchanged 12,000,000 budget.
+  A7's status column is left as `proposed` in section 1 — recording a user
+  confirmation that never happened is not this slice's to make.
 * **Licence (A1 direction)**: Slint crates are tri-licensed; `deny.toml`
   accepts **only** the `GPL-3.0-only` branch, through per-crate
   `[[licenses.exceptions]]` pinned to `@=1.19.0` so a Slint bump forces a
@@ -181,4 +190,8 @@ A7-mandated toolkit is added.
   `-p rufus-helper` alone is 1,384,904 bytes, under `--workspace` 1,405,992,
   because `rustix` 1.1.6 is one package instance shared with the Slint/winit
   tree and gains `mm`, `shm`, `system` there. `size-baseline.json` was
-  refreshed with the measured values only.
+  refreshed with the measured values only; C3 and C4 then took `rufus-gui` to
+  11,566,272 (+24,960) and 11,602,240 (+35,968), the value at the S24 tip,
+  leaving 397,760 bytes of headroom, and `rufus` moved 1,810,200 → 1,809,576
+  (−624) against the same lock refresh. `BINARY_BUDGETS` (3,000,000 /
+  2,500,000 / 12,000,000) is unchanged.

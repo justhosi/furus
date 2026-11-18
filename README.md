@@ -185,7 +185,7 @@ write side is the most complete part:
   test compares the BIOS (Boot/BCD) store's required elements and loader
   description with the UEFI store. No fresh SeaBIOS Windows boot was run
   in this environment, so no Legacy BIOS boot is claimed as verified.
-* The GUI is being built in S24 and is no longer a stub: `rufus-gui` opens a
+* The GUI arrived in S24 and is no longer a stub: `rufus-gui` opens a
   Slint window over the headless `GuiState` (device, boot selection, image
   option, partition scheme, target system, file system, cluster size, labels,
   quick format, bad blocks; START reports the plan or its refusal and CLOSE
@@ -250,8 +250,9 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
   never does.
 * `rufus-cli` - the `rufus` command-line front end: version, checksum,
   analyze, plan, list, write.
-* `rufus-gui` - the Slint desktop front end (S24: the window plus the
-  headless `GuiState` it renders; planning only, no writes).
+* `rufus-gui` - the Slint desktop front end (S24: the window, the headless
+  `GuiState` it renders, the `std::thread` device watch and the background
+  image analyzer; planning only, no writes).
 * `xtask` - repo maintenance: asset-manifest check, parity check, the
   per-binary size gate, CI ordering.
 
@@ -267,7 +268,13 @@ SIGINT handler install in `crates/rufus-linux/src/signal.rs` (one atomic
 store, nothing else) - and `wimlib-sys` carries two more (the raw FFI
 declarations in `src/ffi.rs` and the safe facade in `src/safe/bound.rs`
 with its C calls, trampolines and string decoding). Every other crate
-root keeps `#![forbid(unsafe_code)]`.
+root keeps `#![forbid(unsafe_code)]`. The one exception in spelling is
+the `rufus-gui` binary target, which uses `#![deny(unsafe_code)]`:
+`slint::include_modules!()` expands to vtables that hardcode
+`#[allow(unsafe_code)]`, and an `allow` under a crate-level `forbid` is a
+hard error (E0453). The `rufus-gui` library root keeps the `forbid`, no
+hand-written `rufus-gui` line contains `unsafe` or `#[allow(unsafe_code)]`,
+and the workspace lint would reject one (see `TECHNICAL.md` section 3.7).
 `rufus-core` is dependency-light by design: no async runtime, no logging
 framework, no regex.
 
@@ -286,6 +293,10 @@ allowance (the same compiler emits slightly different bytes on different
 system linkers; it never rewrites the baseline):
 
     CARGO_NET_OFFLINE=true cargo xtask size
+
+At the S24 tip it reports `rufus` 1,809,576 bytes (budget 3,000,000),
+`rufus-helper` 1,405,992 (2,500,000) and `rufus-gui` 11,602,240
+(12,000,000), `size: within committed baseline allowance, all budgets OK`.
 
 ## Tests
 
