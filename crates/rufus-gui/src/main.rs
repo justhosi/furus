@@ -51,7 +51,9 @@ use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 
 use rufus_core::planner::BootloaderOpt;
-use rufus_core::report;
+use rufus_gui::analyzer::{
+    AnalysisCoordinator, AnalysisResult, AnalyzerSender, AnalyzerWorker, checksum,
+};
 use rufus_gui::state::{GuiState, WindowsImageOption};
 use rufus_linux::Device;
 use rufus_linux::sysfs::{self, SysfsRoot};
@@ -379,6 +381,11 @@ fn describe_plan(plan: &Plan) -> String {
     )
 }
 
+enum AnalysisMessage {
+    Result(Box<AnalysisResult>),
+    Stop,
+}
+
 fn model<I, S>(labels: I) -> ModelRc<SharedString>
 where
     I: IntoIterator<Item = S>,
@@ -419,6 +426,7 @@ impl SessionHandle {
 
 struct Session {
     state: GuiState,
+    analyzer: AnalysisCoordinator,
     device_list: rufus_gui::devices::DeviceListState,
     progress: f32,
     note: Option<String>,
@@ -435,6 +443,7 @@ impl Session {
         let note = device_list.error().map(str::to_string);
         let mut session = Self {
             state: GuiState::default(),
+            analyzer: AnalysisCoordinator::default(),
             device_list,
             progress: 0.0,
             note,
@@ -479,35 +488,54 @@ impl Session {
         true
     }
 
-    fn select_image(&mut self) {
-        let Some(path) = pick_image_path() else {
-            self.note = Some(
-                "No file picker found (install zenity or kdialog) to select a boot image."
-                    .to_string(),
-            );
-            return;
-        };
+    fn select_image(&mut self, path: PathBuf, sender: &AnalyzerSender) {
         self.note = None;
-        let is_windows = report::analyze_file(&path)
-            .map(|analysis| analysis.is_windows)
-            .unwrap_or(false);
-        // `select_image` records the inspection outcome (including the
-        // named error) in `GuiState` and its status text.
-        let _ = self.state.select_image(&path, is_windows);
+        let request_id = self.analyzer.begin(&mut self.state, &path);
+        if let Err(error) = sender.submit(request_id, path.clone()) {
+            let _ = self.analyzer.apply(
+                &mut self.state,
+                AnalysisResult {
+                    request_id,
+                    path,
+                    result: Err(error),
+                },
+            );
+        }
+    }
+
+    fn apply_analysis(&mut self, result: AnalysisResult) -> bool {
+        let applied = self.analyzer.apply(&mut self.state, result);
+        if applied {
+            self.note = self
+                .state
+                .clone()
+                .build_plan()
+                .err()
+                .map(|error| format!("Refused to plan: {error}"));
+        }
+        applied
+    }
+
+    fn show_checksum(&mut self) {
+        self.note = Some(
+            checksum(&self.state)
+                .unwrap_or_else(|| "No analyzed image is available for checksum.".to_string()),
+        );
     }
 
     fn start(&mut self) {
-        self.note = self
-            .state
-            .build_plan()
-            .ok()
-            .map(|plan| format!("Planned: {}", describe_plan(&plan)));
+        self.note = Some(match self.state.build_plan() {
+            Ok(plan) => format!(
+                "Planned: {}. No device writes were performed.",
+                describe_plan(&plan)
+            ),
+            Err(error) => format!("Planning refused: {error}. No device writes were performed."),
+        });
     }
 }
 
 /// Ask a desktop file picker for the boot image. Pure std process
-/// spawning — no extra crates (the dependency budget is closed). The
-/// analyzer worker in C4 supersedes this seam.
+/// spawning — no extra crates (the dependency budget is closed).
 fn pick_image_path() -> Option<PathBuf> {
     for (program, args) in [
         (
@@ -586,6 +614,7 @@ fn render(session: &Session, ui: &MainWindow) {
     ui.set_boot_current(SharedString::from(boot_label(&state.bootloader)));
 
     ui.set_select_enabled(true);
+    ui.set_checksum_enabled(state.image.is_some());
 
     ui.set_image_option_model(model(IMAGE_OPTION_LABELS.iter().copied()));
     ui.set_image_option_visible(state.image_option_enabled());
@@ -623,7 +652,7 @@ fn render(session: &Session, ui: &MainWindow) {
         session.note.as_deref(),
         session.device_list.warning(),
     )));
-    ui.set_start_enabled(state.clone().build_plan().is_ok());
+    ui.set_start_enabled(state.start_enabled());
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +670,38 @@ fn run_gui() -> Result<(), slint::PlatformError> {
     };
     let session = SessionHandle::new(Session::new(discovery));
     let epoch = Arc::new(AtomicU64::new(0));
+    let (analysis_tx, analysis_rx) = mpsc::channel::<AnalysisMessage>();
+    let analysis_shutdown_tx = analysis_tx.clone();
+    let analysis_dispatch_session = session.clone();
+    let analysis_dispatch_weak = ui.as_weak();
+    let analysis_dispatcher = thread::spawn(move || {
+        while let Ok(message) = analysis_rx.recv() {
+            let AnalysisMessage::Result(result) = message else {
+                break;
+            };
+            let result = *result;
+            let session = analysis_dispatch_session.clone();
+            let weak = analysis_dispatch_weak.clone();
+            if slint::invoke_from_event_loop(move || {
+                let mut session = session.borrow_mut();
+                if session.apply_analysis(result)
+                    && let Some(ui) = weak.upgrade()
+                {
+                    render(&session, &ui);
+                }
+            })
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let analyzer = AnalyzerWorker::spawn_production(move |result| {
+        analysis_tx
+            .send(AnalysisMessage::Result(Box::new(result)))
+            .is_ok()
+    });
+    let analyzer_sender = analyzer.sender();
     let (updates_tx, updates_rx) = mpsc::channel();
     let dispatcher_session = session.clone();
     let dispatcher_weak = ui.as_weak();
@@ -704,10 +765,28 @@ fn run_gui() -> Result<(), slint::PlatformError> {
     }
     {
         let session = session.clone();
+        let sender = analyzer_sender.clone();
         let weak = ui.as_weak();
         ui.on_select_clicked(move || {
             if let Some(ui) = weak.upgrade() {
-                session.borrow_mut().select_image();
+                if let Some(path) = pick_image_path() {
+                    session.borrow_mut().select_image(path, &sender);
+                } else {
+                    session.borrow_mut().note = Some(
+                        "No file picker found (install zenity or kdialog) to select a boot image."
+                            .to_string(),
+                    );
+                }
+                render(&session.borrow(), &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_checksum_clicked(move || {
+            if let Some(ui) = weak.upgrade() {
+                session.borrow_mut().show_checksum();
                 render(&session.borrow(), &ui);
             }
         });
@@ -860,8 +939,11 @@ fn run_gui() -> Result<(), slint::PlatformError> {
 
     render(&session.borrow(), &ui);
     let result = ui.run();
+    analyzer.shutdown();
+    let _ = analysis_shutdown_tx.send(AnalysisMessage::Stop);
     drop(worker.map(|worker| worker.shutdown()));
     let _ = dispatcher.join();
+    let _ = analysis_dispatcher.join();
     result
 }
 
@@ -965,6 +1047,104 @@ mod tests {
             session.device_list.selected_identity(),
             Some(first.identity().as_str())
         );
+    }
+
+    #[test]
+    fn start_reports_planner_refusal_without_attempting_any_write() {
+        let mut session = Session::new(Discovery {
+            devices: Vec::new(),
+            warning: None,
+        });
+
+        session.start();
+
+        assert!(
+            session
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("Planning refused"))
+        );
+        assert!(
+            session
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("Select a removable device"))
+        );
+        assert!(session.state.device.is_none());
+    }
+
+    /// The production seam end to end, minus the picker and the dispatcher
+    /// thread: a selection takes its request id *before* the worker can see
+    /// it, the worker analyses off-thread and publishes the real
+    /// `AnalysisResult`, and a result for a superseded selection is discarded
+    /// by the same `apply` the event loop uses.
+    #[test]
+    fn selected_image_is_analysed_off_thread_and_a_superseded_result_is_discarded() {
+        use std::path::PathBuf;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use rufus_core::image::{ImageInfo, ImageKind};
+        use rufus_core::report::ImageReport;
+        use rufus_gui::analyzer::{Analysis, AnalyzerWorker};
+
+        let (publish_tx, publish_rx) = mpsc::channel();
+        let worker = AnalyzerWorker::spawn(
+            |path| {
+                Ok(Analysis {
+                    info: ImageInfo {
+                        path: path.display().to_string(),
+                        size_bytes: 21,
+                        sha256: "0".repeat(64),
+                        kind: ImageKind::Raw,
+                    },
+                    report: ImageReport {
+                        kind: "raw".to_string(),
+                        ..ImageReport::default()
+                    },
+                })
+            },
+            move |result| publish_tx.send(result).is_ok(),
+        );
+        let sender = worker.sender();
+        let mut session = Session::new(Discovery {
+            devices: Vec::new(),
+            warning: None,
+        });
+        let image_a = PathBuf::from("/tmp/rufus-gui-c4-analyzer-a.iso");
+        let image_b = PathBuf::from("/tmp/rufus-gui-c4-analyzer-b.iso");
+
+        session.select_image(image_a, &sender);
+        assert!(session.state.status_text().contains("Analyzing"));
+        let first = publish_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker publishes the first analysis");
+        assert_eq!(
+            session.analyzer.latest_pending_id(),
+            Some(first.request_id),
+            "the request id is assigned at selection, before the worker publishes"
+        );
+
+        session.select_image(image_b, &sender);
+        assert!(
+            !session.apply_analysis(first),
+            "a result for a superseded selection is discarded"
+        );
+        assert!(session.state.image.is_none());
+        assert!(session.state.status_text().contains("Analyzing"));
+
+        let second = publish_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker publishes the second analysis");
+        assert!(session.apply_analysis(second));
+        assert!(
+            session
+                .state
+                .image
+                .as_ref()
+                .is_some_and(|image| { image.image.path.ends_with("-b.iso") })
+        );
+        worker.shutdown();
     }
 
     #[test]

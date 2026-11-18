@@ -16,6 +16,7 @@ use rufus_core::image;
 use rufus_core::part::TableKind;
 use rufus_core::part::plan::{DataType, LayoutKind};
 use rufus_core::planner::{self, BootloaderOpt, DeviceProbe, PlanError};
+use rufus_core::report::ImageReport;
 use rufus_linux::Device;
 use rufus_proto::{Filesystem, ImageRef, Layout, Plan, Scheme, Step, Target};
 
@@ -47,6 +48,7 @@ pub struct DeviceSelection {
 pub struct BootSelection {
     pub image: ImageRef,
     pub is_windows: bool,
+    pub report: ImageReport,
 }
 
 /// A state or planner error surfaced to the GUI without panicking.
@@ -119,44 +121,89 @@ impl GuiState {
         self.last_error = None;
     }
 
-    /// Inspect the selected image with the shared read-only image preamble.
-    pub fn select_image(&mut self, path: &Path, is_windows: bool) -> Result<(), GuiError> {
+    /// Mark a newly selected image as pending and clear the previous image
+    /// so no plan can be built against stale facts while analysis runs.
+    pub fn begin_image_analysis(&mut self, path: &Path) {
         self.image = None;
         self.last_error = None;
+        self.image_option = WindowsImageOption::Standard;
+        self.bootloader = BootloaderOpt::Auto;
+        self.iso_mode = false;
+        self.scheme = Scheme::Gpt;
+        self.target = Target::Uefi;
+        self.filesystem = Filesystem::Fat32;
+        self.volume_label = None;
+        self.status = format!("Analyzing image '{}'…", path.display());
+    }
+
+    /// Apply facts produced by the background analyzer. This method adds no
+    /// planning rules; it maps report facts into the existing view model.
+    pub fn apply_image_analysis(&mut self, info: image::ImageInfo, report: ImageReport) {
+        let is_windows = report.is_windows;
+        let volume_label = report.labels.best().map(str::to_string);
+        self.image = Some(BootSelection {
+            image: ImageRef {
+                path: info.path,
+                size_bytes: info.size_bytes,
+                sha256: info.sha256,
+                kind: info.kind,
+            },
+            is_windows,
+            report,
+        });
+        self.image_option = WindowsImageOption::Standard;
+        self.bootloader = BootloaderOpt::Auto;
+        self.iso_mode = false;
+        self.scheme = Scheme::Gpt;
+        self.target = Target::Uefi;
+        self.filesystem = if is_windows {
+            Filesystem::Ntfs
+        } else {
+            Filesystem::Fat32
+        };
+        let image = self.image.as_ref().expect("image was just assigned");
+        self.volume_label = volume_label;
+        self.status = analysis_summary(image);
+        self.last_error = None;
+    }
+
+    /// Apply a named analyzer failure, leaving the selected image absent.
+    pub fn fail_image_analysis(&mut self, path: &Path, message: impl fmt::Display) {
+        self.image = None;
+        let error = GuiError::ImageInspection(format!(
+            "Could not analyze image '{}': {message}",
+            path.display()
+        ));
+        self.status = error.to_string();
+        self.last_error = Some(error);
+    }
+
+    /// Inspect a selected image synchronously. Retained for headless callers;
+    /// the desktop picker uses `begin_image_analysis` and the worker instead.
+    pub fn select_image(&mut self, path: &Path, is_windows: bool) -> Result<(), GuiError> {
+        self.begin_image_analysis(path);
         match image::inspect(path) {
             Ok(info) => {
-                self.image = Some(BootSelection {
-                    image: ImageRef {
-                        path: info.path,
-                        size_bytes: info.size_bytes,
-                        sha256: info.sha256,
-                        kind: info.kind,
-                    },
+                let report = ImageReport {
                     is_windows,
-                });
-                self.image_option = WindowsImageOption::Standard;
-                self.bootloader = BootloaderOpt::Auto;
-                self.iso_mode = false;
-                self.scheme = Scheme::Gpt;
-                self.target = Target::Uefi;
-                self.filesystem = if is_windows {
-                    Filesystem::Ntfs
-                } else {
-                    Filesystem::Fat32
+                    ..ImageReport::default()
                 };
-                self.status = "Image inspected; ready to plan.".to_string();
+                self.apply_image_analysis(info, report);
                 Ok(())
             }
             Err(error) => {
-                let error = GuiError::ImageInspection(format!(
-                    "Could not inspect image '{}': {error}",
-                    path.display()
-                ));
-                self.status = error.to_string();
-                self.last_error = Some(error.clone());
-                Err(error)
+                self.fail_image_analysis(path, &error);
+                Err(self.last_error.clone().unwrap_or(GuiError::NoImage))
             }
         }
+    }
+
+    /// Whether START is actionable; the shared planner remains the single
+    /// source of truth for whether current state has a valid plan.
+    #[must_use]
+    pub fn start_enabled(&self) -> bool {
+        let mut state = self.clone();
+        state.build_plan().is_ok()
     }
 
     /// Whether the Windows image option selector should be shown/enabled.
@@ -327,6 +374,47 @@ impl Default for GuiState {
             last_error: None,
         }
     }
+}
+
+/// A user-facing summary of analyzer facts; planning remains in `GuiState`
+/// and the shared planner.
+fn analysis_summary(image: &BootSelection) -> String {
+    let report = &image.report;
+    let boot_modes = match (report.has_bios, report.has_efi) {
+        (true, true) => "BIOS/UEFI",
+        (true, false) => "BIOS",
+        (false, true) => "UEFI",
+        (false, false) => "no BIOS/UEFI boot path",
+    };
+    let windows = if report.is_windows {
+        let version = report.windows_version.as_deref().map_or_else(
+            || "Windows".to_string(),
+            |version| format!("Windows {version}"),
+        );
+        let edition = report
+            .wim_images
+            .first()
+            .and_then(|edition| edition.display_name.as_deref().or(edition.name.as_deref()));
+        match edition {
+            Some(edition) => format!("{version} / {edition}"),
+            None => version,
+        }
+    } else {
+        report
+            .distro
+            .as_deref()
+            .unwrap_or("non-Windows image")
+            .to_string()
+    };
+    let distro = report
+        .distro
+        .as_deref()
+        .map(|distro| format!(" — distro: {distro}"))
+        .unwrap_or_default();
+    format!(
+        "Analyzed: {} — {windows} — {boot_modes}{distro}",
+        report.kind
+    )
 }
 
 /// `Scheme` to the shared layout planner's `TableKind`: the same wire

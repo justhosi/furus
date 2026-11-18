@@ -28,6 +28,7 @@ export component MainWindow inherits Window {
     in property <[string]> boot-model;
     in-out property <string> boot-current;
     in property <bool> select-enabled;
+    in property <bool> checksum-enabled;
     in property <bool> image-option-visible;
     in property <[string]> image-option-model;
     in-out property <string> image-option-current;
@@ -55,6 +56,7 @@ export component MainWindow inherits Window {
     callback device-selected(string);
     callback boot-selected(string);
     callback select-clicked();
+    callback checksum-clicked();
     callback image-option-selected(string);
     callback scheme-selected(string);
     callback target-selected(string);
@@ -107,6 +109,11 @@ export component MainWindow inherits Window {
                 text: "SELECT";
                 enabled: root.select-enabled;
                 clicked => { root.select-clicked(); }
+            }
+            Button {
+                text: "CHECKSUM";
+                enabled: root.checksum-enabled;
+                clicked => { root.checksum-clicked(); }
             }
         }
 
