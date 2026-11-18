@@ -1,5 +1,5 @@
-//! NTFS integration: drive the external `mkntfs` tool, then verify the VBR
-//! and the volume-name record (S11).
+//! NTFS integration: drive the external `mkntfs` tool, then verify and patch
+//! the VBR, and read the volume-name record (S11).
 //!
 //! PLAN lines 661-679 mandate NTFS volumes that Windows and the UEFI:NTFS
 //! driver accept, built by shelling out to
@@ -12,10 +12,15 @@
 //! this module parses are the 512 VBR bytes and the `$MFT` record 3
 //! volume-name attribute, read back from the target.
 //!
-//! The S21 post-format hook for the NTFS VBR fix (PLAN lines 948-949) is
-//! explicitly deferred — this module ships no hook code, only this note
-//! that the hook has nowhere to live until S21 re-verifies the problem on
-//! Linux.
+//! Post-format VBR `HiddenSectors` guarantee (S21, PLAN lines 948-949):
+//! after `mkntfs` completes, [`patch_hidden_sectors`] reads back the four-byte
+//! `HiddenSectors` field (`u32` LE at VBR offset `0x1C`) from the target and
+//! writes `partition_start_lba` there when it differs. Older `mkntfs` builds
+//! and cross-distro packages may ignore the `-p` flag silently and leave
+//! `HiddenSectors` as zero; without the correct value Windows does not
+//! recognise the partition as bootable. The patch is a single 4-byte write
+//! through [`FileExt::write_all_at`] on a read+write handle this function
+//! opens itself, and is validated by reading the field back.
 //!
 //! Test discipline: the real NTFS toolchain is absent on this host, so
 //! every test below drives `#!/bin/sh` stubs or synthetic VBRs / `$MFT`
@@ -440,6 +445,11 @@ fn format_with(
     }
 
     let boot = boot_sector(&read_vbr(target)?)?;
+
+    // Guarantee HiddenSectors is correct even when mkntfs ignores -p. Only
+    // patch a target already verified to carry an NTFS VBR.
+    patch_hidden_sectors(target, options.partition_start)?;
+
     let label = match volume_label(target, &boot) {
         Ok(label) => label,
         Err(err) => {
@@ -482,6 +492,53 @@ fn read_vbr(target: &Path) -> Result<[u8; 512]> {
     file.read_exact_at(&mut vbr, 0)
         .map_err(|err| CoreError::io(target, err))?;
     Ok(vbr)
+}
+
+/// Guarantee that `HiddenSectors` (BPB `u32` LE at VBR offset `0x1C`) equals
+/// `start_lba`.
+///
+/// Some `mkntfs` builds silently ignore the `-p <start>` geometry flag and
+/// leave `HiddenSectors` as zero; without the correct value Windows does not
+/// recognise the NTFS partition as the system volume. This function reads the
+/// field, writes the correct value when it differs, and re-reads it to
+/// confirm. The whole operation is a single 4-byte write, so it cannot corrupt
+/// the rest of the VBR.
+///
+/// The function is a no-op when `start_lba` is `None` (geometry was not
+/// requested) or when the field already holds the right value.
+pub fn patch_hidden_sectors(target: &Path, start_lba: Option<u32>) -> Result<()> {
+    let Some(lba) = start_lba else {
+        return Ok(());
+    };
+    // Offset 0x1C: the BPB HiddenSectors field (u32 LE) in an NTFS VBR.
+    const OFFSET: u64 = 0x1C;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(target)
+        .map_err(|err| CoreError::io(target, err))?;
+    let mut buf = [0u8; 4];
+    file.read_exact_at(&mut buf, OFFSET)
+        .map_err(|err| CoreError::io(target, err))?;
+    let current = u32::from_le_bytes(buf);
+    if current == lba {
+        return Ok(());
+    }
+    let patched = lba.to_le_bytes();
+    file.write_all_at(&patched, OFFSET)
+        .map_err(|err| CoreError::io(target, err))?;
+    // Verify the write landed.
+    file.read_exact_at(&mut buf, OFFSET)
+        .map_err(|err| CoreError::io(target, err))?;
+    if u32::from_le_bytes(buf) != lba {
+        return Err(CoreError::invalid(format!(
+            "NTFS VBR HiddenSectors patch on {} did not persist: \
+             wrote {lba} but read back {}",
+            target.display(),
+            u32::from_le_bytes(buf),
+        )));
+    }
+    Ok(())
 }
 
 /// Read the volume label from `$MFT` record 3 of `target`.
@@ -1024,6 +1081,82 @@ mod tests {
     }
 
     #[test]
+    fn patch_hidden_sectors_writes_start_lba_when_zero() {
+        // A synthetic 512-byte VBR with HiddenSectors (0x1C..0x20) = 0.
+        // patch_hidden_sectors must write the requested start_lba there
+        // and leave every other byte of the VBR unchanged.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let vbr_path = scratch.path().join("vbr.bin");
+        let vbr = synthetic_vbr(512, 4096);
+        // Confirm the fixture's HiddenSectors field starts at zero (the
+        // synthetic_vbr helper never sets 0x1C..0x20).
+        assert_eq!(&vbr[0x1C..0x20], &[0, 0, 0, 0], "fixture must start zero");
+        std::fs::write(&vbr_path, vbr).expect("write synthetic VBR");
+
+        let start_lba: u32 = 2048;
+        patch_hidden_sectors(&vbr_path, Some(start_lba)).expect("patch must succeed");
+
+        let after = std::fs::read(&vbr_path).expect("read back");
+        assert_eq!(
+            &after[0x1C..0x20],
+            &start_lba.to_le_bytes(),
+            "HiddenSectors must equal start_lba after the patch"
+        );
+        // Every other byte must be unchanged.
+        let mut expected = vbr.to_vec();
+        expected[0x1C..0x20].copy_from_slice(&start_lba.to_le_bytes());
+        assert_eq!(after, expected, "only 0x1C..0x20 must change");
+    }
+
+    #[test]
+    fn patch_hidden_sectors_is_a_noop_when_already_correct() {
+        // If mkntfs already wrote the right value, the patch must not
+        // alter the file at all (single-write guarantee).
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let vbr_path = scratch.path().join("vbr.bin");
+        let start_lba: u32 = 2048;
+        let mut vbr = synthetic_vbr(512, 4096);
+        vbr[0x1C..0x20].copy_from_slice(&start_lba.to_le_bytes());
+        std::fs::write(&vbr_path, vbr).expect("write synthetic VBR");
+
+        patch_hidden_sectors(&vbr_path, Some(start_lba)).expect("patch must succeed");
+
+        let after = std::fs::read(&vbr_path).expect("read back");
+        assert_eq!(
+            after,
+            vbr.to_vec(),
+            "file must be unchanged when value already correct"
+        );
+    }
+
+    #[test]
+    fn patch_hidden_sectors_is_a_noop_when_no_start_lba() {
+        // With start_lba = None the function must not open or modify the
+        // file at all; we pass a path that does not exist to prove it.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let absent = scratch.path().join("absent.bin");
+        patch_hidden_sectors(&absent, None).expect("None start_lba must be a no-op");
+    }
+
+    #[test]
+    fn patch_hidden_sectors_refuses_a_target_shorter_than_the_field() {
+        // HiddenSectors lives at 0x1C..0x20; a target shorter than 0x20
+        // bytes cannot yield those four bytes, so the positional read must
+        // fail and surface as the house io error naming the target.
+        let scratch = tempfile::tempdir().expect("a scratch dir");
+        let target = scratch.path().join("short.bin");
+        std::fs::write(&target, [0u8; 0x1C]).expect("write a short target");
+
+        let error = patch_hidden_sectors(&target, Some(2048))
+            .expect_err("a target shorter than HiddenSectors is refused");
+        assert!(matches!(error, CoreError::Io { .. }), "{error}");
+        assert!(
+            error.to_string().contains(&target.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn boot_sector_accepts_synthetic_vbrs() {
         // Every power-of-two cluster size the options admit at 512-byte
         // sectors, plus the 4096-byte-sector corner (65536 / 4096 = 16
@@ -1281,6 +1414,15 @@ mod tests {
             .expect("a non-zero start is accepted");
 
         format_with(&target, &options, &logger, "mkntfs", &tool_path).expect("the stub exits 0");
+        // The synthetic VBR starts with HiddenSectors zero, so this pins the
+        // patch call site inside format_with: removing that call leaves the
+        // field at zero and fails here.
+        let vbr = read_vbr(&target).expect("the patched VBR reads back");
+        assert_eq!(
+            &vbr[0x1C..0x20],
+            &239616u32.to_le_bytes(),
+            "HiddenSectors must equal the partition start LBA after formatting"
+        );
         let messages: Vec<String> = logger
             .snapshot()
             .iter()
