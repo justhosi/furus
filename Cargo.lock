@@ -403,6 +403,11 @@ dependencies = [
 [[package]]
 name = "rufus-gui"
 version = "0.1.0"
+dependencies = [
+ "rufus-core",
+ "rufus-linux",
+ "rufus-proto",
+]
 
 [[package]]
 name = "rufus-helper"
