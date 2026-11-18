@@ -173,7 +173,7 @@ pub struct Options {
 /// The platform-supplied facts about the selected target path.
 ///
 /// `rufus-linux` fills this from `std::fs::metadata` plus sysfs discovery;
-/// the GUI can fill it straight from a selected [`Device`] model and the
+/// the GUI can fill it straight from a selected `Device` model and the
 /// CLI from the command line. `rufus-core` only grades the facts, so the
 /// crate keeps its platform boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -398,8 +398,6 @@ use super::uefi_ntfs::install_uefi_ntfs;
 use crate::boot::syslinux as boot_syslinux;
 use crate::boot::uefi_ntfs as boot_uefi_ntfs;
 
-mod support;
-
 mod dos;
 mod grub;
 mod run;

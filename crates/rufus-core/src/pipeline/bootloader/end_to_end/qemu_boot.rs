@@ -1,6 +1,12 @@
-use super::*;
 use super::qemu;
+use super::*;
 
+/// Build the Syslinux 4.07 fixture ISO: the same descriptor and
+/// directory shape as [`syslinux_iso`], but a 4.07 banner and no
+/// `.c32` files. 4.07 needs no core library, which is what makes
+/// it the bootable fixture: 6.04 needs real `.c32` modules no
+/// test can provide, so a 6.04 stick can never get past its
+/// loader.
 fn syslinux_407_iso() -> Vec<u8> {
     use crate::copy::source::fixture::*;
     const ROOT: u32 = 20;
@@ -190,8 +196,8 @@ fn syslinux_407_boots_to_its_prompt_in_qemu() {
         rufus_proto::BootloaderMode::Syslinux,
         false,
     );
-    let screen = qemu::capture(&disk, std::time::Duration::from_secs(10))
-        .expect("qemu captures the screen");
+    let screen =
+        qemu::capture(&disk, std::time::Duration::from_secs(10)).expect("qemu captures the screen");
     qemu::log(&screen);
     assert!(
         screen.iter().any(|line| line.contains("SYSLINUX 4.07")),
@@ -229,8 +235,8 @@ fn grub4dos_boots_to_its_prompt_in_qemu() {
         rufus_proto::BootloaderMode::Grub4dos,
         true,
     );
-    let screen = qemu::capture(&disk, std::time::Duration::from_secs(10))
-        .expect("qemu captures the screen");
+    let screen =
+        qemu::capture(&disk, std::time::Duration::from_secs(10)).expect("qemu captures the screen");
     qemu::log(&screen);
     assert!(
         screen.iter().any(|line| line.contains("grub>")),
@@ -256,8 +262,8 @@ fn freedos_boots_to_its_shell_in_qemu() {
         rufus_proto::BootloaderMode::Freedos,
         false,
     );
-    let screen = qemu::capture(&disk, std::time::Duration::from_secs(12))
-        .expect("qemu captures the screen");
+    let screen =
+        qemu::capture(&disk, std::time::Duration::from_secs(12)).expect("qemu captures the screen");
     qemu::log(&screen);
     assert!(
         screen
@@ -351,8 +357,8 @@ fn grub2_bios_boots_its_shell_and_reads_its_config_in_qemu() {
     let (_scratch, disk) = boot_disk(&iso, iso_len, rufus_proto::BootloaderMode::Grub2, true);
     // Fresh boot: the banner and the shell prove the record
     // handed off to the core and the core reached `normal`.
-    let screen = qemu::capture(&disk, std::time::Duration::from_secs(10))
-        .expect("qemu captures the screen");
+    let screen =
+        qemu::capture(&disk, std::time::Duration::from_secs(10)).expect("qemu captures the screen");
     qemu::log(&screen);
     assert!(
         screen.iter().any(|line| line.contains("GNU GRUB")),

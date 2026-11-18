@@ -24,6 +24,9 @@ use rufus_proto::Options;
 use rufus_proto::PLAN_VERSION;
 use rufus_proto::Plan;
 
+mod qemu;
+mod qemu_boot;
+
 /// 128 MiB stick image for the run.
 const DISK_BYTES: u64 = 128 * 1024 * 1024;
 
