@@ -110,6 +110,40 @@ fn default_true() -> bool {
     true
 }
 
+/// Non-destructive GUI display preferences, persisted under `[gui]`.
+///
+/// These only change what the window *shows* (which digests the checksum
+/// modal displays and whether the advanced format section is expanded).
+/// The active locale tag is **not** duplicated here: `Config::locale` is
+/// the single owner, so there is no risk of two disagreeing locale fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuiConfig {
+    /// Show the MD5 digest in the checksum modal.
+    pub hash_md5: bool,
+    /// Show the SHA-1 digest in the checksum modal.
+    pub hash_sha1: bool,
+    /// Show the SHA-256 digest in the checksum modal.
+    pub hash_sha256: bool,
+    /// Show the SHA-512 digest in the checksum modal.
+    pub hash_sha512: bool,
+    /// Expand the advanced format-options section.
+    pub advanced_visible: bool,
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            // Match the historical behaviour: all four digests were shown.
+            hash_md5: true,
+            hash_sha1: true,
+            hash_sha256: true,
+            hash_sha512: true,
+            advanced_visible: false,
+        }
+    }
+}
+
 /// User configuration (serde/TOML).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -130,6 +164,8 @@ pub struct Config {
     pub window: WindowConfig,
     /// Format-time toggles.
     pub advanced: AdvancedConfig,
+    /// Non-destructive GUI display preferences.
+    pub gui: GuiConfig,
 }
 
 impl Default for Config {
@@ -143,6 +179,7 @@ impl Default for Config {
             ignore_devices: Vec::new(),
             window: WindowConfig::default(),
             advanced: AdvancedConfig::default(),
+            gui: GuiConfig::default(),
         }
     }
 }
@@ -307,6 +344,13 @@ mod tests {
                 badblocks: true,
                 quick_format: false,
             },
+            gui: GuiConfig {
+                hash_md5: false,
+                hash_sha1: true,
+                hash_sha256: false,
+                hash_sha512: true,
+                advanced_visible: true,
+            },
         }
     }
 
@@ -449,6 +493,39 @@ mod tests {
         }
         let config: Config = toml::from_str("update_channel = 7\n").expect("parse");
         assert_eq!(config.update_channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn gui_table_loads_defaults_and_round_trips() {
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let path = scratch.path().join("rufus.toml");
+        // A file without `[gui]` must get the defaults, not fail to parse.
+        std::fs::write(&path, "show_all = true\n").expect("seed file");
+        let loaded = Config::load(&path).expect("load");
+        assert_eq!(loaded.config.gui, GuiConfig::default());
+        assert!(loaded.warning.is_none());
+
+        // Explicit `[gui]` keys are honoured and survive a save/reload.
+        std::fs::write(
+            &path,
+            "[gui]\nhash_md5 = false\nhash_sha1 = false\nhash_sha256 = true\nhash_sha512 = false\nadvanced_visible = true\n",
+        )
+        .expect("seed gui table");
+        let loaded = Config::load(&path).expect("load gui table");
+        let want = GuiConfig {
+            hash_md5: false,
+            hash_sha1: false,
+            hash_sha256: true,
+            hash_sha512: false,
+            advanced_visible: true,
+        };
+        assert_eq!(loaded.config.gui, want);
+        loaded.config.save(&path).expect("save");
+        assert_eq!(
+            Config::load(&path).expect("reload").config.gui,
+            want,
+            "the [gui] table survives atomic save"
+        );
     }
 
     #[test]

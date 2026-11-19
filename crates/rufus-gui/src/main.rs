@@ -56,6 +56,8 @@ use rufus_gui::analyzer::{AnalysisCoordinator, AnalysisResult, AnalyzerSender, A
 use rufus_gui::checksum::{
     ChecksumCoordinator, ChecksumOutcome, ChecksumResult, ChecksumSender, ChecksumWorker,
 };
+use rufus_gui::config_bridge::GuiPrefs;
+use rufus_gui::i18n_bridge::LocaleCatalog;
 use rufus_gui::ipc::{IpcError, PkexecTransport, open_helper, start_with_fallback};
 use rufus_gui::run::{CancelRequest, DeviceFacts, LogEntry, Run, RunState};
 use rufus_gui::state::{GuiState, WindowsImageOption};
@@ -698,10 +700,36 @@ struct Session {
     checksum: ChecksumCoordinator,
     checksum_visible: bool,
     checksum_result: Option<ChecksumResult>,
+    /// Locale catalog and active tag: text/flags only, never a business rule.
+    bridge: Arc<LocaleCatalog>,
+    lang: String,
+    /// Persisted GUI-only preferences (locale tag, hash toggles, advanced).
+    prefs: GuiPrefs,
 }
 
 impl Session {
+    /// Test constructor: embedded catalog and in-memory prefs, so a headless
+    /// `Session` never reads or writes a config file. Production startup
+    /// uses [`Session::with_prefs`] with the loaded bridge and prefs.
+    #[cfg(test)]
     fn new(discovery: rufus_gui::devices::Discovery) -> Self {
+        Self::with_prefs(
+            discovery,
+            Arc::new(LocaleCatalog::embedded(None)),
+            GuiPrefs::defaults(rufus_core::paths::default_config_path()),
+        )
+    }
+
+    /// Production/startup constructor: supply the loaded bridge and prefs.
+    fn with_prefs(
+        discovery: rufus_gui::devices::Discovery,
+        bridge: Arc<LocaleCatalog>,
+        prefs: GuiPrefs,
+    ) -> Self {
+        let lang = prefs
+            .locale()
+            .map(str::to_string)
+            .unwrap_or_else(|| bridge.lang().to_string());
         let mut device_list =
             rufus_gui::devices::DeviceListState::new(discovery.devices, discovery.warning);
         let first = device_list.devices().first().cloned();
@@ -720,6 +748,9 @@ impl Session {
             checksum: ChecksumCoordinator::default(),
             checksum_visible: false,
             checksum_result: None,
+            bridge,
+            lang,
+            prefs,
         };
         session.new_run();
         if let Some(first) = first {
@@ -903,6 +934,15 @@ impl Session {
         self.new_run();
         self.note = None;
     }
+
+    /// Persist GUI-only prefs and surface a save failure in the status line.
+    /// A failure never rolls back the in-memory pref (the UI stays in sync
+    /// with what the user just clicked) but it is reported honestly.
+    fn save_prefs(&mut self) {
+        if let Err(error) = self.prefs.save() {
+            self.note = Some(format!("Could not save preferences: {error}"));
+        }
+    }
 }
 
 /// Ask a desktop file picker for the boot image. Pure std process
@@ -941,6 +981,14 @@ fn pick_image_path() -> Option<PathBuf> {
 // strings the window shows come from here.
 // ---------------------------------------------------------------------------
 
+/// Pure caption formatter: resolve one static caption id through the bridge.
+///
+/// The caption ids and their English literals live in the Rust i18n bridge;
+/// `main.rs` only marshals the resolved text into a Slint property.
+fn caption(bridge: &LocaleCatalog, lang: &str, msgid: &str) -> String {
+    bridge.translate(lang, msgid)
+}
+
 fn status_with_device_warning(status: &str, note: Option<&str>, warning: Option<&str>) -> String {
     [Some(status), note, warning]
         .into_iter()
@@ -953,6 +1001,57 @@ fn status_with_device_warning(status: &str, note: Option<&str>, warning: Option<
 fn render(session: &Session, ui: &MainWindow) {
     let state = &session.state;
     let run_view = run_view(&session.run);
+
+    // Slice 7: locale, translated captions and GUI-only preferences. The
+    // bridge decides all text; `render` only marshals it into properties.
+    let lang = session.lang.as_str();
+    let bridge = &session.bridge;
+    ui.set_locale_model(model(
+        bridge
+            .locale_entries()
+            .into_iter()
+            .map(|(_, display)| display),
+    ));
+    ui.set_locale_current(SharedString::from(bridge.display_name(lang)));
+    ui.set_rtl(bridge.rtl(lang));
+    ui.set_caption_device(SharedString::from(caption(bridge, lang, "IDS_DEVICE_TXT")));
+    ui.set_caption_boot(SharedString::from(caption(
+        bridge,
+        lang,
+        "IDS_BOOT_SELECTION_TXT",
+    )));
+    ui.set_caption_partition(SharedString::from(caption(
+        bridge,
+        lang,
+        "IDS_PARTITION_TYPE_TXT",
+    )));
+    ui.set_caption_target(SharedString::from(caption(
+        bridge,
+        lang,
+        "IDS_TARGET_SYSTEM_TXT",
+    )));
+    ui.set_caption_fs(SharedString::from(caption(
+        bridge,
+        lang,
+        "IDS_FILE_SYSTEM_TXT",
+    )));
+    ui.set_caption_cluster(SharedString::from(caption(
+        bridge,
+        lang,
+        "IDS_CLUSTER_SIZE_TXT",
+    )));
+    ui.set_caption_format_options(SharedString::from(caption(
+        bridge,
+        lang,
+        "IDS_FORMAT_OPTIONS_TXT",
+    )));
+
+    let prefs = &session.prefs;
+    ui.set_advanced_visible(prefs.advanced_visible());
+    ui.set_hash_md5_checked(prefs.hash_md5());
+    ui.set_hash_sha1_checked(prefs.hash_sha1());
+    ui.set_hash_sha256_checked(prefs.hash_sha256());
+    ui.set_hash_sha512_checked(prefs.hash_sha512());
 
     ui.set_device_model(model(
         session.device_list.devices().iter().map(device_label),
@@ -1075,7 +1174,23 @@ fn run_gui() -> Result<(), slint::PlatformError> {
             warning: Some(format!("Device discovery failed: {error}")),
         },
     };
-    let session = SessionHandle::new(Session::new(discovery));
+    // Startup: load one TOML config through the core-owned bridge, then
+    // build the asset-or-embedded catalog for the saved locale. A load
+    // failure is reported but never overwrites the user's config file.
+    let config_path = rufus_core::paths::default_config_path();
+    let (prefs, warning) = match GuiPrefs::load(&config_path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("rufus-gui: could not load GUI preferences: {error}");
+            (GuiPrefs::defaults(&config_path), None)
+        }
+    };
+    let bridge = Arc::new(LocaleCatalog::load(prefs.locale()));
+    let mut started = Session::with_prefs(discovery, bridge, prefs);
+    if let Some(warning) = warning {
+        started.note = Some(warning);
+    }
+    let session = SessionHandle::new(started);
     let epoch = Arc::new(AtomicU64::new(0));
     let (analysis_tx, analysis_rx) = mpsc::channel::<AnalysisMessage>();
     let analysis_shutdown_tx = analysis_tx.clone();
@@ -1474,6 +1589,85 @@ fn run_gui() -> Result<(), slint::PlatformError> {
             }
         });
     }
+
+    // Slice 7 callbacks: locale change, the four hash-display toggles and
+    // advanced-options visibility. Each mutates only GUI prefs and saves
+    // through the core config; none touches planning or run state.
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_locale_selected(move |display| {
+            if let Some(ui) = weak.upgrade() {
+                let mut guard = session.borrow_mut();
+                if let Some(tag) = guard.bridge.tag_for_display(&display) {
+                    guard.lang = tag.clone();
+                    guard.prefs.set_locale(Some(tag));
+                    guard.save_prefs();
+                }
+                render(&guard, &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_hash_md5_toggled(move || {
+            if let Some(ui) = weak.upgrade() {
+                let mut guard = session.borrow_mut();
+                guard.prefs.set_hash_md5(ui.get_hash_md5_checked());
+                guard.save_prefs();
+                render(&guard, &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_hash_sha1_toggled(move || {
+            if let Some(ui) = weak.upgrade() {
+                let mut guard = session.borrow_mut();
+                guard.prefs.set_hash_sha1(ui.get_hash_sha1_checked());
+                guard.save_prefs();
+                render(&guard, &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_hash_sha256_toggled(move || {
+            if let Some(ui) = weak.upgrade() {
+                let mut guard = session.borrow_mut();
+                guard.prefs.set_hash_sha256(ui.get_hash_sha256_checked());
+                guard.save_prefs();
+                render(&guard, &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_hash_sha512_toggled(move || {
+            if let Some(ui) = weak.upgrade() {
+                let mut guard = session.borrow_mut();
+                guard.prefs.set_hash_sha512(ui.get_hash_sha512_checked());
+                guard.save_prefs();
+                render(&guard, &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_advanced_visible_toggled(move || {
+            if let Some(ui) = weak.upgrade() {
+                let mut guard = session.borrow_mut();
+                guard.prefs.set_advanced_visible(ui.get_advanced_visible());
+                guard.save_prefs();
+                render(&guard, &ui);
+            }
+        });
+    }
     ui.on_close_clicked(|| {
         let _ = slint::quit_event_loop();
     });
@@ -1513,13 +1707,14 @@ mod tests {
 
     use rufus_gui::checksum::{ChecksumOutcome, ChecksumResult, Digests};
     use rufus_gui::devices::{DeviceUpdate, Discovery};
+    use rufus_gui::i18n_bridge::LocaleCatalog;
     use rufus_gui::run::{DeviceFacts, LogEntry, Run, RunState};
     use rufus_gui::state::{GuiError, GuiState};
     use rufus_linux::{Device, Partition, Transport};
     use rufus_proto::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, Outcome, Progress};
 
     use super::{
-        CancelBridge, Session, checksum_digests, checksum_progress, checksum_status,
+        CancelBridge, Session, caption, checksum_digests, checksum_progress, checksum_status,
         confirmation_facts, log_lines, run_view, startup_refusal, status_with_device_warning,
     };
 
@@ -1771,6 +1966,34 @@ mod tests {
         assert!(status.contains("Select a device"));
         assert!(status.contains("WARNING: Show all exposes internal disks"));
         assert!(status.contains("destroy its data"));
+    }
+
+    #[test]
+    fn translated_captions_use_ids_and_keep_english_when_untranslated() {
+        let embedded = LocaleCatalog::embedded(Some("en-US"));
+        assert_eq!(caption(&embedded, "en-US", "IDS_DEVICE_TXT"), "Device");
+        assert_eq!(
+            caption(&embedded, "en-US", "IDS_FORMAT_OPTIONS_TXT"),
+            "Format Options"
+        );
+
+        // A catalog that carries no caption entry keeps the English literal
+        // instead of leaking a raw msgid into the UI; unknown ids stay as-is.
+        let partial = b"l \"en-US\" \"English\"\nt IDS_DEVICE_TXT \"Device\"\n";
+        let partial = LocaleCatalog::from_bytes(partial, Some("en-US"));
+        assert_eq!(
+            caption(&partial, "en-US", "IDS_BOOT_SELECTION_TXT"),
+            "Boot selection"
+        );
+        assert_eq!(caption(&partial, "en-US", "NO_SUCH_ID"), "NO_SUCH_ID");
+
+        // A real translation is used verbatim when the block has one.
+        let translated = "l \"en-US\" \"English\"\n\
+t IDS_DEVICE_TXT \"Device\"\n\
+l \"de-DE\" \"German\"\n\
+t IDS_DEVICE_TXT \"Gerät\"\n";
+        let de = LocaleCatalog::from_bytes(translated.as_bytes(), Some("de-DE"));
+        assert_eq!(caption(&de, "de-DE", "IDS_DEVICE_TXT"), "Gerät");
     }
 
     #[test]

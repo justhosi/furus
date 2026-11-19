@@ -52,6 +52,27 @@ export component MainWindow inherits Window {
     in property <string> status-text;
     in property <bool> start-enabled;
 
+    // ---- Slice 7: locale / i18n / GUI prefs (all values come from Rust) ----
+    // Slint 1.19 has no RTL layout engine; `rtl` is used only for pure
+    // presentation (text alignment), never for a business rule.
+    in property <[string]> locale-model;
+    in-out property <string> locale-current;
+    in property <bool> rtl;
+    in-out property <bool> advanced-visible;
+    in-out property <bool> hash-md5-checked;
+    in-out property <bool> hash-sha1-checked;
+    in-out property <bool> hash-sha256-checked;
+    in-out property <bool> hash-sha512-checked;
+    // Static captions are translated in Rust; the English source ids live
+    // in the Rust i18n bridge, not in this file.
+    in property <string> caption-device;
+    in property <string> caption-boot;
+    in property <string> caption-partition;
+    in property <string> caption-target;
+    in property <string> caption-fs;
+    in property <string> caption-cluster;
+    in property <string> caption-format-options;
+
     // ---- S25 run wiring (all values/callbacks come from Rust) ----
     // One flag locks every configuration control while a run is in flight.
     in property <bool> form-enabled: true;
@@ -91,17 +112,41 @@ export component MainWindow inherits Window {
     callback close-clicked();
     callback checksum-cancel-clicked();
     callback checksum-close-clicked();
+    callback locale-selected(string);
+    callback hash-md5-toggled();
+    callback hash-sha1-toggled();
+    callback hash-sha256-toggled();
+    callback hash-sha512-toggled();
+    callback advanced-visible-toggled();
 
     VerticalLayout {
         padding: 12px;
         spacing: 8px;
 
+        // Locale selection: the model of display names and the mapping back
+        // to locale tags are both provided by the Rust bridge.
         HorizontalLayout {
             spacing: 8px;
             Text {
-                text: "Device";
+                text: "Language";
                 vertical-alignment: center;
                 width: 110px;
+                horizontal-alignment: root.rtl ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
+            }
+            ComboBox {
+                model: root.locale-model;
+                current-value <=> root.locale-current;
+                selected(value) => { root.locale-selected(value); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.caption-device;
+                vertical-alignment: center;
+                width: 110px;
+                horizontal-alignment: root.rtl ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
             }
             device-combo := ComboBox {
                 model: root.device-model;
@@ -119,9 +164,10 @@ export component MainWindow inherits Window {
         HorizontalLayout {
             spacing: 8px;
             Text {
-                text: "Boot selection";
+                text: root.caption-boot;
                 vertical-alignment: center;
                 width: 110px;
+                horizontal-alignment: root.rtl ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
             }
             boot-combo := ComboBox {
                 model: root.boot-model;
@@ -160,9 +206,10 @@ export component MainWindow inherits Window {
         HorizontalLayout {
             spacing: 8px;
             Text {
-                text: "Partition scheme";
+                text: root.caption-partition;
                 vertical-alignment: center;
                 width: 110px;
+                horizontal-alignment: root.rtl ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
             }
             ComboBox {
                 model: root.scheme-model;
@@ -171,8 +218,9 @@ export component MainWindow inherits Window {
                 selected(value) => { root.scheme-selected(value); }
             }
             Text {
-                text: "Target system";
+                text: root.caption-target;
                 vertical-alignment: center;
+                horizontal-alignment: root.rtl ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
             }
             ComboBox {
                 model: root.target-model;
@@ -185,9 +233,10 @@ export component MainWindow inherits Window {
         HorizontalLayout {
             spacing: 8px;
             Text {
-                text: "File system";
+                text: root.caption-fs;
                 vertical-alignment: center;
                 width: 110px;
+                horizontal-alignment: root.rtl ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
             }
             ComboBox {
                 model: root.fs-model;
@@ -196,8 +245,9 @@ export component MainWindow inherits Window {
                 selected(value) => { root.fs-selected(value); }
             }
             Text {
-                text: "Cluster size";
+                text: root.caption-cluster;
                 vertical-alignment: center;
+                horizontal-alignment: root.rtl ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
             }
             ComboBox {
                 model: root.cluster-model;
@@ -228,30 +278,46 @@ export component MainWindow inherits Window {
             toggled => { root.extended-label-toggled(); }
         }
 
+        // Advanced-options visibility is a persisted GUI preference. The
+        // checkbox only flips a display flag; every underlying toggle still
+        // routes through its Rust callback.
         CheckBox {
-            text: "Quick format";
-            checked <=> root.quick-format-checked;
-            enabled: root.form-enabled;
-            toggled => { root.quick-format-toggled(); }
+            text: "Advanced options";
+            checked <=> root.advanced-visible;
+            toggled => { root.advanced-visible-toggled(); }
         }
 
-        HorizontalLayout {
+        if root.advanced-visible : VerticalLayout {
             spacing: 8px;
-            bad-blocks-check := CheckBox {
-                text: "Check device for bad blocks";
-                checked <=> root.bad-blocks-checked;
-                enabled: root.form-enabled;
-                toggled => { root.bad-blocks-toggled(); }
-            }
             Text {
-                text: "passes";
-                vertical-alignment: center;
+                text: root.caption-format-options;
+                font-weight: 700;
+                horizontal-alignment: root.rtl ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
             }
-            ComboBox {
-                model: root.passes-model;
-                current-value <=> root.passes-current;
-                enabled: root.form-enabled && root.passes-enabled;
-                selected(value) => { root.passes-selected(value); }
+            CheckBox {
+                text: "Quick format";
+                checked <=> root.quick-format-checked;
+                enabled: root.form-enabled;
+                toggled => { root.quick-format-toggled(); }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                bad-blocks-check := CheckBox {
+                    text: "Check device for bad blocks";
+                    checked <=> root.bad-blocks-checked;
+                    enabled: root.form-enabled;
+                    toggled => { root.bad-blocks-toggled(); }
+                }
+                Text {
+                    text: "passes";
+                    vertical-alignment: center;
+                }
+                ComboBox {
+                    model: root.passes-model;
+                    current-value <=> root.passes-current;
+                    enabled: root.form-enabled && root.passes-enabled;
+                    selected(value) => { root.passes-selected(value); }
+                }
             }
         }
 
@@ -371,7 +437,33 @@ export component MainWindow inherits Window {
                     ProgressIndicator {
                         progress: root.checksum-progress;
                     }
+                    // Which digests are shown is a persisted GUI preference.
+                    // The checkboxes only toggle display; hashing still runs
+                    // for all four algorithms in the Rust worker.
                     HorizontalLayout {
+                        spacing: 8px;
+                        CheckBox {
+                            text: "MD5";
+                            checked <=> root.hash-md5-checked;
+                            toggled => { root.hash-md5-toggled(); }
+                        }
+                        CheckBox {
+                            text: "SHA-1";
+                            checked <=> root.hash-sha1-checked;
+                            toggled => { root.hash-sha1-toggled(); }
+                        }
+                        CheckBox {
+                            text: "SHA-256";
+                            checked <=> root.hash-sha256-checked;
+                            toggled => { root.hash-sha256-toggled(); }
+                        }
+                        CheckBox {
+                            text: "SHA-512";
+                            checked <=> root.hash-sha512-checked;
+                            toggled => { root.hash-sha512-toggled(); }
+                        }
+                    }
+                    if root.hash-md5-checked : HorizontalLayout {
                         spacing: 8px;
                         Text {
                             text: "MD5";
@@ -383,7 +475,7 @@ export component MainWindow inherits Window {
                             read-only: true;
                         }
                     }
-                    HorizontalLayout {
+                    if root.hash-sha1-checked : HorizontalLayout {
                         spacing: 8px;
                         Text {
                             text: "SHA-1";
@@ -395,7 +487,7 @@ export component MainWindow inherits Window {
                             read-only: true;
                         }
                     }
-                    HorizontalLayout {
+                    if root.hash-sha256-checked : HorizontalLayout {
                         spacing: 8px;
                         Text {
                             text: "SHA-256";
@@ -407,7 +499,7 @@ export component MainWindow inherits Window {
                             read-only: true;
                         }
                     }
-                    HorizontalLayout {
+                    if root.hash-sha512-checked : HorizontalLayout {
                         spacing: 8px;
                         Text {
                             text: "SHA-512";

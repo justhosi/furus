@@ -506,7 +506,7 @@ const BINARY_BUDGETS: &[BinaryBudget] = &[
     },
     BinaryBudget {
         name: "rufus-gui",
-        budget: 12_000_000,
+        budget: 14_000_000,
     },
 ];
 
@@ -931,7 +931,7 @@ mod tests {
                 "rufus-gui".to_string(),
                 BaselineEntry {
                     bytes: 80,
-                    budget: 12_000_000,
+                    budget: 14_000_000,
                 },
             ),
         ]
