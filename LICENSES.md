@@ -8,7 +8,7 @@ manifest is not embedded in the payload, resource names are content-based
 inferences. No lawyer was consulted — this is an engineering sanity pass, as
 planned in S00.
 
-Baseline: the rewrite is licensed **GPL-3.0-or-later** (proposed decision A1),
+Baseline: the rewrite is licensed **GPL-3.0-or-later** (approved 2026-11-19, decision A1),
 and the assets are reused as embedded data (proposed decision A6). Component
 licences below use SPDX identifiers.
 

@@ -8,18 +8,19 @@ and each slice's amendments are recorded in section 4.
 
 ## 1. Decisions A1–A12
 
-These are the defaults the plan assumes (`PLAN.md` section 1). A4 is settled;
+These are the defaults the plan assumes (`PLAN.md` section 1). A1, A3, A4 and
+A5 are **approved** (ratified 2026-11-19 for A1/A3/A5, 2026-10-27 for A4);
 the rest are recorded here as **proposed**: they are plan defaults awaiting the
 user's confirmation. Each one changes the schedule if changed. If any of
 A1–A12 is rejected, stop and revise the plan before S01.
 
 | ID | Decision | Value | Status | Rationale |
 |----|----------|-------|--------|-----------|
-| A1 | Licence | **GPL-3.0-or-later** | proposed | Rufus is GPLv3; a derivative must stay GPLv3. |
+| A1 | Licence | **GPL-3.0-or-later** | approved 2026-11-19 | Rufus is GPLv3; a derivative must stay GPLv3. |
 | A2 | Public name | **new name** (working name `rufus-linux`) | proposed | GPL covers code, not the "Rufus" trademark. Keep attribution, avoid confusion. |
-| A3 | Targets | x86_64 + aarch64, glibc ≥ 2.31; static musl for CLI/helper | proposed | Covers Debian 11+, Ubuntu 20.04+, Fedora, Arch, Raspberry Pi. |
+| A3 | Targets | x86_64 + aarch64, glibc ≥ 2.31; static musl for CLI/helper | approved 2026-11-19 | Covers Debian 11+, Ubuntu 20.04+, Fedora, Arch, Raspberry Pi. |
 | A4 | External tools | **allowed** (approved 2026-10-27): `mke2fs`, `mkntfs`, `mkudffs`, behind a runtime check. FAT32/exFAT are written natively. | **approved 2026-10-27** | Pure-Rust ext4/NTFS/UDF writers are multi-year projects. |
-| A5 | C libraries | **wimlib** (LGPL-3.0-or-later) linked for WIM/ESD; optional `libext2fs` feature | proposed | Only sane way to apply Windows images correctly. |
+| A5 | C libraries | **wimlib** (LGPL-3.0-or-later) linked for WIM/ESD; optional `libext2fs` feature | approved 2026-11-19 | Only sane way to apply Windows images correctly. |
 | A6 | Assets | reuse Rufus's GPLv3 embedded assets, with provenance + licence audit (this slice's `LICENSES.md` and `assets/manifest.json`) | proposed | FreeDOS, Syslinux, GRUB4DOS, UEFI:NTFS, `rufus.loc`, icons. |
 | A7 | GUI | **Slint** (GPLv3), software renderer, no GPU, no webview, no GTK | proposed | Smallest native toolkit with this widget set; ~4–6 MB. |
 | A8 | Concurrency | threads + channels, **no async runtime** | proposed | Async buys nothing here; saves ~1 MB and startup time. |
@@ -30,7 +31,7 @@ A1–A12 is rejected, stop and revise the plan before S01.
 
 Note on A4: the runtime check behind A4 covers `mke2fs`, `mkntfs`, `mkudffs`
 with a clear package hint when absent. Wimlib linkage is recorded under **A5**,
-not A4, and follows A5's status (still proposed).
+not A4, and follows A5's status (approved 2026-11-19).
 
 ## 2. Trademark and naming
 
@@ -58,8 +59,9 @@ go-ahead.** S00 delivers only this file, `LICENSES.md` and
 next slice (S01 — workspace, CI, size gates, parity tool) is gated on:
 
 1. the user's explicit go-ahead, and
-2. the status of A1–A3 and A5–A12 (proposed here; a rejection of any of them
-   means stop and revise the plan before S01).
+2. the status of the decisions still proposed here (A2 and A6–A12): A1, A3, A4
+   and A5 are now approved and no longer block, but a rejection of any
+   still-proposed decision means stop and revise the plan before S01.
 
 ## 4. Amendments after S00
 
@@ -261,3 +263,44 @@ A1–A12 value changes and no dependency is added.
 * **Not renumbered**: for the same reason as the slice-1 entry above — these
   settle contracts *inside* the A8/A9 decisions rather than adding a plan
   default whose value would still await user confirmation.
+
+### 2026-11-19 - S26 amendments (A1, A3, A5 ratified)
+
+S26 ratifies three of the S00 plan defaults — A1, A3 and A5 — against what the
+tree already ships. Only these three status cells change; their values and
+rationales in section 1 are unchanged, and no other A-number is touched.
+
+* **A1 (Licence) — GPL-3.0-or-later, approved**: the rewrite is GPL-3.0-or-later,
+  as upstream Rufus is GPLv3 and a derivative must stay GPLv3. This is not a new
+  commitment: `LICENSES.md`'s audit of all 86 embedded assets already records
+  that baseline, and `deny.toml` already accepts only the `GPL-3.0-only`
+  copyleft branch of the tri-licensed Slint crates (pinned to `=1.19.0`), never
+  the proprietary `LicenseRef-Slint-*` branches. In user-facing terms: the
+  program and its assets stay free and open under GPLv3, and because this
+  repository is public it is itself the corresponding-source offer required by
+  the GPL — anyone who receives a binary can get the source that built it.
+
+* **A3 (Targets) — approved**: the two target families are x86_64 and aarch64,
+  each on glibc ≥ 2.31 (Debian 11+, Ubuntu 20.04+, Fedora, Arch, Raspberry Pi),
+  with a static-musl option for the CLI and the helper. The mechanism that will
+  exercise these is `xtask dist --target <triple>`. Honest scope note: only the
+  host triple is verified in this environment; cross-building requires the
+  target toolchains to be installed, so no aarch64 binary is claimed to have
+  been built here.
+
+* **A5 (C libraries) — approved**: wimlib remains LGPL-3.0-or-later and is
+  linked for WIM/ESD through `wimlib-sys`, with the opt-in `strict-link` feature
+  added in S22 turning a missing system `libwim` into a compile error. The LGPL
+  relink and source obligations are met by shipping wimlib as a separate
+  package (so a recipient can relink against a modified library) and by
+  including the licence texts in the distribution bundle. The optional
+  `libext2fs` feature is unchanged.
+
+* **A2 and A6–A12 remain proposed and are outside S26's authorization.**
+  Ratifying them would require user decisions that were never given — the
+  public name (A2) specifically still awaits the user, because "Rufus" is a
+  trademark and only the user can pick the release name. Consequently the
+  specification's broad phrase "no unratified S00 architecture items
+  remaining" is not literally achievable without fabricating those decisions;
+  after S26 the accurate statement is that A1, A3, A4 and A5 are approved and
+  A2 and A6–A12 remain proposed.
