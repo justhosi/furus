@@ -3,4 +3,5 @@
 pub mod analyzer;
 pub mod devices;
 pub mod ipc;
+pub mod run;
 pub mod state;
