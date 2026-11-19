@@ -3549,8 +3549,10 @@ dependencies = [
  "rufus-linux",
  "rufus-proto",
  "rustix 1.1.6",
+ "serde_json",
  "slint",
  "slint-build",
+ "zbus 6.2.0",
 ]
 
 [[package]]

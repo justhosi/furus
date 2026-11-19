@@ -8,8 +8,60 @@ use std::sync::{Arc, Mutex};
 
 use rufus_proto::{Event, LineError, Plan, from_jsonl_line};
 
+pub mod dbus;
 pub mod pkexec;
+pub use dbus::DbusTransport;
 pub use pkexec::PkexecTransport;
+
+/// Chosen implementation of the helper transport.
+pub enum TransportChoice {
+    /// Prefer the privileged system-bus service.
+    Dbus(DbusTransport),
+    /// One-shot fallback through pkexec.
+    Pkexec(PkexecTransport),
+}
+
+impl HelperTransport for TransportChoice {
+    fn start(&mut self, plan: &Plan) -> Result<Started, IpcError> {
+        match self {
+            Self::Dbus(transport) => transport.start(plan),
+            Self::Pkexec(transport) => transport.start(plan),
+        }
+    }
+}
+
+/// Prefer the system-bus service; fall back to the one-shot pkexec path.
+///
+/// `prefer_dbus` is an injected probe so selection is testable without any
+/// bus access. If the selected D-Bus transport later returns
+/// [`IpcError::Unavailable`] from `start`, the caller should retry once with
+/// pkexec via [`start_with_fallback`].
+#[must_use]
+pub fn open_helper(prefer_dbus: impl FnOnce() -> bool) -> TransportChoice {
+    if prefer_dbus() {
+        TransportChoice::Dbus(DbusTransport::new())
+    } else {
+        TransportChoice::Pkexec(PkexecTransport::new())
+    }
+}
+
+/// Start the preferred transport, retrying through `fallback` only when its
+/// error is [`IpcError::Unavailable`]. The fallback is constructed and
+/// started at most once; its result is returned unchanged.
+///
+/// AccessDenied may mean either polkit denied the user or the helper's
+/// authorization check is unavailable; fallback cannot distinguish
+/// them and could re-prompt a user who already refused.
+pub fn start_with_fallback(
+    preferred: &mut dyn HelperTransport,
+    plan: &Plan,
+    fallback: impl FnOnce() -> Box<dyn HelperTransport>,
+) -> Result<Started, IpcError> {
+    match preferred.start(plan) {
+        Err(IpcError::Unavailable(_)) => fallback().start(plan),
+        result => result,
+    }
+}
 
 /// Failure to start or communicate with the privileged helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +242,10 @@ mod tests {
         Step, Target,
     };
 
-    use super::{CancelHandle, EventStream, HelperTransport, IpcError, MockTransport};
+    use super::{
+        CancelHandle, DbusTransport, EventStream, HelperTransport, IpcError, MockTransport,
+        PkexecTransport, Started, TransportChoice, open_helper, start_with_fallback,
+    };
 
     fn plan() -> Plan {
         Plan {
@@ -317,6 +372,126 @@ mod tests {
             Some(Err(IpcError::Transport("reader closed".to_string())))
         );
         assert_eq!(events.next(), None);
+    }
+
+    struct FailingTransport {
+        result: Option<IpcError>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HelperTransport for FailingTransport {
+        fn start(&mut self, _plan: &rufus_proto::Plan) -> Result<Started, IpcError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(self.result.take().expect("start called once"))
+        }
+    }
+
+    #[test]
+    fn open_helper_selects_transport_from_injected_probe() {
+        assert!(matches!(open_helper(|| true), TransportChoice::Dbus(_)));
+        assert!(matches!(open_helper(|| false), TransportChoice::Pkexec(_)));
+        fn assert_transport<T: HelperTransport>() {}
+        assert_transport::<DbusTransport>();
+        assert_transport::<PkexecTransport>();
+    }
+
+    #[test]
+    fn unavailable_preferred_transport_retries_fallback_once_and_returns_its_result() {
+        let preferred_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let mut preferred = FailingTransport {
+            result: Some(IpcError::Unavailable("bus absent".to_string())),
+            calls: Arc::clone(&preferred_calls),
+        };
+        let fallback_counter = Arc::clone(&fallback_calls);
+        let fallback = move || {
+            Box::new(FailingTransport {
+                result: Some(IpcError::Transport("fallback result".to_string())),
+                calls: fallback_counter,
+            }) as Box<dyn HelperTransport>
+        };
+        assert_eq!(
+            start_with_fallback(&mut preferred, &plan(), fallback).err(),
+            Some(IpcError::Transport("fallback result".to_string()))
+        );
+        assert_eq!(preferred_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn authorization_denial_from_dbus_does_not_construct_fallback() {
+        let mapped = super::dbus::map_bus_error(
+            zbus::fdo::Error::AccessDenied("polkit denied".to_string()).into(),
+            super::dbus::BusPhase::AfterExecute,
+        );
+        assert!(matches!(mapped, IpcError::Transport(_)));
+
+        let mut preferred = FailingTransport {
+            result: Some(mapped),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let fallback_called = Arc::new(AtomicUsize::new(0));
+        let fallback_counter = Arc::clone(&fallback_called);
+        let result = start_with_fallback(&mut preferred, &plan(), move || {
+            fallback_counter.fetch_add(1, Ordering::Relaxed);
+            Box::new(FailingTransport {
+                result: Some(IpcError::Transport("unexpected".to_string())),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        });
+        assert!(matches!(result, Err(IpcError::Transport(_))));
+        assert_eq!(fallback_called.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn execute_io_error_does_not_construct_fallback() {
+        let mapped = super::dbus::map_bus_error(
+            zbus::Error::InputOutput(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "connection lost after Execute",
+            ))),
+            super::dbus::BusPhase::AfterExecute,
+        );
+        assert!(matches!(mapped, IpcError::Transport(_)));
+
+        let mut preferred = FailingTransport {
+            result: Some(mapped),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let fallback_called = Arc::new(AtomicUsize::new(0));
+        let fallback_counter = Arc::clone(&fallback_called);
+        let result = start_with_fallback(&mut preferred, &plan(), move || {
+            fallback_counter.fetch_add(1, Ordering::Relaxed);
+            Box::new(FailingTransport {
+                result: Some(IpcError::Transport("unexpected".to_string())),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        });
+        assert!(matches!(result, Err(IpcError::Transport(_))));
+        assert_eq!(fallback_called.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn non_unavailable_preferred_error_does_not_construct_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut preferred = FailingTransport {
+            result: Some(IpcError::Transport("not fallback eligible".to_string())),
+            calls: Arc::clone(&calls),
+        };
+        let fallback_called = Arc::new(AtomicUsize::new(0));
+        let fallback_counter = Arc::clone(&fallback_called);
+        let result = start_with_fallback(&mut preferred, &plan(), move || {
+            fallback_counter.fetch_add(1, Ordering::Relaxed);
+            Box::new(FailingTransport {
+                result: Some(IpcError::Transport("unexpected".to_string())),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        });
+        assert_eq!(
+            result.err(),
+            Some(IpcError::Transport("not fallback eligible".to_string()))
+        );
+        assert_eq!(fallback_called.load(Ordering::Relaxed), 0);
     }
 
     #[test]

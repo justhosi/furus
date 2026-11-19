@@ -16,6 +16,13 @@ path = "src/main.rs"
 rufus-core = { path = "../rufus-core" }
 rufus-linux = { path = "../rufus-linux" }
 rufus-proto = { path = "../rufus-proto" }
+# Serializes the D-Bus-mapped `rufus_proto::Event` into a JSONL line for
+# `rufus-proto`'s shared `from_jsonl_line` parser (no second parser).
+serde_json.workspace = true
+# System-bus client for `org.rufuslinux.Helper1`. zbus 6 has no blocking API,
+# so its connection, proxy and signal stream are driven with `zbus::block_on`
+# on this transport's own thread.
+zbus.workspace = true
 # A7: Slint is the mandated GUI toolkit (S24-T1). Pinned to a single
 # exact version with default-features off; the feature set is the
 # minimal one for a winit backend with the software renderer only —
