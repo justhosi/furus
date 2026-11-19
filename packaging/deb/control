@@ -1,0 +1,13 @@
+Package: rufus
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: any
+Maintainer: furus maintainers <mohamadzadeh@outlook.com>
+Depends: libc6 (>= 2.31)
+Recommends: ntfs-3g, e2fsprogs, udftools, libwim15
+Description: native USB image writer for Linux
+ Write disk images to USB devices with a native writer. FAT32 and exFAT are
+ written natively; an optional root-owned D-Bus helper mediates device access.
+ NTFS, ext2/3/4, UDF and WIM/ESD images need the recommended external tools
+ (ntfs-3g, e2fsprogs, udftools and libwim15) available at write time.

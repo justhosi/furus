@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=rufus-linux
+GenericName=USB Image Writer
+Comment=Write disk images to USB devices
+Exec=rufus-gui
+Icon=org.rufuslinux.Rufus
+Terminal=false
+Categories=System;Utility;
+StartupWMClass=rufus-gui
+Keywords=usb;image;writer;flash;disk;bootable;rufus;

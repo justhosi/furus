@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="0" y="0" width="128" height="128" rx="16" fill="#1f2933"/>
+  <!-- USB connector and housing -->
+  <rect x="52" y="14" width="24" height="22" rx="3" fill="#cbd2d9"/>
+  <rect x="44" y="32" width="40" height="26" rx="4" fill="#9aa5b1"/>
+  <!-- Drive body -->
+  <rect x="38" y="56" width="52" height="56" rx="8" fill="#3d5a80"/>
+  <!-- Write arrow: shaft pointing down into the drive, arrowhead at the tip -->
+  <path d="M64 68 V96 M64 96 L54 86 M64 96 L74 86"
+        fill="none" stroke="#f4f6f8" stroke-width="7"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

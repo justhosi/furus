@@ -1,0 +1,42 @@
+# Maintainer: furus maintainers <mohamadzadeh@outlook.com>
+pkgname=rufus-linux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native USB image writer for Linux"
+arch=('x86_64' 'aarch64')
+url="https://github.com/justhosi/furus"
+license=('GPL-3.0-or-later')
+# The source is the distribution bundle produced by `cargo xtask dist`
+# (rufus-linux-0.1.0-<target>.tar.gz); dist stages the binaries and metadata
+# into it. Nothing is downloaded from the network in package().
+source=("rufus-linux-${pkgver}.tar.gz")
+depends=('glibc>=2.31')
+optdepends=(
+  'ntfs-3g'
+  'ntfsprogs'
+  'e2fsprogs'
+  'udftools'
+  'wimlib'
+)
+
+package() {
+  install -Dm755 "${srcdir}/rufus" "${pkgdir}/usr/bin/rufus"
+  install -Dm755 "${srcdir}/rufus-gui" "${pkgdir}/usr/bin/rufus-gui"
+  install -Dm755 -o root -g root "${srcdir}/rufus-helper" \
+    "${pkgdir}/usr/libexec/rufus-helper"
+
+  install -Dm644 "${srcdir}/org.rufuslinux.policy" \
+    "${pkgdir}/usr/share/polkit-1/actions/org.rufuslinux.policy"
+  install -Dm644 "${srcdir}/org.rufuslinux.Helper1.service" \
+    "${pkgdir}/usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service"
+  install -Dm644 "${srcdir}/org.rufuslinux.Helper1.conf" \
+    "${pkgdir}/usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf"
+  install -Dm644 "${srcdir}/org.rufuslinux.Rufus.desktop" \
+    "${pkgdir}/usr/share/applications/org.rufuslinux.Rufus.desktop"
+  install -Dm644 "${srcdir}/org.rufuslinux.Rufus.metainfo.xml" \
+    "${pkgdir}/usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml"
+  install -Dm644 "${srcdir}/org.rufuslinux.Rufus.svg" \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg"
+  install -Dm644 "${srcdir}/LICENSES.md" \
+    "${pkgdir}/usr/share/licenses/rufus-linux/LICENSES.md"
+}
