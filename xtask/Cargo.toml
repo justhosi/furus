@@ -7,6 +7,11 @@ publish.workspace = true
 [dependencies]
 anyhow = "1"
 csv = "1"
+# S26-T3: distribution bundles. These are already in Cargo.lock as transitive
+# dependencies of the workspace, so adding them here needs no new downloads.
+flate2 = "1.1"
+quick-xml = "0.41"
+tar = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
