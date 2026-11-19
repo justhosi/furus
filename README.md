@@ -188,18 +188,37 @@ write side is the most complete part:
 * The GUI arrived in S24 and is no longer a stub: `rufus-gui` opens a
   Slint window over the headless `GuiState` (device, boot selection, image
   option, partition scheme, target system, file system, cluster size, labels,
-  quick format, bad blocks; START reports the plan or its refusal and CLOSE
-  quits), refuses to run as root, and never writes to a device. Live hotplug
-  watching keeps the device list current (S24 C3: a watcher thread whose
-  snapshots are published to the event loop, with the selection held by stable
-  device identity); selecting an image now analyses it off the UI thread
+  quick format, bad blocks), refuses to run as root, and stays unprivileged —
+  writes run in the separate privileged helper, never in the GUI process. Live
+  hotplug watching keeps the device list current (S24 C3: a watcher thread
+  whose snapshots are published to the event loop, with the selection held by
+  stable device identity); selecting an image analyses it off the UI thread
   (S24 C4: size/SHA-256/kind plus the Windows-ness, boot-mode, distro and WIM
   facts, with a monotonic request id so a superseded result can never
-  overwrite a newer selection), the CHECKSUM button shows the digest that
-  analysis already computed without re-reading the file, and START stays
-  disabled until the shared planner accepts the current state. The window has
-  not been rendered on a real display — see `TECHNICAL.md` section 3.7 for
-  exactly what is and is not verified.
+  overwrite a newer selection), and START stays disabled until the shared
+  planner accepts the current state. S25 wired the confirmed write path:
+  START still only builds a plan, but it now opens a "CONFIRM DESTRUCTIVE
+  WRITE" dialog carrying the captured device facts and an irreversibility
+  warning; only "CONFIRM AND WRITE" attaches the plan's SHA-256 confirm token
+  and hands it to a worker that starts the helper transport and streams its
+  events into a run state machine. "GO BACK" discards the plan, CANCEL is
+  enabled while a run is in flight, a form-wide lock freezes every
+  configuration control during the run, and a show/hide log drawer renders
+  the buffered events and the terminal outcome. The helper is reached through
+  a pkexec reader thread or a D-Bus client on `org.rufuslinux.Helper1`, with
+  one fallback to pkexec when the preferred transport is unavailable. The
+  CHECKSUM button now opens a cancellable modal that streams MD5, SHA-1,
+  SHA-256 and SHA-512 digests at once through the core hasher with bounded
+  progress, rather than echoing the single digest analysis already computed.
+  A Language combo selects the display locale (from the system `.loc` asset
+  or a small embedded fallback, with translation through `rufus_core::i18n`),
+  and Arabic, Hebrew, Persian and Urdu get RTL text alignment; the locale,
+  advanced-section visibility and which of the four digests the modal shows
+  are persisted as GUI preferences in a `[gui]` table of the core-owned TOML
+  config. The window has not been rendered on a real display, and the
+  privileged transports have not been exercised against a live system bus
+  here — see `TECHNICAL.md` sections 3.7 and 3.8 for exactly what is and is
+  not verified.
 
 There is no production-readiness claim here. Open acceptance items (for
 example a real 32 GB Windows installer boot) are documented as such in
@@ -252,7 +271,10 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
   analyze, plan, list, write.
 * `rufus-gui` - the Slint desktop front end (S24: the window, the headless
   `GuiState` it renders, the `std::thread` device watch and the background
-  image analyzer; planning only, no writes).
+  image analyzer; S25: the confirmation-gated run flow, the cancellable
+  four-algorithm checksum modal, the locale and GUI-preference bridges, and
+  the pkexec/D-Bus helper transports. It still owns no privilege: confirmed
+  writes run in the helper).
 * `xtask` - repo maintenance: asset-manifest check, parity check, the
   per-binary size gate, CI ordering.
 
@@ -294,9 +316,11 @@ system linkers; it never rewrites the baseline):
 
     CARGO_NET_OFFLINE=true cargo xtask size
 
-At the S24 tip it reports `rufus` 1,809,576 bytes (budget 3,000,000),
-`rufus-helper` 1,405,992 (2,500,000) and `rufus-gui` 11,602,240
-(12,000,000), `size: within committed baseline allowance, all budgets OK`.
+At the S25 tip it reports `rufus` 1,810,152 bytes (budget 3,000,000),
+`rufus-helper` 1,406,296 (2,500,000) and `rufus-gui` 12,774,280
+(14,000,000 — raised from 12 MB in S25 to absorb the two zbus versions and
+the rest of the S25 GUI growth), `size: within committed baseline allowance,
+all budgets OK`.
 
 ## Tests
 
