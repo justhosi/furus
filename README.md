@@ -225,6 +225,24 @@ There is no production-readiness claim here. Open acceptance items (for
 example a real 32 GB Windows installer boot) are documented as such in
 the test module docs rather than faked.
 
+### Slice completion (S21–S27)
+
+This matrix is the authoritative completion marker for the later slices. It
+also records the automation/release slices (S26, S27), which have **no rows in
+the function-parity ledger** (`data/parity.csv`) because they ported no
+analysed upstream function — the ledger only covers functions and thunks from
+`data/functions.csv`. Those slices are tracked here instead.
+
+| Slice | Scope | State |
+|---|---|---|
+| S21 | Windows To Go / FFU-WIM — GPT Windows To Go layout, WIM apply via wimlib, UEFI/BIOS BCD stores built without Windows tools, offline `SanPolicy=4` | complete (on `main`) |
+| S22 | Windows User Experience — wimlib strict-link feature, NTFS overhead pre-flight reserve, dynamic locale/template-GUID fallback, regf property tests | complete (on `main`) |
+| S23 | Hashing / SBAT / EFI fixup — MD5/SHA1/SHA256/SHA512 hashing, shared plan builder, bootloader submodules and bad-blocks reconciliation; the ledger also assigns the `hash-efi` (SBAT + EFI boot-file fixup) module here | complete (on `main`) |
+| S24 | Slint GUI — unprivileged window over `GuiState`, hotplug device watch, background image analysis | complete (on `main`) |
+| S25 | Update check + confirmed write flow — confirmation-gated GUI run and helper IPC transports, four-digest checksum modal, locale/preferences; the parity ledger assigns the `net` (HTTP update check/download) module here, but only the `check_updates`/`update_channel` config fields exist, not a live update-check feature | complete (on `main`) |
+| S26 | Release bundles / packaging — finalized `packaging/` metadata and the deterministic `cargo xtask dist` bundle | complete (on `main`) |
+| S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | T1 (gate) committed at `75563b4`; T2 (this documentation slice) uncommitted; T3 (CI wiring in `.github/workflows/ci.yml`) pending |
+
 ### `analyze` report
 
 `rufus analyze [--json] <image>` reports the S16 image analysis in a
@@ -277,8 +295,8 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
   the pkexec/D-Bus helper transports. It still owns no privilege: confirmed
   writes run in the helper).
 * `xtask` - repo maintenance: asset-manifest check, parity check, the
-  per-binary size gate, CI ordering, and `dist` (release bundles - see Build
-  below).
+  per-binary size gate, CI ordering, `dist` (release bundles - see Build
+  below), and `qa` (the two-tier end-to-end release gate - see Tests below).
 
 The crate layering keeps privileged I/O in `rufus-linux` /
 `rufus-helper` and the formatter logic in `rufus-core`, which never
@@ -391,6 +409,42 @@ through the real kernel (`#[ignore]`d, root + loop devices, run with
 against a real NTFS volume in OVMF (unprivileged; it runs in the normal
 suite and skips with one `skip:` line when qemu, grub-mkimage, mkntfs,
 ntfscp, unshare, ntfs-3g or the OVMF images are absent).
+
+### Automated QA gate (`cargo xtask qa`)
+
+`cargo xtask qa` is the S27 end-to-end release gate: one command that
+orchestrates the suites above and reports one `PASS`, `FAIL` or `SKIP` line
+per stage, ending in `qa: all suites passed` (or a list of failures). It is
+unprivileged by default and safe to run on a plain CI runner. From this host:
+
+    env -u APPDIR PATH="$HOME/.cargo/bin:$PATH" cargo xtask qa
+
+* **Tier 1 — always on, unprivileged, sparse-file targets only.** It runs the
+  MBR/GPT partition-table suite, the FAT32/exFAT/NTFS/ext4/UDF formatter
+  suites, the UEFI:NTFS structural tests, and the Windows BCD / SYSTEM hive
+  suites (the BCD element set, the `0xc0000001` regression guard, and
+  `SanPolicy=4` in the SYSTEM hive). No root and no loop devices are needed:
+  these are file-backed images and structural tests.
+* **Tier 2 — headless QEMU boot checks, when QEMU + firmware are installed.**
+  BIOS is checked twice: a self-contained smoke test boots a hand-assembled
+  512-byte MBR (real-mode loop printing `FURUS-QA-OK` to COM1, asserted over
+  `-serial stdio` under SeaBIOS), then the real Syslinux 4.07, FreeDOS and
+  GRUB2 BIOS boot suites run. UEFI delegation reuses the existing
+  OVMF/UEFI:NTFS `uefi_ntfs_boot` harness, which asserts its own
+  `UEFI-NTFS-OK` serial marker instead of crafting an EFI binary in xtask.
+* **Strict deadlines and kill/reap.** Every suite has a 120-second backstop
+  deadline (the BIOS smoke boot gets 30 seconds), and the spawned child is
+  killed and reaped on timeout, failure or early return (`ChildGuard`), so a
+  hung machine can never hang CI. Missing tools or firmware produce an
+  explicit `SKIP` line, never a silent pass.
+* **Flags.** `--require-qemu` makes a missing QEMU/OVMF toolchain fatal
+  instead of skipping; `--privileged` additionally enables the
+  loop-device/mount and pipeline end-to-end suites, which are `#[ignore]`d
+  and off by default. `APPDIR` is removed at spawn so a stale AppImage
+  variable cannot break asset lookup.
+
+CI will run `cargo xtask qa` as a gate; the workflow wiring is the remaining
+S27 task (Slice 3/3, `.github/workflows/ci.yml`).
 
 ## Docs
 

@@ -1,106 +1,101 @@
-# HANDOFF — furus/ repo, S26 final (Slice 4/4 complete)
+# HANDOFF — furus/ repo, S27-T2 (Slice 2/3)
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD `d0b9d42`.
-This file is self-contained for a fresh context. **S26 (Distribution packaging
-& release bundles) is fully complete.** Nothing has been committed or pushed by
-this slice; do neither without explicit user permission. `coder` never pushes.
+Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`. Base HEAD `75563b4`
+(`feat(qa): implement S27-T1 xtask qa release gate`, Slice 1/3, committed).
+S27-T1 is complete and committed; **S27-T2 (this slice) is uncommitted in the
+working tree**; S27-T3 (CI wiring) is the remaining slice. This file is
+self-contained for a fresh context. **Nothing was committed or pushed by this
+slice; do neither without explicit user permission.** `coder` never pushes.
 
-## Commits so far (all already on `main`)
+## Slice map
 
-* `9cd7d38` — docs: ratify A1, A3, A5 in S26-T1 decision records.
-* `2ba0ff4` — feat(packaging): complete S26-T2 distribution definitions.
-* `d0b9d42` — feat(dist): implement S26-T3 distribution bundles and align distro specs.
+| Slice | Content | State |
+|---|---|---|
+| S27-T1 | `cargo xtask qa` two-tier gate + 8 new `xtask` tests | committed at `75563b4` |
+| S27-T2 | Completion markers + docs (this slice) | uncommitted in working tree |
+| S27-T3 | Add `cargo xtask qa` to `.github/workflows/ci.yml` | remaining (not started) |
 
-S26-T4 (this slice) is intentionally **uncommitted** in the working tree so a
-reviewer can inspect it; the only changed files are:
-`xtask/src/main.rs` (tests + one behavior-preserving helper extraction),
-`TECHNICAL.md` (appended S26 section) and this `HANDOFF.md` (overwritten).
+## What S27-T2 changed (this slice, uncommitted)
 
-`cargo`/`rustc` 1.99.0 live in `~/.cargo/bin`, not on the default PATH. Prefix
-cargo commands with `PATH="$HOME/.cargo/bin:$PATH"`.
+Only in-scope files were touched (`git status --short` must show these and
+nothing else):
 
-## What S26 built
+* `tools/parity.py` — **docstring/comment only**. Extended the module docstring
+  to explain that the ledger covers analysed functions/thunks only, that S26
+  (packaging) and S27 (QA gate) are therefore absent from it and are tracked in
+  the README completion table, and to list the S21–S27 slice meanings. No
+  `BY_MODULE`, `OVERRIDES` or generated-row change; parity.csv stays byte-stable.
+* `README.md` — added a `### Slice completion (S21–S27)` matrix under Status,
+  added a `### Automated QA gate (\`cargo xtask qa\`)` subsection under Tests
+  (two tiers, SeaBIOS COM1 smoke, real BIOS/UEFI suites, timeouts/kill-reap,
+  `SKIP` lines, flags, CI-wiring note), and updated the `xtask` layout bullet
+  to mention `qa`.
+* `TECHNICAL.md` — appended `## S27 — Automated QA gate` recording all T1–T3
+  decisions and trade-offs, verification and known limitations. All prior
+  S21–S26 content untouched.
+* `HANDOFF.md` (this file) — rewritten from the stale S26 state.
+* `docs/handoffs/HANDOFF-S27-slice-2.md` — new slice-level handoff.
 
-`cargo xtask dist [--target <triple>] [--out-dir <dir>]` release-builds the
-workspace, enforces size budgets (rufus 3M / helper 2.5M / GUI 14M), validates
-the 11 finalized `packaging/` files (XML via quick-xml, INI via a hand-written
-parser, distro-token checks), stages a 12-file FHS tree into
-`target/dist-staging/<triple>`, writes a deterministic
-`rufus-<version>-<triple>.tar.gz` (gzip mtime 0, sorted tar entries, uid/gid/
-mtime 0), conditionally builds a `.deb` with `dpkg-deb --root-owner-group`, and
-writes `SHA256SUMS`. Full architecture, security invariants, the `org.rufuslinux`
-naming deviation, the external-tool rationale, the packaging↔dist contract and
-the decision record are in the new `## S26` section of `TECHNICAL.md`.
+Out of scope and deliberately untouched: `xtask/src/main.rs` and
+`.github/workflows/ci.yml` (T1 and T3 respectively).
 
-## S26-T4 changes in detail
+## Verification actually run (final, all passed)
 
-* `xtask/src/main.rs`:
-  * Extracted `write_sha256sums(out_dir, artifacts)` from `cmd_dist` (identical
-    output; CLI behavior unchanged) and added a test-only `verify_sha256sums`
-    helper plus a `TempDir` (pid + atomic counter, cleanup on `Drop`).
-  * Grew the `#[cfg(test)] mod tests` from **15 to 21** tests: `staged_layout_has_exact_paths_and_modes`, `staged_control_architecture_follows_target_mapping`, `real_packaging_xml_and_ini_files_validate`, `malformed_xml_is_rejected`, `malformed_ini_is_rejected_by_validators`, `sha256sums_match_artifact_bytes_and_detect_corruption`, and a strengthened `dist_archive_is_byte_identical` (mtime/uid/gid/mode pinned). No new dependency.
-* `TECHNICAL.md`: appended `## S26 — Distribution packaging & release bundles`,
-  leaving all prior S21–S25 content untouched.
-* `HANDOFF.md`: this final handoff (stale T3-blocker wording removed).
+From `/home/hosi/dev/REA-Rufus/furus`, with
+`PATH="$HOME/.cargo/bin:$PATH"`:
 
-## Verification actually run (final run, all passed)
-
-From `/home/hosi/dev/REA-Rufus/furus`, with `PATH="$HOME/.cargo/bin:$PATH"`:
-
+* `cargo xtask parity --check` → exit 0; `parity: data/parity.csv is fresh
+  (regeneration changes nothing)`, `2709 data rows`, all disposition counts and
+  address sets match.
+* `cargo test -p xtask` → `test result: ok. 29 passed; 0 failed; 0 ignored;
+  0 measured; 0 filtered out`.
 * `cargo fmt --all -- --check` → exit 0, clean.
-* `cargo test -p xtask` → `21 passed; 0 failed; 0 ignored; 0 measured;
-  0 filtered out` (was 15 before T4).
-* `cargo xtask dist` → exit 0; sizes `rufus` 1,810,152 / `rufus-helper`
-  1,406,296 / `rufus-gui` 12,774,280 bytes, all `[OK]`; `11 packaging files`
-  validated; `skip .deb: dpkg-deb not available`; artifact
-  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz` in
-  `target/dist/x86_64-unknown-linux-gnu/`.
-* `sha256sum -c SHA256SUMS` in that out-dir →
-  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz: OK`.
-* `cargo xtask ci` → `ci: all gates passed` (fmt, clippy, workspace test,
-  assets 86/86, parity 2,709 rows, size, `cargo deny check` ok;
-  `cargo-audit` reported `SKIP (not installed)`).
-* `git diff --check` → exit 0, clean.
-
-During T4 one clippy `useless_format` in a new test was caught by `cargo xtask
-ci` and fixed; the final CI re-run is clean.
-
-## Caveats / unverified
-
-* No `dpkg-deb` here: `.deb` generation is skipped by design and untested.
-  `rpmspec` and `rpmlint` are also absent, so the spec was never parsed/linted
-  by a real tool (the Arch `package()` was run for real under `fakeroot` in T3
-  review and passed).
-* Only the host triple `x86_64-unknown-linux-gnu` is installed; no aarch64
-  cross-build was produced or verified.
-* T1's "no unratified S00 architecture items remaining" stays formally unmet
-  **by design**: A1, A3, A4 and A5 are approved, but **A2 and A6–A12 remain
-  proposed** in `DECISIONS.md` §4. Do not ratify them to satisfy that phrase.
-* Non-fatal `cargo deny` duplicate-crate warnings (zbus, thiserror, toml,
-  windows-sys, …) remain unchanged from S25. `cargo-audit` is not installed.
+* `env -u APPDIR PATH="$HOME/.cargo/bin:$PATH" cargo xtask qa` → exit 0,
+  `qa: all suites passed`. 11 Tier 1 suites PASS; one explicit
+  `SKIP  tier1/pipeline-loop: loop-device / throughput tests need --privileged`;
+  Tier 2 `bios-smoke`, `bios-bootloaders` (3 passed, 1 ignored GRUB4DOS,
+  29.63 s) and `uefi-ntfs-ovmf` (1 passed, 17.55 s) PASS. No `/tmp/furus-qa-bios-*`
+  scratch left behind.
 
 ## Gotchas (do not regress)
 
-* Keep `org.rufuslinux.*` identifiers and filenames exactly as shipped; the
-  GUI/helper hardcode the bus name, object path, interface and polkit action.
-* Dist's single artifact name and `usr/` + `DEBIAN/` layout are the authoritative
-  packaging contract consumed by PKGBUILD `source=` and RPM `Source0`. Do not
-  add a second tarball or flatten the archive.
-* Stored mtimes are always 0; GNU `tar -tv` may display `1970-01-01 02:00` due
-  to the local UTC+2 display timezone — this is not a real timestamp.
-* Default out-dir is `target/dist/<triple>`; `target/dist-staging/<triple>` is
-  wiped and rebuilt on every dist run. Explicit `--out-dir` is honored.
-* Explicit `--target <host>` makes Cargo build into `target/<triple>/release`;
-  code keys `bin_dir` off `target.is_some()`, not `triple == host` (a T3 fix).
+* **`APPDIR` must be removed at spawn.** A stale AppImage `APPDIR` breaks
+  asset lookup in the suites; `qa` removes it in both `run_suite` and
+  `qemu_bios_smoke`. This shell currently has `APPDIR` unset, but `env -u
+  APPDIR` is used in verification anyway to be safe.
+* **Parity is byte-stable.** `data/parity.csv` is generated from
+  `data/functions.csv` (2,709 rows). Never change `BY_MODULE`, `OVERRIDES` or
+  generator logic to "represent" S26/S27; `cargo xtask parity --check` must
+  stay at exit 0. Only comments/docstrings may change in parity.py.
+* **QEMU + OVMF are present here**, so Tier 2 genuinely ran: `qemu-system-x86_64`,
+  `grub-mkimage`, `mkntfs`, `ntfscp`, `unshare`, `ntfs-3g` and
+  `/usr/share/edk2/x64/OVMF_CODE.4m.fd` + `OVMF_VARS.4m.fd`. Do not claim a
+  skip where none occurred.
+* **`dpkg-deb` and `cargo-audit` are absent** on this host; `.deb` generation and
+  the audit gate are skipped by design and reported as such, never as passes.
+* **No push without permission.** Do not commit or push this slice. Hand it to
+  the reviewer first; publish only after the user explicitly authorises it.
+* `cargo`/`rustc` 1.99.0 live in `~/.cargo/bin`, not the default PATH — prefix
+  cargo commands with `PATH="$HOME/.cargo/bin:$PATH"`.
 
-## Remaining work / exact next steps
+## Remaining work / exact next steps (Slice 3/3)
 
-1. Hand this slice to the `reviewer` subagent for structure + security review.
-   If blockers are reported, send them back to `coder` and repeat; do not push.
-2. Once the reviewer signs off, **ask the user for explicit permission to
-   publish** using `notify-telegram` plus the `question` tool.
-3. Only after that explicit permission, invoke the `publisher` subagent: verify
-   review sign-off, update `README.md` if needed, commit the docs, and push.
-   `coder` must never push.
-4. Thereafter the earlier S21 boot-acceptance item (separate from S26) remains
-   unverified on this host; see `/home/hosi/dev/REA-Rufus/HANDOFF.md`.
+1. Hand S27-T2 to the `reviewer` subagent for structure + security review. If
+   blockers are reported, send them back to `coder` and repeat; do not push.
+2. Only after review sign-off, implement S27-T3: add `cargo xtask qa` as a CI
+   gate in `.github/workflows/ci.yml` (this file was out of scope for T2). Run
+   the workflow YAML check available on this host and confirm the gate is
+   ordered sensibly with the existing gates.
+3. Ask the user for explicit permission to publish via `notify-telegram` plus
+   the `question` tool. Only after that permission may the `publisher` commit
+   and push. `coder` must never push.
+
+## Acceptance criteria still open
+
+* `git status --short` shows only the five in-scope files above (no commit).
+* All four verification commands in the section above exit 0 (already met in
+  this tree; re-run after any further edit).
+* S27-T3: `.github/workflows/ci.yml` runs `cargo xtask qa` with `APPDIR`
+  removed and a generous timeout, and CI is green with it — **not yet done**.
+* No change to `BY_MODULE` / `OVERRIDES` / `data/parity.csv`, no `unsafe`, and
+  no new dependency introduced by this slice (met).

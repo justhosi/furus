@@ -12,6 +12,21 @@ Every analysed function gets exactly one disposition:
   replace     replaced by Rust std / libc / OS facility
   thunk       PLT/thunk row, follows its module
 
+Scope of the ledger: this is a *function*-parity table. A row exists only for
+an analysed function (or thunk) from functions.csv, so a slice whose work has
+no corresponding analysed function is not represented here. In particular
+S26 (distribution packaging / release bundles) and S27 (automated QA gate)
+add automation and release tooling, not ported functions; they are tracked in
+the README slice-completion table instead. Do not invent rows or change the
+BY_MODULE / OVERRIDES mappings to "represent" them: the generated parity.csv
+is byte-stable (2,709 rows) and `cargo xtask parity --check` must stay green.
+
+Slice names for the S21-S27 range (the meanings those completion markers use):
+  S21 Windows To Go / FFU-WIM        S25 update check + confirmed write flow
+  S22 Windows User Experience        S26 release bundles / packaging
+  S23 hashing / SBAT / EFI fixup     S27 automated QA gate
+  S24 Slint GUI
+
 Run from anywhere:  python3 tools/parity.py
 """
 

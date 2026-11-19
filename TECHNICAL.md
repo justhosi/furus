@@ -518,3 +518,182 @@ All commands were run from `/home/hosi/dev/REA-Rufus/furus` with
 
 The non-fatal `cargo deny` duplicate-crate warnings (zbus, thiserror, toml,
 windows-sys, etc.) remain unchanged from S25 and are not introduced by S26.
+
+## S27 — Automated QA gate (`cargo xtask qa`)
+
+This section records the technical decisions behind the S27 release gate. It
+is written for an engineer seeing the project for the first time. The gate
+lives entirely in `xtask/src/main.rs` (`cmd_qa` and its helpers); no feature
+code in the shipped binaries was changed, and `data/parity.csv` was deliberately
+left untouched.
+
+### What changed and why (T1–T3)
+
+S27 is an **automation** slice, not a functionality slice. The formatters,
+partition writers, BCD/SYSTEM-hive logic and the BIOS/UEFI boot suites already
+existed and were verified individually; what was missing was one deterministic,
+unprivileged command that runs them all and fails CI if any of them fails. The
+three tasks map as follows:
+
+* **T1 — the gate (commit `75563b4`)**: implemented `cargo xtask qa` with two
+  tiers, strict timeouts, kill/reap, explicit `SKIP` lines and the
+  `--require-qemu` / `--privileged` flags, plus the `xtask` unit tests
+  (the suite total went from 21 to **29**).
+* **T2 — completion markers and documentation (this slice)**: extended the
+  `tools/parity.py` docstring, added the S21–S27 slice-completion matrix and
+  the `cargo xtask qa` section to `README.md`, appended this `## S27` section,
+  and rewrote the root `HANDOFF.md` plus a new slice handoff. No `BY_MODULE` /
+  `OVERRIDES` entry and no generated row changed.
+* **T3 — CI wiring (remaining, Slice 3/3)**: add `cargo xtask qa` as a gate in
+  `.github/workflows/ci.yml`. That file is out of this slice's scope; until it
+  lands, the command is green locally but CI does not yet call it.
+
+### Architecture and data flow
+
+`cmd_qa(root, options)` builds a `QaSummary` that collects failed stage labels
+so the gate reports **every** failure instead of stopping at the first.
+
+1. **Options.** `parse_qa_options` accepts only `--require-qemu` and
+   `--privileged`; anything else is a named error. Parsing is a pure,
+   unit-tested value (`QaOptions`), so no process is spawned to test it.
+2. **Tier 1 (always on).** Eleven unprivileged suites are orchestrated as
+   `cargo test` subprocesses with inherited stdio (each suite's own `skip:`
+   lines stay visible): the `rufus-linux` `partition_table` suite (MBR/GPT),
+   the `rufus-core` `fat32_format`, `exfat_format`, `ntfs_format`,
+   `ext_format` and `udf_format` suites, the `uefi_ntfs::` structural library
+   tests, and the Windows suites (`windows::bcd::`, `windows::to_go::`,
+   `windows::boot_files::`, `pipeline::bootloader::tests::windows::`). The BCD
+   element shapes, the stripped class-0x4 elements, the `0xc0000001`
+   regression guard and the SYSTEM hive `SanPolicy=4` assertion all live in
+   those pre-existing tests. All targets are regular/sparse files — no root,
+   no loop device, no mount.
+3. **Privileged opt-in.** The `pipeline_end_to_end`, `loop_device` and
+   `mount_seam` suites are `#[ignore]`d by default and need real loop devices.
+   Without `--privileged`, `tier1/pipeline-loop` prints an explicit
+   `SKIP  ... need --privileged` line; with it, the ignored tests are run
+   (`loop` filters out the 4 GiB throughput benchmark on this host).
+4. **Tier 2 (conditional).** If `qemu-system-x86_64` is absent, the three boot
+   stages print `SKIP` lines and the gate still finishes successfully — unless
+   `--require-qemu` was set, in which case the missing toolchain is fatal
+   (`bail!`). When QEMU is present:
+   * `tier2/bios-smoke` writes a 512-byte MBR boot sector into a scratch
+     directory under `std::env::temp_dir()` and boots it with
+     `-display none -serial stdio -monitor none -no-reboot -drive ...,format=raw,if=ide`.
+     `boot_sector_bytes` assembles a real-mode loop (`cli`, `cld`, then per
+     character poll the COM1 line-status register at `0x3FD` for the
+     transmit-holding-register-empty bit, write the data port `0x3F8`, finish
+     with `hlt` and a `jmp $` park) and ends with the `0x55AA` signature at
+     offsets 510/511 that makes SeaBIOS execute the sector at `0x7C00`. The
+     marker is `FURUS-QA-OK`; the assertion is a case-insensitive ASCII search
+     over the captured raw serial bytes. The scratch directory is removed on
+     every path.
+   * `tier2/bios-bootloaders` runs the existing
+     `pipeline::bootloader::end_to_end::qemu_boot::` suites (Syslinux 4.07,
+     FreeDOS, GRUB2 BIOS). Each already has a 10–12 second capture deadline;
+     the gate's outer deadline is only a backstop for a hung `cargo` process.
+   * `tier2/uefi-ntfs-ovmf` first probes `qemu-system-x86_64`, `grub-mkimage`,
+     `mkntfs`, `ntfscp`, `unshare`, `ntfs-3g` and a complete OVMF code+vars
+     pair (checked across the common `/usr/share/edk2/...` and
+     `/usr/share/OVMF/...` layouts). If anything is missing it prints one
+     `SKIP` (or fails under `--require-qemu`); otherwise it runs the existing
+     `uefi_ntfs_boot` integration test, which asserts its own `UEFI-NTFS-OK`
+     serial marker from the shim's GRUB payload.
+5. **Reporting.** Each stage logs `PASS  <label>` or `FAIL  <label>: <reason>`;
+   `QaSummary::finish` ends with `qa: all suites passed` or a named list of
+   failures and a non-zero exit.
+
+### Decisions and trade-offs
+
+* **Orchestrate existing suites, never reimplement.** The root cause of S27
+  was missing automation, not missing functionality. Formatting, MBR/GPT
+  writing, BCD parsing and boot capture already have their own tests; `qa`
+  only sequences them. Reimplementing any of them inside `xtask` would create
+  a second source of truth that could pass while the real code regressed.
+* **No `rufus-core` dependency in `xtask`.** The gate drives the suites as
+  `cargo test` subprocesses and inspects only their exit status and (for the
+  smoke test) QEMU's stdout. Linking `rufus-core` into `xtask` would drag the
+  formatter/tool chain and its dependencies into the maintenance crate,
+  duplicate the tests' tool probes, and couple the gate to crate internals.
+  Keeping the boundary at the process level means the gate stays small, uses
+  only `std` plus the dependencies already present, and exercises exactly the
+  code the shipped binaries use.
+* **Hand-assembled 512-byte MBR + COM1, not VGA capture.** A deterministic
+  byte-coded boot sector that prints `FURUS-QA-OK` to COM1 is the smallest
+  possible proof that a BIOS actually executed sector 0 from our image: it is
+  file-backed (no loop device or root), needs no framebuffer, terminal or
+  graphical console, and makes the assertion a plain byte-substring search.
+  Reusing a VGA/framebuffer capture would tie the gate to host graphics and a
+  font/rendering path that has nothing to do with boot correctness; the real
+  bootloaders are still covered by the existing VGA-tolerant QEMU suites in
+  the next stage.
+* **Delegate UEFI to the existing OVMF harness.** The `uefi_ntfs_boot` suite
+  already builds a shim, boots it under OVMF, and checks both the positive
+  (marker present) and negative (marker must be absent without the shim)
+  cases. Hand-crafting an EFI binary in `xtask` would duplicate that work and
+  lose the negative control.
+* **Strict deadlines + `ChildGuard`.** `QA_SUITE_TIMEOUT` is a 120-second
+  backstop for each `cargo test` and `QA_QEMU_TIMEOUT` is 30 seconds for the
+  smoke boot (well inside the promised 30–60 s window; the 162-byte loop
+  prints in well under a second). Every spawn is wrapped so `Drop` kills and
+  **reaps** the child, and the QEMU stdout reader runs on a thread while
+  stderr is drained, so neither a full pipe nor a surviving `hlt`ed machine
+  can hang CI. This is defence in depth: the suites' own 10–12 s capture
+  guards handle the normal case, the gate's deadline handles a hung process.
+* **`APPDIR` is removed at spawn.** Both `run_suite` and `qemu_bios_smoke`
+  call `.env_remove("APPDIR")`. A stale AppImage variable makes
+  `rufus_core::paths::asset_path` resolve to a non-existent AppImage tree,
+  which fails unrelated asset tests (the reason S25 handoffs require
+  `env -u APPDIR`); the gate removes it so callers need not remember.
+* **Parity ledger intentionally unchanged.** `tools/parity.py` maps analysed
+  functions by module/address. S26 and S27 ported no function, so giving them
+  rows would be fiction and would break the byte-stable 2,709-row
+  `data/parity.csv`. Only the docstring was extended; the completion matrix
+  in `README.md` is the authoritative marker for these slices.
+* **Flags semantics.** `--require-qemu` changes *missing toolchain* from a
+  `SKIP` into a hard failure (it does not force an installed toolchain to
+  pass); `--privileged` is the only way to opt into root/loop suites, so the
+  default gate remains runnable by an unprivileged CI user. Unknown flags are
+  rejected rather than ignored.
+* **No `unsafe`, no new dependency.** `xtask` keeps `#![forbid(unsafe_code)]`;
+  the real-mode bytes are assembled by pushing `u8` literals into a `Vec`, and
+  the tests use the existing pid+atomic-counter `TempDir` pattern.
+
+### Verification record (S27-T2)
+
+All commands were run from `/home/hosi/dev/REA-Rufus/furus` with
+`PATH="$HOME/.cargo/bin:$PATH"` (and `env -u APPDIR` for the QA gate):
+
+* `cargo xtask parity --check` → exit 0; `parity: data/parity.csv is fresh
+  (regeneration changes nothing)`, `2,709 data rows`, all per-disposition
+  counts and address sets match. The parity.py docstring edit did not change a
+  generated byte.
+* `cargo test -p xtask` → `test result: ok. 29 passed; 0 failed; 0 ignored;
+  0 measured; 0 filtered out` (21 before T1).
+* `cargo fmt --all -- --check` → exit 0, clean.
+* `env -u APPDIR PATH="$HOME/.cargo/bin:$PATH" cargo xtask qa` → exit 0,
+  `qa: all suites passed`. Eleven Tier 1 suites `PASS`; `SKIP
+  tier1/pipeline-loop: loop-device / throughput tests need --privileged`;
+  Tier 2 `tier2/bios-smoke`, `tier2/bios-bootloaders` (3 passed / 1 ignored
+  GRUB4DOS, 29.63 s) and `tier2/uefi-ntfs-ovmf` (1 passed, 17.55 s) all
+  `PASS`. No scratch directory was left in `/tmp`.
+* Tool context: `qemu-system-x86_64`, `grub-mkimage`, `mkntfs`, `ntfscp`,
+  `unshare`, `ntfs-3g` and an OVMF code+vars pair are installed here, so Tier 2
+  genuinely ran rather than skipping. `dpkg-deb` and `cargo-audit` are absent.
+
+### Known limitations
+
+* **No real root/loop test on this host.** `--privileged` was not used; the
+  loop-device, mount-seam and ignored pipeline suites are skipped by design.
+  Their behaviour is only covered where they are individually documented.
+* **Host-specific SeaBIOS.** The BIOS smoke test asserts a COM1 marker under
+  this host's SeaBIOS via `-display none`; a different firmware that does not
+  map COM1 the same way could fail without indicating a product regression.
+  The marker assertion tolerates case, not a different console device.
+* **No fresh Windows BIOS boot.** Windows coverage in Tier 1 is BCD
+  element-parity and SYSTEM-hive structural tests, not a booted SeaBIOS
+  Windows To Go image; no legacy BIOS Windows boot is claimed as verified.
+* **GRUB4DOS and real hardware remain out of scope.** The GRUB4DOS boot test
+  is `#[ignore]`d pending a caller-supplied `grldr`, and no physical USB stick
+  was booted in this environment.
+* **CI wiring is not yet done.** T3 (`.github/workflows/ci.yml`) is a separate
+  slice; until then the gate is local-only.
