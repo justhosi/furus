@@ -62,6 +62,13 @@ export component MainWindow inherits Window {
     in property <string> log-text;
     in-out property <bool> log-open: false;
 
+    // ---- S25 slice 6 checksum modal (presentation only; all values from Rust) ----
+    in property <bool> checksum-visible: false;
+    in property <float> checksum-progress: 0;
+    in property <[string]> checksum-digests;
+    in property <string> checksum-status;
+    in property <bool> checksum-cancel-enabled: false;
+
     // ---- UI -> Rust (every state change goes back through GuiState) ----
     callback device-selected(string);
     callback boot-selected(string);
@@ -82,6 +89,8 @@ export component MainWindow inherits Window {
     callback cancel-clicked();
     callback discard-clicked();
     callback close-clicked();
+    callback checksum-cancel-clicked();
+    callback checksum-close-clicked();
 
     VerticalLayout {
         padding: 12px;
@@ -329,6 +338,98 @@ export component MainWindow inherits Window {
                         Button {
                             text: "CONFIRM AND WRITE";
                             clicked => { root.confirm-clicked(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Checksum modal. Rust owns the algorithms, progress, cancellation and
+    // stale-result decisions; this layer only displays the four digests in
+    // read-only (still selectable/copyable) fields and forwards two clicks.
+    if root.checksum-visible : Rectangle {
+        background: #000000aa;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 12px;
+            Rectangle {
+                background: #ffffff;
+                border-radius: 8px;
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 10px;
+                    Text {
+                        text: "CHECKSUM";
+                        font-weight: 700;
+                        font-size: 16px;
+                    }
+                    Text {
+                        text: root.checksum-status;
+                        wrap: word-wrap;
+                    }
+                    ProgressIndicator {
+                        progress: root.checksum-progress;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "MD5";
+                            vertical-alignment: center;
+                            width: 70px;
+                        }
+                        LineEdit {
+                            text: root.checksum-digests[0];
+                            read-only: true;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "SHA-1";
+                            vertical-alignment: center;
+                            width: 70px;
+                        }
+                        LineEdit {
+                            text: root.checksum-digests[1];
+                            read-only: true;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "SHA-256";
+                            vertical-alignment: center;
+                            width: 70px;
+                        }
+                        LineEdit {
+                            text: root.checksum-digests[2];
+                            read-only: true;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "SHA-512";
+                            vertical-alignment: center;
+                            width: 70px;
+                        }
+                        LineEdit {
+                            text: root.checksum-digests[3];
+                            read-only: true;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Button {
+                            text: "CANCEL";
+                            enabled: root.checksum-cancel-enabled;
+                            clicked => { root.checksum-cancel-clicked(); }
+                        }
+                        Button {
+                            text: "CLOSE";
+                            clicked => { root.checksum-close-clicked(); }
                         }
                     }
                 }

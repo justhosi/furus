@@ -52,8 +52,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rufus_core::planner::BootloaderOpt;
-use rufus_gui::analyzer::{
-    AnalysisCoordinator, AnalysisResult, AnalyzerSender, AnalyzerWorker, checksum,
+use rufus_gui::analyzer::{AnalysisCoordinator, AnalysisResult, AnalyzerSender, AnalyzerWorker};
+use rufus_gui::checksum::{
+    ChecksumCoordinator, ChecksumOutcome, ChecksumResult, ChecksumSender, ChecksumWorker,
 };
 use rufus_gui::ipc::{IpcError, PkexecTransport, open_helper, start_with_fallback};
 use rufus_gui::run::{CancelRequest, DeviceFacts, LogEntry, Run, RunState};
@@ -537,6 +538,57 @@ fn log_lines<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Vec<String>
     entries.into_iter().map(log_line).collect()
 }
 
+// ---------------------------------------------------------------------------
+// S25 slice 6 checksum modal display helpers (presentation only). The
+// coordinator in `checksum.rs` owns every state decision; these only turn a
+// `ChecksumResult` snapshot into the strings and fraction Slint renders.
+// ---------------------------------------------------------------------------
+
+/// Copyable hex strings in MD5 / SHA-1 / SHA-256 / SHA-512 order. Only a
+/// finished result fills them, so a cancelled/failed run shows no partial
+/// digests as if they were complete.
+fn checksum_digests(result: Option<&ChecksumResult>) -> [String; 4] {
+    match result {
+        Some(result) if result.outcome == Some(ChecksumOutcome::Finished) => [
+            result.digests.md5.clone().unwrap_or_default(),
+            result.digests.sha1.clone().unwrap_or_default(),
+            result.digests.sha256.clone().unwrap_or_default(),
+            result.digests.sha512.clone().unwrap_or_default(),
+        ],
+        _ => std::array::from_fn(|_| String::new()),
+    }
+}
+
+/// Status line for the modal: computing, finished, cancelled or the named
+/// failure. No hashing or policy here — just text for what the worker sent.
+fn checksum_status(result: Option<&ChecksumResult>) -> String {
+    match result {
+        None => "Computing digests…".to_string(),
+        Some(result) => match &result.outcome {
+            None => format!("Computing digests… {}%", result.progress),
+            Some(ChecksumOutcome::Finished) => {
+                let name = result.path.file_name().map_or_else(
+                    || result.path.display().to_string(),
+                    |n| n.to_string_lossy().into(),
+                );
+                format!("Finished — all four digests for {name}.")
+            }
+            Some(ChecksumOutcome::Cancelled) => {
+                "Cancelled — no digests were completed.".to_string()
+            }
+            Some(ChecksumOutcome::Failed(message)) => format!("Failed: {message}"),
+        },
+    }
+}
+
+fn checksum_progress(result: Option<&ChecksumResult>) -> f32 {
+    result.map_or(0.0, |result| f32::from(result.progress) / 100.0)
+}
+
+fn checksum_cancel_enabled(visible: bool, result: Option<&ChecksumResult>) -> bool {
+    visible && result.is_none_or(|result| result.outcome.is_none())
+}
+
 /// A live system bus is addressable when its well-known socket exists or the
 /// address was overridden. Construction never connects: the real probe is
 /// only used by the worker, so tests stay offline. The live D-Bus path is
@@ -643,6 +695,9 @@ struct Session {
     run: Run,
     cancel_bridge: CancelBridge,
     run_started: Option<Instant>,
+    checksum: ChecksumCoordinator,
+    checksum_visible: bool,
+    checksum_result: Option<ChecksumResult>,
 }
 
 impl Session {
@@ -662,6 +717,9 @@ impl Session {
             run: Run::new(),
             cancel_bridge: CancelBridge::default(),
             run_started: None,
+            checksum: ChecksumCoordinator::default(),
+            checksum_visible: false,
+            checksum_result: None,
         };
         session.new_run();
         if let Some(first) = first {
@@ -745,11 +803,43 @@ impl Session {
         applied
     }
 
-    fn show_checksum(&mut self) {
-        self.note = Some(
-            checksum(&self.state)
-                .unwrap_or_else(|| "No analyzed image is available for checksum.".to_string()),
-        );
+    /// Open the modal at 0% with no digests and hand the selected image to
+    /// the checksum worker. All request-id and stale decisions live in the
+    /// coordinator; this method only starts the request and stores the view.
+    fn begin_checksum(&mut self, sender: &ChecksumSender) {
+        let Some(image) = self.state.image.as_ref() else {
+            return;
+        };
+        let path = PathBuf::from(&image.image.path);
+        let (request_id, token) = self.checksum.begin(&path);
+        self.checksum_visible = true;
+        self.checksum_result = None;
+        if let Err(error) = sender.submit(request_id, path.clone(), token) {
+            let failed = ChecksumResult::failed(request_id, path, error);
+            self.apply_checksum_result(failed);
+        }
+    }
+
+    /// Apply a worker publication through the coordinator's stale guard.
+    /// False means the result belonged to a superseded request and no UI
+    /// state was touched.
+    fn apply_checksum_result(&mut self, result: ChecksumResult) -> bool {
+        if !self.checksum.apply(result.clone()) {
+            return false;
+        }
+        self.checksum_result = Some(result);
+        true
+    }
+
+    fn request_checksum_cancel(&mut self) {
+        self.checksum.cancel();
+    }
+
+    fn close_checksum(&mut self) {
+        // Closing while a run is in flight still cancels it; after a terminal
+        // result the token is already cleared, so this is a harmless no-op.
+        self.checksum.cancel();
+        self.checksum_visible = false;
     }
 
     /// START only plans and opens the confirmation gate. No transport is
@@ -950,6 +1040,16 @@ fn render(session: &Session, ui: &MainWindow) {
     ui.set_step_text(SharedString::from(run_view.detail.clone()));
     ui.set_log_text(SharedString::from(log_lines(session.run.logs()).join("\n")));
 
+    let checksum_result = session.checksum_result.as_ref();
+    ui.set_checksum_visible(session.checksum_visible);
+    ui.set_checksum_progress(checksum_progress(checksum_result));
+    ui.set_checksum_digests(model(checksum_digests(checksum_result)));
+    ui.set_checksum_status(SharedString::from(checksum_status(checksum_result)));
+    ui.set_checksum_cancel_enabled(checksum_cancel_enabled(
+        session.checksum_visible,
+        checksum_result,
+    ));
+
     let mut status = state.status_text().to_string();
     if let Some(terminal) = &run_view.terminal {
         status.push('\n');
@@ -1009,6 +1109,34 @@ fn run_gui() -> Result<(), slint::PlatformError> {
             .is_ok()
     });
     let analyzer_sender = analyzer.sender();
+
+    // Checksum worker: one long-lived thread publishing progress and the
+    // terminal result into an mpsc channel. The dispatcher is the only place
+    // that touches Session/Slint, matching the analysis and device paths.
+    let (checksum_tx, checksum_rx) = mpsc::channel::<ChecksumResult>();
+    let checksum_dispatch_session = session.clone();
+    let checksum_dispatch_weak = ui.as_weak();
+    let checksum_dispatcher = thread::spawn(move || {
+        while let Ok(result) = checksum_rx.recv() {
+            let session = checksum_dispatch_session.clone();
+            let weak = checksum_dispatch_weak.clone();
+            if slint::invoke_from_event_loop(move || {
+                let mut session = session.borrow_mut();
+                if session.apply_checksum_result(result)
+                    && let Some(ui) = weak.upgrade()
+                {
+                    render(&session, &ui);
+                }
+            })
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let checksum_worker = ChecksumWorker::spawn(move |result| checksum_tx.send(result).is_ok());
+    let checksum_sender = checksum_worker.sender();
+
     let (updates_tx, updates_rx) = mpsc::channel();
     let dispatcher_session = session.clone();
     let dispatcher_weak = ui.as_weak();
@@ -1117,10 +1245,31 @@ fn run_gui() -> Result<(), slint::PlatformError> {
     }
     {
         let session = session.clone();
+        let sender = checksum_sender.clone();
         let weak = ui.as_weak();
         ui.on_checksum_clicked(move || {
             if let Some(ui) = weak.upgrade() {
-                session.borrow_mut().show_checksum();
+                session.borrow_mut().begin_checksum(&sender);
+                render(&session.borrow(), &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_checksum_cancel_clicked(move || {
+            if let Some(ui) = weak.upgrade() {
+                session.borrow_mut().request_checksum_cancel();
+                render(&session.borrow(), &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_checksum_close_clicked(move || {
+            if let Some(ui) = weak.upgrade() {
+                session.borrow_mut().close_checksum();
                 render(&session.borrow(), &ui);
             }
         });
@@ -1331,6 +1480,10 @@ fn run_gui() -> Result<(), slint::PlatformError> {
 
     render(&session.borrow(), &ui);
     let result = ui.run();
+    // Cancel any checksum still in flight so its worker returns at the next
+    // read chunk, then shut it down and join its dispatcher like the others.
+    session.borrow().checksum.cancel();
+    checksum_worker.shutdown();
     analyzer.shutdown();
     let _ = analysis_shutdown_tx.send(AnalysisMessage::Stop);
     drop(worker.map(|worker| worker.shutdown()));
@@ -1346,6 +1499,7 @@ fn run_gui() -> Result<(), slint::PlatformError> {
     let _ = run_dispatcher.join();
     let _ = dispatcher.join();
     let _ = analysis_dispatcher.join();
+    let _ = checksum_dispatcher.join();
     result
 }
 
@@ -1357,6 +1511,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use rufus_gui::checksum::{ChecksumOutcome, ChecksumResult, Digests};
     use rufus_gui::devices::{DeviceUpdate, Discovery};
     use rufus_gui::run::{DeviceFacts, LogEntry, Run, RunState};
     use rufus_gui::state::{GuiError, GuiState};
@@ -1364,8 +1519,8 @@ mod tests {
     use rufus_proto::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, Outcome, Progress};
 
     use super::{
-        CancelBridge, Session, confirmation_facts, log_lines, run_view, startup_refusal,
-        status_with_device_warning,
+        CancelBridge, Session, checksum_digests, checksum_progress, checksum_status,
+        confirmation_facts, log_lines, run_view, startup_refusal, status_with_device_warning,
     };
 
     static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
@@ -1779,5 +1934,47 @@ mod tests {
             log_lines(&entries),
             vec!["[error] write failed", "[info] started", "[warn] retrying"]
         );
+    }
+
+    /// The formatter shows digests only for a finished result, in algorithm
+    /// order, and names the outcome for cancelled/failed runs instead.
+    #[test]
+    fn checksum_formatters_present_only_finished_digests_and_name_the_outcome() {
+        let path = PathBuf::from("/tmp/image.iso");
+        let finished = ChecksumResult {
+            request_id: 1,
+            path: path.clone(),
+            progress: 100,
+            digests: Digests {
+                md5: Some("d".repeat(32)),
+                sha1: Some("1".repeat(40)),
+                sha256: Some("2".repeat(64)),
+                sha512: Some("5".repeat(128)),
+            },
+            outcome: Some(ChecksumOutcome::Finished),
+        };
+        assert_eq!(checksum_digests(Some(&finished))[0], "d".repeat(32));
+        assert_eq!(checksum_digests(Some(&finished))[3], "5".repeat(128));
+        assert!((checksum_progress(Some(&finished)) - 1.0).abs() < f32::EPSILON);
+        assert!(checksum_status(Some(&finished)).contains("image.iso"));
+
+        let cancelled = ChecksumResult::failed(1, path.clone(), "stopped".to_string());
+        assert_eq!(
+            checksum_digests(Some(&cancelled)),
+            [String::new(), String::new(), String::new(), String::new()]
+        );
+        assert!(checksum_status(Some(&cancelled)).contains("stopped"));
+
+        let running = ChecksumResult {
+            request_id: 1,
+            path: path.clone(),
+            progress: 25,
+            digests: Digests::default(),
+            outcome: None,
+        };
+        assert_eq!(checksum_digests(Some(&running))[0], String::new());
+        assert!((checksum_progress(Some(&running)) - 0.25).abs() < f32::EPSILON);
+        assert!(checksum_status(Some(&running)).contains("25%"));
+        assert!(checksum_status(None).contains("Computing"));
     }
 }
