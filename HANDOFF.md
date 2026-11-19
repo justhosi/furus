@@ -1,117 +1,106 @@
-# HANDOFF — furus/ repo, S26-T3 blocker remediation (still Slice 3/4)
+# HANDOFF — furus/ repo, S26 final (Slice 4/4 complete)
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`. Base HEAD `2ba0ff4`
-(S26-T2). The reviewer did **not** commit T3; its blocker is now fixed in the
-working tree. This file is self-contained for a fresh context.
+Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD `d0b9d42`.
+This file is self-contained for a fresh context. **S26 (Distribution packaging
+& release bundles) is fully complete.** Nothing has been committed or pushed by
+this slice; do neither without explicit user permission. `coder` never pushes.
 
-## Current state
+## Commits so far (all already on `main`)
 
-- S26-T3 is complete **and its one review blocker is resolved**. Nothing has
-  been committed or pushed; do neither without explicit user permission.
-  `coder` never pushes.
-- Working-tree changes (uncommitted): `xtask/src/main.rs`, `xtask/Cargo.toml`,
-  `Cargo.lock`, `packaging/arch/PKGBUILD`, `packaging/rpm/rufus.spec`,
-  `HANDOFF.md`.
-- `packaging/README.md` was deliberately left unchanged: it contains no
-  source-tarball name or flat-layout claim that became wrong.
-- `cargo`/`rustc` 1.99.0 are at `~/.cargo/bin`, not on the default PATH.
-  Prefix every cargo command with `PATH="$HOME/.cargo/bin:$PATH"`.
+* `9cd7d38` — docs: ratify A1, A3, A5 in S26-T1 decision records.
+* `2ba0ff4` — feat(packaging): complete S26-T2 distribution definitions.
+* `d0b9d42` — feat(dist): implement S26-T3 distribution bundles and align distro specs.
 
-## Resolved blocker: dist bundle vs. packaging contract
+S26-T4 (this slice) is intentionally **uncommitted** in the working tree so a
+reviewer can inspect it; the only changed files are:
+`xtask/src/main.rs` (tests + one behavior-preserving helper extraction),
+`TECHNICAL.md` (appended S26 section) and this `HANDOFF.md` (overwritten).
 
-The reviewer found that `cargo xtask dist` emits a single triple-named tarball
-whose root is the staged FHS tree (`usr/`, `DEBIAN/`), while PKGBUILD and the
-RPM spec claimed different tarball names and read loose files from the
-extraction root. Planner decision: **fix the packaging, not dist**.
+`cargo`/`rustc` 1.99.0 live in `~/.cargo/bin`, not on the default PATH. Prefix
+cargo commands with `PATH="$HOME/.cargo/bin:$PATH"`.
 
-- Dist logic, archive name and archive layout are unchanged. The only xtask
-  edit in this remediation was the module doc comment at `main.rs:13` (it no
-  longer calls `dist` a stub).
-- `packaging/arch/PKGBUILD` now declares
-  `_target=${_target:-x86_64-unknown-linux-gnu}` (packagers override for
-  `aarch64-unknown-linux-gnu`) and
-  `source=("rufus-${pkgver}-${_target}.tar.gz")`, exactly matching the dist
-  artifact `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`. Every `package()`
-  source path now points into the staged tree (`${srcdir}/usr/bin/rufus`,
-  `${srcdir}/usr/libexec/rufus-helper`, `${srcdir}/usr/share/...`,
-  `${srcdir}/usr/share/doc/rufus/LICENSES.md`). Destinations, root ownership
-  of the helper and all optdepends tokens (`ntfs-3g`, `ntfsprogs`,
-  `e2fsprogs`, `udftools`, `wimlib`) are unchanged.
-- `packaging/rpm/rufus.spec` now has `%global dist_target
-  x86_64-unknown-linux-gnu`, `Source0:
-  rufus-%{version}-%{dist_target}.tar.gz` and `BuildArch: x86_64`, with a
-  comment explaining the aarch64 overrides. The false claim that dist edits
-  BuildArch into the spec was removed. `%prep` uses
-  `%setup -q -c -n rufus-%{version}` (the archive has no leading directory).
-  All `%install` sources now use the staged layout; destinations, `%files`
-  and `Recommends: ntfs-3g, e2fsprogs, udftools, libwim15` are unchanged.
+## What S26 built
 
-## Verification actually run (all passed)
+`cargo xtask dist [--target <triple>] [--out-dir <dir>]` release-builds the
+workspace, enforces size budgets (rufus 3M / helper 2.5M / GUI 14M), validates
+the 11 finalized `packaging/` files (XML via quick-xml, INI via a hand-written
+parser, distro-token checks), stages a 12-file FHS tree into
+`target/dist-staging/<triple>`, writes a deterministic
+`rufus-<version>-<triple>.tar.gz` (gzip mtime 0, sorted tar entries, uid/gid/
+mtime 0), conditionally builds a `.deb` with `dpkg-deb --root-owner-group`, and
+writes `SHA256SUMS`. Full architecture, security invariants, the `org.rufuslinux`
+naming deviation, the external-tool rationale, the packaging↔dist contract and
+the decision record are in the new `## S26` section of `TECHNICAL.md`.
 
-From `/home/hosi/dev/REA-Rufus/furus`:
+## S26-T4 changes in detail
 
-- `PATH="$HOME/.cargo/bin:$PATH" cargo xtask dist` → exit 0, same output as
-  T3 (three budgets OK, 11 packaging files validated,
-  `skip .deb: dpkg-deb not available`, artifact
-  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`).
-- Extracted the tarball to a temp dir: all 12 expected files present. Derived
-  every `${srcdir}/...` path from PKGBUILD `package()` and every `usr/...`
-  source from the spec `%install` (after joining `\` continuations) and
-  checked existence — 10/10 OK for each.
-- `bash -n packaging/arch/PKGBUILD` → exit 0.
-- PKGBUILD simulation: extracted the bundle into a temp `srcdir`, ran the
-  **real** `package()` under `fakeroot bash -c 'srcdir=… pkgdir=…; source
-  packaging/arch/PKGBUILD; package'` → exit 0; installed tree showed 755
-  binaries/helper and 644 metadata at the expected pkgdir paths.
-- RPM simulation: extracted the `%install` lines, joined continuations,
-  substituted `%{buildroot}`, `%{_bindir}`, `%{_datadir}` with temp paths,
-  and ran them from the extraction dir → exit 0; installed tree matched the
-  `%files` destinations.
-- Filename line-up: printed `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`
-  and grepped the `source=("rufus-${pkgver}-${_target}.tar.gz")` and
-  `Source0: rufus-%{version}-%{dist_target}.tar.gz` templates in the two
-  specs — both matched.
-- `rpmspec` and `rpmlint` are **absent**, so no real spec parse/lint was run.
-- `git diff --check`, `cargo fmt --all -- --check`, `cargo test -p xtask`
-  → all clean (`15 passed; 0 failed`); `cargo xtask ci` → `ci: all gates passed`.
-  An initial doc-comment indent triggered clippy
-  `doc_overindented_list_items`; it was fixed to the existing 2-space
-  continuation style and CI re-ran clean.
+* `xtask/src/main.rs`:
+  * Extracted `write_sha256sums(out_dir, artifacts)` from `cmd_dist` (identical
+    output; CLI behavior unchanged) and added a test-only `verify_sha256sums`
+    helper plus a `TempDir` (pid + atomic counter, cleanup on `Drop`).
+  * Grew the `#[cfg(test)] mod tests` from **15 to 21** tests: `staged_layout_has_exact_paths_and_modes`, `staged_control_architecture_follows_target_mapping`, `real_packaging_xml_and_ini_files_validate`, `malformed_xml_is_rejected`, `malformed_ini_is_rejected_by_validators`, `sha256sums_match_artifact_bytes_and_detect_corruption`, and a strengthened `dist_archive_is_byte_identical` (mtime/uid/gid/mode pinned). No new dependency.
+* `TECHNICAL.md`: appended `## S26 — Distribution packaging & release bundles`,
+  leaving all prior S21–S25 content untouched.
+* `HANDOFF.md`: this final handoff (stale T3-blocker wording removed).
 
-## Gotchas
+## Verification actually run (final run, all passed)
 
-- Naming invariant: keep `org.rufuslinux.*` identifiers and filenames exactly
-  as shipped; the GUI/helper hardcode the bus name and polkit action.
-- Dist's single artifact name/layout is now the authoritative packaging
-  contract. Do not add second tarballs or flatten the archive.
-- `dpkg-deb` is absent: `.deb` generation is untested here and skipped by
-  design. Only `x86_64-unknown-linux-gnu` is installed; no target was added.
-- Default out-dir is `target/dist/<triple>`; `target/dist-staging/<triple>`
-  is wiped and rebuilt on every dist run.
-- Explicit `--target <host>` makes Cargo build into `target/<triple>/release`;
-  the code keys `bin_dir` off `target.is_some()`, not `triple == host`.
-- Architecture mapping: `x86_64*` → `amd64`, `aarch64*`/`arm64*` → `arm64`,
-  otherwise an early clear error before the build.
-- GNU tar displays mtime as `1970-01-01 02:00` due to the local UTC+2 display
-  timezone; stored mtime is 0 and verified by `verify_archive`.
+From `/home/hosi/dev/REA-Rufus/furus`, with `PATH="$HOME/.cargo/bin:$PATH"`:
 
-## Remaining work: S26-T4 (Slice 4/4)
+* `cargo fmt --all -- --check` → exit 0, clean.
+* `cargo test -p xtask` → `21 passed; 0 failed; 0 ignored; 0 measured;
+  0 filtered out` (was 15 before T4).
+* `cargo xtask dist` → exit 0; sizes `rufus` 1,810,152 / `rufus-helper`
+  1,406,296 / `rufus-gui` 12,774,280 bytes, all `[OK]`; `11 packaging files`
+  validated; `skip .deb: dpkg-deb not available`; artifact
+  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz` in
+  `target/dist/x86_64-unknown-linux-gnu/`.
+* `sha256sum -c SHA256SUMS` in that out-dir →
+  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz: OK`.
+* `cargo xtask ci` → `ci: all gates passed` (fmt, clippy, workspace test,
+  assets 86/86, parity 2,709 rows, size, `cargo deny check` ok;
+  `cargo-audit` reported `SKIP (not installed)`).
+* `git diff --check` → exit 0, clean.
 
-1. Expand tests in `xtask/src/main.rs`: negative cases for malformed XML/INI
-   and each distro dependency assertion, staging layout/mode checks including
-   the `Architecture:` rewrite, SHA256SUMS format and CLI parsing.
-2. Update `TECHNICAL.md` with the dist pipeline, determinism strategy, the
-   exact bundle-name/staged-tree contract consumed by PKGBUILD and the RPM
-   spec, and the `.deb` skip condition.
-3. Final verification: `cargo fmt --all -- --check`, `cargo test -p xtask`,
-   `cargo xtask ci`, `cargo xtask dist`; then hand to the reviewer subagent
-   (structure + security) and ask the user for publish permission only after
-   review sign-off. Never push from `coder`.
+During T4 one clippy `useless_format` in a new test was caught by `cargo xtask
+ci` and fixed; the final CI re-run is clean.
 
-## Open acceptance criteria
+## Caveats / unverified
 
-- T1's "no unratified S00 architecture items remaining" stays formally unmet
-  by design — A2 and A6–A12 remain proposed in `DECISIONS.md` Section 4. Do
-  not ratify them to satisfy it.
-- Boot acceptance from the earlier S21 work is still unverified (separate
-  from S26); see `/home/hosi/dev/REA-Rufus/HANDOFF.md`.
+* No `dpkg-deb` here: `.deb` generation is skipped by design and untested.
+  `rpmspec` and `rpmlint` are also absent, so the spec was never parsed/linted
+  by a real tool (the Arch `package()` was run for real under `fakeroot` in T3
+  review and passed).
+* Only the host triple `x86_64-unknown-linux-gnu` is installed; no aarch64
+  cross-build was produced or verified.
+* T1's "no unratified S00 architecture items remaining" stays formally unmet
+  **by design**: A1, A3, A4 and A5 are approved, but **A2 and A6–A12 remain
+  proposed** in `DECISIONS.md` §4. Do not ratify them to satisfy that phrase.
+* Non-fatal `cargo deny` duplicate-crate warnings (zbus, thiserror, toml,
+  windows-sys, …) remain unchanged from S25. `cargo-audit` is not installed.
+
+## Gotchas (do not regress)
+
+* Keep `org.rufuslinux.*` identifiers and filenames exactly as shipped; the
+  GUI/helper hardcode the bus name, object path, interface and polkit action.
+* Dist's single artifact name and `usr/` + `DEBIAN/` layout are the authoritative
+  packaging contract consumed by PKGBUILD `source=` and RPM `Source0`. Do not
+  add a second tarball or flatten the archive.
+* Stored mtimes are always 0; GNU `tar -tv` may display `1970-01-01 02:00` due
+  to the local UTC+2 display timezone — this is not a real timestamp.
+* Default out-dir is `target/dist/<triple>`; `target/dist-staging/<triple>` is
+  wiped and rebuilt on every dist run. Explicit `--out-dir` is honored.
+* Explicit `--target <host>` makes Cargo build into `target/<triple>/release`;
+  code keys `bin_dir` off `target.is_some()`, not `triple == host` (a T3 fix).
+
+## Remaining work / exact next steps
+
+1. Hand this slice to the `reviewer` subagent for structure + security review.
+   If blockers are reported, send them back to `coder` and repeat; do not push.
+2. Once the reviewer signs off, **ask the user for explicit permission to
+   publish** using `notify-telegram` plus the `question` tool.
+3. Only after that explicit permission, invoke the `publisher` subagent: verify
+   review sign-off, update `README.md` if needed, commit the docs, and push.
+   `coder` must never push.
+4. Thereafter the earlier S21 boot-acceptance item (separate from S26) remains
+   unverified on this host; see `/home/hosi/dev/REA-Rufus/HANDOFF.md`.

@@ -294,3 +294,227 @@ A run that was cancelled synthesises `cancelled` whatever its status. A real `Do
 ### Resolved (`0xc0000001`):
 * **Windows First-Boot `0xc0000001`**: This was NOT a WIM-specialization limitation — it was a BCD bug. The generated UEFI store omitted the loader's `12000004` description element, which bootmgr requires; any store without it lands in Recovery with `0xc0000001`. An earlier note claiming "an identical `bcdboot` deployment fails identically" was wrong: a WinPE-regenerated `bcdboot` BCD on the same image boots past bootmgr, and a controlled A/B test isolated `12000004` as the deciding element. Fixed in `4d22a12` (caller always supplies a non-empty description), with the surrounding bcdboot-parity work in `44e8062`, `a3c2154`, `8e01ab0` and `296261b`.
 * **Remaining Setup screen (out of S21 scope)**: Because the image applies an unspecialized deployment `install.wim`, boot currently stops at the "Install Windows / Windows installation error" Setup screen — the same screen the known-good `bcdboot` BCD reaches. Reaching a full desktop requires Windows Setup's specialize pass (a generalized/specialized WIM), which is a separate concern from S21's BCD correctness. The S21 acceptance criterion — no `0xc0000001`, no manual `bcdedit`/`chkdsk`/`bcdboot` repair — is MET.
+
+## S26 — Distribution packaging & release bundles
+
+This section explains how furus turns a validated workspace and a set of
+packaging metadata files into installable release bundles. It is written for an
+engineer seeing the project for the first time; everything here lives under
+`xtask/src/main.rs` (the `dist` pipeline and its unit tests) and `packaging/`
+(the metadata that gets validated and staged). No feature code in the shipped
+binaries was changed by this work.
+
+### What changed and why (T1–T5)
+
+S26 is the distribution slice. It makes releases reproducible and installable
+on Debian/Ubuntu, Arch and RPM systems. The five tasks map as follows:
+
+* **T1 — ratification (commit `9cd7d38`)**: three open S00 plan defaults were
+  ratified against what the code already does — A1 (licence GPL-3.0-or-later),
+  A3 (targets x86_64 + aarch64, glibc ≥ 2.31) and A5 (wimlib for WIM/ESD),
+  recorded in `DECISIONS.md` §4. **A2 and A6–A12 deliberately remain proposed**;
+  ratifying them is outside S26's authorization, so the broad S00 phrase "no
+  unratified architecture items" stays formally unmet by design.
+* **T2 — packaging files (commit `2ba0ff4`)**: finalized the 11 files under
+  `packaging/` — the D-Bus service + `system.d` conf, the polkit policy, the
+  desktop entry, AppStream metainfo, SVG icon, Debian `control`/`postinst`, Arch
+  `PKGBUILD`, RPM spec, and `packaging/README.md`.
+* **T3 — dist pipeline (commit `d0b9d42`)**: implemented
+  `cargo xtask dist` end to end and aligned the Arch/RPM specs with the archive
+  it actually emits.
+* **T4 — tests (this final slice)**: expanded the `xtask` unit tests from 15 to
+  21, covering the staged layout and modes, positive/negative XML and INI
+  validation, and SHA-256 generation/corruption detection. One small,
+  behavior-preserving refactor extracted `write_sha256sums` from `cmd_dist` so
+  the exact digest format can be tested without a release build.
+* **T5 — verification (this final slice)**: ran the full gate set (`fmt`,
+  `cargo test -p xtask`, `cargo xtask dist`, `cargo xtask ci`, and `sha256sum -c`
+  on the produced bundle); all passed. Tail results are recorded below.
+
+### Architecture and data flow
+
+`cargo xtask dist [--target <triple>] [--out-dir <dir>]` runs this pipeline in
+`cmd_dist`, anchored at the workspace root derived from `CARGO_MANIFEST_DIR`
+(never the current directory):
+
+1. **Root + triple resolution.** `repo_root()` is the directory containing
+   `xtask/`. `host_triple()` reads the `host:` line of `rustc -vV`. The effective
+   triple is `--target` if given, else the host. `debian_arch()` maps the triple
+   to a Debian architecture and fails fast on anything else.
+2. **Release build + size gates.** It runs `cargo build --release --workspace`
+   (adding `--target <triple>` when one was supplied), then stats the three
+   binaries and enforces the committed budgets: `rufus` 3,000,000 bytes,
+   `rufus-helper` 2,500,000, `rufus-gui` 14,000,000. `cmd_size` additionally
+   checks drift against `size-baseline.json` with a 4,096-byte allowance; the
+   `dist` path itself only enforces the hard budgets.
+3. **Manifest validation.** `validate_packaging()` reads all 11 `PACKAGING_FILES`
+   and validates the semantic ones: XML files (polkit policy, D-Bus `system.d`
+   conf, AppStream metainfo) are parsed with **quick-xml** into a small element
+   tree (`xml_tree`) and checked for required attributes/text; INI-shaped files
+   (D-Bus service, desktop entry) go through a **hand-written `parse_ini`** that
+   fails closed on duplicates, stray keys and malformed lines; the distro files
+   are checked for required tokens (`require_tokens`). Validated texts are
+   returned in a `Packaging` struct so staging never re-reads them.
+4. **Staging tree.** `stage_tree()` wipes and rebuilds `target/dist-staging/<triple>`
+   with exactly 12 files: `usr/bin/rufus`, `usr/bin/rufus-gui`,
+   `usr/libexec/rufus-helper`, the polkit/service/bus-conf/desktop/metainfo/SVG
+   data files, `usr/share/doc/rufus/LICENSES.md`, `DEBIAN/control` and
+   `DEBIAN/postinst`. Binaries, the helper and `postinst` are mode **0755**; all
+   metadata and the control file are **0644**. The literal `Architecture: any`
+   in `deb/control` is rewritten once to the concrete `amd64`/`arm64` value.
+5. **Deterministic tarball.** `write_dist_archive()` emits a `.tar.gz` straight
+   into the output file: **flate2 `GzBuilder` with `mtime(0)`** and best
+   compression wraps a `tar::Builder`. Entries are collected by
+   `collect_staged()`, sorted by path (directories before files), and each
+   header is built with `Header::new_gnu()` with **mtime = uid = gid = 0**, empty
+   uname/gname, and the staged mode. Non-regular staged entries fail closed.
+   `verify_archive()` reads the finished archive back and checks every entry's
+   path, mtime and uid/gid against the staging tree.
+6. **Conditional .deb.** If `dpkg-deb` is on `PATH`, `cmd_dist` runs
+   `dpkg-deb --root-owner-group --build <staging> <out>/<stem>.deb` so the helper
+   is installed root-owned. Here `dpkg-deb` is absent, so it prints
+   `skip .deb: dpkg-deb not available` and continues — the tar.gz and SHA256SUMS
+   are still a successful release.
+7. **SHA256SUMS.** `write_sha256sums(out_dir, artifacts)` writes one
+   `<64-hex-digest>  <name>\n` line per produced artifact in stable order. In
+   this environment the only artifact is
+   `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`.
+
+The artifact name is `rufus-<CARGO_PKG_VERSION>-<triple>.tar.gz`. The default
+output directory is `target/dist/<triple>`; `--out-dir <dir>` is honored and
+resolved relative to the repo root. The staging directory is always
+`target/dist-staging/<triple>` and is wiped on every run.
+
+### Security invariants
+
+* **Privileged helper.** `usr/libexec/rufus-helper` is staged mode 0755 and,
+  in the `.deb`, built with `dpkg-deb --root-owner-group` so it lands
+  root-owned; `DEBIAN/postinst` re-asserts `chown root:root` and `chmod 0755`
+  idempotently. The GUI never runs as root (S24 split).
+* **Polkit authorization gate.** The action `org.rufuslinux.write-device` uses
+  `allow_any=no`, `allow_inactive=no` and `allow_active=auth_admin_keep`, so an
+  administrator authenticates once per session for a write, not once per
+  sector. The helper checks this action for the caller before reading a plan.
+* **D-Bus ownership confinement.** `org.rufuslinux.Helper1.conf` uses a
+  `<policy user="root">` that allows only `own` of `org.rufuslinux.Helper1`, and
+  a `<policy context="default">` that **denies `own` but allows
+  `send_destination`**. This restricts *who can claim* the well-known name
+  (defence in depth against an impostor) without blocking the unprivileged GUI
+  from calling `Execute`/`Cancel`. A group-restricted send policy was rejected:
+  it would duplicate the method-authorization decision that already belongs to
+  the polkit action, and the two could drift apart. Method authorization is the
+  helper's job, not the bus policy's.
+
+### Naming deviation: `org.rufuslinux.*`, not `org.rufus.*`
+
+The S26 specification literally writes the IDs/filenames as `org.rufus.*`. The
+shipped code hardcodes the D-Bus name and interface `org.rufuslinux.Helper1`,
+the object path `/org/rufuslinux/Helper1`, the polkit action
+`org.rufuslinux.write-device`, and the desktop id `org.rufuslinux.Rufus.desktop`
+(the `--dbus` CLI switch on the helper is also fixed). The GUI and helper
+compile against these exact strings; changing them would break the running
+system. Every filename and identifier therefore keeps the `org.rufuslinux.*`
+namespace. **This is an accepted, documented deviation from the spec's literal
+names**, recorded in `packaging/README.md` and the decision records. The
+required *properties* (auth_admin_keep, root-only name ownership, the install
+locations) are all met; only the literal spelling differs.
+
+### External-tool dependency rationale
+
+Following decision A4, formatters are runtime-checked and declared as
+*recommendations*, not hard dependencies, so images that need no external
+formatter still work. FAT32 and exFAT are written natively. The rest:
+
+| Format | Tool | Debian / Ubuntu | Arch |
+|---|---|---|---|
+| NTFS | `mkntfs`/`mkfs.ntfs` | `ntfs-3g` | `ntfs-3g` **and** `ntfsprogs` |
+| ext2/3/4 | `mke2fs`/`e2fsck` | `e2fsprogs` | `e2fsprogs` |
+| UDF | `mkudffs` | `udftools` | `udftools` |
+| WIM/ESD | wimlib | `libwim15` | `wimlib` |
+
+These are declared as `Recommends: ntfs-3g, e2fsprogs, udftools, libwim15` in
+`deb/control`, as `optdepends=('ntfs-3g' 'ntfsprogs' 'e2fsprogs' 'udftools'
+'wimlib')` in the Arch `PKGBUILD`, and as `Recommends: ...` in the RPM spec.
+**There is no `rufus doctor` subcommand** — none was added. Validation of these
+dependencies lives entirely in the packaging metadata and the runtime checks in
+the writer code; do not claim a CLI command was introduced.
+
+### Target / architecture mapping and the `--target` fix
+
+`debian_arch()` maps `x86_64-*` → `amd64` and `aarch64-*`/`arm64*` → `arm64`;
+anything else fails early with a clear message before a build is attempted.
+Only the host triple `x86_64-unknown-linux-gnu` is installed here, so no
+aarch64 cross-build was produced or verified.
+
+A bug was found and fixed in T3: an explicit `--target` always makes Cargo build
+into `target/<triple>/release`, even when the triple equals the host, whereas a
+host build without `--target` lands in `target/release`. `cmd_dist` keys its
+`bin_dir` off `target.is_some()` (not `triple == host`) so it reads binaries
+from the right place in both cases.
+
+### Packaging ↔ dist contract (the T3 blocker and its resolution)
+
+The reviewer of T3 found a mismatch: `dist` emits **one** triple-named archive
+whose top level is the staged FHS tree (`usr/` and `DEBIAN/`), while the Arch
+`PKGBUILD` and RPM spec claimed different tarball names and read loose files
+from the extraction root. The decision was to **fix the packaging, not dist** —
+the archive name and layout are now the authoritative contract:
+
+* `packaging/arch/PKGBUILD` sets `_target=${_target:-x86_64-unknown-linux-gnu}`
+  and `source=("rufus-${pkgver}-${_target}.tar.gz")`, matching the real artifact
+  exactly. Every `package()` source path now points into the staged tree
+  (`${srcdir}/usr/bin/rufus`, `${srcdir}/usr/libexec/rufus-helper`,
+  `${srcdir}/usr/share/...`). A real `makepkg`-style `package()` run under
+  `fakeroot` passed in review.
+* `packaging/rpm/rufus.spec` sets `%global dist_target
+  x86_64-unknown-linux-gnu`, `Source0: rufus-%{version}-%{dist_target}.tar.gz`
+  and `BuildArch: x86_64`, with `%setup -q -c -n rufus-%{version}` (the archive
+  has no leading directory) and every `%install` source taken from the staged
+  tree.
+
+A future engineer must not reintroduce a second tarball or flatten the archive:
+both distro specs consume this exact `usr/` + `DEBIAN/` layout.
+
+### Decisions and trade-offs
+
+* **In-process tar/flate2 vs. shelling out to GNU tar.** The archive is built
+  with the `tar` and `flate2` crates directly. This avoids depending on a host
+  `tar` binary and gives precise control over header fields (uid/gid/mtime 0,
+  GNU headers, sorted order), which is what makes the output deterministic.
+* **Deterministic gzip vs. apparent mtime.** The gzip header mtime and every
+  tar-entry mtime are stored as **0**. GNU `tar -tv` may *display* the epoch as
+  `1970-01-01 02:00` because it applies the local (UTC+2 here) timezone to that
+  stored zero; nothing is actually timestamped. No timestamp other than zero is
+  written anywhere.
+* **Conditional .deb.** `.deb` generation is attempted only when `dpkg-deb`
+  exists. Here it does not, so `.deb` output is untested in this environment and
+  skipped by design while the rest of the release still succeeds.
+* **No `unsafe` in xtask.** The crate declares `#![forbid(unsafe_code)]`; all of
+  this is safe Rust, with std plus the already-present `anyhow`, `flate2`, `tar`,
+  `quick-xml`, `serde`/`serde_json` dependencies. No new dependency was added
+  for tests (a pid + atomic-counter `TempDir` replaces a tempfile crate).
+* **Coverage limits.** No aarch64 cross-build, real `dpkg-deb`, `rpmspec` or
+  `rpmlint` check was possible here; those surfaces remain unverified.
+
+### Verification record (final S26-T4 run)
+
+All commands were run from `/home/hosi/dev/REA-Rufus/furus` with
+`PATH="$HOME/.cargo/bin:$PATH"`:
+
+* `cargo fmt --all -- --check` → clean (exit 0).
+* `cargo test -p xtask` → `test result: ok. 21 passed; 0 failed; 0 ignored;
+  0 measured; 0 filtered out` (was 15 before T4).
+* `cargo xtask dist` → exit 0; sizes `rufus` 1,810,152 / `rufus-helper`
+  1,406,296 / `rufus-gui` 12,774,280 bytes, all `[OK]`; `11 packaging files`
+  validated; `skip .deb: dpkg-deb not available`; artifact
+  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`.
+* `sha256sum -c SHA256SUMS` in
+  `target/dist/x86_64-unknown-linux-gnu/` →
+  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz: OK`.
+* `cargo xtask ci` → `ci: all gates passed` (fmt, clippy, workspace test,
+  assets 86/86, parity 2,709 rows, size, `cargo deny check` = advisories/bans/
+  licences/sources ok; `cargo-audit` reported `SKIP (not installed)`).
+* `git diff --check` → clean.
+
+The non-fatal `cargo deny` duplicate-crate warnings (zbus, thiserror, toml,
+windows-sys, etc.) remain unchanged from S25 and are not introduced by S26.

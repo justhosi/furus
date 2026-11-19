@@ -1371,6 +1371,19 @@ fn verify_archive(archive: &Path, staging: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write one `<sha256>  <name>` line per artifact into `<out_dir>/SHA256SUMS`,
+/// in the order given. Factored out of `cmd_dist` so the exact format the CLI
+/// emits can be exercised directly by tests without a release build.
+fn write_sha256sums(out_dir: &Path, artifacts: &[String]) -> Result<()> {
+    let mut sums = String::new();
+    for name in artifacts {
+        let digest = sha256_of(&out_dir.join(name))?;
+        sums.push_str(&format!("{digest}  {name}\n"));
+    }
+    let path = out_dir.join("SHA256SUMS");
+    std::fs::write(&path, sums).with_context(|| format!("cannot write {}", path.display()))
+}
+
 /// Full distribution pipeline: build + size gates, packaging validation,
 /// staging, deterministic tarball, conditional .deb and SHA256SUMS.
 fn cmd_dist(target: Option<String>, out_dir: Option<PathBuf>) -> Result<()> {
@@ -1466,13 +1479,7 @@ fn cmd_dist(target: Option<String>, out_dir: Option<PathBuf>) -> Result<()> {
     }
 
     // 6. One digest line per produced artifact, in a stable order.
-    let mut sums = String::new();
-    for name in &artifacts {
-        let digest = sha256_of(&out.join(name))?;
-        sums.push_str(&format!("{digest}  {name}\n"));
-    }
-    std::fs::write(out.join("SHA256SUMS"), sums)
-        .with_context(|| format!("cannot write {}", out.join("SHA256SUMS").display()))?;
+    write_sha256sums(&out, &artifacts)?;
 
     println!("dist: target={triple} out_dir={}", out.display());
     println!("dist: artifacts: {}", artifacts.join(", "));
@@ -1647,6 +1654,56 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    /// Unique scratch directory per test, cleaned up on drop. The process id
+    /// plus an atomic counter keeps names distinct even when tests run in
+    /// parallel inside the same test binary (no external tempfile crate).
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("furus-dist-test-{tag}-{}-{n}", std::process::id()));
+            if path.exists() {
+                std::fs::remove_dir_all(&path).unwrap();
+            }
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Re-read a generated SHA256SUMS and check every `<digest>  <name>` line
+    /// against the on-disk bytes. Test-only counterpart of `write_sha256sums`.
+    fn verify_sha256sums(out_dir: &Path) -> Result<()> {
+        let path = out_dir.join("SHA256SUMS");
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        for line in text.lines() {
+            let (digest, name) = line
+                .split_once("  ")
+                .with_context(|| format!("malformed SHA256SUMS line: {line:?}"))?;
+            let actual = sha256_of(&out_dir.join(name))?;
+            if actual != digest {
+                bail!("SHA256SUMS: digest mismatch for `{name}`: {digest} != {actual}");
+            }
+        }
+        Ok(())
+    }
 
     const SAMPLE_MANIFEST: &str = r#"{
         "meta": {"description": "test manifest"},
@@ -1889,6 +1946,230 @@ mod tests {
         write_dist_archive(&staging, std::fs::File::create(&b).unwrap()).unwrap();
         assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
         verify_archive(&a, &staging).unwrap();
+        // Pin the deterministic header invariants carried by every entry.
+        let file = std::fs::File::open(&a).unwrap();
+        let mut ar = Archive::new(GzDecoder::new(file));
+        let mut entries = 0;
+        for entry in ar.entries().unwrap() {
+            let entry = entry.unwrap();
+            let h = entry.header();
+            let name = h.path().unwrap().to_string_lossy().into_owned();
+            assert_eq!(h.mtime().unwrap(), 0, "{name}: mtime must be zero");
+            assert_eq!(h.uid().unwrap(), 0, "{name}: uid must be zero");
+            assert_eq!(h.gid().unwrap(), 0, "{name}: gid must be zero");
+            if name == "usr/bin/rufus" {
+                assert_eq!(h.mode().unwrap() & 0o7777, 0o755);
+            }
+            entries += 1;
+        }
+        assert_eq!(entries, 3); // two directories (usr, usr/bin) + one file
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The exact 12 paths staged by `stage_tree`, with their expected modes.
+    /// Binaries, the helper and the postinst are 0755; all data is 0644.
+    const STAGED_LAYOUT: &[(&str, u32)] = &[
+        ("usr/bin/rufus", 0o755),
+        ("usr/bin/rufus-gui", 0o755),
+        ("usr/libexec/rufus-helper", 0o755),
+        ("usr/share/polkit-1/actions/org.rufuslinux.policy", 0o644),
+        (
+            "usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service",
+            0o644,
+        ),
+        (
+            "usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf",
+            0o644,
+        ),
+        ("usr/share/applications/org.rufuslinux.Rufus.desktop", 0o644),
+        (
+            "usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml",
+            0o644,
+        ),
+        (
+            "usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg",
+            0o644,
+        ),
+        ("usr/share/doc/rufus/LICENSES.md", 0o644),
+        ("DEBIAN/control", 0o644),
+        ("DEBIAN/postinst", 0o755),
+    ];
+
+    #[test]
+    fn staged_layout_has_exact_paths_and_modes() {
+        let tmp = TempDir::new("layout");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["rufus", "rufus-gui", "rufus-helper"] {
+            std::fs::write(bin_dir.join(name), format!("fixture binary {name}")).unwrap();
+        }
+        let packaging = validate_packaging(&repo_root().join("packaging")).unwrap();
+
+        let arch = debian_arch("x86_64-unknown-linux-gnu").unwrap();
+        let staging = tmp.path().join("staging-amd64");
+        stage_tree(&repo_root(), arch, &bin_dir, &packaging, &staging).unwrap();
+
+        for (rel, mode) in STAGED_LAYOUT {
+            let path = staging.join(rel);
+            assert!(path.is_file(), "missing staged file {rel}");
+            let actual = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(actual, *mode, "wrong mode for {rel}: {actual:o}");
+        }
+
+        // No extra staged files beyond the 12 (collect_staged walks the tree).
+        let (_, files) = collect_staged(&staging).unwrap();
+        assert_eq!(files.len(), STAGED_LAYOUT.len());
+
+        // The literal `Architecture: any` was rewritten for the concrete
+        // target, and nowhere else did the control text change shape.
+        let control = std::fs::read_to_string(staging.join("DEBIAN/control")).unwrap();
+        assert!(control.lines().any(|l| l == "Architecture: amd64"));
+        assert!(!control.contains("Architecture: any"));
+    }
+
+    #[test]
+    fn staged_control_architecture_follows_target_mapping() {
+        let tmp = TempDir::new("arch");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["rufus", "rufus-gui", "rufus-helper"] {
+            std::fs::write(bin_dir.join(name), b"x").unwrap();
+        }
+        let packaging = validate_packaging(&repo_root().join("packaging")).unwrap();
+
+        for (triple, expected) in [
+            ("x86_64-unknown-linux-gnu", "amd64"),
+            ("aarch64-unknown-linux-gnu", "arm64"),
+        ] {
+            // Test the mapping directly as well as its effect on staging.
+            assert_eq!(debian_arch(triple).unwrap(), expected);
+            let staging = tmp.path().join(format!("staging-{expected}"));
+            let arch = debian_arch(triple).unwrap();
+            stage_tree(&repo_root(), arch, &bin_dir, &packaging, &staging).unwrap();
+            let control = std::fs::read_to_string(staging.join("DEBIAN/control")).unwrap();
+            assert!(
+                control
+                    .lines()
+                    .any(|l| l == format!("Architecture: {expected}")),
+                "{triple} did not map to {expected}"
+            );
+        }
+        assert!(debian_arch("i686-unknown-linux-gnu").is_err());
+    }
+
+    #[test]
+    fn real_packaging_xml_and_ini_files_validate() {
+        let root = repo_root().join("packaging");
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap();
+        // XML-backed definitions.
+        validate_polkit(&read("polkit/org.rufuslinux.policy")).unwrap();
+        validate_bus_conf(&read("dbus/org.rufuslinux.Helper1.conf")).unwrap();
+        validate_metainfo(&read("org.rufuslinux.Rufus.metainfo.xml")).unwrap();
+        // INI-backed definitions.
+        validate_service(&read("dbus/org.rufuslinux.Helper1.service")).unwrap();
+        validate_desktop(&read("org.rufuslinux.Rufus.desktop")).unwrap();
+        // Distro metadata tokens.
+        validate_deb_control(&read("deb/control")).unwrap();
+        validate_rpm_spec(&read("rpm/rufus.spec")).unwrap();
+        validate_arch_pkgbuild(&read("arch/PKGBUILD")).unwrap();
+        // All 11 finalized files exist, including the non-validated payloads.
+        assert_eq!(PACKAGING_FILES.len(), 11);
+        for rel in PACKAGING_FILES {
+            assert!(root.join(rel).is_file(), "missing packaging file {rel}");
+        }
+    }
+
+    #[test]
+    fn malformed_xml_is_rejected() {
+        // Unclosed element.
+        assert!(
+            validate_polkit("<policyconfig><action id=\"org.rufuslinux.write-device\">").is_err()
+        );
+        // Mismatched closing tag.
+        assert!(validate_bus_conf("<busconfig><policy></busconfig>").is_err());
+        // Polkit action with the wrong/missing id.
+        let no_id = "<policyconfig><action id=\"other\"><defaults>\
+                     <allow_any>no</allow_any><allow_inactive>no</allow_inactive>\
+                     <allow_active>auth_admin_keep</allow_active></defaults></action></policyconfig>";
+        assert!(validate_polkit(no_id).is_err());
+        assert!(validate_polkit("<policyconfig/>").is_err());
+        // Polkit defaults missing auth_admin_keep (wrong value).
+        let wrong_keep = "<policyconfig><action id=\"org.rufuslinux.write-device\"><defaults>\
+                          <allow_any>no</allow_any><allow_inactive>no</allow_inactive>\
+                          <allow_active>yes</allow_active></defaults></action></policyconfig>";
+        assert!(validate_polkit(wrong_keep).is_err());
+        // Bus config missing the root-owned `own` rule.
+        let bus_no_root = "<busconfig><policy context=\"default\">\
+                           <deny own=\"org.rufuslinux.Helper1\"/>\
+                           <allow send_destination=\"org.rufuslinux.Helper1\"/>\
+                           </policy></busconfig>";
+        assert!(validate_bus_conf(bus_no_root).is_err());
+        // Metainfo missing the required <id>.
+        assert!(
+            validate_metainfo("<component type=\"desktop-application\"><name>x</name></component>")
+                .is_err()
+        );
+        // Metainfo with the wrong id.
+        assert!(
+            validate_metainfo("<component type=\"desktop-application\"><id>wrong</id></component>")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_ini_is_rejected_by_validators() {
+        // Duplicate section, duplicate key and key outside a section all go
+        // through parse_ini; the higher-level validators must refuse them too.
+        assert!(validate_service("[D-Bus Service]\nName=x\nName=y\n").is_err());
+        assert!(validate_service("[D-Bus Service]\nName=x\n[D-Bus Service]\nExec=y\n").is_err());
+        assert!(validate_desktop("Exec=rufus-gui\n[Desktop Entry]\nType=Application\n").is_err());
+        // Missing required keys: Exec in the desktop entry, User in the
+        // service. Both otherwise-valid files must still be rejected.
+        let no_exec = "[Desktop Entry]\nType=Application\nName=x\nIcon=x\nTerminal=false\nCategories=System;\n";
+        assert!(validate_desktop(no_exec).is_err());
+        let no_user =
+            "[D-Bus Service]\nName=org.rufuslinux.Helper1\nExec=/usr/libexec/rufus-helper --dbus\n";
+        assert!(validate_service(no_user).is_err());
+        // A wrong Exec value is rejected as well.
+        let wrong_exec =
+            "[D-Bus Service]\nName=org.rufuslinux.Helper1\nExec=/bin/false\nUser=root\n";
+        assert!(validate_service(wrong_exec).is_err());
+    }
+
+    #[test]
+    fn sha256sums_match_artifact_bytes_and_detect_corruption() {
+        let tmp = TempDir::new("sums");
+        let a = tmp.path().join("artifact.bin");
+        let b = tmp.path().join("other.txt");
+        std::fs::write(&a, b"deterministic payload 12345").unwrap();
+        std::fs::write(&b, b"second").unwrap();
+        let names = vec!["artifact.bin".to_string(), "other.txt".to_string()];
+
+        write_sha256sums(tmp.path(), &names).unwrap();
+        let text = std::fs::read_to_string(tmp.path().join("SHA256SUMS")).unwrap();
+        // Exact GNU-coreutils-style format: `<hex>  <name>\n`, stable order.
+        assert_eq!(
+            text,
+            format!(
+                "{}  artifact.bin\n{}  other.txt\n",
+                sha256_of(&a).unwrap(),
+                sha256_of(&b).unwrap()
+            )
+        );
+        for (line, name) in text.lines().zip(&names) {
+            let (digest, n) = line.split_once("  ").unwrap();
+            assert_eq!(n, name);
+            assert_eq!(digest, &sha256_of(&tmp.path().join(name)).unwrap());
+        }
+        verify_sha256sums(tmp.path()).unwrap();
+
+        // A corrupted digest line is detected.
+        std::fs::write(tmp.path().join("SHA256SUMS"), "deadbeef  artifact.bin\n").unwrap();
+        assert!(verify_sha256sums(tmp.path()).is_err());
+
+        // Rewriting correct sums then mutating an artifact is also detected.
+        write_sha256sums(tmp.path(), &names).unwrap();
+        std::fs::write(&a, b"tampered payload").unwrap();
+        assert!(verify_sha256sums(tmp.path()).is_err());
     }
 }
