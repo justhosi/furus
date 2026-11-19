@@ -12,8 +12,9 @@ by line number); it is not checked in here. What is in-repo is
 plan defaults (licence, public name, targets, external-tool policy, GUI
 toolkit, privilege model, ...) and their S00 status. Its "no
 implementation has started" line is an S00 snapshot - implementation has
-advanced well past it - and its public-name and licence decisions (A1,
-A2) remain marked "proposed".
+advanced well past it - and, of the decisions called out
+here, the public name (A2) is still proposed while the licence (A1) was
+ratified 2026-11-19 as GPL-3.0-or-later (A3 and A5 were ratified the same day).
 
 ## Status
 
@@ -276,7 +277,8 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
   the pkexec/D-Bus helper transports. It still owns no privilege: confirmed
   writes run in the helper).
 * `xtask` - repo maintenance: asset-manifest check, parity check, the
-  per-binary size gate, CI ordering.
+  per-binary size gate, CI ordering, and `dist` (release bundles - see Build
+  below).
 
 The crate layering keeps privileged I/O in `rufus-linux` /
 `rufus-helper` and the formatter logic in `rufus-core`, which never
@@ -322,6 +324,41 @@ At the S25 tip it reports `rufus` 1,810,152 bytes (budget 3,000,000),
 the rest of the S25 GUI growth), `size: within committed baseline allowance,
 all budgets OK`.
 
+### Release bundles (`cargo xtask dist`)
+
+Building is not the same as shipping: `cargo xtask dist [--target <triple>]
+[--out-dir <dir>]` release-builds the workspace, enforces the same size
+budgets, validates the eleven finalized `packaging/` files (XML via quick-xml,
+INI via a hand-written parser, plus distro-token checks), stages an exact
+twelve-file FHS tree, and writes a deterministic
+`rufus-<version>-<triple>.tar.gz` alongside a `SHA256SUMS`. The default target
+is the rustc host triple and the default output directory is
+`target/dist/<triple>`; `sha256sum -c SHA256SUMS` verifies a bundle. Entries
+are sorted and uid/gid/mtime and the gzip mtime are zeroed so the tarball is
+byte-for-byte reproducible; stored mtimes of zero may display as `1970-01-01`
+in `tar -tv`, shifted by the local timezone, which is display only.
+
+A `.deb` is built only where `dpkg-deb` is installed (`dpkg-deb
+--root-owner-group`); elsewhere the command prints `skip .deb: dpkg-deb not
+available` and still succeeds with the tarball and digest file - this host has
+no `dpkg-deb`, so `.deb` generation is not verified here. The staged tree puts
+the CLI and GUI at `/usr/bin/rufus` and `/usr/bin/rufus-gui` and the privileged
+helper at `/usr/libexec/rufus-helper` (root-owned, 0755): the GUI never runs as
+root, so writes happen only in the helper, gated by the polkit action, and the
+D-Bus system.d configuration restricts who may own the well-known name. The
+polkit policy, D-Bus files, desktop entry, AppStream metainfo, icon and licence
+texts install under `/usr/share`; only the `.deb` uses `DEBIAN/control` and
+`DEBIAN/postinst`.
+
+The Arch `PKGBUILD` and RPM `rufus.spec` consume that same single tarball and
+its staged `usr/` tree, so the artifact name and layout are a contract - no
+second tarball, no flattened archive. The packaging files keep the
+`org.rufuslinux.*` namespace because the GUI and helper hardcode those bus and
+polkit identifiers, and the external formatters (`ntfs-3g`, `e2fsprogs`,
+`udftools`, wimlib) are recommendations or optional dependencies rather than
+hard ones, since decision A4 makes them runtime-checked. `packaging/README.md`
+has the full install-path table and service-verification commands.
+
 ## Tests
 
 The formatters are verified against real external tools, which the
@@ -366,6 +403,6 @@ ntfscp, unshare, ntfs-3g or the OVMF images are absent).
   `HANDOFF-boot-c0000001.md` (the resolved `0xc0000001` BCD boot-store bug).
 * `LICENSES.md` - asset licence audit for the Rufus 4.15 resources the
   implementation reuses; the code licence is GPL-3.0-or-later (decision
-  A1, still proposed).
+  A1, approved 2026-11-19).
 * `assets/`, `data/`, `packaging/` and the `tests/` fixtures carry their
   own READMEs.
