@@ -241,7 +241,7 @@ analysed upstream function — the ledger only covers functions and thunks from
 | S24 | Slint GUI — unprivileged window over `GuiState`, hotplug device watch, background image analysis | complete (on `main`) |
 | S25 | Update check + confirmed write flow — confirmation-gated GUI run and helper IPC transports, four-digest checksum modal, locale/preferences; the parity ledger assigns the `net` (HTTP update check/download) module here, but only the `check_updates`/`update_channel` config fields exist, not a live update-check feature | complete (on `main`) |
 | S26 | Release bundles / packaging — finalized `packaging/` metadata and the deterministic `cargo xtask dist` bundle | complete (on `main`) |
-| S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | T1 (gate) committed at `75563b4`; T2 (this documentation slice) uncommitted; T3 (CI wiring in `.github/workflows/ci.yml`) pending |
+| S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | complete (on `main`) |
 
 ### `analyze` report
 
@@ -443,8 +443,9 @@ unprivileged by default and safe to run on a plain CI runner. From this host:
   and off by default. `APPDIR` is removed at spawn so a stale AppImage
   variable cannot break asset lookup.
 
-CI will run `cargo xtask qa` as a gate; the workflow wiring is the remaining
-S27 task (Slice 3/3, `.github/workflows/ci.yml`).
+CI runs `cargo xtask qa` as a gate on pushes and pull requests, after
+installing the filesystem, QEMU/OVMF and GRUB tools the suites need
+(`.github/workflows/ci.yml`).
 
 ## Docs
 
