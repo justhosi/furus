@@ -52,6 +52,16 @@ export component MainWindow inherits Window {
     in property <string> status-text;
     in property <bool> start-enabled;
 
+    // ---- S25 run wiring (all values/callbacks come from Rust) ----
+    // One flag locks every configuration control while a run is in flight.
+    in property <bool> form-enabled: true;
+    in property <bool> confirm-visible: false;
+    in property <string> confirm-facts;
+    in property <bool> cancel-enabled: false;
+    in property <string> step-text;
+    in property <string> log-text;
+    in-out property <bool> log-open: false;
+
     // ---- UI -> Rust (every state change goes back through GuiState) ----
     callback device-selected(string);
     callback boot-selected(string);
@@ -68,6 +78,9 @@ export component MainWindow inherits Window {
     callback bad-blocks-toggled();
     callback passes-selected(string);
     callback start-clicked();
+    callback confirm-clicked();
+    callback cancel-clicked();
+    callback discard-clicked();
     callback close-clicked();
 
     VerticalLayout {
@@ -84,6 +97,7 @@ export component MainWindow inherits Window {
             device-combo := ComboBox {
                 model: root.device-model;
                 current-value <=> root.device-current;
+                enabled: root.form-enabled;
                 selected(value) => { root.device-selected(value); }
             }
         }
@@ -103,16 +117,17 @@ export component MainWindow inherits Window {
             boot-combo := ComboBox {
                 model: root.boot-model;
                 current-value <=> root.boot-current;
+                enabled: root.form-enabled;
                 selected(value) => { root.boot-selected(value); }
             }
             Button {
                 text: "SELECT";
-                enabled: root.select-enabled;
+                enabled: root.form-enabled && root.select-enabled;
                 clicked => { root.select-clicked(); }
             }
             Button {
                 text: "CHECKSUM";
-                enabled: root.checksum-enabled;
+                enabled: root.form-enabled && root.checksum-enabled;
                 clicked => { root.checksum-clicked(); }
             }
         }
@@ -128,6 +143,7 @@ export component MainWindow inherits Window {
             ComboBox {
                 model: root.image-option-model;
                 current-value <=> root.image-option-current;
+                enabled: root.form-enabled;
                 selected(value) => { root.image-option-selected(value); }
             }
         }
@@ -142,6 +158,7 @@ export component MainWindow inherits Window {
             ComboBox {
                 model: root.scheme-model;
                 current-value <=> root.scheme-current;
+                enabled: root.form-enabled;
                 selected(value) => { root.scheme-selected(value); }
             }
             Text {
@@ -151,6 +168,7 @@ export component MainWindow inherits Window {
             ComboBox {
                 model: root.target-model;
                 current-value <=> root.target-current;
+                enabled: root.form-enabled;
                 selected(value) => { root.target-selected(value); }
             }
         }
@@ -165,7 +183,7 @@ export component MainWindow inherits Window {
             ComboBox {
                 model: root.fs-model;
                 current-value <=> root.fs-current;
-                enabled: root.fs-enabled;
+                enabled: root.form-enabled && root.fs-enabled;
                 selected(value) => { root.fs-selected(value); }
             }
             Text {
@@ -175,6 +193,7 @@ export component MainWindow inherits Window {
             ComboBox {
                 model: root.cluster-model;
                 current-value <=> root.cluster-current;
+                enabled: root.form-enabled;
                 selected(value) => { root.cluster-selected(value); }
             }
         }
@@ -188,6 +207,7 @@ export component MainWindow inherits Window {
             }
             LineEdit {
                 text <=> root.volume-label;
+                enabled: root.form-enabled;
                 edited(value) => { root.label-edited(value); }
             }
         }
@@ -195,12 +215,14 @@ export component MainWindow inherits Window {
         CheckBox {
             text: "Create extended label and icon files";
             checked <=> root.extended-label-checked;
+            enabled: root.form-enabled;
             toggled => { root.extended-label-toggled(); }
         }
 
         CheckBox {
             text: "Quick format";
             checked <=> root.quick-format-checked;
+            enabled: root.form-enabled;
             toggled => { root.quick-format-toggled(); }
         }
 
@@ -209,6 +231,7 @@ export component MainWindow inherits Window {
             bad-blocks-check := CheckBox {
                 text: "Check device for bad blocks";
                 checked <=> root.bad-blocks-checked;
+                enabled: root.form-enabled;
                 toggled => { root.bad-blocks-toggled(); }
             }
             Text {
@@ -218,7 +241,7 @@ export component MainWindow inherits Window {
             ComboBox {
                 model: root.passes-model;
                 current-value <=> root.passes-current;
-                enabled: root.passes-enabled;
+                enabled: root.form-enabled && root.passes-enabled;
                 selected(value) => { root.passes-selected(value); }
             }
         }
@@ -228,22 +251,87 @@ export component MainWindow inherits Window {
         }
 
         Text {
+            text: root.step-text;
+            wrap: word-wrap;
+        }
+
+        Text {
             text: root.status-text;
             wrap: word-wrap;
             vertical-stretch: 1;
+        }
+
+        Button {
+            text: root.log-open ? "Hide log" : "Show log";
+            clicked => { root.log-open = !root.log-open; }
+        }
+        if root.log-open : Rectangle {
+            min-height: 120px;
+            background: #f6f6f6;
+            Flickable {
+                content-height: log-text.preferred-height;
+                log-text := Text {
+                    text: root.log-text;
+                    wrap: word-wrap;
+                }
+            }
         }
 
         HorizontalLayout {
             spacing: 8px;
             alignment: end;
             Button {
+                text: "CANCEL";
+                enabled: root.cancel-enabled;
+                clicked => { root.cancel-clicked(); }
+            }
+            Button {
                 text: "START";
-                enabled: root.start-enabled;
+                enabled: root.form-enabled && root.start-enabled;
                 clicked => { root.start-clicked(); }
             }
             Button {
                 text: "CLOSE";
                 clicked => { root.close-clicked(); }
+            }
+        }
+    }
+
+    // Destructive confirmation overlay. The facts are Rust-provided; this
+    // layer only shows them and forwards the two choices. No rule lives here.
+    if root.confirm-visible : Rectangle {
+        background: #000000aa;
+        VerticalLayout {
+            padding: 24px;
+            spacing: 12px;
+            Rectangle {
+                background: #ffffff;
+                border-radius: 8px;
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+                    Text {
+                        text: "CONFIRM DESTRUCTIVE WRITE";
+                        font-weight: 700;
+                        font-size: 16px;
+                    }
+                    Text {
+                        text: root.confirm-facts;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Button {
+                            text: "GO BACK";
+                            clicked => { root.discard-clicked(); }
+                        }
+                        Button {
+                            text: "CONFIRM AND WRITE";
+                            clicked => { root.confirm-clicked(); }
+                        }
+                    }
+                }
             }
         }
     }

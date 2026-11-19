@@ -49,15 +49,20 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use rufus_core::planner::BootloaderOpt;
 use rufus_gui::analyzer::{
     AnalysisCoordinator, AnalysisResult, AnalyzerSender, AnalyzerWorker, checksum,
 };
+use rufus_gui::ipc::{IpcError, PkexecTransport, open_helper, start_with_fallback};
+use rufus_gui::run::{CancelRequest, DeviceFacts, LogEntry, Run, RunState};
 use rufus_gui::state::{GuiState, WindowsImageOption};
 use rufus_linux::Device;
 use rufus_linux::sysfs::{self, SysfsRoot};
-use rufus_proto::{Filesystem, Plan, Scheme, Step, Target};
+use rufus_proto::{
+    Completion, EVENT_STREAM_VERSION, Event, Filesystem, Outcome, Plan, Scheme, Step, Target,
+};
 use rustix::process;
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
@@ -381,6 +386,212 @@ fn describe_plan(plan: &Plan) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// S25 slice 5 presentation infrastructure. The rules stay in `run` and the
+// transports in `ipc`; everything below is formatting or threading glue.
+// ---------------------------------------------------------------------------
+
+/// One-shot bridge from the UI thread to the worker's `CancelHandle`.
+///
+/// The `Run` owns a `CancelRequest` whose action is `bridge.request()`. The
+/// handle only exists once the worker has started the transport, so an early
+/// cancellation is latched and delivered at `install` instead of being lost.
+#[derive(Clone, Default)]
+struct CancelBridge {
+    inner: Arc<Mutex<CancelBridgeInner>>,
+}
+
+#[derive(Default)]
+struct CancelBridgeInner {
+    requested: bool,
+    fired: bool,
+    sink: Option<Box<dyn Fn() + Send>>,
+}
+
+impl CancelBridge {
+    fn request(&self) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if inner.fired {
+            return;
+        }
+        inner.requested = true;
+        if let Some(sink) = inner.sink.as_ref() {
+            sink();
+            inner.fired = true;
+        }
+    }
+
+    /// Install the worker's cancellation action. A request made before the
+    /// transport was ready is delivered exactly once here.
+    fn install(&self, sink: impl Fn() + Send + 'static) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.sink = Some(Box::new(sink));
+        if inner.requested && !inner.fired {
+            inner.sink.as_ref().expect("sink was just installed")();
+            inner.fired = true;
+        }
+    }
+}
+
+/// Every display value the window needs from the run machine, in one
+/// snapshot so `render` never has to interpret a `RunState` itself.
+struct RunView {
+    progress: f32,
+    detail: String,
+    locked: bool,
+    cancel_enabled: bool,
+    start_enabled: bool,
+    terminal: Option<String>,
+}
+
+/// Pure render-input helper: format progress, derive the lock flags and the
+/// terminal status. No reference to Slint, a transport or a device.
+fn run_view(run: &Run) -> RunView {
+    let locked = run.configuration_locked();
+    let mut progress = 0.0_f32;
+    let mut detail = String::new();
+    let mut cancel_enabled = false;
+    let mut start_enabled = false;
+    let mut terminal = None;
+    match run.state() {
+        RunState::Idle => start_enabled = true,
+        RunState::Confirming => {}
+        RunState::Running {
+            step,
+            percent,
+            rate,
+            eta,
+        } => {
+            cancel_enabled = true;
+            progress = percent.map_or(0.0, |percent| f32::from(percent) / 100.0);
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(step) = step {
+                parts.push(format!("step {}", step.as_str()));
+            }
+            if let Some(percent) = percent {
+                parts.push(format!("{percent}%"));
+            }
+            if let Some(rate) = rate {
+                parts.push(rate.clone());
+            }
+            if let Some(eta) = eta {
+                parts.push(format!("ETA {eta}"));
+            }
+            detail = parts.join(" · ");
+        }
+        RunState::Finished(outcome) => {
+            progress = 1.0;
+            start_enabled = true;
+            terminal = Some(outcome_text(outcome));
+        }
+    }
+    RunView {
+        progress,
+        detail,
+        locked,
+        cancel_enabled,
+        start_enabled,
+        terminal,
+    }
+}
+
+fn outcome_text(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Ok => "Completed successfully.".to_string(),
+        Outcome::Cancelled => "Cancelled.".to_string(),
+        Outcome::Refused { code, message } => format!("Refused ({code}): {message}"),
+        Outcome::Failed { code, message } => format!("Failed ({code}): {message}"),
+    }
+}
+
+/// Facts shown in the destructive confirmation dialog: exactly the ones the
+/// user saw on the form, plus an explicit irreversibility warning.
+fn confirmation_facts(facts: &DeviceFacts) -> String {
+    format!(
+        "Model: {}\n\
+         Path: {}\n\
+         Serial: {}\n\
+         Capacity: {} ({} bytes)\n\
+         Existing mounts: {}\n\
+         \n\
+         WARNING: this will DESTROY all data on this device.\n\
+         The operation cannot be undone.",
+        facts.model.as_deref().unwrap_or("unknown model"),
+        facts.path,
+        facts.serial.as_deref().unwrap_or("no serial"),
+        human_size(facts.size_bytes),
+        facts.size_bytes,
+        facts.mount_summary,
+    )
+}
+
+fn log_line(entry: &LogEntry) -> String {
+    format!("[{}] {}", entry.level.as_str(), entry.message)
+}
+
+fn log_lines<'a>(entries: impl IntoIterator<Item = &'a LogEntry>) -> Vec<String> {
+    entries.into_iter().map(log_line).collect()
+}
+
+/// A live system bus is addressable when its well-known socket exists or the
+/// address was overridden. Construction never connects: the real probe is
+/// only used by the worker, so tests stay offline. The live D-Bus path is
+/// unverified in this environment (no system bus).
+fn prefer_system_bus() -> bool {
+    std::env::var_os("DBUS_SYSTEM_BUS_ADDRESS").is_some()
+        || std::path::Path::new("/run/dbus/system_bus_socket").exists()
+}
+
+/// Messages the worker publishes to the UI thread. All `Run` mutations still
+/// happen on the event loop; this channel only carries data.
+enum RunMessage {
+    Event(Result<Event, IpcError>),
+    Failed(String),
+    Stop,
+}
+
+fn finish_run_as_failed(session: &mut Session, code: &str, message: String) {
+    session.run.apply(
+        &Event::Done(Completion {
+            session: String::new(),
+            version: EVENT_STREAM_VERSION,
+            outcome: Outcome::Failed {
+                code: code.to_string(),
+                message: message.clone(),
+            },
+        }),
+        Duration::ZERO,
+    );
+}
+
+/// Transport work runs here because `start` may block on polkit for the whole
+/// authorization budget. No Slint API is touched from this thread.
+fn run_worker(plan: Plan, bridge: CancelBridge, sender: mpsc::Sender<RunMessage>) {
+    let mut transport = open_helper(prefer_system_bus);
+    match start_with_fallback(&mut transport, &plan, || Box::new(PkexecTransport::new())) {
+        Ok(started) => {
+            bridge.install({
+                let cancel = started.cancel.clone();
+                move || {
+                    let _ = cancel.cancel();
+                }
+            });
+            for event in started.events {
+                if sender.send(RunMessage::Event(event)).is_err() {
+                    break;
+                }
+            }
+        }
+        Err(error) => {
+            let _ = sender.send(RunMessage::Failed(error.to_string()));
+        }
+    }
+}
+
 enum AnalysisMessage {
     Result(Box<AnalysisResult>),
     Stop,
@@ -428,8 +639,10 @@ struct Session {
     state: GuiState,
     analyzer: AnalysisCoordinator,
     device_list: rufus_gui::devices::DeviceListState,
-    progress: f32,
     note: Option<String>,
+    run: Run,
+    cancel_bridge: CancelBridge,
+    run_started: Option<Instant>,
 }
 
 impl Session {
@@ -445,14 +658,30 @@ impl Session {
             state: GuiState::default(),
             analyzer: AnalysisCoordinator::default(),
             device_list,
-            progress: 0.0,
             note,
+            run: Run::new(),
+            cancel_bridge: CancelBridge::default(),
+            run_started: None,
         };
+        session.new_run();
         if let Some(first) = first {
             let summary = mount_summary(&first);
             session.state.select_device(&first, summary);
         }
         session
+    }
+
+    /// Give the next run a fresh one-shot cancel bridge. A new run is only
+    /// created after a terminal outcome, so no old worker can still install
+    /// a handle into it.
+    fn new_run(&mut self) {
+        let bridge = CancelBridge::default();
+        self.run = Run::with_cancel(CancelRequest::new({
+            let bridge = bridge.clone();
+            move || bridge.request()
+        }));
+        self.cancel_bridge = bridge;
+        self.run_started = None;
     }
 
     fn select_device(&mut self, label: &str) -> Option<u64> {
@@ -523,14 +752,66 @@ impl Session {
         );
     }
 
+    /// START only plans and opens the confirmation gate. No transport is
+    /// touched here, so this remains a no-write operation.
     fn start(&mut self) {
-        self.note = Some(match self.state.build_plan() {
-            Ok(plan) => format!(
-                "Planned: {}. No device writes were performed.",
-                describe_plan(&plan)
-            ),
-            Err(error) => format!("Planning refused: {error}. No device writes were performed."),
-        });
+        if matches!(self.run.state(), RunState::Finished(_)) {
+            self.new_run();
+        }
+        match self.run.start(&mut self.state) {
+            Ok(()) => {
+                let plan = self.run.plan().expect("START prepared a plan");
+                self.note = Some(format!(
+                    "Planned: {}. No device writes were performed.",
+                    describe_plan(plan)
+                ));
+            }
+            Err(error) => {
+                self.note = Some(format!(
+                    "Planning refused: {error}. No device writes were performed."
+                ));
+            }
+        }
+    }
+
+    fn confirm(&mut self) -> Option<Plan> {
+        let result = self.run.confirm().cloned();
+        match result {
+            Ok(plan) => {
+                self.note = None;
+                self.run_started = Some(Instant::now());
+                Some(plan)
+            }
+            Err(error) => {
+                self.note = Some(error.to_string());
+                None
+            }
+        }
+    }
+
+    fn apply_run_message(&mut self, message: RunMessage) {
+        match message {
+            RunMessage::Event(Ok(event)) => {
+                let elapsed = self
+                    .run_started
+                    .map_or(Duration::ZERO, |start| start.elapsed());
+                self.run.apply(&event, elapsed);
+            }
+            RunMessage::Event(Err(error)) => {
+                self.note = Some(format!("Helper error: {error}"));
+                finish_run_as_failed(self, "ipc", error.to_string());
+            }
+            RunMessage::Failed(text) => {
+                self.note = Some(format!("Could not start helper: {text}"));
+                finish_run_as_failed(self, "ipc", text);
+            }
+            RunMessage::Stop => {}
+        }
+    }
+
+    fn discard(&mut self) {
+        self.new_run();
+        self.note = None;
     }
 }
 
@@ -581,6 +862,7 @@ fn status_with_device_warning(status: &str, note: Option<&str>, warning: Option<
 
 fn render(session: &Session, ui: &MainWindow) {
     let state = &session.state;
+    let run_view = run_view(&session.run);
 
     ui.set_device_model(model(
         session.device_list.devices().iter().map(device_label),
@@ -646,13 +928,38 @@ fn render(session: &Session, ui: &MainWindow) {
         state.bad_blocks_passes.max(1),
     )));
 
-    ui.set_progress_value(session.progress);
+    // The lock flag from `Run` gates every configuration control with one
+    // binding; the per-control flags above still express weaker rules
+    // (e.g. the checksum button needs an analysed image).
+    ui.set_form_enabled(!run_view.locked);
+    ui.set_cancel_enabled(run_view.cancel_enabled);
+    ui.set_start_enabled(state.start_enabled() && run_view.start_enabled);
+
+    let confirming = matches!(session.run.state(), RunState::Confirming);
+    ui.set_confirm_visible(confirming);
+    if confirming {
+        ui.set_confirm_facts(SharedString::from(
+            session
+                .run
+                .device()
+                .map_or_else(String::new, confirmation_facts),
+        ));
+    }
+
+    ui.set_progress_value(run_view.progress);
+    ui.set_step_text(SharedString::from(run_view.detail.clone()));
+    ui.set_log_text(SharedString::from(log_lines(session.run.logs()).join("\n")));
+
+    let mut status = state.status_text().to_string();
+    if let Some(terminal) = &run_view.terminal {
+        status.push('\n');
+        status.push_str(terminal);
+    }
     ui.set_status_text(SharedString::from(status_with_device_warning(
-        state.status_text(),
+        &status,
         session.note.as_deref(),
         session.device_list.warning(),
     )));
-    ui.set_start_enabled(state.start_enabled());
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +1040,33 @@ fn run_gui() -> Result<(), slint::PlatformError> {
             None
         }
     };
+
+    // The helper worker only publishes data here; the event-loop dispatcher
+    // is the sole place that mutates `Run` and the Slint properties.
+    let (run_tx, run_rx) = mpsc::channel::<RunMessage>();
+    let run_dispatch_session = session.clone();
+    let run_dispatch_weak = ui.as_weak();
+    let run_dispatcher = thread::spawn(move || {
+        while let Ok(message) = run_rx.recv() {
+            if matches!(message, RunMessage::Stop) {
+                break;
+            }
+            let session = run_dispatch_session.clone();
+            let weak = run_dispatch_weak.clone();
+            if slint::invoke_from_event_loop(move || {
+                let mut session = session.borrow_mut();
+                session.apply_run_message(message);
+                if let Some(ui) = weak.upgrade() {
+                    render(&session, &ui);
+                }
+            })
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let run_worker_handle: Arc<Mutex<Option<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
     // Every callback: mutate `GuiState` through the session, then
     // re-render the whole form from `GuiState` (one-way display).
@@ -933,6 +1267,64 @@ fn run_gui() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        let run_tx = run_tx.clone();
+        let handles = Arc::clone(&run_worker_handle);
+        ui.on_confirm_clicked(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let (plan, bridge) = {
+                let mut guard = session.borrow_mut();
+                let plan = guard.confirm();
+                (plan, guard.cancel_bridge.clone())
+            };
+            let Some(plan) = plan else {
+                render(&session.borrow(), &ui);
+                return;
+            };
+            // Hide the dialog and lock the form before any process starts.
+            render(&session.borrow(), &ui);
+            let sender = run_tx.clone();
+            let handle = thread::Builder::new()
+                .name("rufus-run-worker".to_string())
+                .spawn(move || run_worker(plan, bridge, sender));
+            if let Ok(handle) = handle {
+                if let Ok(mut slot) = handles.lock() {
+                    *slot = Some(handle);
+                }
+            } else {
+                let _ = run_tx.send(RunMessage::Failed(
+                    "could not start the helper worker thread".to_string(),
+                ));
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_cancel_clicked(move || {
+            if let Some(ui) = weak.upgrade() {
+                let mut guard = session.borrow_mut();
+                let _ = guard.run.cancel();
+                guard.cancel_bridge.request();
+                drop(guard);
+                render(&session.borrow(), &ui);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_discard_clicked(move || {
+            if let Some(ui) = weak.upgrade() {
+                session.borrow_mut().discard();
+                render(&session.borrow(), &ui);
+            }
+        });
+    }
     ui.on_close_clicked(|| {
         let _ = slint::quit_event_loop();
     });
@@ -942,6 +1334,16 @@ fn run_gui() -> Result<(), slint::PlatformError> {
     analyzer.shutdown();
     let _ = analysis_shutdown_tx.send(AnalysisMessage::Stop);
     drop(worker.map(|worker| worker.shutdown()));
+    // Ask any in-flight helper to stop so its event stream ends and the
+    // worker can be joined. A pkexec authorization budget bounds the wait.
+    session.borrow().cancel_bridge.request();
+    let _ = run_tx.send(RunMessage::Stop);
+    if let Ok(mut slot) = run_worker_handle.lock()
+        && let Some(handle) = slot.take()
+    {
+        let _ = handle.join();
+    }
+    let _ = run_dispatcher.join();
     let _ = dispatcher.join();
     let _ = analysis_dispatcher.join();
     result
@@ -949,11 +1351,68 @@ fn run_gui() -> Result<(), slint::PlatformError> {
 
 #[cfg(test)]
 mod tests {
-    use rufus_gui::devices::{DeviceUpdate, Discovery};
-    use rufus_gui::state::GuiError;
-    use rufus_linux::{Device, Partition, Transport};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-    use super::{Session, startup_refusal, status_with_device_warning};
+    use rufus_gui::devices::{DeviceUpdate, Discovery};
+    use rufus_gui::run::{DeviceFacts, LogEntry, Run, RunState};
+    use rufus_gui::state::{GuiError, GuiState};
+    use rufus_linux::{Device, Partition, Transport};
+    use rufus_proto::{Completion, EVENT_STREAM_VERSION, Event, LogLevel, Outcome, Progress};
+
+    use super::{
+        CancelBridge, Session, confirmation_facts, log_lines, run_view, startup_refusal,
+        status_with_device_warning,
+    };
+
+    static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    /// A 4 KiB raw image with no container magic — enough for the planner
+    /// fixture, written and removed entirely in the temp directory.
+    struct ImageFile(PathBuf);
+
+    impl ImageFile {
+        fn raw() -> Self {
+            let serial = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rufus-gui-slice5-{}-{serial}.img",
+                std::process::id()
+            ));
+            fs::write(&path, [0xA5; 4096]).expect("write raw fixture");
+            Self(path)
+        }
+    }
+
+    impl Drop for ImageFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn planned_gui() -> (GuiState, ImageFile) {
+        let image = ImageFile::raw();
+        let mut device = fixture_device("sdz");
+        device.size_bytes = 32_010_928_128;
+        let mut gui = GuiState::default();
+        gui.select_device(&device, "not mounted");
+        gui.select_image(&image.0, false).expect("inspect fixture");
+        (gui, image)
+    }
+
+    fn progress_event(step: usize, op: &str, done: u64, total: Option<u64>) -> Event {
+        Event::Progress(Progress::new("s-1", step, op, done, total))
+    }
+
+    fn done_event(outcome: Outcome) -> Event {
+        Event::Done(Completion {
+            session: "s-1".to_string(),
+            version: EVENT_STREAM_VERSION,
+            outcome,
+        })
+    }
 
     fn fixture_device(name: &str) -> Device {
         Device {
@@ -1184,5 +1643,141 @@ mod tests {
                 "euid {euid} must not be refused"
             );
         }
+    }
+
+    #[test]
+    fn start_requires_confirmation_before_a_transport_can_start() {
+        let (mut gui, _image) = planned_gui();
+        let mut run = Run::new();
+
+        run.start(&mut gui).expect("START builds a plan");
+        assert_eq!(run.state(), &RunState::Confirming);
+        assert_eq!(run.plan().expect("provisional plan").confirm, "");
+        assert_eq!(
+            run.confirmed_plan().err(),
+            Some(rufus_gui::run::RunError::ConfirmationRequired),
+            "no transport may start after START alone"
+        );
+
+        let token = run
+            .confirm()
+            .expect("confirm attaches the token")
+            .confirm
+            .clone();
+        assert!(token.starts_with("sha256:"));
+        assert_eq!(run.confirmed_plan().expect("gate open").confirm, token);
+        assert!(matches!(run.state(), RunState::Running { .. }));
+    }
+
+    #[test]
+    fn run_state_drives_progress_and_locked_controls() {
+        let (mut gui, _image) = planned_gui();
+        let mut run = Run::new();
+        assert!(run_view(&run).start_enabled);
+        assert!(!run_view(&run).locked);
+
+        run.start(&mut gui).expect("START");
+        let locked = run_view(&run);
+        assert!(locked.locked, "Confirming locks the form");
+        assert!(!locked.start_enabled);
+        assert!(!locked.cancel_enabled);
+
+        run.confirm().expect("confirm");
+        // Two samples give a rate and an ETA for the same write step.
+        run.apply(
+            &progress_event(4, "write", 3 * 1024 * 1024, Some(6 * 1024 * 1024)),
+            Duration::from_secs(1),
+        );
+        run.apply(
+            &progress_event(4, "write", 3 * 1024 * 1024, Some(6 * 1024 * 1024)),
+            Duration::from_secs(3),
+        );
+        let running = run_view(&run);
+        assert!(running.locked, "Running locks the form");
+        assert!(running.cancel_enabled);
+        assert!(!running.start_enabled);
+        assert!((running.progress - 0.5).abs() < f32::EPSILON);
+        assert!(running.detail.contains("write"), "{}", running.detail);
+        assert!(running.detail.contains("50%"), "{}", running.detail);
+        assert!(running.detail.contains("1.50 MiB/s"), "{}", running.detail);
+        assert!(running.detail.contains("ETA 0:02"), "{}", running.detail);
+
+        run.apply(&done_event(Outcome::Ok), Duration::from_secs(4));
+        let finished = run_view(&run);
+        assert!(!finished.locked, "Finished unlocks the form");
+        assert!(finished.start_enabled);
+        assert!(!finished.cancel_enabled);
+        assert_eq!(
+            finished.terminal.as_deref(),
+            Some("Completed successfully.")
+        );
+    }
+
+    #[test]
+    fn cancel_bridge_is_one_shot_and_survives_early_cancel() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let bridge = CancelBridge::default();
+
+        bridge.request();
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "no handle installed yet");
+
+        bridge.install(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "early cancel is delivered"
+        );
+
+        bridge.request();
+        bridge.request();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "still exactly once");
+    }
+
+    #[test]
+    fn confirmation_facts_include_every_destructive_warning() {
+        let facts = DeviceFacts {
+            model: Some("Test Stick".to_string()),
+            path: "/dev/sdz".to_string(),
+            serial: Some("ABC123".to_string()),
+            size_bytes: 32_010_928_128,
+            mount_summary: "mounted at /media/usb".to_string(),
+        };
+        let text = confirmation_facts(&facts);
+        for needle in [
+            "Test Stick",
+            "/dev/sdz",
+            "ABC123",
+            "32.0 GB",
+            "32010928128",
+            "mounted at /media/usb",
+            "DESTROY",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn log_lines_keep_level_and_order() {
+        let entries = vec![
+            LogEntry {
+                level: LogLevel::Error,
+                message: "write failed".to_string(),
+            },
+            LogEntry {
+                level: LogLevel::Info,
+                message: "started".to_string(),
+            },
+            LogEntry {
+                level: LogLevel::Warn,
+                message: "retrying".to_string(),
+            },
+        ];
+        assert_eq!(
+            log_lines(&entries),
+            vec!["[error] write failed", "[info] started", "[warn] retrying"]
+        );
     }
 }
