@@ -225,7 +225,7 @@ There is no production-readiness claim here. Open acceptance items (for
 example a real 32 GB Windows installer boot) are documented as such in
 the test module docs rather than faked.
 
-### Slice completion (S21–S27)
+### Slice completion (S21–S28)
 
 This matrix is the authoritative completion marker for the later slices. It
 also records the automation/release slices (S26, S27), which have **no rows in
@@ -242,6 +242,7 @@ analysed upstream function — the ledger only covers functions and thunks from
 | S25 | Update check + confirmed write flow — confirmation-gated GUI run and helper IPC transports, four-digest checksum modal, locale/preferences; the parity ledger assigns the `net` (HTTP update check/download) module here, but only the `check_updates`/`update_channel` config fields exist, not a live update-check feature | complete (on `main`) |
 | S26 | Release bundles / packaging — finalized `packaging/` metadata and the deterministic `cargo xtask dist` bundle | complete (on `main`) |
 | S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | complete (on `main`) |
+| S28 | CI dependency fix — install fontconfig/winit native build headers on ubuntu-latest so `xtask ci` (clippy) and `xtask qa` both run green | complete (on `main`) |
 
 ### `analyze` report
 
@@ -445,7 +446,11 @@ unprivileged by default and safe to run on a plain CI runner. From this host:
 
 CI runs `cargo xtask qa` as a gate on pushes and pull requests, after
 installing the filesystem, QEMU/OVMF and GRUB tools the suites need
-(`.github/workflows/ci.yml`).
+(`.github/workflows/ci.yml`). On `ubuntu-latest` the workflow also installs
+the native build headers Slint/winit need (`pkg-config` plus the fontconfig,
+xkbcommon, wayland and xcb dev packages) and shims Ubuntu's `OVMF_*_4M.fd`
+firmware into the Arch-style `/usr/share/edk2/x64/*.4m.fd` paths the harness
+expects, so Tier 2 UEFI boots on CI instead of skipping.
 
 ## Docs
 

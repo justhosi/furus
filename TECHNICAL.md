@@ -548,6 +548,15 @@ three tasks map as follows:
   `.github/workflows/ci.yml`. That file is out of this slice's scope; until it
   lands, the command is green locally but CI does not yet call it.
 
+**CI native build dependencies (S28, workflow-only).** On `ubuntu-latest` the
+workflow installs Slint's native dev headers (`pkg-config`, fontconfig,
+xkbcommon, wayland and xcb) because `yeslogic-fontconfig-sys` needs
+`fontconfig.pc` and Slint 1.19 (`backend-winit` + `renderer-software`) probes
+`wayland-client.pc` and x11/x11-xcb via pkg-config, and it shims Ubuntu's
+`OVMF_*_4M.fd` firmware into the Arch-expected `/usr/share/edk2/x64/*.4m.fd`
+names so Tier 2 UEFI boots instead of skipping — no architecture changed, and
+`libwim-dev` was deliberately left out because `wimlib-sys` builds without it.
+
 ### Architecture and data flow
 
 `cmd_qa(root, options)` builds a `QaSummary` that collects failed stage labels
