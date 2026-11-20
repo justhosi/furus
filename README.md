@@ -225,7 +225,7 @@ There is no production-readiness claim here. Open acceptance items (for
 example a real 32 GB Windows installer boot) are documented as such in
 the test module docs rather than faked.
 
-### Slice completion (S21–S28)
+### Slice completion (S21–S29)
 
 This matrix is the authoritative completion marker for the later slices. It
 also records the automation/release slices (S26, S27), which have **no rows in
@@ -243,6 +243,7 @@ analysed upstream function — the ledger only covers functions and thunks from
 | S26 | Release bundles / packaging — finalized `packaging/` metadata and the deterministic `cargo xtask dist` bundle | complete (on `main`) |
 | S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | complete (on `main`) |
 | S28 | CI dependency fix — install fontconfig/winit native build headers on ubuntu-latest so `xtask ci` (clippy) and `xtask qa` both run green | complete (on `main`) |
+| S29 | GUI / IPC verification — single-source D-Bus/polkit/packaging contract with a CI drift check, offscreen Slint render smoke, and a real compiled-helper JSONL/run-state wire test | complete (on `main`) |
 
 ### `analyze` report
 
@@ -451,6 +452,27 @@ the native build headers Slint/winit need (`pkg-config` plus the fontconfig,
 xkbcommon, wayland and xcb dev packages) and shims Ubuntu's `OVMF_*_4M.fd`
 firmware into the Arch-style `/usr/share/edk2/x64/*.4m.fd` paths the harness
 expects, so Tier 2 UEFI boots on CI instead of skipping.
+
+### GUI / IPC verification (S29)
+
+Three automated gates cover the GUI/helper split; none needs root, a display
+server, a real block device or a new dependency:
+
+* **Contract identifiers** — `cargo xtask contract --check`, wired into
+  `cargo xtask ci` between parity and size, reads the D-Bus / polkit / packaging
+  identifiers single-sourced in `rufus-proto::service` and fails on any drift
+  in the GUI, helper or packaging copies.
+* **Offscreen render smoke** — `cargo test -p rufus-gui --test render_smoke`
+  instantiates the Slint window through the software renderer with every
+  overlay visible, renders a non-blank frame and needs no window system.
+* **Real helper wire** — `cargo test -p rufus-gui --test helper_wire` launches
+  the compiled helper under `unshare -Ur`, drives its real JSONL event stream
+  through the GUI's parser and run state machine, and asserts a
+  `not_a_block_device` refusal with no device I/O or writes (root exists only
+  inside the user namespace).
+
+`cargo-audit` remains a documented `SKIP` here (not installed on this host),
+and the non-fatal duplicate-crate warnings from `cargo-deny` are pre-existing.
 
 ## Docs
 

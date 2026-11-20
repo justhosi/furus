@@ -706,3 +706,101 @@ All commands were run from `/home/hosi/dev/REA-Rufus/furus` with
   was booted in this environment.
 * **CI wiring is not yet done.** T3 (`.github/workflows/ci.yml`) is a separate
   slice; until then the gate is local-only.
+
+---
+
+## S29 — GUI / IPC verification without root, display or devices
+
+S29 closes the verification gaps around the unprivileged GUI / root-helper
+split. It changes no runtime behaviour and no wire format and adds no
+dependency. Every gate runs on a plain CI runner: no root, no display server,
+no real block device, no pkexec/polkit/system bus and no async runtime. The
+three code slices are `571ca4b`, `c3fb0b2` and `450c8fe`.
+
+### Single-source identifiers + a scanner for non-importable literals (slice 1)
+
+The D-Bus name, object path, interface, polkit action, four error names and
+the installed helper path/argument already matched across the GUI, helper and
+packaging — the bug class was that the literals were duplicated with no
+automated enforcement, so they could drift silently. Slice 1 puts ten
+`pub const NAME: &str = "..."` values in `crates/rufus-proto/src/service.rs`;
+the GUI's D-Bus client and the helper import them (the helper keeps its old
+`pub const` names as thin aliases so callers and tests need no edits). No
+behaviour changes.
+
+Packaging files and the helper's `#[zbus::interface(name = "...")]` macro
+cannot import a Rust constant — the macro needs a literal. So `xtask`'s
+`contract --check` reads the literal values straight out of `service.rs` and
+asserts every packaging file agrees, rejecting the legacy `org.rufus.`
+namespace and the old `/usr/lib/rufus/rufus-helper` path with file/line errors.
+`xtask` deliberately has no `rufus-proto` dependency, so this is a small
+string scan rather than a compile-time import; keep the const declaration
+spelling stable or the scanner breaks. `packaging/README.md` alone is skipped
+by the negative scan because it discusses the rejected namespace in prose.
+The check is wired into `cargo xtask ci` between `parity --check` and `size`,
+so a drift in any of the three copies is a CI failure.
+
+### Offscreen Slint render smoke (slice 2)
+
+`crates/rufus-gui/tests/render_smoke.rs` proves the window can be built and
+drawn with no window system. It installs a minimal `Platform` whose window
+adapter hands out one shared `Rc<MinimalSoftwareWindow>` (software renderer,
+320x240), calls `set_platform` before creating any component, then instantiates
+`ui/main.slint` via `slint::include_modules!()`. It turns on **all four**
+conditional overlays at once (`advanced-visible`, `log-open`, `confirm-visible`,
+`checksum-visible`) with the four hash checkboxes and a four-element
+`checksum-digests` model, forcing every hidden binding to evaluate, and renders
+into a vector of boolean target pixels. The two assertions are that the draw
+callback ran and that at least one pixel drew — no exact colour or font-metric
+claim. It is a single-test binary: `set_platform` is process-global, so one
+test per binary keeps it race-free. No `i-slint-backend-testing` dependency and
+no `configure_test_fonts()` are needed for that weak claim.
+
+**`deny` vs `forbid`.** `slint::include_modules!()` expands to vtables that
+hardcode `#[allow(unsafe_code)]`; under a crate-level `#![forbid(unsafe_code)]`
+that is the hard error **E0453**. The test therefore opens with
+`#![deny(unsafe_code)]`, exactly like `src/main.rs`. No hand-written line is
+unsafe and the workspace `[lints] unsafe_code = "deny"` is untouched. The
+`rufus-gui` library root still keeps the literal `forbid`.
+
+### Real compiled-helper wire test (slice 3)
+
+`crates/rufus-gui/tests/helper_wire.rs` launches the **compiled** helper
+(binary found via `current_exe()` with a one-shot `cargo build` fallback) and
+drives it through the GUI's *production* seams: `PkexecTransport::with_command`
+spawns `/bin/sh -c` in place of `pkexec`; `EventStream` parses every stdout line
+with `rufus_proto::from_jsonl_line`; `Run::apply` consumes the events. No stub,
+mock transport or second parser.
+
+The plan points at a nonexistent `/dev/furus-qa-missing-*` path, so the helper
+refuses at `validate::device_node_checks` before any image hashing, device
+open or write. The test asserts a single terminal `Done` with
+`Outcome::Refused { code: "not_a_block_device" }`: only the real validator
+emits that code, whereas a transport-synthesised `Done` uses `"exit"`, so the
+code proves the real helper ran. Feeding that event through `Run` yields
+`Finished(Refused(...))` with `configuration_locked() == false`.
+
+`unshare -Ur` is probed first and the test prints a SKIP and returns when user
+namespaces are unavailable; it maps the caller to uid 0 **inside the namespace
+only**, satisfying the helper's root check without creating host root. The
+wrapper is `exec unshare -Ur '<helper-path>' "$@"` with **no `shift`**: under
+`sh -c SCRIPT name arg...` POSIX puts `name` in `$0` and `$@` is already
+`--plan FILE --progress jsonl`, so a `shift` would drop `--plan` and turn the
+intended refusal into a usage error. No pkexec, polkit, bus, async runtime,
+sleep, new timeout or new dependency is involved.
+
+### Size and verification
+
+The release binaries are byte-for-byte identical to `size-baseline.json`
+(`rufus` 1,810,152, `rufus-helper` 1,406,296, `rufus-gui` 12,774,280): the new
+files are integration tests, not the release binaries the size gate measures,
+so no baseline change was needed. At the S29 tip `cargo xtask ci` exits 0
+(`contract --check` PASS, assets 86/86, parity 2,709 rows, size within the
+committed allowance, `cargo-deny` ok; `cargo-audit` SKIP/not installed) and
+`env -u APPDIR cargo xtask qa` exits 0 (`qa: all suites passed`, including the
+documented `tier1/pipeline-loop` SKIP and both QEMU/UEFI Tier 2 tiers).
+
+**Not exercised here:** the `unshare` SKIP branch (user namespaces work on this
+host) and the one-shot `cargo build` fallback (the helper binary was already
+present); the pre-existing non-fatal `cargo-deny` duplicate-crate warnings
+(zbus 5/6, thiserror 1/2, toml, windows-sys, …) remain unchanged.
