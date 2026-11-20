@@ -87,6 +87,16 @@ pub use events::{
     from_jsonl_line,
 };
 
+// S29: the GUI / helper / packaging service identifiers live in one module
+// so they cannot drift between those three consumers. `xtask contract --check`
+// reads that module and validates the packaging files against it.
+pub mod service;
+
+pub use service::{
+    BUS_NAME, ERROR_BUSY, ERROR_INVALID_PLAN, ERROR_NOT_AUTHORIZED, ERROR_UNKNOWN_SESSION,
+    HELPER_BIN_PATH, HELPER_DBUS_ARG, INTERFACE_NAME, OBJECT_PATH, POLKIT_ACTION,
+};
+
 /// Schema version of [`Plan`]. v6 added the `windows`
 /// [`BootloaderMode`] variant, and refuses v1/v2/v3/v4/v5 plans,
 /// fail closed — see the schema history in the crate documentation.

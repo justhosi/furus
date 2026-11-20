@@ -119,6 +119,7 @@ use rufus_proto::EVENT_STREAM_VERSION;
 use rufus_proto::Event;
 use rufus_proto::Outcome;
 use rufus_proto::Progress;
+use rufus_proto::service;
 
 use crate::exec;
 use crate::namespace;
@@ -126,29 +127,35 @@ use crate::progress::ProgressSink;
 use crate::session;
 use crate::validate;
 
+// These identifiers are the single-sourced GUI / helper / packaging contract
+// in `rufus_proto::service`. They stay as `pub const` aliases here so the
+// existing API used by `main.rs` and the tests below is unchanged, but their
+// values now have exactly one definition. `xtask contract --check` reads the
+// shared module and validates the installed packaging files against it.
+
 /// The well-known bus name part 5b requests for the helper service.
-pub const BUS_NAME: &str = "org.rufuslinux.Helper1";
+pub const BUS_NAME: &str = service::BUS_NAME;
 
 /// The object path carrying the helper interface (part 5b).
-pub const OBJECT_PATH: &str = "/org/rufuslinux/Helper1";
+pub const OBJECT_PATH: &str = service::OBJECT_PATH;
 
 /// The polkit action a caller must hold to run a plan (fail closed:
 /// [`Registry::execute`] asks [`Authorizer`] before it looks at a
 /// plan).
-pub const POLKIT_ACTION: &str = "org.rufuslinux.write-device";
+pub const POLKIT_ACTION: &str = service::POLKIT_ACTION;
 
 /// D-Bus error name of an authorization that denied a caller, or whose
 /// check itself failed — the name [`ServiceError::code`] maps.
-pub const ERROR_NOT_AUTHORIZED: &str = "org.rufuslinux.Error.NotAuthorized";
+pub const ERROR_NOT_AUTHORIZED: &str = service::ERROR_NOT_AUTHORIZED;
 
 /// D-Bus error name of a refused request while another session runs.
-pub const ERROR_BUSY: &str = "org.rufuslinux.Error.Busy";
+pub const ERROR_BUSY: &str = service::ERROR_BUSY;
 
 /// D-Bus error name of a `Cancel` naming nothing running.
-pub const ERROR_UNKNOWN_SESSION: &str = "org.rufuslinux.Error.UnknownSession";
+pub const ERROR_UNKNOWN_SESSION: &str = service::ERROR_UNKNOWN_SESSION;
 
 /// D-Bus error name of a plan that failed to parse or to validate.
-pub const ERROR_INVALID_PLAN: &str = "org.rufuslinux.Error.InvalidPlan";
+pub const ERROR_INVALID_PLAN: &str = service::ERROR_INVALID_PLAN;
 
 /// Name of the worker thread one accepted run executes on (pinned for
 /// `top`/reporting; the worker shares no state with the bus except
@@ -778,8 +785,9 @@ impl Registry {
 
 /// The interface name the object exports. Conventionally equal to
 /// [`BUS_NAME`], kept separate so a rename of one is a compile-visible
-/// decision for the other.
-pub const INTERFACE_NAME: &str = "org.rufuslinux.Helper1";
+/// decision for the other. The `#[zbus::interface(name = "...")]` literal
+/// below is checked against this constant by `xtask contract --check`.
+pub const INTERFACE_NAME: &str = service::INTERFACE_NAME;
 
 /// Polkit's authority: a well-known service of its own, never ours.
 const POLKIT_SERVICE: &str = "org.freedesktop.PolicyKit1";

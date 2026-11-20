@@ -24,19 +24,18 @@ use std::sync::mpsc;
 use std::thread;
 
 use rufus_proto::{
-    Completion, EVENT_STREAM_VERSION, Event, LogLevel, LogLine, Outcome, Plan, Progress,
+    BUS_NAME, Completion, ERROR_BUSY, ERROR_INVALID_PLAN, ERROR_NOT_AUTHORIZED,
+    ERROR_UNKNOWN_SESSION, EVENT_STREAM_VERSION, Event, INTERFACE_NAME, LogLevel, LogLine,
+    OBJECT_PATH, Outcome, Plan, Progress,
 };
 use zbus::export::futures_core::Stream;
 
 use super::{CancelHandle, EventStream, HelperTransport, IpcError, Started};
 
-const BUS_NAME: &str = "org.rufuslinux.Helper1";
-const OBJECT_PATH: &str = "/org/rufuslinux/Helper1";
-const INTERFACE_NAME: &str = "org.rufuslinux.Helper1";
-const ERROR_NOT_AUTHORIZED: &str = "org.rufuslinux.Error.NotAuthorized";
-const ERROR_BUSY: &str = "org.rufuslinux.Error.Busy";
-const ERROR_INVALID_PLAN: &str = "org.rufuslinux.Error.InvalidPlan";
-const ERROR_UNKNOWN_SESSION: &str = "org.rufuslinux.Error.UnknownSession";
+// The D-Bus name, path, interface and error names are the single-sourced
+// contract in `rufus_proto` (shared with the helper and checked against the
+// packaging files by `xtask contract --check`). Only the wire-level
+// `UNKNOWN_TOTAL` sentinel stays local to this transport.
 const UNKNOWN_TOTAL: i64 = -1;
 
 #[derive(Clone, Copy)]
