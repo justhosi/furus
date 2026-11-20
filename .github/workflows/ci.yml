@@ -34,9 +34,14 @@ jobs:
           # QEMU + OVMF let Tier 2 boot BIOS/UEFI images headlessly.
           # grub-common + grub-pc-bin provide grub-mkimage and the i386-pc
           # boot.img needed to build a bootable GRUB2 BIOS image.
+          # Native build headers for Slint/winit (fontconfig.pc,
+          # wayland-client.pc and x11/x11-xcb pkg-config modules), needed by
+          # `cargo clippy --workspace --all-targets`.
           sudo apt-get install -y --no-install-recommends \
             dosfstools ntfs-3g e2fsprogs udftools exfatprogs mtools \
-            qemu-system-x86 ovmf grub-common grub-pc-bin
+            qemu-system-x86 ovmf grub-common grub-pc-bin \
+            pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
           # uefi_ntfs_boot.rs hard-codes Arch's /usr/share/edk2/x64/*.4m.fd
           # paths; Ubuntu's ovmf package instead installs OVMF_*_4M.fd under
           # /usr/share/OVMF. Shim the expected names so the UEFI Tier 2 check
