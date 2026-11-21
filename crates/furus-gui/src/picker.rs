@@ -56,9 +56,9 @@ pub fn pick_image_path() -> PickerOutcome {
 fn pick_via_xdg_portal() -> PickerOutcome {
     match zbus::block_on(portal_open()) {
         Ok(outcome) => outcome,
-        Err(error) => PickerOutcome::Unavailable(format!(
-            "XDG desktop portal unavailable: {error}"
-        )),
+        Err(error) => {
+            PickerOutcome::Unavailable(format!("XDG desktop portal unavailable: {error}"))
+        }
     }
 }
 
@@ -78,16 +78,15 @@ async fn portal_open() -> Result<PickerOutcome, zbus::Error> {
     // Subscribe to the Request's Response signal BEFORE calling OpenFile: a
     // fast portal must not emit the response in the gap between the method
     // reply and our subscription.
-    let request =
-        zbus::Proxy::new(&connection, PORTAL_DEST, request_path, REQUEST_IFACE).await?;
+    let request = zbus::Proxy::new(&connection, PORTAL_DEST, request_path, REQUEST_IFACE).await?;
     let mut responses = request.receive_signal("Response").await?;
 
     let chooser =
         zbus::Proxy::new(&connection, PORTAL_DEST, PORTAL_PATH, FILE_CHOOSER_IFACE).await?;
 
     let boot_patterns: Vec<(u32, &str)> = [
-        "*.iso", "*.img", "*.wim", "*.esd", "*.vhd", "*.vhdx", "*.raw", "*.bin", "*.gz",
-        "*.xz", "*.zst", "*.bz2",
+        "*.iso", "*.img", "*.wim", "*.esd", "*.vhd", "*.vhdx", "*.raw", "*.bin", "*.gz", "*.xz",
+        "*.zst", "*.bz2",
     ]
     .into_iter()
     .map(|pattern| (0, pattern))
@@ -109,10 +108,8 @@ async fn portal_open() -> Result<PickerOutcome, zbus::Error> {
 
     // Stay inside the single outer block_on: poll the signal stream directly
     // instead of nesting another block_on on this thread.
-    let message = std::future::poll_fn(|cx| {
-        Stream::poll_next(std::pin::Pin::new(&mut responses), cx)
-    })
-    .await;
+    let message =
+        std::future::poll_fn(|cx| Stream::poll_next(std::pin::Pin::new(&mut responses), cx)).await;
     let Some(message) = message else {
         return Ok(PickerOutcome::Unavailable(
             "portal returned no file URI".into(),
