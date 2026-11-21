@@ -817,30 +817,42 @@ the release binaries are byte-for-byte the ones measured by the S29 size gate.
 The three landed slices are `eff1b70`, `3d49f33` and `6aa51b5`; this wrap-up and
 the final handoff close the series.
 
-### Two-job release workflow and least privilege
+### Four-job release workflow and least privilege
 
 `.github/workflows/release.yml` triggers on a pushed `v*` tag, or on a manual
 `workflow_dispatch` where the operator must supply the existing tag in a
-required `tag` input (on a manual run `github.ref_name` is a branch, not a tag).
-The workflow has exactly two jobs, and the split is a security boundary, not a
-stylistic choice:
+required `tag` input (on a manual run `github.ref_name` is a branch, not a tag)
+and a `publish` boolean that defaults to false, so a manual run is a dry run
+unless publication is explicitly requested. The workflow has four jobs, and the
+build/publish split is a security boundary, not a stylistic choice:
 
 * **`build`** holds only `contents: read` (as does the workflow top level). It
   runs all the work that touches untrusted inputs — checkout, pinned Rust
   1.99.0 toolchain with rustfmt/clippy, pinned cargo-deny 0.20.2 and cargo-audit
   0.22.2 installs, the full QA apt package list, the OVMF 4M firmware symlink
   shim, then `cargo xtask ci`, `cargo xtask qa` and `cargo xtask dist`. It
-  uploads `target/dist/` as one artifact.
-* **`release`** (`needs: build`) is the **only** job with `contents: write`. It
-  downloads that artifact, flattens it, re-verifies the digests and publishes
-  the GitHub release with the built-in `github.token`.
+  uploads `target/dist/` as one artifact and derives the version and target
+  from the single tarball for the downstream jobs.
+* **`package-rpm`** (`needs: build`, read-only) consumes the dist tarball and
+  `packaging/rpm/rufus.spec` in a Fedora container, builds with `rpmbuild
+  --define` overrides and verifies the resulting `.rpm` with `rpm -qlp` /
+  `rpm -qpR` before uploading it.
+* **`package-arch`** (`needs: build`, read-only) consumes the same tarball and
+  `packaging/arch/PKGBUILD` in an Arch container as a non-root builder, builds
+  with `rufus_version`/`_target` environment overrides and verifies the
+  `.pkg.tar.zst` contents before uploading it.
+* **`publish`** (`needs: [build, package-rpm, package-arch]`) is the **only**
+  job with `contents: write`. It downloads all three artifacts merged into one
+  `release/` directory, flattens them (see below), regenerates and re-verifies
+  the unified digests, then publishes the GitHub release with the built-in
+  `github.token`. Its final step is gated on `push` events or `inputs.publish`.
 
-Keeping build and publish apart means a compromised build script, dependency or
-toolchain step cannot mint a release: those steps never see a write token. Only
-the small, auditable publish job does. Both jobs use full-SHA-pinned actions;
-the checkout and rust-toolchain pins are inherited from `ci.yml`, and the
-artifact upload/download pins were resolved deliberately (dates recorded in the
-workflow comments), not by blind bumping.
+Keeping build/package and publish apart means a compromised build script,
+dependency, recipe or toolchain step cannot mint a release: those steps never
+see a write token. Only the small, auditable publish job does. All jobs use
+full-SHA-pinned actions; the checkout and rust-toolchain pins are inherited from
+`ci.yml`, and the artifact upload/download pins were resolved deliberately
+(dates recorded in the workflow comments), not by blind bumping.
 
 ### Dist artifacts, SHA256SUMS and cross-job verification
 
@@ -855,15 +867,23 @@ staging tree. With no `--target` it builds the host triple, so there is one
 
 `SHA256SUMS` has one line per produced artifact in the form
 `<64-hex digest>  <bare filename>` — two spaces, a bare filename with no
-directory component, stable artifact order. On this host the only artifact is
-the tarball, so the file has a single line. The release job exploits that: after
-downloading `dist/` (which mirrors `target/dist/<triple>/`) it copies the
-`*.tar.gz`, `*.deb` and `SHA256SUMS` files into one `release/` directory so the
-bare names resolve, then runs `sha256sum -c SHA256SUMS` there. A mismatch or
-corruption in the upload/download round trip fails the job **before**
-`gh release create` runs, so the bits published are exactly the bits built and
-verified. `gh` is preinstalled on the runner, which avoids a third-party release
-action and any secret beyond `github.token`.
+directory component, stable artifact order. The `dist` artifact is uploaded
+with `path: target/dist/`, so its tarball, `.deb` and (single-line) `SHA256SUMS`
+arrive under a `<target>/` subdirectory when artifacts are downloaded, whereas
+the RPM and Arch artifacts (uploaded from `out/*.rpm` and `out/*.pkg.tar.zst`)
+are already flat in `release/`. The publish job therefore **flattens first**:
+it deletes only the nested, narrower `SHA256SUMS` and moves every remaining
+nested file up to the `release/` root. This is a deliberate no-op for an
+already-flat layout and cannot collide, because dist basenames are
+target-suffixed while the RPM/Arch basenames are different formats. Only then
+does it copy nothing and regenerate one unified `SHA256SUMS` over all four
+kinds (`*.tar.gz`, `*.deb`, `*.rpm`, `*.pkg.tar.zst`) and run
+`sha256sum -c SHA256SUMS` there. A mismatch or corruption in the
+upload/download round trip fails the job **before** `gh release create` runs,
+so the bits published are exactly the bits built and verified. `gh` is
+preinstalled on the runner and is called with an explicit `--repo` because the
+publish job has no checkout, which avoids a third-party release action and any
+secret beyond `github.token`.
 
 ### Why the `.deb` is conditional
 
