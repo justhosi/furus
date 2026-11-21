@@ -2,7 +2,7 @@
 
 ## State
 
-Work in `/home/hosi/dev/REA-Furus/furus`, branch `main`, starting HEAD
+Work in `/home/hosi/dev/REA-Rufus/furus`, branch `main`, starting HEAD
 `89578f3` (Slice 1, the code-and-packaging rebrand commit). This slice is **not committed and not pushed**.
 
 Slice 1 already renamed the code, crate directories, binaries, D-Bus/polkit

@@ -36,8 +36,11 @@ exactly. The original Slice 2 acceptance criteria are met.
 
 - HANDOFF-S31-publish-flatten.md says remote `v0.1.0` points at `aab6f79`;
   the actual tag object is `e5a73cd` (commit `aab6f79`). Harmless but stale.
-- README.md line 247 still says the workflow "has not yet been executed
-  end-to-end". It has now been executed successfully.
+- README.md line 247 historically said the workflow "has not yet been
+  executed end-to-end"; it has since been executed successfully. The docs
+  rebrand slice corrected that S31 row (now ~line 248) to record the validated
+  end-to-end run and the publication of `v0.1.1`, so the current README no
+  longer carries the stale caveat.
 - README.md lines 393-404 and packaging/README.md lines 13-15 use `furus-*`
   install wildcards, which match the actual v0.1.1 asset names.
 
