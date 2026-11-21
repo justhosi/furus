@@ -36,13 +36,20 @@ jobs:
   build:
     permissions:
       contents: read
-    runs-on: ubuntu-latest
-    # VERSION/TARGET are read from the one tarball that `cargo xtask dist`
-    # emits, so the recipe jobs below use exactly the names the tarball carries
-    # (not the Git tag, which may differ from Cargo's package version).
-    outputs:
-      version: ${{ steps.dist-info.outputs.version }}
-      target: ${{ steps.dist-info.outputs.target }}
+    # Build natively on each architecture. The triple is passed explicitly to
+    # `cargo xtask dist` so the tarball name carries the right target, and the
+    # matrix travels with the artifact name so no two lanes collide.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       # Action pins are full commit SHAs, matching ci.yml's convention.
       # checkout / rust-toolchain pins are inherited verbatim from ci.yml
@@ -66,9 +73,6 @@ jobs:
           # check FAT (dosfstools), NTFS (ntfs-3g), ext* (e2fsprogs), UDF
           # (udftools) and exFAT (exfatprogs) images; mtools seeds reads/writes
           # FAT media without a privileged loop mount.
-          # QEMU + OVMF let Tier 2 boot BIOS/UEFI images headlessly.
-          # grub-common + grub-pc-bin provide grub-mkimage and the i386-pc
-          # boot.img needed to build a bootable GRUB2 BIOS image.
           # Native build headers for Slint/winit (fontconfig.pc,
           # wayland-client.pc and x11/x11-xcb pkg-config modules), needed by
           # `cargo clippy --workspace --all-targets`.
@@ -77,10 +81,18 @@ jobs:
           # of skipping it on this runner.
           sudo apt-get install -y --no-install-recommends \
             dosfstools ntfs-3g e2fsprogs udftools exfatprogs mtools \
-            qemu-system-x86 ovmf grub-common grub-pc-bin \
             pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             dpkg
+      - name: Install x86-only boot/QEMU tools
+        if: matrix.arch == 'x86_64'
+        run: |
+          # QEMU + OVMF let Tier 2 boot BIOS/UEFI images headlessly.
+          # grub-common + grub-pc-bin provide grub-mkimage and the i386-pc
+          # boot.img needed to build a bootable GRUB2 BIOS image. These are
+          # x86-only packages, not available or relevant on the ARM runner.
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 ovmf grub-common grub-pc-bin
           # uefi_ntfs_boot.rs hard-codes Arch's /usr/share/edk2/x64/*.4m.fd
           # paths; Ubuntu's ovmf package instead installs OVMF_*_4M.fd under
           # /usr/share/OVMF. Shim the expected names so the UEFI Tier 2 check
@@ -91,45 +103,27 @@ jobs:
             sudo ln -sf /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd
             sudo ln -sf /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/edk2/x64/OVMF_VARS.4m.fd
           fi
+      # `xtask ci` includes the size-drift gate, whose baseline was recorded on
+      # x86_64. Running it on ARM would fail spuriously, so only the x86_64
+      # lane runs `ci`; both lanes run `qa`, and `xtask dist` enforces the
+      # absolute release budgets on ARM as well.
       - name: Run xtask ci
+        if: matrix.arch == 'x86_64'
         run: cargo xtask ci
       - name: Run xtask qa
         run: cargo xtask qa
       - name: Build release artifacts
-        run: cargo xtask dist
+        run: cargo xtask dist --target ${{ matrix.target }}
       # The published artifacts come only from `cargo xtask dist` under
       # target/dist/<triple>/: a deterministic tar.gz, a .deb and SHA256SUMS.
-      # Nothing else in the tree is packaged or uploaded.
+      # Nothing else in the tree is packaged or uploaded. Each matrix leg gets
+      # its own artifact name so the two architectures cannot collide.
       - name: Upload dist artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dist
+          name: dist-${{ matrix.arch }}
           path: target/dist/
           if-no-files-found: error
-      # Derive the recipe inputs from the artifact that actually exists. The
-      # target is exactly rustc's host triple (what `cargo xtask dist` used);
-      # the version is the tarball stem minus that target. This stays correct
-      # for any v* tag even when Cargo's package version differs from it.
-      - name: Resolve dist version and target
-        id: dist-info
-        run: |
-          set -euo pipefail
-          mapfile -t tarballs < <(find target/dist -type f -name '*.tar.gz')
-          if [ "${#tarballs[@]}" -ne 1 ]; then
-            echo "expected exactly one dist tarball, found ${#tarballs[@]}" >&2
-            exit 1
-          fi
-          target="$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"
-          [ -n "$target" ] || { echo "cannot resolve host target" >&2; exit 1; }
-          name="$(basename "${tarballs[0]}" .tar.gz)"     # furus-<version>-<target>
-          version="${name#furus-}"
-          version="${version%-${target}}"
-          if [ -z "$version" ] || [ "$version" = "$name" ]; then
-            echo "cannot derive version from ${tarballs[0]} for target $target" >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "target=$target" >> "$GITHUB_OUTPUT"
 
   # package-rpm: read-only token. Container jobs have no source checkout, so we
   # check out the repo (installing git first) purely to obtain the parameterized
@@ -139,11 +133,18 @@ jobs:
     needs: build
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: fedora:latest
-    env:
-      FURUS_VERSION: ${{ needs.build.outputs.version }}
-      FURUS_TARGET: ${{ needs.build.outputs.target }}
     steps:
       - name: Install RPM build tools
         run: dnf install -y rpm-build tar gzip git
@@ -151,20 +152,34 @@ jobs:
       - name: Download dist artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: dist
+          name: dist-${{ matrix.arch }}
           path: dist
       - name: Build and verify RPM
         run: |
           set -euo pipefail
-          : "${FURUS_VERSION:?missing build output version}"
-          : "${FURUS_TARGET:?missing build output target}"
+          # Derive the version from the single dist tarball this lane produced;
+          # the Git tag may differ from Cargo's package version. Each artifact
+          # contains exactly one tarball, named furus-<version>-<target>.
+          mapfile -t tarballs < <(find dist -type f -name '*.tar.gz')
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "expected exactly one dist tarball, found ${#tarballs[@]}" >&2
+            exit 1
+          fi
+          name="$(basename "${tarballs[0]}" .tar.gz)"
+          version="${name#furus-}"
+          version="${version%-${{ matrix.target }}}"
+          if [ -z "$version" ] || [ "$version" = "$name" ]; then
+            echo "cannot derive version from ${tarballs[0]} for target ${{ matrix.target }}" >&2
+            exit 1
+          fi
           mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
           # rpmbuild resolves Source0 from SOURCES; the exact-name tarball is
-          # the only input. Version and target are passed as --define macros.
+          # the only input. Version, target and BuildArch are --define macros.
           find dist -type f -name '*.tar.gz' -exec cp {} ~/rpmbuild/SOURCES/ \;
           rpmbuild -bb \
-            --define "furus_version $FURUS_VERSION" \
-            --define "furus_target $FURUS_TARGET" \
+            --define "furus_version $version" \
+            --define "furus_target ${{ matrix.target }}" \
+            --define "furus_build_arch ${{ matrix.arch }}" \
             packaging/rpm/furus.spec
           rpm_file="$(find ~/rpmbuild/RPMS -type f -name '*.rpm' -print -quit)"
           [ -n "$rpm_file" ] && [ -s "$rpm_file" ] || { echo 'no RPM produced' >&2; exit 1; }
@@ -190,7 +205,7 @@ jobs:
       - name: Upload RPM
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: rpm
+          name: rpm-${{ matrix.arch }}
           path: out/*.rpm
           if-no-files-found: error
 
@@ -201,11 +216,24 @@ jobs:
     needs: build
     permissions:
       contents: read
-    runs-on: ubuntu-latest
-    container: archlinux:latest
-    env:
-      FURUS_VERSION: ${{ needs.build.outputs.version }}
-      FURUS_TARGET: ${{ needs.build.outputs.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            arch_image: archlinux:latest
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            arch_image: lfdevs/archlinux-ports:base-devel@sha256:a24c8b0151cdfcd678027eebba1d315f3c0d5433747c314b95e634a4492e280b
+    runs-on: ${{ matrix.runner }}
+    # Official `archlinux:latest` publishes an amd64 image only, so the ARM
+    # lane uses the maintained AArch64 port image instead. It is pinned by
+    # index digest so the mutable `base-devel` tag cannot change this build;
+    # x86_64 keeps the exact original `archlinux:latest` string.
+    container: ${{ matrix.arch_image }}
     steps:
       - name: Install Arch build tools
         run: |
@@ -215,13 +243,26 @@ jobs:
       - name: Download dist artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: dist
+          name: dist-${{ matrix.arch }}
           path: dist
       - name: Build and verify Arch package
         run: |
           set -euo pipefail
-          : "${FURUS_VERSION:?missing build output version}"
-          : "${FURUS_TARGET:?missing build output target}"
+          # Derive the version from the single dist tarball this lane produced;
+          # the Git tag may differ from Cargo's package version. Each artifact
+          # contains exactly one tarball, named furus-<version>-<target>.
+          mapfile -t tarballs < <(find dist -type f -name '*.tar.gz')
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "expected exactly one dist tarball, found ${#tarballs[@]}" >&2
+            exit 1
+          fi
+          name="$(basename "${tarballs[0]}" .tar.gz)"
+          version="${name#furus-}"
+          version="${version%-${{ matrix.target }}}"
+          if [ -z "$version" ] || [ "$version" = "$name" ]; then
+            echo "cannot derive version from ${tarballs[0]} for target ${{ matrix.target }}" >&2
+            exit 1
+          fi
           # makepkg refuses to run as root: build in a dir owned by `builder`.
           id builder >/dev/null 2>&1 || useradd -m builder
           mkdir -p /work
@@ -229,8 +270,9 @@ jobs:
           find dist -type f -name '*.tar.gz' -exec cp {} /work/ \;
           chown -R builder:builder /work
           # furus_version (not pkgver: makepkg unsets pkgver) and _target are
-          # the environment overrides the recipe reads.
-          su builder -c "cd /work && furus_version='$FURUS_VERSION' _target='$FURUS_TARGET' makepkg -f --noconfirm --skipchecksums"
+          # the environment overrides the recipe reads. `arch=('x86_64'
+          # 'aarch64')` in PKGBUILD lets makepkg pick the runner's native arch.
+          su builder -c "cd /work && furus_version='$version' _target='${{ matrix.target }}' makepkg -f --noconfirm --skipchecksums"
           pkg_file="$(find /work -maxdepth 1 -type f -name '*.pkg.tar.zst' -print -quit)"
           [ -n "$pkg_file" ] && [ -s "$pkg_file" ] || { echo 'no Arch package produced' >&2; exit 1; }
           listing="$(tar --zstd -tf "$pkg_file" | sed 's#^\./##')"
@@ -253,7 +295,7 @@ jobs:
       - name: Upload Arch package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: arch
+          name: arch-${{ matrix.arch }}
           path: out/*.pkg.tar.zst
           if-no-files-found: error
 
@@ -279,19 +321,19 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          # `dist` was uploaded with `path: target/dist/`, so its tarball,
-          # .deb and SHA256SUMS arrive under a <target>/ subdirectory, while
-          # the rpm and arch artifacts are already flat in release/. Move
-          # every file up to the root so the globs below see them, and drop
-          # the dist job's narrower nested SHA256SUMS; the unified one is
-          # regenerated in the next step.
+          # Each `dist-<arch>` artifact was uploaded with `path: target/dist/`,
+          # so its tarball, .deb and SHA256SUMS arrive under a <target>/
+          # subdirectory — one per architecture (x86_64 and aarch64). The rpm
+          # and arch artifacts are already flat in release/. Move every file
+          # up to the root so the globs below see all 8 files, and drop every
+          # nested SHA256SUMS; the unified one is regenerated in the next step.
           find . -mindepth 2 -type f -name SHA256SUMS -delete
           find . -mindepth 2 -type f -exec mv -t . -- {} +
       - name: Regenerate unified SHA256SUMS and verify
         run: |
           set -euo pipefail
           cd release
-          # Drop the dist job's narrower SHA256SUMS and replace it with one
+          # Drop any stray per-arch dist SHA256SUMS and replace it with one
           # covering every file that will be attached to the release. Bare
           # filenames keep `sha256sum -c` resolvable in this directory; a
           # mismatch fails the step and therefore the whole job.

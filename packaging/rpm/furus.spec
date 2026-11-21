@@ -5,6 +5,9 @@ Name:           furus
 # With no --define the defaults below keep a plain `rpmbuild -bb` working.
 %{!?furus_version:%global furus_version 0.1.0}
 %{!?furus_target:%global furus_target x86_64-unknown-linux-gnu}
+# BuildArch is overridable so the aarch64 lane can tag its RPM aarch64; the
+# default keeps a plain `rpmbuild -bb` working as before.
+%{!?furus_build_arch:%global furus_build_arch x86_64}
 # The dist binaries are pre-built release binaries with no debuginfo. Fedora's
 # automatic debuginfo/debugsource subpackages would otherwise fail on an empty
 # debugsourcefiles.list; disable them instead of recompiling anything here.
@@ -20,8 +23,9 @@ URL:            https://github.com/justhosi/furus
 %global dist_target %{furus_target}
 Source0:        furus-%{version}-%{dist_target}.tar.gz
 # For an aarch64 rebuild pass --define 'furus_target aarch64-unknown-linux-gnu'
-# and set BuildArch: aarch64.
-BuildArch:      x86_64
+# and override BuildArch with --define 'furus_build_arch aarch64', so the RPM
+# is tagged aarch64.
+BuildArch:      %{furus_build_arch}
 
 Requires:       glibc >= 2.31
 # Fedora names: wimlib (not Debian's libwim15); polkit/fontconfig are needed by
