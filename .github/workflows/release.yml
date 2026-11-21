@@ -1,0 +1,130 @@
+name: release
+
+# Two triggers:
+#   * a pushed `v*` tag releases that tag (github.ref_name is the tag), and
+#   * a manual run releases an existing tag supplied by the operator, because
+#     on workflow_dispatch github.ref_name is a branch, not a tag. The required
+#     `tag` input removes that ambiguity.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release, e.g. v0.1.0'
+        required: true
+        type: string
+
+# Least privilege: nothing outside the release job may write to the repository.
+permissions:
+  contents: read
+
+jobs:
+  # build: read-only token. It builds, tests and packages the project and only
+  # hands the resulting bytes to the next job. Keeping build and publish apart
+  # means a compromised build script (or a malicious dependency) cannot push a
+  # release with the write token; only the small release job holds that power.
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      # Action pins are full commit SHAs, matching ci.yml's convention.
+      # checkout / rust-toolchain pins are inherited verbatim from ci.yml
+      # (resolved there on 2026-10-28); upload-artifact / download-artifact
+      # were resolved via `gh api` on 2026-11-21. Re-resolve deliberately, not
+      # by bumping blindly.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust 1.99.0 with rustfmt and clippy
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - name: Install cargo-deny and cargo-audit
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+      - name: Install QA system tools
+        run: |
+          sudo apt-get update
+          # Filesystem tools for the orchestrated Tier 1 suites: create and
+          # check FAT (dosfstools), NTFS (ntfs-3g), ext* (e2fsprogs), UDF
+          # (udftools) and exFAT (exfatprogs) images; mtools seeds reads/writes
+          # FAT media without a privileged loop mount.
+          # QEMU + OVMF let Tier 2 boot BIOS/UEFI images headlessly.
+          # grub-common + grub-pc-bin provide grub-mkimage and the i386-pc
+          # boot.img needed to build a bootable GRUB2 BIOS image.
+          # Native build headers for Slint/winit (fontconfig.pc,
+          # wayland-client.pc and x11/x11-xcb pkg-config modules), needed by
+          # `cargo clippy --workspace --all-targets`.
+          # dpkg is added here (ci.yml omits it): it provides dpkg-deb, so
+          # `cargo xtask dist` really builds the .deb release artifact instead
+          # of skipping it on this runner.
+          sudo apt-get install -y --no-install-recommends \
+            dosfstools ntfs-3g e2fsprogs udftools exfatprogs mtools \
+            qemu-system-x86 ovmf grub-common grub-pc-bin \
+            pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            dpkg
+          # uefi_ntfs_boot.rs hard-codes Arch's /usr/share/edk2/x64/*.4m.fd
+          # paths; Ubuntu's ovmf package instead installs OVMF_*_4M.fd under
+          # /usr/share/OVMF. Shim the expected names so the UEFI Tier 2 check
+          # boots (and is not skipped) on ubuntu-latest, but only when the
+          # Ubuntu firmware files are actually present.
+          if [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]; then
+            sudo mkdir -p /usr/share/edk2/x64
+            sudo ln -sf /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd
+            sudo ln -sf /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/edk2/x64/OVMF_VARS.4m.fd
+          fi
+      - name: Run xtask ci
+        run: cargo xtask ci
+      - name: Run xtask qa
+        run: cargo xtask qa
+      - name: Build release artifacts
+        run: cargo xtask dist
+      # The published artifacts come only from `cargo xtask dist` under
+      # target/dist/<triple>/: a deterministic tar.gz, a .deb and SHA256SUMS.
+      # Nothing else in the tree is packaged or uploaded.
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: target/dist/
+          if-no-files-found: error
+
+  # release: the ONLY job with contents:write. It downloads the exact bytes the
+  # build job produced, re-checks every digest, and publishes with the built-in
+  # github.token. gh (preinstalled on ubuntu-latest) avoids a third-party
+  # release action and any extra secret.
+  release:
+    needs: build
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+      - name: Flatten artifacts and verify checksums
+        run: |
+          mkdir -p release
+          # dist/ mirrors target/dist/<triple>/; pull the three artifact kinds
+          # into one directory so SHA256SUMS (bare filenames) resolves locally.
+          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name 'SHA256SUMS' \) \
+            -exec cp {} release/ \;
+          cd release
+          # Fails the job on any mismatch: the bits built must be the bits
+          # published, with no corruption between the two jobs.
+          sha256sum -c SHA256SUMS
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            ./*.tar.gz ./*.deb ./SHA256SUMS
