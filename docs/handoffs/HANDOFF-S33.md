@@ -1,19 +1,20 @@
-# S33 — Post-release hygiene — SLICE 4 HANDOFF
+# S33 — Post-release hygiene — SLICE 5 HANDOFF
 
 Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, current HEAD
-`191621a` (S33.4 committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
+`48aaae5` (S33.5 Part A committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
 with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 This is the authoritative S33 handoff. It is updated as each slice lands.
 Per-slice records may be added alongside it as historical notes.
 
-## Status: Slices 1-4/9 complete and verified, committed locally; nothing pushed
+## Status: Slices 1-5/9 complete and verified, committed locally; nothing pushed
 
 All S33 work is committed locally on top of pushed `da44823`: `8c1ef69`
-(S33.1), `6ce1a51` (S33.2), `cf10532` (S33.3), `191621a` (S33.4), plus the
-two S32 documentation commits `e4fc6e6` and `3416f1c` which the user chose to
-keep local. No reset/rebase/amend/push/tag was performed. `v0.1.1` already
-exists as a published tag; S33 does not create or move tags. The user has not
+(S33.1), `6ce1a51` (S33.2), `cf10532` (S33.3), `191621a` (S33.4), `b06a3d3`
+(handoff through slice 4), `48aaae5` (S33.5 Part A), plus the two S32
+documentation commits `e4fc6e6` and `3416f1c` which the user chose to keep
+local. No reset/rebase/amend/push/tag was performed. `v0.1.1` already exists
+as a published tag; S33 does not create or move tags. The user has not
 authorized publishing any of these commits.
 
 Guardrails still in force: preserve `unsafe_code = "deny"` in `Cargo.toml` and
@@ -33,7 +34,7 @@ that happens.
 | 2/9 | Standardize user-facing display/package metadata (`Furus` / `furus`): desktop `Name`, metainfo `<name>` + description, Arch `pkgname` + license dir, release verification path, packaging README, README Arch artifact examples | **Complete, verified** — `6ce1a51` |
 | 3/9 | SIGINT via `sigaction` with explicit `SA_RESTART` | **Complete, verified** — `cf10532` |
 | 4/9 | Portable paired OVMF firmware discovery with env overrides, xtask QA parity, removal of the Ubuntu CI symlink shims | **Complete, verified** — `191621a` |
-| 5/9 | Part A: extract inline `#[cfg(test)] mod tests` from `pipeline/mod.rs`, `furus-helper/src/dbus.rs`, `furus-gui/src/main.rs` into sibling test files | Pending |
+| 5/9 | Part A: extract inline `#[cfg(test)] mod tests` from `pipeline/mod.rs`, `furus-helper/src/dbus.rs`, `furus-gui/src/main.rs` into sibling test files | **Complete, verified** — `48aaae5` |
 | 6/9 | Part B: split `crates/furus-cli/src/main.rs` into `main`, `cli`, `output`, `commands` modules | Pending |
 | 7/9 | Part B: split `crates/furus-core/src/fs/exfat/volume.rs` into `volume/{mod,format,fat,io,tests}.rs` | Pending |
 | 8/9 | Part B: split `xtask/src/main.rs` into `main`, `util`, `assets`, `parity`, `size`, `packaging`, `dist`, `contract`, `ci`, `qa` modules | Pending |
@@ -211,10 +212,51 @@ Ubuntu-only CI symlink workaround. Exactly four files:
 - Not exercised locally: a host with ONLY Ubuntu's `/usr/share/OVMF/OVMF_*_4M.fd`
   (pair 3 in the list, covered by the pure selection test) — CI now exercises it.
 
+## Slice 5/9 — what changed (commit `48aaae5`)
+
+Pure mechanical move of three inline test modules into sibling files, with the
+module declarations left as `#[cfg(test)] #[path = "…"] mod tests;`:
+
+- `crates/furus-core/src/pipeline/mod.rs` → new `pipeline/tests.rs` (4456 lines).
+- `crates/furus-helper/src/dbus.rs` → new `dbus_tests.rs` (1018 lines).
+- `crates/furus-gui/src/main.rs` → new `main_tests.rs` (501 lines).
+
+Each new file holds the former module body de-indented by four spaces (no new
+`mod tests` wrapper). Production prefixes are byte-identical to `HEAD`; only
+the declaration was added. No test, assertion, helper, import, attribute or
+name changed — rustfmt reflowed five lines in `pipeline/tests.rs` after the
+de-indent and removed one trailing comma where `fn image_file(...)` params
+collapsed to a single line; both are whitespace/syntax-only. `super::` paths
+still resolve to the same parent module (compilation is proof). No visibility
+widening, no new unsafe or production `.unwrap()`, no behavior change.
+
+Diff stat: 6 files, 5981 insertions / 5985 deletions. No docs/handoff touched
+by the coder; this section was added by the parent afterwards.
+
+## Verification (Slice 5/9 — coder and independent reviewer)
+
+- `cargo fmt --all -- --check` → **clean** after formatting (the first check
+  flagged five line reflows in the new `tests.rs`; `cargo fmt --all` touched
+  only the six in-scope files).
+- `cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**, no warnings.
+- `cargo test --workspace --all-targets -- --list | grep -cE ': test$'` →
+  **1912** (unchanged baseline).
+- `cargo test --workspace` → **1883 passed, 0 failed, 29 ignored**.
+- `cargo xtask ci` → **pass**; size gate green with no baseline refresh (no
+  shipped binary changed). Only pre-existing `cargo-audit` not-installed skip
+  and duplicate-lock warnings.
+- `cargo xtask qa` → **pass**; `tier2/uefi-ntfs-ovmf` PASS; only the
+  pre-existing `tier1/pipeline-loop ... need --privileged` skip.
+- `git diff --check` → **clean**. Reviewer re-ran every gate and independently
+  compared each extracted body with `git show HEAD:<path>` modulo de-indent.
+- The coder used `git add -N` (intent-to-add) while inspecting; the reviewer
+  replaced it with a normal `git add -A`, and the commit contains all three new
+  files with full content.
+
 ## What remains
 
-Slices 5/9 through 9/9 per the plan table. Each must stay behaviour-preserving:
+Slices 6/9 through 9/9 per the plan table. Each must stay behaviour-preserving:
 no public signature/CLI/JSON/error-message changes, no visibility widening, no
 new unsafe or production `.unwrap()`, and the test count must not drop below
 1912. Keep the no-push / no-tag rule until the user explicitly authorizes
-publication. Slices 4/9 and earlier are committed locally (not pushed).
+publication. Slices 5/9 and earlier are committed locally (not pushed).
