@@ -46,7 +46,7 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -59,6 +59,7 @@ use furus_gui::checksum::{
 use furus_gui::config_bridge::GuiPrefs;
 use furus_gui::i18n_bridge::LocaleCatalog;
 use furus_gui::ipc::{IpcError, PkexecTransport, open_helper, start_with_fallback};
+use furus_gui::picker::PickerOutcome;
 use furus_gui::run::{CancelRequest, DeviceFacts, LogEntry, Run, RunState};
 use furus_gui::state::{GuiState, WindowsImageOption};
 use furus_linux::Device;
@@ -103,13 +104,15 @@ fn print_help() {
     println!(
         "furus-gui {} — graphical USB imaging front end (Slint)\n\
          \n\
-         usage: furus-gui [OPTION]\n\
+         usage: furus-gui [OPTION] [IMAGE_PATH]\n\
          \n\
          options:\n\
          \x20 --version   print the version and exit\n\
          \x20 --help, -h  print this help and exit\n\
          \n\
-         With no option the GUI window opens. The GUI runs unprivileged\n\
+         With no argument the GUI window opens. An optional positional\n\
+         IMAGE_PATH pre-selects and analyzes the image at startup (e.g.\n\
+         from a file manager's \"Open With\"). The GUI runs unprivileged\n\
          and refuses to start as root: privileged device work belongs to\n\
          the separate furus-helper privileged helper.",
         env!("CARGO_PKG_VERSION")
@@ -118,17 +121,26 @@ fn print_help() {
 
 fn main() -> std::process::ExitCode {
     // Fast paths first: no Slint, no display, no euid check — these
-    // must work headless in CI (contract 0.4.6).
-    match std::env::args().nth(1).as_deref() {
-        Some("--version") => {
-            print_version();
-            return std::process::ExitCode::SUCCESS;
+    // must work headless in CI (contract 0.4.6). Parse OsString so an
+    // arbitrary (non-UTF-8) filesystem path is accepted verbatim.
+    let first = std::env::args_os().nth(1);
+    if let Some(flag) = first.as_deref().and_then(|arg| arg.to_str()) {
+        match flag {
+            "--version" => {
+                print_version();
+                return std::process::ExitCode::SUCCESS;
+            }
+            "--help" | "-h" => {
+                print_help();
+                return std::process::ExitCode::SUCCESS;
+            }
+            _ if flag.starts_with('-') => {
+                eprintln!("furus-gui: unknown option '{flag}'");
+                print_help();
+                return std::process::ExitCode::FAILURE;
+            }
+            _ => {}
         }
-        Some("--help" | "-h") => {
-            print_help();
-            return std::process::ExitCode::SUCCESS;
-        }
-        _ => {}
     }
 
     if let Some(message) = startup_refusal(process::geteuid().as_raw()) {
@@ -136,7 +148,8 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    match run_gui() {
+    let startup_path = first.map(PathBuf::from);
+    match run_gui(startup_path) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("furus-gui: {error}");
@@ -945,37 +958,6 @@ impl Session {
     }
 }
 
-/// Ask a desktop file picker for the boot image. Pure std process
-/// spawning — no extra crates (the dependency budget is closed).
-fn pick_image_path() -> Option<PathBuf> {
-    for (program, args) in [
-        (
-            "zenity",
-            vec![
-                "--file-selection",
-                "--title=Select boot image",
-                "--file-filter=Images | *.iso *.img *.dd *.vhd *.vhdx *.wim *.esd",
-                "--file-filter=All files | *",
-            ],
-        ),
-        (
-            "kdialog",
-            vec!["--title", "Select boot image", "--getopenfilename", "."],
-        ),
-    ] {
-        let Ok(output) = std::process::Command::new(program).args(&args).output() else {
-            continue;
-        };
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Rendering: `GuiState` -> UI properties. One-way display; the only
 // strings the window shows come from here.
@@ -1165,7 +1147,7 @@ fn render(session: &Session, ui: &MainWindow) {
 // Window construction and callback wiring.
 // ---------------------------------------------------------------------------
 
-fn run_gui() -> Result<(), slint::PlatformError> {
+fn run_gui(startup_path: Option<PathBuf>) -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let discovery = match sysfs::enumerate(&SysfsRoot::new("/sys")) {
         Ok(found) => furus_gui::devices::discover_candidates(found, false),
@@ -1341,20 +1323,54 @@ fn run_gui() -> Result<(), slint::PlatformError> {
         });
     }
     {
+        // The picker dialog is synchronous and can block for as long as the
+        // user takes, so it runs on a dedicated worker thread. The busy flag
+        // (toggled on this UI thread) prevents a second dialog while one is
+        // already open; every Session/Slint mutation is bounced back onto the
+        // event loop, matching the other dispatchers in this file.
+        let picker_busy = Arc::new(AtomicBool::new(false));
         let session = session.clone();
         let sender = analyzer_sender.clone();
         let weak = ui.as_weak();
         ui.on_select_clicked(move || {
-            if let Some(ui) = weak.upgrade() {
-                if let Some(path) = pick_image_path() {
-                    session.borrow_mut().select_image(path, &sender);
-                } else {
-                    session.borrow_mut().note = Some(
-                        "No file picker found (install zenity or kdialog) to select a boot image."
-                            .to_string(),
-                    );
-                }
-                render(&session.borrow(), &ui);
+            if picker_busy.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let session = session.clone();
+            let sender = sender.clone();
+            let weak = weak.clone();
+            let busy = Arc::clone(&picker_busy);
+            if thread::Builder::new()
+                .name("furus-file-picker".to_string())
+                .spawn(move || {
+                    let outcome = furus_gui::picker::pick_image_path();
+                    let busy_for_loop = Arc::clone(&busy);
+                    if slint::invoke_from_event_loop(move || {
+                        {
+                            let mut session = session.borrow_mut();
+                            match outcome {
+                                PickerOutcome::Selected(path) => {
+                                    session.select_image(path, &sender);
+                                }
+                                PickerOutcome::Cancelled => {}
+                                PickerOutcome::Unavailable(msg) => {
+                                    session.note = Some(msg);
+                                }
+                            }
+                        }
+                        if let Some(ui) = weak.upgrade() {
+                            render(&session.borrow(), &ui);
+                        }
+                        busy_for_loop.store(false, Ordering::Release);
+                    })
+                    .is_err()
+                    {
+                        busy.store(false, Ordering::Release);
+                    }
+                })
+                .is_err()
+            {
+                picker_busy.store(false, Ordering::Release);
             }
         });
     }
@@ -1671,6 +1687,10 @@ fn run_gui() -> Result<(), slint::PlatformError> {
     ui.on_close_clicked(|| {
         let _ = slint::quit_event_loop();
     });
+
+    if let Some(path) = startup_path {
+        session.borrow_mut().select_image(path, &analyzer_sender);
+    }
 
     render(&session.borrow(), &ui);
     let result = ui.run();
