@@ -2,9 +2,11 @@ name: release
 
 # Two triggers:
 #   * a pushed `v*` tag releases that tag (github.ref_name is the tag), and
-#   * a manual run releases an existing tag supplied by the operator, because
+#   * a manual run packages an existing tag supplied by the operator, because
 #     on workflow_dispatch github.ref_name is a branch, not a tag. The required
-#     `tag` input removes that ambiguity.
+#     `tag` input removes that ambiguity. `publish` defaults to false so a
+#     manual run is a dry run: everything is built and verified, but no GitHub
+#     release is created unless the operator opts in.
 on:
   push:
     tags: ['v*']
@@ -14,20 +16,33 @@ on:
         description: 'Existing tag to release, e.g. v0.1.0'
         required: true
         type: string
+      publish:
+        description: 'Actually create the GitHub release (default: dry run)'
+        required: false
+        default: false
+        type: boolean
 
-# Least privilege: nothing outside the release job may write to the repository.
+# Least privilege: only the publish job may write to the repository.
 permissions:
   contents: read
 
 jobs:
-  # build: read-only token. It builds, tests and packages the project and only
-  # hands the resulting bytes to the next job. Keeping build and publish apart
-  # means a compromised build script (or a malicious dependency) cannot push a
-  # release with the write token; only the small release job holds that power.
+  # build: read-only token. It builds, tests and packages the project once and
+  # hands the resulting bytes to the next jobs. Rust is compiled here and only
+  # here; the distro jobs consume the dist tarball from this build. Keeping
+  # build and publish apart means a compromised build script (or a malicious
+  # dependency) cannot push a release with the write token; only the small
+  # publish job holds that power.
   build:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    # VERSION/TARGET are read from the one tarball that `cargo xtask dist`
+    # emits, so the recipe jobs below use exactly the names the tarball carries
+    # (not the Git tag, which may differ from Cargo's package version).
+    outputs:
+      version: ${{ steps.dist-info.outputs.version }}
+      target: ${{ steps.dist-info.outputs.target }}
     steps:
       # Action pins are full commit SHAs, matching ci.yml's convention.
       # checkout / rust-toolchain pins are inherited verbatim from ci.yml
@@ -91,40 +106,196 @@ jobs:
           name: dist
           path: target/dist/
           if-no-files-found: error
+      # Derive the recipe inputs from the artifact that actually exists. The
+      # target is exactly rustc's host triple (what `cargo xtask dist` used);
+      # the version is the tarball stem minus that target. This stays correct
+      # for any v* tag even when Cargo's package version differs from it.
+      - name: Resolve dist version and target
+        id: dist-info
+        run: |
+          set -euo pipefail
+          mapfile -t tarballs < <(find target/dist -type f -name '*.tar.gz')
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "expected exactly one dist tarball, found ${#tarballs[@]}" >&2
+            exit 1
+          fi
+          target="$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"
+          [ -n "$target" ] || { echo "cannot resolve host target" >&2; exit 1; }
+          name="$(basename "${tarballs[0]}" .tar.gz)"     # rufus-<version>-<target>
+          version="${name#rufus-}"
+          version="${version%-${target}}"
+          if [ -z "$version" ] || [ "$version" = "$name" ]; then
+            echo "cannot derive version from ${tarballs[0]} for target $target" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
 
-  # release: the ONLY job with contents:write. It downloads the exact bytes the
-  # build job produced, re-checks every digest, and publishes with the built-in
-  # github.token. gh (preinstalled on ubuntu-latest) avoids a third-party
-  # release action and any extra secret.
-  release:
+  # package-rpm: read-only token. Container jobs have no source checkout, so we
+  # check out the repo (installing git first) purely to obtain the parameterized
+  # spec file. No cargo/rustc runs here: rpmbuild only unpacks the pre-built
+  # dist tarball into an FHS tree.
+  package-rpm:
     needs: build
     permissions:
-      contents: write
+      contents: read
     runs-on: ubuntu-latest
+    container: fedora:latest
+    env:
+      RUFUS_VERSION: ${{ needs.build.outputs.version }}
+      RUFUS_TARGET: ${{ needs.build.outputs.target }}
     steps:
+      - name: Install RPM build tools
+        run: dnf install -y rpm-build tar gzip git
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download dist artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: dist
           path: dist
-      - name: Flatten artifacts and verify checksums
+      - name: Build and verify RPM
         run: |
-          mkdir -p release
-          # dist/ mirrors target/dist/<triple>/; pull the three artifact kinds
-          # into one directory so SHA256SUMS (bare filenames) resolves locally.
-          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name 'SHA256SUMS' \) \
-            -exec cp {} release/ \;
+          set -euo pipefail
+          : "${RUFUS_VERSION:?missing build output version}"
+          : "${RUFUS_TARGET:?missing build output target}"
+          mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          # rpmbuild resolves Source0 from SOURCES; the exact-name tarball is
+          # the only input. Version and target are passed as --define macros.
+          find dist -type f -name '*.tar.gz' -exec cp {} ~/rpmbuild/SOURCES/ \;
+          rpmbuild -bb \
+            --define "rufus_version $RUFUS_VERSION" \
+            --define "rufus_target $RUFUS_TARGET" \
+            packaging/rpm/rufus.spec
+          rpm_file="$(find ~/rpmbuild/RPMS -type f -name '*.rpm' -print -quit)"
+          [ -n "$rpm_file" ] && [ -s "$rpm_file" ] || { echo 'no RPM produced' >&2; exit 1; }
+          listing="$(rpm -qlp "$rpm_file")"
+          for path in \
+            /usr/bin/rufus \
+            /usr/bin/rufus-gui \
+            /usr/libexec/rufus-helper \
+            /usr/share/polkit-1/actions/org.rufuslinux.policy \
+            /usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service \
+            /usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf \
+            /usr/share/applications/org.rufuslinux.Rufus.desktop \
+            /usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml \
+            /usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg \
+            /usr/share/licenses/rufus/LICENSES.md
+          do
+            printf '%s\n' "$listing" | grep -Fxq -- "$path" || { echo "RPM missing $path" >&2; exit 1; }
+          done
+          echo "RPM requires:"; rpm -qpR "$rpm_file"
+          echo "RPM recommends:"; rpm -qp --recommends "$rpm_file"
+          mkdir -p out
+          cp "$rpm_file" out/
+      - name: Upload RPM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rpm
+          path: out/*.rpm
+          if-no-files-found: error
+
+  # package-arch: read-only token. As above, we check out the repo only for the
+  # parameterized PKGBUILD; makepkg runs as a non-root builder and consumes the
+  # pre-built tarball, with no Rust recompilation.
+  package-arch:
+    needs: build
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      RUFUS_VERSION: ${{ needs.build.outputs.version }}
+      RUFUS_TARGET: ${{ needs.build.outputs.target }}
+    steps:
+      - name: Install Arch build tools
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm base-devel zstd tar git
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download dist artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist
+      - name: Build and verify Arch package
+        run: |
+          set -euo pipefail
+          : "${RUFUS_VERSION:?missing build output version}"
+          : "${RUFUS_TARGET:?missing build output target}"
+          # makepkg refuses to run as root: build in a dir owned by `builder`.
+          id builder >/dev/null 2>&1 || useradd -m builder
+          mkdir -p /work
+          cp packaging/arch/PKGBUILD /work/
+          find dist -type f -name '*.tar.gz' -exec cp {} /work/ \;
+          chown -R builder:builder /work
+          # rufus_version (not pkgver: makepkg unsets pkgver) and _target are
+          # the environment overrides the recipe reads.
+          su builder -c "cd /work && rufus_version='$RUFUS_VERSION' _target='$RUFUS_TARGET' makepkg -f --noconfirm --skipchecksums"
+          pkg_file="$(find /work -maxdepth 1 -type f -name '*.pkg.tar.zst' -print -quit)"
+          [ -n "$pkg_file" ] && [ -s "$pkg_file" ] || { echo 'no Arch package produced' >&2; exit 1; }
+          listing="$(tar --zstd -tf "$pkg_file" | sed 's#^\./##')"
+          for path in \
+            usr/bin/rufus \
+            usr/bin/rufus-gui \
+            usr/libexec/rufus-helper \
+            usr/share/polkit-1/actions/org.rufuslinux.policy \
+            usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service \
+            usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf \
+            usr/share/applications/org.rufuslinux.Rufus.desktop \
+            usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml \
+            usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg \
+            usr/share/licenses/rufus-linux/LICENSES.md
+          do
+            printf '%s\n' "$listing" | grep -Fxq -- "$path" || { echo "Arch package missing $path" >&2; exit 1; }
+          done
+          mkdir -p out
+          cp "$pkg_file" out/
+      - name: Upload Arch package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: arch
+          path: out/*.pkg.tar.zst
+          if-no-files-found: error
+
+  # publish: the ONLY job with contents:write. It downloads every artifact into
+  # one directory, rebuilds one SHA256SUMS covering all four artifact kinds so
+  # the verification and the upload agree, and publishes with the built-in
+  # github.token. gh (preinstalled on ubuntu-latest) avoids a third-party
+  # release action and any extra secret. `--repo` is explicit: gh has no Git
+  # repository to infer from here (there is no checkout in this job).
+  publish:
+    needs: [build, package-rpm, package-arch]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+          path: release
+      - name: Regenerate unified SHA256SUMS and verify
+        run: |
+          set -euo pipefail
           cd release
-          # Fails the job on any mismatch: the bits built must be the bits
-          # published, with no corruption between the two jobs.
+          # Drop the dist job's narrower SHA256SUMS and replace it with one
+          # covering every file that will be attached to the release. Bare
+          # filenames keep `sha256sum -c` resolvable in this directory; a
+          # mismatch fails the step and therefore the whole job.
+          rm -f SHA256SUMS
+          sha256sum *.tar.gz *.deb *.rpm *.pkg.tar.zst > SHA256SUMS
           sha256sum -c SHA256SUMS
       - name: Publish GitHub release
+        if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           cd release
           TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
-            ./*.tar.gz ./*.deb ./SHA256SUMS
+            --repo "${{ github.repository }}" \
+            ./*.tar.gz ./*.deb ./*.rpm ./*.pkg.tar.zst ./SHA256SUMS
