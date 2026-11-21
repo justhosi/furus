@@ -1,18 +1,19 @@
-# S33 — Post-release hygiene — SLICE 6 HANDOFF
+# S33 — Post-release hygiene — SLICE 7 HANDOFF
 
 Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, current HEAD
-`53a1a91` (S33.5 Part B CLI split committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
+`8e9ae92` (S33.5 Part B exfat volume split committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
 with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 This is the authoritative S33 handoff. It is updated as each slice lands.
 Per-slice records may be added alongside it as historical notes.
 
-## Status: Slices 1-6/9 complete and verified, committed locally; nothing pushed
+## Status: Slices 1-7/9 complete and verified, committed locally; nothing pushed
 
 All S33 work is committed locally on top of pushed `da44823`: `8c1ef69`
 (S33.1), `6ce1a51` (S33.2), `cf10532` (S33.3), `191621a` (S33.4), `b06a3d3`
 (handoff through slice 4), `48aaae5` (S33.5 Part A), `9e5361b` (handoff
-through slice 5), `53a1a91` (S33.5 Part B CLI split), plus the two S32
+through slice 5), `53a1a91` (S33.5 Part B CLI split), `86736cb` (handoff
+through slice 6), `8e9ae92` (S33.5 Part B exfat volume split), plus the two S32
 documentation commits `e4fc6e6` and `3416f1c` which the user chose to keep
 local. No reset/rebase/amend/push/tag was performed. `v0.1.1` already exists
 as a published tag; S33 does not create or move tags. The user has not
@@ -37,7 +38,7 @@ that happens.
 | 4/9 | Portable paired OVMF firmware discovery with env overrides, xtask QA parity, removal of the Ubuntu CI symlink shims | **Complete, verified** — `191621a` |
 | 5/9 | Part A: extract inline `#[cfg(test)] mod tests` from `pipeline/mod.rs`, `furus-helper/src/dbus.rs`, `furus-gui/src/main.rs` into sibling test files | **Complete, verified** — `48aaae5` |
 | 6/9 | Part B: split `crates/furus-cli/src/main.rs` into `main`, `cli`, `output`, `commands` modules | **Complete, verified** — `53a1a91` |
-| 7/9 | Part B: split `crates/furus-core/src/fs/exfat/volume.rs` into `volume/{mod,format,fat,io,tests}.rs` | Pending |
+| 7/9 | Part B: split `crates/furus-core/src/fs/exfat/volume.rs` into `volume/{mod,format,fat,io,tests}.rs` | **Complete, verified** — `8e9ae92` |
 | 8/9 | Part B: split `xtask/src/main.rs` into `main`, `util`, `assets`, `parity`, `size`, `packaging`, `dist`, `contract`, `ci`, `qa` modules | Pending |
 | 9/9 | Final full gate, README slice table row, `TECHNICAL.md` S33 section, final handoff | Pending |
 
@@ -298,9 +299,69 @@ in prose). Diff stat: 8 files, 1791 insertions / 1697 deletions.
   module verified separately, all 8 tests identical).
 - `git diff --check` clean; `git add -A` staged exactly eight files.
 
+## Slice 7/9 — what changed (commit `8e9ae92`)
+
+Split the 4344-line `crates/furus-core/src/fs/exfat/volume.rs` into a `volume/`
+directory of five files:
+
+- `mod.rs` (535 lines) — module docs, imports, `DirInfo` / private
+  `DirContent` / `Level` / `FileTarget` / `GrowthPlan` / `Snapshot` /
+  `Exfat<V>`, constants, `bitmap_entry_image`, `open` / `geometry` / `flush`,
+  `mod format; mod fat; mod io;`, and
+  `#[cfg(test)] #[path = "tests.rs"] mod tests;`.
+- `format.rs` (35) — the `Exfat::format` entrypoint.
+- `fat.rs` (198) — cluster allocation / free accounting and FAT-chain
+  traversal: `allocate`, `release`, `free_bytes`, `fat_entry`,
+  `set_fat_entry`, `set_fat_entry_ledgered`, `snapshot`, `restore`,
+  `read_clusters`, `allocate_in_place`, `patch_percent_in_use`.
+- `io.rs` (1613) — remaining `Exfat` methods plus the free helpers
+  `read_whole`, `zero_cluster`, `slot_image`, `live_label_slot`,
+  `fresh_label_slot`, `deleted_label_image`, `parent_text`.
+- `tests.rs` (1979) — the former inline test body, de-indented one level, no
+  wrapper.
+
+`crates/furus-core/src/fs/exfat/mod.rs` is unchanged (`pub mod volume;` at
+line 41, `pub use volume::DirInfo; pub use volume::Exfat;` at 49–50). Public
+API unchanged; no new plain `pub`. Structural edits only: an alias
+`use crate::fs::exfat::format as fmt;` in `mod.rs` (forced by the new
+`mod format;` name collision) with three `format::ENTRY_BYTES` →
+`fmt::ENTRY_BYTES` qualifications; narrow `use` additions; `pub(super)` on
+fourteen cross-submodule items. No test, assertion, error message, disk bytes,
+unsafe site or production `.unwrap()` changed. Diff stat: 6 files, 4360
+insertions / 4344 deletions (net +16 structural lines).
+
+## Verification (Slice 7/9 — coder and independent reviewer)
+
+- `cargo fmt --all -- --check` → **clean** after one `cargo fmt --all`
+  (only in-scope files touched).
+- `cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**.
+- `cargo test --workspace --all-targets -- --list | grep -cE ': test$'` →
+  **1912** (unchanged); `cargo test --workspace` → **1883 passed, 0 failed,
+  29 ignored**.
+- `cargo xtask ci` → **all gates passed**; size gate green with no baseline
+  refresh. Only the documented `cargo-audit` not-installed skip and
+  pre-existing duplicate-lock warnings.
+- `cargo xtask qa` → **all suites passed**; only the documented
+  `tier1/pipeline-loop ... need --privileged` skip; `tier2/uefi-ntfs-ovmf`
+  PASS.
+- Preservation proof: reviewer extracted 52 production functions and 58 test
+  items from both `git show HEAD:...volume.rs` and the new files; all bodies
+  identical modulo visibility keywords, the `fmt::` alias, import/use lines
+  and rustfmt reflow from de-indentation. All **39 tests** in identical
+  order with unchanged names and assertions. Zero new `unsafe`, zero new
+  production `.unwrap()`.
+- `RUSTDOCFLAGS="-D warnings" cargo doc -p furus-core --no-deps` → **exit 101**,
+  but this is pre-existing: reviewer built a detached worktree at `86736cb`
+  and both trees emit exactly **226 `error:` lines** with **identical error
+  message multisets** (13 volume-related errors are the same messages,
+  merely relocated). No new doc errors were introduced; fixing the 185
+  crate-wide intra-doc link errors is out of scope for this pure refactor.
+- `git diff --check` clean; `git add -A` staged exactly the six in-scope
+  files. Working tree clean after commit.
+
 ## What remains
 
-Slices 7/9 through 9/9 per the plan table. Each must stay behaviour-preserving:
+Slices 8/9 through 9/9 per the plan table. Each must stay behaviour-preserving:
 no public signature/CLI/JSON/error-message changes, no visibility widening, no
 new unsafe or production `.unwrap()`, and the test count must not drop below
 1912. Keep the no-push / no-tag rule until the user explicitly authorizes
