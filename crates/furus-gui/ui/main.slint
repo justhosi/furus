@@ -122,6 +122,7 @@ export component MainWindow inherits Window {
     VerticalLayout {
         padding: 12px;
         spacing: 8px;
+        alignment: start;
 
         // Locale selection: the model of display names and the mapping back
         // to locale tags are both provided by the Rust bridge.
@@ -333,7 +334,6 @@ export component MainWindow inherits Window {
         Text {
             text: root.status-text;
             wrap: word-wrap;
-            vertical-stretch: 1;
         }
 
         Button {
