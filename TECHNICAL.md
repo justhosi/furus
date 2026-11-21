@@ -1272,3 +1272,106 @@ with all six jobs green. The new release carries exactly 9 assets (8 packages
 plus the unified `SHA256SUMS`); all assets were downloaded, `sha256sum -c
 SHA256SUMS` passed for all eight packages, and every GitHub asset digest matched
 its local hash.
+
+## S32 — Native XDG desktop portal file picker and UI polish
+
+### Diagnosis
+
+On Omarchy (Arch + Hyprland/Wayland) the GUI's SELECT button failed with
+`No file picker found (install zenity or kdialog) to select a boot image.` The
+old `pick_image_path()` lived directly in `main.rs` and only tried zenity then
+kdialog, synchronously on the Slint UI thread. That had three consequences: it
+depends on a GTK/Qt helper being installed (not true on a minimal Wayland
+session), it blocks the event loop while the helper runs, and there was no way
+to supply an image path from the command line (e.g. a file-manager "Open With"
+action). A separate visual complaint was an excess blank vertical gap above the
+"Show log" button on tall tiling windows.
+
+### Picker module and protocol details
+
+`crates/furus-gui/src/picker.rs` is the single owner of image selection. It
+exports `PickerOutcome { Selected(PathBuf), Cancelled, Unavailable(String) }`
+and `pick_image_path()`, which is `resolve_chain(pick_via_xdg_portal(),
+pick_via_fallbacks)`. The chain falls through **only** on `Unavailable`; a
+`Cancelled` response is terminal and never triggers zenity. That distinction is
+covered by pure unit tests.
+
+`pick_via_xdg_portal()` runs one `zbus::block_on(portal_open())`. The important
+protocol detail is ordering: the `Request` proxy is created and its `Response`
+signal stream subscribed **before** calling
+`org.freedesktop.portal.FileChooser.OpenFile`, so a fast portal cannot emit the
+response in the gap between the method reply and our subscription. The signal
+is awaited with `poll_fn(Stream::poll_next)` rather than a nested `block_on`,
+keeping everything inside the single outer `block_on`. The call signature is
+`(s, s, a{sv}) -> o`; `parent_window` is the empty string, which is valid. The
+request object path is derived from the unique bus name by stripping the
+leading `:`, replacing `.` with `_`, and appending the handle token:
+`/org/freedesktop/portal/desktop/request/<sender>/<token>`. The token is
+`furus_open_<pid>_<AtomicU64 counter>`. Response 0 means success: the first
+element of the `uris` field is decoded by `decode_file_uri` (handles `file://`
+with an optional `localhost` authority, `%XX` decoding, UTF-8 validation,
+rejects malformed `%` escapes, deliberately does not translate `+` to space).
+Any other response maps to `Cancelled`; any error maps to `Unavailable`.
+
+**Critical dependency correction.** The handoff spec assumed
+`zbus::blocking::Connection::session()`, but the workspace pins zbus 6.2.0,
+which has no `zbus::blocking` module. The crate's established pattern in
+`crates/furus-gui/src/ipc/dbus.rs` is `zbus::block_on(async { … })` on a
+dedicated thread, and `picker.rs` follows it. No async runtime was added. The
+canonical zbus 6 re-exports `Variant`, `OwnedVariant` and `OwnedObjectPath` come
+from `zbus::wire`; `zbus::zvariant` is deprecated since 6.0 and is unused.
+
+The fallback still tries zenity then kdialog, but its error message now names
+`xdg-desktop-portal` and the `furus-gui /path/to/image.iso` escape hatch.
+
+### Threading and event-loop marshalling
+
+`on_select_clicked` in `main.rs` no longer calls the picker directly. An
+`Arc<AtomicBool>` guard uses `swap(true, Ordering::AcqRel)` to reject a second
+click while a dialog is open. A named `furus-file-picker` thread calls
+`pick_image_path()` and marshals the outcome back with
+`slint::invoke_from_event_loop`, following the existing
+analysis/checksum/device dispatcher pattern (clone `SessionHandle` +
+`ui.as_weak()` into the worker; render from the UI thread). On the UI thread,
+`Selected` calls `select_image`, `Cancelled` is a silent no-op, and
+`Unavailable` sets `note`. The busy flag is released on every path: inside the
+queued closure (via a dedicated clone), on `invoke_from_event_loop` failure, and
+on thread-spawn failure. No Slint widget or `Session` is mutated off the UI
+thread, and the `MutexGuard` is dropped in an inner block before `render` to
+avoid re-entrant borrows.
+
+### CLI positional image path
+
+`main()` now uses `std::env::args_os().nth(1)` so non-UTF-8 paths survive.
+`--version`, `--help` and `-h` keep their fast paths and exit before any
+display or euid initialization. Other leading-`-` arguments are rejected as
+unknown options so a typo is not mistaken for a path. A non-flag argument is
+converted to `PathBuf` and passed as `run_gui(startup_path)`; just before the
+final render, `session.borrow_mut().select_image(path, &analyzer_sender)`
+pre-selects and analyzes it. The analyzer sender is created before both this
+call and the SELECT wiring, so the worker always exists.
+
+### UI spacing fix
+
+`MainWindow` has `preferred-height: 640px` and no max height, so a tall tiling
+window gives it spare vertical space. The parent `VerticalLayout` in
+`ui/main.slint` (line 122) had Slint's default `alignment: Stretch`, and the
+status `Text` had `vertical-stretch: 1`, so that one element absorbed all spare
+height and appeared as a blank gap above "Show log". Removing the stretch alone
+is insufficient: under `Stretch`, when the sum of stretch factors is 0, Slint
+distributes spare height equally among all growable items, and Slint buttons
+have no `max-height` so they would become tall. The fix therefore also sets
+`alignment: start;` on the parent layout: every item stays at its preferred
+size and the spare height is parked at the bottom. The confirm and checksum
+overlays are siblings outside this layout and are unaffected.
+
+### Build and verification consequences
+
+The new module and wiring grew the `furus-gui` release binary by 32,128 bytes
+(12,774,280 → 12,806,408), still far below its 14,000,000-byte budget; the size
+baseline was refreshed in commit `39e97ba`. Slice 1 was originally committed
+without running rustfmt, which made `cargo xtask ci` fail at its fmt gate; that
+was fixed by `cargo fmt --all` in commit `052aa4e`. With those two corrections,
+`cargo xtask ci` and `cargo xtask qa` both pass on `main`. End-to-end dialog
+behavior still requires a real display session; CI exercises the pure logic,
+headless CLI paths, offscreen render smoke test and all release gates.
