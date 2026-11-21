@@ -2,15 +2,15 @@
   "binaries": {
     "furus": {
       "budget": 3000000,
-      "bytes": 1810152
+      "bytes": 1810504
     },
     "furus-gui": {
       "budget": 14000000,
-      "bytes": 12774280
+      "bytes": 12806408
     },
     "furus-helper": {
       "budget": 2500000,
-      "bytes": 1406296
+      "bytes": 1406392
     }
   }
 }
