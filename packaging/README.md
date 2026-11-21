@@ -49,7 +49,7 @@ archived `docs/handoffs/HANDOFF-root-S27-archive.md`.
 | `deb/postinst` | `DEBIAN/postinst` inside the deb (mode 0755) |
 | `arch/PKGBUILD` | release-bundle metadata for Arch source builds |
 | `rpm/furus.spec` | release-bundle metadata for RPM builds |
-| `LICENSES.md` (repository root) | `/usr/share/licenses/furus-linux/LICENSES.md` |
+| `LICENSES.md` (repository root) | `/usr/share/licenses/furus/LICENSES.md` |
 
 Binaries, built and installed by `xtask dist` from the release build:
 

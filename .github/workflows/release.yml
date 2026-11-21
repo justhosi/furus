@@ -286,7 +286,7 @@ jobs:
             usr/share/applications/org.furuslinux.Furus.desktop \
             usr/share/metainfo/org.furuslinux.Furus.metainfo.xml \
             usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg \
-            usr/share/licenses/furus-linux/LICENSES.md
+            usr/share/licenses/furus/LICENSES.md
           do
             printf '%s\n' "$listing" | grep -Fxq -- "$path" || { echo "Arch package missing $path" >&2; exit 1; }
           done

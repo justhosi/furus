@@ -3,10 +3,10 @@
   <id>org.furuslinux.Furus.desktop</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
-  <name>furus-linux</name>
+  <name>Furus</name>
   <summary>Write disk images to USB devices</summary>
   <description>
-    <p>furus-linux creates bootable USB drives and writes raw disk images to
+    <p>Furus creates bootable USB drives and writes raw disk images to
     removable devices. It writes FAT32 and exFAT natively and can drive the
     external formatters for NTFS, ext2/3/4 and UDF through a privileged
     D-Bus helper.</p>

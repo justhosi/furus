@@ -1,5 +1,5 @@
 # Maintainer: furus maintainers <mohamadzadeh@outlook.com>
-pkgname=furus-linux
+pkgname=furus
 # Both are overridable by the offline/local CI recipe build, e.g.
 #   furus_version=0.1.1 _target=x86_64-unknown-linux-gnu makepkg -f --noconfirm
 # With no override, the same safe defaults as the dist bundle apply. `pkgver`
@@ -54,5 +54,5 @@ package() {
   install -Dm644 "${srcdir}/usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg" \
     "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg"
   install -Dm644 "${srcdir}/usr/share/doc/furus/LICENSES.md" \
-    "${pkgdir}/usr/share/licenses/furus-linux/LICENSES.md"
+    "${pkgdir}/usr/share/licenses/furus/LICENSES.md"
 }

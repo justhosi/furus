@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=furus-linux
+Name=Furus
 GenericName=USB Image Writer
 Comment=Write disk images to USB devices
 Exec=furus-gui
