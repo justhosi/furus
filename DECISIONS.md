@@ -287,7 +287,12 @@ rationales in section 1 are unchanged, and no other A-number is touched.
   exercise these is `xtask dist --target <triple>`. Honest scope note: only the
   host triple is verified in this environment; cross-building requires the
   target toolchains to be installed, so no aarch64 binary is claimed to have
-  been built here.
+  been built here. **Dual-arch realization (2026-11-21):** the value of A3 is
+  now exercised by the release workflow, which builds native x86_64 and
+  aarch64 artifacts on a two-runner matrix (see `TECHNICAL.md`), so aarch64
+  binaries are produced in CI. This realizes the decision without changing
+  it, and does not alter the local-scope note above — this development host
+  still only builds the host triple.
 
 * **A5 (C libraries) — approved**: wimlib remains LGPL-3.0-or-later and is
   linked for WIM/ESD through `wimlib-sys`, with the opt-in `strict-link` feature

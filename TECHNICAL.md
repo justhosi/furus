@@ -1166,3 +1166,104 @@ Release `v0.1.1` was published on 2026-11-21 with the pre-rebrand asset names
 (five assets, digests matching `SHA256SUMS`). Because the published artifacts
 carry the old identity, replacing that release and tag with rebranded artifacts
 is tracked as Slice 4 and is **not** part of this rename.
+
+## Dual-architecture release workflow (2026-11-21)
+
+This section records the dual-architecture extension of S30/S31's release
+workflow and supersedes the "one dist build, reused by every distro job" and
+four-job-DAG descriptions above where they describe a single architecture. No
+runtime behaviour, wire format, dependency or binary size changed: the release
+binaries are byte-for-byte the ones measured by the size gate. The workflow and
+test changes are committed and pushed on `main` at `cc15dca`.
+
+### Matrix design
+
+`.github/workflows/release.yml` now builds **natively** on each architecture
+via a two-entry matrix on the `build`, `package-rpm` and `package-arch` jobs
+(`strategy.fail-fast: false`):
+
+| arch | target triple | runner |
+| --- | --- | --- |
+| `x86_64` | `x86_64-unknown-linux-gnu` | `ubuntu-latest` |
+| `aarch64` | `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` |
+
+There is no cross-compilation: each lane uses a native runner for its triple,
+and `cargo xtask dist --target ${{ matrix.target }}` puts the tarball name and
+dist directory under that triple. Each job uploads arch-suffixed artifacts
+(`dist-<arch>`, `rpm-<arch>`, `arch-<arch>`) so the two lanes cannot collide.
+Every lane derives its version from its own single dist tarball (the Git tag
+can differ from Cargo's package version), so the removed `dist-info` output and
+all `needs.build.outputs` references are gone. The `publish` job still has no
+checkout, contains no compilation, and is the only job holding `contents: write`;
+all action SHA pins are unchanged.
+
+### Per-arch artifacts and the unified digest
+
+Each architecture produces the same four artifact kinds from its own dist
+build, for eight packages total:
+
+| arch | artifacts |
+| --- | --- |
+| `x86_64` | `furus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`, `furus-0.1.0-x86_64-unknown-linux-gnu.deb`, `furus-0.1.0-1.fc45.x86_64.rpm`, `furus-linux-0.1.0-1-x86_64.pkg.tar.zst` |
+| `aarch64` | `furus-0.1.0-aarch64-unknown-linux-gnu.tar.gz`, `furus-0.1.0-aarch64-unknown-linux-gnu.deb`, `furus-0.1.0-1.fc45.aarch64.rpm`, `furus-linux-0.1.0-1-aarch64.pkg.tar.zst` |
+
+`publish` downloads all artifacts with `merge-multiple: true`, flattens the two
+nested `<target>/` directories (deleting only the narrower per-arch
+`SHA256SUMS`), then regenerates **one unified `SHA256SUMS` with eight lines** —
+one per package — and runs `sha256sum -c SHA256SUMS` before `gh release create`.
+A mismatch or corruption in the upload/download round trip therefore fails
+before publication, and the nine release assets (8 packages + `SHA256SUMS`) are
+exactly the verified bytes. The RPM build passes an overridable
+`furus_build_arch` macro (default `x86_64`) that drives `BuildArch:`, so the
+aarch64 RPM carries the right architecture.
+
+### Why `xtask ci` is x86-only
+
+`xtask ci` includes the size-drift gate, whose committed `size-baseline.json`
+is host-specific (recorded on x86_64); running it on ARM would fail spuriously.
+Only the x86_64 lane runs `xtask ci` (fmt, clippy, tests, assets, parity,
+contract, size and cargo-deny). **Both** lanes run `xtask qa` and `xtask dist`;
+`dist` still enforces the absolute release size budgets on ARM even though the
+relative size-drift gate does not run there. The x86-only boot/QEMU step also
+installs `qemu-system-x86`, OVMF, `grub-common` and `grub-pc-bin` plus the
+`/usr/share/edk2/x64` firmware shim; the aarch64 lane skips the QEMU/OVMF
+Tier 2 boot tests, which remain covered by the x86 lane.
+
+### The ARM Arch port image and its trust tradeoff
+
+The official `archlinux:latest` image publishes an **amd64-only** manifest — it
+has no `linux/arm64` variant — so the aarch64 `package-arch` lane cannot use it.
+It instead uses the maintained, unofficial AArch64 port image
+
+```
+lfdevs/archlinux-ports:base-devel@sha256:a24c8b0151cdfcd678027eebba1d315f3c0d5433747c314b95e634a4492e280b
+```
+
+x86_64 keeps the exact original `archlinux:latest` string. The port image is
+pinned by index digest, so the mutable `base-devel` tag cannot drift this
+build; the digest was resolved from the registry (HTTP 200) to an OCI index
+containing `linux/arm64`. Trust/supply-chain note: this is a **third-party**
+image, not an official Arch release artifact — the publisher documents a
+bootstrap trust path through a drzee.net signing key, and the produced packages
+target ARMv8.2-A+. The user explicitly accepted this tradeoff; the digest pin
+bounds it to one reviewed image.
+
+### exfat whitespace fix
+
+The `dump.exfat` geometry assertions in
+`crates/furus-core/tests/exfat_format.rs` originally pinned the exact column
+padding of `dump.exfat` output. exfatprogs 1.2.2 emits spaces for those fields
+on x86_64 but tabs on aarch64, so the aarch64 QA suite failed on formatting
+alone. Commit `cc15dca` collapses whitespace before comparing (`split_whitespace()`
+joined with single spaces), preserving every value checked while accepting both
+column layouts.
+
+### Validation
+
+Dry run `44931040759` (`workflow_dispatch`, `publish=false`) on `cc15dca`
+finished green: both native builds, all four package jobs (two per arch), and
+`publish`'s download, flatten and checksum steps passed. The final
+`gh release create` step was correctly skipped. The authoritative process
+record is `docs/handoffs/HANDOFF-aarch64-release.md`. Publishing the dual-arch
+assets by replacing the `v0.1.1` release/tag is the final step and is **not** done
+here.

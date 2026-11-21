@@ -245,7 +245,7 @@ analysed upstream function — the ledger only covers functions and thunks from
 | S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | complete (on `main`) |
 | S28 | CI dependency fix — install fontconfig/winit native build headers on ubuntu-latest so `xtask ci` (clippy) and `xtask qa` both run green | complete (on `main`) |
 | S29 | GUI / IPC verification — single-source D-Bus/polkit/packaging contract with a CI drift check, offscreen Slint render smoke, and a real compiled-helper JSONL/run-state wire test | complete (on `main`) |
-| S31 | Native packages in CI — parameterized RPM/Arch recipes and a four-job release workflow that builds `.rpm` and `.pkg.tar.zst` from the single dist tarball under one unified `SHA256SUMS` | complete (on `main`); workflow validated end-to-end — release v0.1.1 published 2026-11-21 with 5 assets and matching `SHA256SUMS` |
+| S31 | Native packages in CI — parameterized RPM/Arch recipes and a dual-architecture release workflow that builds `.rpm` and `.pkg.tar.zst` natively for x86_64 and aarch64 under one unified `SHA256SUMS` (8 packages + digest = 9 assets) | complete (on `main`); workflow validated end-to-end for both architectures — dry run `44931040759` (publish=false) green; publishing the dual-arch assets to v0.1.1 is the final publishing step |
 
 #### Update-check fields are dormant (A12)
 
@@ -394,15 +394,33 @@ has the full install-path table and service-verification commands.
 ### Release assets / install
 
 Every `v*` tag is built automatically by `.github/workflows/release.yml` from
-one `cargo xtask dist` build: the generic tarball, a `.deb`, an `.rpm` and a
-`.pkg.tar.zst` all come from that single set of release binaries, and the
-release also publishes one unified `SHA256SUMS` covering every artifact.
-Install the native package for your distro from the directory holding the
-downloaded files (the `./` makes your package manager use the local file):
+**two native builds** — one on `ubuntu-latest` (x86_64) and one on
+`ubuntu-24.04-arm` (aarch64). Each architecture produces the same four artifact
+kinds from its own `cargo xtask dist --target <triple>` build: a generic
+`.tar.gz` tarball, a `.deb`, an `.rpm` and a `.pkg.tar.zst`. The architecture is
+part of every filename, so the two sets cannot collide. The release publishes
+all eight packages plus one unified `SHA256SUMS` covering every artifact.
+
+Both an x86_64 and an aarch64 file of each kind exist; pick the one matching
+your machine. Install the native package for your distro from the directory
+holding the downloaded files (the `./` makes your package manager use the local
+file, and the glob matches whichever architecture you downloaded):
 
 * Ubuntu/Debian: `sudo apt install ./furus-*.deb`
+  (e.g. `furus-0.1.0-x86_64-unknown-linux-gnu.deb` or
+  `furus-0.1.0-aarch64-unknown-linux-gnu.deb`)
 * Fedora: `sudo dnf install ./furus-*.rpm`
+  (e.g. `furus-0.1.0-1.fc45.x86_64.rpm` or `furus-0.1.0-1.fc45.aarch64.rpm`)
 * Arch Linux: `sudo pacman -U ./furus-*.pkg.tar.zst`
+  (e.g. `furus-linux-0.1.0-1-x86_64.pkg.tar.zst` or
+  `furus-linux-0.1.0-1-aarch64.pkg.tar.zst`)
+
+The single `SHA256SUMS` has one line per package (eight in total). Verify your
+downloads against it from the same directory:
+
+```
+sha256sum -c SHA256SUMS
+```
 
 `packaging/README.md` has the full install-path table and service-verification
 commands.

@@ -27,10 +27,14 @@ original Windows utility for Linux. Capabilities present in this version:
 - `cargo xtask dist` (deterministic tarball, a `.deb` where `dpkg-deb` exists,
   and `SHA256SUMS`) and `cargo xtask qa` (the two-tier automated QA gate).
 - Tag-triggered `.github/workflows/release.yml`: on a `v*` tag it builds via
-  `cargo xtask dist`, re-verifies `SHA256SUMS`, and publishes the tarball, `.deb`
-  and digest file as a GitHub release. The workflow itself is only exercised on
-  GitHub with a real tag; `docs/RELEASE-CHECKLIST.md` records the manual hardware
+  `cargo xtask dist`, re-verifies `SHA256SUMS`, and publishes the release assets
+  as a GitHub release. `docs/RELEASE-CHECKLIST.md` records the manual hardware
   sign-off that must precede tagging.
+- Dual-architecture release artifacts: the workflow now builds natively for
+  x86_64 and aarch64 and publishes eight packages — a generic `.tar.gz`, a
+  `.deb`, an `.rpm` and a `.pkg.tar.zst` for each architecture — plus one unified
+  `SHA256SUMS` (eight lines, one per package). Both architectures were validated
+  end-to-end in dry run `44931040759`.
 
 ### Notes
 
