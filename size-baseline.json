@@ -1,14 +1,14 @@
 {
   "binaries": {
-    "rufus": {
+    "furus": {
       "budget": 3000000,
       "bytes": 1810152
     },
-    "rufus-gui": {
+    "furus-gui": {
       "budget": 14000000,
       "bytes": 12774280
     },
-    "rufus-helper": {
+    "furus-helper": {
       "budget": 2500000,
       "bytes": 1406296
     }

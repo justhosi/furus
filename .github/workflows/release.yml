@@ -121,8 +121,8 @@ jobs:
           fi
           target="$(rustc -vV | sed -n 's/^host:[[:space:]]*//p')"
           [ -n "$target" ] || { echo "cannot resolve host target" >&2; exit 1; }
-          name="$(basename "${tarballs[0]}" .tar.gz)"     # rufus-<version>-<target>
-          version="${name#rufus-}"
+          name="$(basename "${tarballs[0]}" .tar.gz)"     # furus-<version>-<target>
+          version="${name#furus-}"
           version="${version%-${target}}"
           if [ -z "$version" ] || [ "$version" = "$name" ]; then
             echo "cannot derive version from ${tarballs[0]} for target $target" >&2
@@ -142,8 +142,8 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:latest
     env:
-      RUFUS_VERSION: ${{ needs.build.outputs.version }}
-      RUFUS_TARGET: ${{ needs.build.outputs.target }}
+      FURUS_VERSION: ${{ needs.build.outputs.version }}
+      FURUS_TARGET: ${{ needs.build.outputs.target }}
     steps:
       - name: Install RPM build tools
         run: dnf install -y rpm-build tar gzip git
@@ -156,30 +156,30 @@ jobs:
       - name: Build and verify RPM
         run: |
           set -euo pipefail
-          : "${RUFUS_VERSION:?missing build output version}"
-          : "${RUFUS_TARGET:?missing build output target}"
+          : "${FURUS_VERSION:?missing build output version}"
+          : "${FURUS_TARGET:?missing build output target}"
           mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
           # rpmbuild resolves Source0 from SOURCES; the exact-name tarball is
           # the only input. Version and target are passed as --define macros.
           find dist -type f -name '*.tar.gz' -exec cp {} ~/rpmbuild/SOURCES/ \;
           rpmbuild -bb \
-            --define "rufus_version $RUFUS_VERSION" \
-            --define "rufus_target $RUFUS_TARGET" \
-            packaging/rpm/rufus.spec
+            --define "furus_version $FURUS_VERSION" \
+            --define "furus_target $FURUS_TARGET" \
+            packaging/rpm/furus.spec
           rpm_file="$(find ~/rpmbuild/RPMS -type f -name '*.rpm' -print -quit)"
           [ -n "$rpm_file" ] && [ -s "$rpm_file" ] || { echo 'no RPM produced' >&2; exit 1; }
           listing="$(rpm -qlp "$rpm_file")"
           for path in \
-            /usr/bin/rufus \
-            /usr/bin/rufus-gui \
-            /usr/libexec/rufus-helper \
-            /usr/share/polkit-1/actions/org.rufuslinux.policy \
-            /usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service \
-            /usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf \
-            /usr/share/applications/org.rufuslinux.Rufus.desktop \
-            /usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml \
-            /usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg \
-            /usr/share/licenses/rufus/LICENSES.md
+            /usr/bin/furus \
+            /usr/bin/furus-gui \
+            /usr/libexec/furus-helper \
+            /usr/share/polkit-1/actions/org.furuslinux.policy \
+            /usr/share/dbus-1/system-services/org.furuslinux.Helper1.service \
+            /usr/share/dbus-1/system.d/org.furuslinux.Helper1.conf \
+            /usr/share/applications/org.furuslinux.Furus.desktop \
+            /usr/share/metainfo/org.furuslinux.Furus.metainfo.xml \
+            /usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg \
+            /usr/share/licenses/furus/LICENSES.md
           do
             printf '%s\n' "$listing" | grep -Fxq -- "$path" || { echo "RPM missing $path" >&2; exit 1; }
           done
@@ -204,8 +204,8 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     env:
-      RUFUS_VERSION: ${{ needs.build.outputs.version }}
-      RUFUS_TARGET: ${{ needs.build.outputs.target }}
+      FURUS_VERSION: ${{ needs.build.outputs.version }}
+      FURUS_TARGET: ${{ needs.build.outputs.target }}
     steps:
       - name: Install Arch build tools
         run: |
@@ -220,31 +220,31 @@ jobs:
       - name: Build and verify Arch package
         run: |
           set -euo pipefail
-          : "${RUFUS_VERSION:?missing build output version}"
-          : "${RUFUS_TARGET:?missing build output target}"
+          : "${FURUS_VERSION:?missing build output version}"
+          : "${FURUS_TARGET:?missing build output target}"
           # makepkg refuses to run as root: build in a dir owned by `builder`.
           id builder >/dev/null 2>&1 || useradd -m builder
           mkdir -p /work
           cp packaging/arch/PKGBUILD /work/
           find dist -type f -name '*.tar.gz' -exec cp {} /work/ \;
           chown -R builder:builder /work
-          # rufus_version (not pkgver: makepkg unsets pkgver) and _target are
+          # furus_version (not pkgver: makepkg unsets pkgver) and _target are
           # the environment overrides the recipe reads.
-          su builder -c "cd /work && rufus_version='$RUFUS_VERSION' _target='$RUFUS_TARGET' makepkg -f --noconfirm --skipchecksums"
+          su builder -c "cd /work && furus_version='$FURUS_VERSION' _target='$FURUS_TARGET' makepkg -f --noconfirm --skipchecksums"
           pkg_file="$(find /work -maxdepth 1 -type f -name '*.pkg.tar.zst' -print -quit)"
           [ -n "$pkg_file" ] && [ -s "$pkg_file" ] || { echo 'no Arch package produced' >&2; exit 1; }
           listing="$(tar --zstd -tf "$pkg_file" | sed 's#^\./##')"
           for path in \
-            usr/bin/rufus \
-            usr/bin/rufus-gui \
-            usr/libexec/rufus-helper \
-            usr/share/polkit-1/actions/org.rufuslinux.policy \
-            usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service \
-            usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf \
-            usr/share/applications/org.rufuslinux.Rufus.desktop \
-            usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml \
-            usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg \
-            usr/share/licenses/rufus-linux/LICENSES.md
+            usr/bin/furus \
+            usr/bin/furus-gui \
+            usr/libexec/furus-helper \
+            usr/share/polkit-1/actions/org.furuslinux.policy \
+            usr/share/dbus-1/system-services/org.furuslinux.Helper1.service \
+            usr/share/dbus-1/system.d/org.furuslinux.Helper1.conf \
+            usr/share/applications/org.furuslinux.Furus.desktop \
+            usr/share/metainfo/org.furuslinux.Furus.metainfo.xml \
+            usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg \
+            usr/share/licenses/furus-linux/LICENSES.md
           do
             printf '%s\n' "$listing" | grep -Fxq -- "$path" || { echo "Arch package missing $path" >&2; exit 1; }
           done

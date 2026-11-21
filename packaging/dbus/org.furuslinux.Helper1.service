@@ -1,0 +1,4 @@
+[D-Bus Service]
+Name=org.furuslinux.Helper1
+Exec=/usr/libexec/furus-helper --dbus
+User=root

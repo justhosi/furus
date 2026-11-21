@@ -1,4 +1,0 @@
-[D-Bus Service]
-Name=org.rufuslinux.Helper1
-Exec=/usr/libexec/rufus-helper --dbus
-User=root

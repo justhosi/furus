@@ -3,7 +3,7 @@
 //!
 //! The only `unsafe` in this file is calling wimlib and decoding what it
 //! hands back; every public item takes and returns safe types only, so
-//! dependents (notably `rufus-core`, which forbids `unsafe`) use the
+//! dependents (notably `furus-core`, which forbids `unsafe`) use the
 //! facade without ever touching a raw pointer.
 //!
 //! Progress reporting: [`Wim::extract_image`] registers a trampoline

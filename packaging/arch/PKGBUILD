@@ -1,10 +1,10 @@
 # Maintainer: furus maintainers <mohamadzadeh@outlook.com>
-pkgname=rufus-linux
+pkgname=furus-linux
 # Both are overridable by the offline/local CI recipe build, e.g.
-#   rufus_version=0.1.0 _target=x86_64-unknown-linux-gnu makepkg -f --noconfirm
+#   furus_version=0.1.0 _target=x86_64-unknown-linux-gnu makepkg -f --noconfirm
 # With no override, the same safe defaults as the dist bundle apply. `pkgver`
 # itself cannot be used here: makepkg unsets that name before sourcing PKGBUILD.
-pkgver=${rufus_version:-0.1.0}
+pkgver=${furus_version:-0.1.0}
 pkgrel=1
 pkgdesc="Native USB image writer for Linux"
 arch=('x86_64' 'aarch64')
@@ -14,11 +14,11 @@ license=('GPL-3.0-or-later')
 # step would otherwise re-strip them and run gdb-add-index, which prints
 # misleading "No debugging symbols" errors and tampers with verified bytes.
 options=(!strip)
-# `cargo xtask dist` emits one exact-name bundle, rufus-<version>-<triple>.tar.gz,
+# `cargo xtask dist` emits one exact-name bundle, furus-<version>-<triple>.tar.gz,
 # whose root is the staged FHS tree (usr/, DEBIAN/), not loose files. Override
 # _target=aarch64-unknown-linux-gnu for an aarch64 build. Nothing is downloaded.
 _target=${_target:-x86_64-unknown-linux-gnu}
-source=("rufus-${pkgver}-${_target}.tar.gz")
+source=("furus-${pkgver}-${_target}.tar.gz")
 # The dist tarball is already verified against SHA256SUMS by the release
 # workflow before it reaches this recipe; `SKIP` is deliberate, not a missing
 # entry (makepkg requires one hash per source). Verify it there, not here.
@@ -36,23 +36,23 @@ optdepends=(
 
 package() {
   # Sources are the paths inside the dist bundle's staged tree.
-  install -Dm755 "${srcdir}/usr/bin/rufus" "${pkgdir}/usr/bin/rufus"
-  install -Dm755 "${srcdir}/usr/bin/rufus-gui" "${pkgdir}/usr/bin/rufus-gui"
-  install -Dm755 -o root -g root "${srcdir}/usr/libexec/rufus-helper" \
-    "${pkgdir}/usr/libexec/rufus-helper"
+  install -Dm755 "${srcdir}/usr/bin/furus" "${pkgdir}/usr/bin/furus"
+  install -Dm755 "${srcdir}/usr/bin/furus-gui" "${pkgdir}/usr/bin/furus-gui"
+  install -Dm755 -o root -g root "${srcdir}/usr/libexec/furus-helper" \
+    "${pkgdir}/usr/libexec/furus-helper"
 
-  install -Dm644 "${srcdir}/usr/share/polkit-1/actions/org.rufuslinux.policy" \
-    "${pkgdir}/usr/share/polkit-1/actions/org.rufuslinux.policy"
-  install -Dm644 "${srcdir}/usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service" \
-    "${pkgdir}/usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service"
-  install -Dm644 "${srcdir}/usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf" \
-    "${pkgdir}/usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf"
-  install -Dm644 "${srcdir}/usr/share/applications/org.rufuslinux.Rufus.desktop" \
-    "${pkgdir}/usr/share/applications/org.rufuslinux.Rufus.desktop"
-  install -Dm644 "${srcdir}/usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml" \
-    "${pkgdir}/usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml"
-  install -Dm644 "${srcdir}/usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg" \
-    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg"
-  install -Dm644 "${srcdir}/usr/share/doc/rufus/LICENSES.md" \
-    "${pkgdir}/usr/share/licenses/rufus-linux/LICENSES.md"
+  install -Dm644 "${srcdir}/usr/share/polkit-1/actions/org.furuslinux.policy" \
+    "${pkgdir}/usr/share/polkit-1/actions/org.furuslinux.policy"
+  install -Dm644 "${srcdir}/usr/share/dbus-1/system-services/org.furuslinux.Helper1.service" \
+    "${pkgdir}/usr/share/dbus-1/system-services/org.furuslinux.Helper1.service"
+  install -Dm644 "${srcdir}/usr/share/dbus-1/system.d/org.furuslinux.Helper1.conf" \
+    "${pkgdir}/usr/share/dbus-1/system.d/org.furuslinux.Helper1.conf"
+  install -Dm644 "${srcdir}/usr/share/applications/org.furuslinux.Furus.desktop" \
+    "${pkgdir}/usr/share/applications/org.furuslinux.Furus.desktop"
+  install -Dm644 "${srcdir}/usr/share/metainfo/org.furuslinux.Furus.metainfo.xml" \
+    "${pkgdir}/usr/share/metainfo/org.furuslinux.Furus.metainfo.xml"
+  install -Dm644 "${srcdir}/usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg" \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg"
+  install -Dm644 "${srcdir}/usr/share/doc/furus/LICENSES.md" \
+    "${pkgdir}/usr/share/licenses/furus-linux/LICENSES.md"
 }

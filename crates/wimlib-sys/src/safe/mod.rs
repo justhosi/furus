@@ -1,7 +1,7 @@
 //! Safe, configuration-independent facade over wimlib (S21).
 //!
 //! `cfg(wimlib_present)` is set only for the `wimlib-sys` crate: it does
-//! not propagate to dependents, and `rufus-core` forbids `unsafe` code,
+//! not propagate to dependents, and `furus-core` forbids `unsafe` code,
 //! so it may never call a raw extern. This module is the seam that makes
 //! that work: every public item here exists with an identical signature
 //! in both configurations. When the library is linked (`bound`) the
@@ -15,7 +15,7 @@
 //!
 //! Not here yet: split-WIM assembly, capture/update flows, and a wired
 //! integrity-check path — the [`OpenFlags::CHECK_INTEGRITY`] bit exists
-//! for callers that want fail-fast opens, but the `rufus-core` layer
+//! for callers that want fail-fast opens, but the `furus-core` layer
 //! opens plain (see `windows::wim`) until a later slice wires
 //! verification in.
 

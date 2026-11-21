@@ -4,9 +4,9 @@ set -e
 # The privileged helper is shipped root-owned and mode 0755. Re-assert that
 # idempotently in case an earlier install left different bits behind. No
 # service-manager restart is issued: this must work in containers and chroots.
-if [ -f /usr/libexec/rufus-helper ]; then
-    chown root:root /usr/libexec/rufus-helper
-    chmod 0755 /usr/libexec/rufus-helper
+if [ -f /usr/libexec/furus-helper ]; then
+    chown root:root /usr/libexec/furus-helper
+    chmod 0755 /usr/libexec/furus-helper
 fi
 
 exit 0

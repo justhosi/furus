@@ -525,23 +525,23 @@ struct BinaryBudget {
 
 const BINARY_BUDGETS: &[BinaryBudget] = &[
     BinaryBudget {
-        name: "rufus",
+        name: "furus",
         budget: 3_000_000,
     },
     BinaryBudget {
-        name: "rufus-helper",
+        name: "furus-helper",
         budget: 2_500_000,
     },
     BinaryBudget {
-        name: "rufus-gui",
+        name: "furus-gui",
         budget: 14_000_000,
     },
 ];
 
 /// How many bytes a measured binary may exceed its committed baseline
 /// before the gate calls it drift. Rust binaries are not byte-identical
-/// across systems: the same rustc 1.99.0 produced +80 bytes (`rufus`),
-/// +264 bytes (`rufus-helper`) and +32 bytes (`rufus-gui`) on the
+/// across systems: the same rustc 1.99.0 produced +80 bytes (`furus`),
+/// +264 bytes (`furus-helper`) and +32 bytes (`furus-gui`) on the
 /// ubuntu-latest runner versus the recording host (CI run 41327026453,
 /// total +376). The allowance is far larger than that measured noise and
 /// far smaller than any real regression (a new crate or feature adds tens
@@ -673,25 +673,25 @@ fn cmd_size(root: &Path, write_baseline: bool) -> Result<()> {
 /// The 11 files finalized in S26-T2. Every one must exist and validate before
 /// dist stages anything; the list is also the exact set held in `Packaging`.
 const PACKAGING_FILES: &[&str] = &[
-    "dbus/org.rufuslinux.Helper1.service",
-    "dbus/org.rufuslinux.Helper1.conf",
-    "polkit/org.rufuslinux.policy",
-    "org.rufuslinux.Rufus.desktop",
-    "org.rufuslinux.Rufus.metainfo.xml",
-    "org.rufuslinux.Rufus.svg",
+    "dbus/org.furuslinux.Helper1.service",
+    "dbus/org.furuslinux.Helper1.conf",
+    "polkit/org.furuslinux.policy",
+    "org.furuslinux.Furus.desktop",
+    "org.furuslinux.Furus.metainfo.xml",
+    "org.furuslinux.Furus.svg",
     "deb/control",
     "deb/postinst",
     "arch/PKGBUILD",
-    "rpm/rufus.spec",
+    "rpm/furus.spec",
     "README.md",
 ];
 
 // Naming invariant: these identifiers are hardcoded in the shipped GUI and
 // helper (bus name, polkit action, desktop id). Never rewrite them to the
-// spec's literal `org.rufus.*` form; see packaging/README.md.
-const BUS_NAME: &str = "org.rufuslinux.Helper1";
-const POLKIT_ACTION: &str = "org.rufuslinux.write-device";
-const DESKTOP_ID: &str = "org.rufuslinux.Rufus.desktop";
+// spec's literal `org.furus.*` form; see packaging/README.md.
+const BUS_NAME: &str = "org.furuslinux.Helper1";
+const POLKIT_ACTION: &str = "org.furuslinux.write-device";
+const DESKTOP_ID: &str = "org.furuslinux.Furus.desktop";
 
 /// Validated packaging texts, keyed by path relative to `packaging/`.
 #[derive(Debug)]
@@ -968,7 +968,7 @@ fn validate_service(text: &str) -> Result<()> {
         .context("D-Bus service: missing [D-Bus Service]")?;
     for (key, expected) in [
         ("Name", BUS_NAME),
-        ("Exec", "/usr/libexec/rufus-helper --dbus"),
+        ("Exec", "/usr/libexec/furus-helper --dbus"),
         ("User", "root"),
     ] {
         let actual = service
@@ -988,7 +988,7 @@ fn validate_desktop(text: &str) -> Result<()> {
         .context("desktop entry: missing [Desktop Entry]")?;
     for (key, expected) in [
         ("Type", "Application"),
-        ("Exec", "rufus-gui"),
+        ("Exec", "furus-gui"),
         ("Terminal", "false"),
     ] {
         let actual = entry
@@ -1094,13 +1094,13 @@ fn validate_packaging(packaging_root: &Path) -> Result<Packaging> {
             .with_context(|| format!("missing packaging file {}", path.display()))?;
         texts.insert((*rel).to_string(), text);
     }
-    validate_service(packaged(&texts, "dbus/org.rufuslinux.Helper1.service")?)?;
-    validate_bus_conf(packaged(&texts, "dbus/org.rufuslinux.Helper1.conf")?)?;
-    validate_polkit(packaged(&texts, "polkit/org.rufuslinux.policy")?)?;
-    validate_desktop(packaged(&texts, "org.rufuslinux.Rufus.desktop")?)?;
-    validate_metainfo(packaged(&texts, "org.rufuslinux.Rufus.metainfo.xml")?)?;
+    validate_service(packaged(&texts, "dbus/org.furuslinux.Helper1.service")?)?;
+    validate_bus_conf(packaged(&texts, "dbus/org.furuslinux.Helper1.conf")?)?;
+    validate_polkit(packaged(&texts, "polkit/org.furuslinux.policy")?)?;
+    validate_desktop(packaged(&texts, "org.furuslinux.Furus.desktop")?)?;
+    validate_metainfo(packaged(&texts, "org.furuslinux.Furus.metainfo.xml")?)?;
     validate_deb_control(packaged(&texts, "deb/control")?)?;
-    validate_rpm_spec(packaged(&texts, "rpm/rufus.spec")?)?;
+    validate_rpm_spec(packaged(&texts, "rpm/furus.spec")?)?;
     validate_arch_pkgbuild(packaged(&texts, "arch/PKGBUILD")?)?;
     println!("dist: validated {} packaging files", PACKAGING_FILES.len());
     Ok(Packaging { texts })
@@ -1170,44 +1170,44 @@ fn stage_tree(
     std::fs::create_dir_all(staging)
         .with_context(|| format!("cannot create {}", staging.display()))?;
 
-    stage_copy(&bin_dir.join("rufus"), staging, "usr/bin/rufus", 0o755)?;
+    stage_copy(&bin_dir.join("furus"), staging, "usr/bin/furus", 0o755)?;
     stage_copy(
-        &bin_dir.join("rufus-gui"),
+        &bin_dir.join("furus-gui"),
         staging,
-        "usr/bin/rufus-gui",
+        "usr/bin/furus-gui",
         0o755,
     )?;
     stage_copy(
-        &bin_dir.join("rufus-helper"),
+        &bin_dir.join("furus-helper"),
         staging,
-        "usr/libexec/rufus-helper",
+        "usr/libexec/furus-helper",
         0o755,
     )?;
 
     for (src, dst) in [
         (
-            "polkit/org.rufuslinux.policy",
-            "usr/share/polkit-1/actions/org.rufuslinux.policy",
+            "polkit/org.furuslinux.policy",
+            "usr/share/polkit-1/actions/org.furuslinux.policy",
         ),
         (
-            "dbus/org.rufuslinux.Helper1.service",
-            "usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service",
+            "dbus/org.furuslinux.Helper1.service",
+            "usr/share/dbus-1/system-services/org.furuslinux.Helper1.service",
         ),
         (
-            "dbus/org.rufuslinux.Helper1.conf",
-            "usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf",
+            "dbus/org.furuslinux.Helper1.conf",
+            "usr/share/dbus-1/system.d/org.furuslinux.Helper1.conf",
         ),
         (
-            "org.rufuslinux.Rufus.desktop",
-            "usr/share/applications/org.rufuslinux.Rufus.desktop",
+            "org.furuslinux.Furus.desktop",
+            "usr/share/applications/org.furuslinux.Furus.desktop",
         ),
         (
-            "org.rufuslinux.Rufus.metainfo.xml",
-            "usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml",
+            "org.furuslinux.Furus.metainfo.xml",
+            "usr/share/metainfo/org.furuslinux.Furus.metainfo.xml",
         ),
         (
-            "org.rufuslinux.Rufus.svg",
-            "usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg",
+            "org.furuslinux.Furus.svg",
+            "usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg",
         ),
     ] {
         stage_bytes(staging, dst, packaging.get(src)?.as_bytes(), 0o644)?;
@@ -1215,7 +1215,7 @@ fn stage_tree(
 
     let licenses = std::fs::read(root.join("LICENSES.md"))
         .context("cannot read LICENSES.md from the repo root")?;
-    stage_bytes(staging, "usr/share/doc/rufus/LICENSES.md", &licenses, 0o644)?;
+    stage_bytes(staging, "usr/share/doc/furus/LICENSES.md", &licenses, 0o644)?;
 
     // `Architecture: any` is literal in the source; rewrite exactly that one
     // line for the concrete target (validated by validate_deb_control).
@@ -1462,7 +1462,7 @@ fn cmd_dist(target: Option<String>, out_dir: Option<PathBuf>) -> Result<()> {
 
     // 4. Deterministic archive, verified by reading it back.
     std::fs::create_dir_all(&out).with_context(|| format!("cannot create {}", out.display()))?;
-    let stem = format!("rufus-{}-{triple}", env!("CARGO_PKG_VERSION"));
+    let stem = format!("furus-{}-{triple}", env!("CARGO_PKG_VERSION"));
     let tgz_name = format!("{stem}.tar.gz");
     let tgz_path = out.join(&tgz_name);
     let file = std::fs::File::create(&tgz_path)
@@ -1511,7 +1511,7 @@ fn cmd_dist(target: Option<String>, out_dir: Option<PathBuf>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Read the value of a `pub const NAME: &str = "...";` declaration from the
-/// single source of truth (`crates/rufus-proto/src/service.rs`). The file is
+/// single source of truth (`crates/furus-proto/src/service.rs`). The file is
 /// ours, so a missing or unterminated declaration is a hard failure with a
 /// file-specific message. Simple string scanning; no new dependency.
 fn contract_const<'a>(source: &'a str, name: &str, path: &Path) -> Result<&'a str> {
@@ -1583,10 +1583,10 @@ fn contract_collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 /// Verify the D-Bus / polkit / helper-path identifiers used by the GUI, the
 /// helper and the packaging files are the single values declared in
-/// `crates/rufus-proto/src/service.rs`. Reads and scans files only — no build,
+/// `crates/furus-proto/src/service.rs`. Reads and scans files only — no build,
 /// no bus, no root, no new dependencies.
 fn cmd_contract(root: &Path) -> Result<()> {
-    let service_rel = "crates/rufus-proto/src/service.rs";
+    let service_rel = "crates/furus-proto/src/service.rs";
     let service_path = root.join(service_rel);
     let service_src = std::fs::read_to_string(&service_path)
         .with_context(|| format!("cannot read {}", service_path.display()))?;
@@ -1666,10 +1666,10 @@ fn cmd_contract(root: &Path) -> Result<()> {
         );
     }
 
-    // 4. crates/rufus-helper/src/dbus.rs: the `#[zbus::interface(name = "...")]`
+    // 4. crates/furus-helper/src/dbus.rs: the `#[zbus::interface(name = "...")]`
     //    literal the macro needs. It cannot be a constant, so the source is
     //    read and compared to INTERFACE_NAME here.
-    let helper_dbus_rel = "crates/rufus-helper/src/dbus.rs";
+    let helper_dbus_rel = "crates/furus-helper/src/dbus.rs";
     let helper_dbus_path = root.join(helper_dbus_rel);
     let helper_dbus_src = std::fs::read_to_string(&helper_dbus_path)
         .with_context(|| format!("cannot read {}", helper_dbus_path.display()))?;
@@ -1691,7 +1691,7 @@ fn cmd_contract(root: &Path) -> Result<()> {
     // 5. Packaging recipes must all install/chown the shared helper path.
     for rel in [
         "packaging/arch/PKGBUILD",
-        "packaging/rpm/rufus.spec",
+        "packaging/rpm/furus.spec",
         "packaging/deb/postinst",
     ] {
         let path = root.join(rel);
@@ -1706,8 +1706,8 @@ fn cmd_contract(root: &Path) -> Result<()> {
     // 6. Negative scan: no wrong namespace prefix or legacy helper path in
     //    any packaging file or either D-Bus source file. `packaging/README.md`
     //    is documentation that deliberately explains the rejected
-    //    `org.rufus.*` namespace, so it is the one intentional exception.
-    let gui_dbus_rel = "crates/rufus-gui/src/ipc/dbus.rs";
+    //    `org.furus.*` namespace, so it is the one intentional exception.
+    let gui_dbus_rel = "crates/furus-gui/src/ipc/dbus.rs";
     let gui_dbus_path = root.join(gui_dbus_rel);
     let gui_dbus_src = std::fs::read_to_string(&gui_dbus_path)
         .with_context(|| format!("cannot read {}", gui_dbus_path.display()))?;
@@ -1728,15 +1728,15 @@ fn cmd_contract(root: &Path) -> Result<()> {
     for (path, text) in &negative_files {
         for (index, line) in text.lines().enumerate() {
             let line_no = index + 1;
-            if line.contains("org.rufus.") {
+            if line.contains("org.furus.") {
                 bail!(
-                    "{}:{line_no}: wrong namespace prefix `org.rufus.` (expected `org.rufuslinux.`)",
+                    "{}:{line_no}: wrong namespace prefix `org.furus.` (expected `org.furuslinux.`)",
                     path.display()
                 );
             }
-            if line.contains("/usr/lib/rufus/rufus-helper") {
+            if line.contains("/usr/lib/furus/furus-helper") {
                 bail!(
-                    "{}:{line_no}: wrong helper path `/usr/lib/rufus/rufus-helper` (expected `{helper_bin}`)",
+                    "{}:{line_no}: wrong helper path `/usr/lib/furus/furus-helper` (expected `{helper_bin}`)",
                     path.display()
                 );
             }
@@ -2128,53 +2128,53 @@ fn cmd_qa(root: &Path, options: QaOptions) -> Result<()> {
     let suites: &[(&str, &[&str])] = &[
         (
             "tier1/mbr-gpt-partitions",
-            &["test", "-p", "rufus-linux", "--test", "partition_table"],
+            &["test", "-p", "furus-linux", "--test", "partition_table"],
         ),
         (
             "tier1/fat32",
-            &["test", "-p", "rufus-core", "--test", "fat32_format"],
+            &["test", "-p", "furus-core", "--test", "fat32_format"],
         ),
         (
             "tier1/exfat",
-            &["test", "-p", "rufus-core", "--test", "exfat_format"],
+            &["test", "-p", "furus-core", "--test", "exfat_format"],
         ),
         (
             "tier1/ntfs",
-            &["test", "-p", "rufus-core", "--test", "ntfs_format"],
+            &["test", "-p", "furus-core", "--test", "ntfs_format"],
         ),
         (
             "tier1/ext4",
-            &["test", "-p", "rufus-core", "--test", "ext_format"],
+            &["test", "-p", "furus-core", "--test", "ext_format"],
         ),
         (
             "tier1/udf",
-            &["test", "-p", "rufus-core", "--test", "udf_format"],
+            &["test", "-p", "furus-core", "--test", "udf_format"],
         ),
         (
             "tier1/uefi-ntfs-structure",
-            &["test", "-p", "rufus-core", "--lib", "uefi_ntfs::"],
+            &["test", "-p", "furus-core", "--lib", "uefi_ntfs::"],
         ),
         // BCD elements 11000001/12000004/12000005/21000001/23000003/
         // 16000009, stripped class-0x4 elements and the 0xc0000001 guard all
         // live here; SYSTEM hive SanPolicy=4 lives in the `to_go` tests.
         (
             "tier1/windows-bcd",
-            &["test", "-p", "rufus-core", "--lib", "windows::bcd::"],
+            &["test", "-p", "furus-core", "--lib", "windows::bcd::"],
         ),
         (
             "tier1/windows-system-hive",
-            &["test", "-p", "rufus-core", "--lib", "windows::to_go::"],
+            &["test", "-p", "furus-core", "--lib", "windows::to_go::"],
         ),
         (
             "tier1/windows-boot-files",
-            &["test", "-p", "rufus-core", "--lib", "windows::boot_files::"],
+            &["test", "-p", "furus-core", "--lib", "windows::boot_files::"],
         ),
         (
             "tier1/windows-bootloader",
             &[
                 "test",
                 "-p",
-                "rufus-core",
+                "furus-core",
                 "--lib",
                 "pipeline::bootloader::tests::windows::",
             ],
@@ -2195,7 +2195,7 @@ fn cmd_qa(root: &Path, options: QaOptions) -> Result<()> {
             &[
                 "test",
                 "-p",
-                "rufus-core",
+                "furus-core",
                 "--test",
                 "pipeline_end_to_end",
                 "--",
@@ -2216,7 +2216,7 @@ fn cmd_qa(root: &Path, options: QaOptions) -> Result<()> {
                 &[
                     "test",
                     "-p",
-                    "rufus-linux",
+                    "furus-linux",
                     "--test",
                     suite,
                     "--",
@@ -2277,7 +2277,7 @@ fn cmd_qa(root: &Path, options: QaOptions) -> Result<()> {
         &[
             "test",
             "-p",
-            "rufus-core",
+            "furus-core",
             "--lib",
             "pipeline::bootloader::end_to_end::qemu_boot::",
         ],
@@ -2310,7 +2310,7 @@ fn cmd_qa(root: &Path, options: QaOptions) -> Result<()> {
         let result = run_suite(
             uefi_label,
             "cargo",
-            &["test", "-p", "rufus-core", "--test", "uefi_ntfs_boot"],
+            &["test", "-p", "furus-core", "--test", "uefi_ntfs_boot"],
             root,
             QA_SUITE_TIMEOUT,
         );
@@ -2634,21 +2634,21 @@ mod tests {
     fn size_drift_detection() {
         let baseline: BTreeMap<String, BaselineEntry> = [
             (
-                "rufus".to_string(),
+                "furus".to_string(),
                 BaselineEntry {
                     bytes: 100,
                     budget: 3_000_000,
                 },
             ),
             (
-                "rufus-helper".to_string(),
+                "furus-helper".to_string(),
                 BaselineEntry {
                     bytes: 90,
                     budget: 2_500_000,
                 },
             ),
             (
-                "rufus-gui".to_string(),
+                "furus-gui".to_string(),
                 BaselineEntry {
                     bytes: 80,
                     budget: 14_000_000,
@@ -2657,11 +2657,11 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let full = |rufus_bytes: u64| -> BTreeMap<String, u64> {
+        let full = |furus_bytes: u64| -> BTreeMap<String, u64> {
             [
-                ("rufus".to_string(), rufus_bytes),
-                ("rufus-helper".to_string(), 90),
-                ("rufus-gui".to_string(), 80),
+                ("furus".to_string(), furus_bytes),
+                ("furus-helper".to_string(), 90),
+                ("furus-gui".to_string(), 80),
             ]
             .into_iter()
             .collect()
@@ -2674,12 +2674,12 @@ mod tests {
         assert!(check_size_drift(&full(99), &baseline).is_ok());
         // Missing baseline entry fails.
         let mut missing = baseline.clone();
-        missing.remove("rufus-gui");
+        missing.remove("furus-gui");
         assert!(check_size_drift(&full(100), &missing).is_err());
         // Stale budget fails even when the bytes match.
         let mut stale = baseline.clone();
         stale.insert(
-            "rufus".to_string(),
+            "furus".to_string(),
             BaselineEntry {
                 bytes: 100,
                 budget: 3_000_001,
@@ -2754,7 +2754,7 @@ mod tests {
         }
         let staging = dir.join("staging");
         std::fs::create_dir_all(staging.join("usr/bin")).unwrap();
-        let binary = staging.join("usr/bin/rufus");
+        let binary = staging.join("usr/bin/furus");
         std::fs::write(&binary, b"binary payload").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -2775,7 +2775,7 @@ mod tests {
             assert_eq!(h.mtime().unwrap(), 0, "{name}: mtime must be zero");
             assert_eq!(h.uid().unwrap(), 0, "{name}: uid must be zero");
             assert_eq!(h.gid().unwrap(), 0, "{name}: gid must be zero");
-            if name == "usr/bin/rufus" {
+            if name == "usr/bin/furus" {
                 assert_eq!(h.mode().unwrap() & 0o7777, 0o755);
             }
             entries += 1;
@@ -2787,28 +2787,28 @@ mod tests {
     /// The exact 12 paths staged by `stage_tree`, with their expected modes.
     /// Binaries, the helper and the postinst are 0755; all data is 0644.
     const STAGED_LAYOUT: &[(&str, u32)] = &[
-        ("usr/bin/rufus", 0o755),
-        ("usr/bin/rufus-gui", 0o755),
-        ("usr/libexec/rufus-helper", 0o755),
-        ("usr/share/polkit-1/actions/org.rufuslinux.policy", 0o644),
+        ("usr/bin/furus", 0o755),
+        ("usr/bin/furus-gui", 0o755),
+        ("usr/libexec/furus-helper", 0o755),
+        ("usr/share/polkit-1/actions/org.furuslinux.policy", 0o644),
         (
-            "usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service",
+            "usr/share/dbus-1/system-services/org.furuslinux.Helper1.service",
             0o644,
         ),
         (
-            "usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf",
+            "usr/share/dbus-1/system.d/org.furuslinux.Helper1.conf",
             0o644,
         ),
-        ("usr/share/applications/org.rufuslinux.Rufus.desktop", 0o644),
+        ("usr/share/applications/org.furuslinux.Furus.desktop", 0o644),
         (
-            "usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml",
+            "usr/share/metainfo/org.furuslinux.Furus.metainfo.xml",
             0o644,
         ),
         (
-            "usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg",
+            "usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg",
             0o644,
         ),
-        ("usr/share/doc/rufus/LICENSES.md", 0o644),
+        ("usr/share/doc/furus/LICENSES.md", 0o644),
         ("DEBIAN/control", 0o644),
         ("DEBIAN/postinst", 0o755),
     ];
@@ -2818,7 +2818,7 @@ mod tests {
         let tmp = TempDir::new("layout");
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        for name in ["rufus", "rufus-gui", "rufus-helper"] {
+        for name in ["furus", "furus-gui", "furus-helper"] {
             std::fs::write(bin_dir.join(name), format!("fixture binary {name}")).unwrap();
         }
         let packaging = validate_packaging(&repo_root().join("packaging")).unwrap();
@@ -2850,7 +2850,7 @@ mod tests {
         let tmp = TempDir::new("arch");
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        for name in ["rufus", "rufus-gui", "rufus-helper"] {
+        for name in ["furus", "furus-gui", "furus-helper"] {
             std::fs::write(bin_dir.join(name), b"x").unwrap();
         }
         let packaging = validate_packaging(&repo_root().join("packaging")).unwrap();
@@ -2880,15 +2880,15 @@ mod tests {
         let root = repo_root().join("packaging");
         let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap();
         // XML-backed definitions.
-        validate_polkit(&read("polkit/org.rufuslinux.policy")).unwrap();
-        validate_bus_conf(&read("dbus/org.rufuslinux.Helper1.conf")).unwrap();
-        validate_metainfo(&read("org.rufuslinux.Rufus.metainfo.xml")).unwrap();
+        validate_polkit(&read("polkit/org.furuslinux.policy")).unwrap();
+        validate_bus_conf(&read("dbus/org.furuslinux.Helper1.conf")).unwrap();
+        validate_metainfo(&read("org.furuslinux.Furus.metainfo.xml")).unwrap();
         // INI-backed definitions.
-        validate_service(&read("dbus/org.rufuslinux.Helper1.service")).unwrap();
-        validate_desktop(&read("org.rufuslinux.Rufus.desktop")).unwrap();
+        validate_service(&read("dbus/org.furuslinux.Helper1.service")).unwrap();
+        validate_desktop(&read("org.furuslinux.Furus.desktop")).unwrap();
         // Distro metadata tokens.
         validate_deb_control(&read("deb/control")).unwrap();
-        validate_rpm_spec(&read("rpm/rufus.spec")).unwrap();
+        validate_rpm_spec(&read("rpm/furus.spec")).unwrap();
         validate_arch_pkgbuild(&read("arch/PKGBUILD")).unwrap();
         // All 11 finalized files exist, including the non-validated payloads.
         assert_eq!(PACKAGING_FILES.len(), 11);
@@ -2901,7 +2901,7 @@ mod tests {
     fn malformed_xml_is_rejected() {
         // Unclosed element.
         assert!(
-            validate_polkit("<policyconfig><action id=\"org.rufuslinux.write-device\">").is_err()
+            validate_polkit("<policyconfig><action id=\"org.furuslinux.write-device\">").is_err()
         );
         // Mismatched closing tag.
         assert!(validate_bus_conf("<busconfig><policy></busconfig>").is_err());
@@ -2912,14 +2912,14 @@ mod tests {
         assert!(validate_polkit(no_id).is_err());
         assert!(validate_polkit("<policyconfig/>").is_err());
         // Polkit defaults missing auth_admin_keep (wrong value).
-        let wrong_keep = "<policyconfig><action id=\"org.rufuslinux.write-device\"><defaults>\
+        let wrong_keep = "<policyconfig><action id=\"org.furuslinux.write-device\"><defaults>\
                           <allow_any>no</allow_any><allow_inactive>no</allow_inactive>\
                           <allow_active>yes</allow_active></defaults></action></policyconfig>";
         assert!(validate_polkit(wrong_keep).is_err());
         // Bus config missing the root-owned `own` rule.
         let bus_no_root = "<busconfig><policy context=\"default\">\
-                           <deny own=\"org.rufuslinux.Helper1\"/>\
-                           <allow send_destination=\"org.rufuslinux.Helper1\"/>\
+                           <deny own=\"org.furuslinux.Helper1\"/>\
+                           <allow send_destination=\"org.furuslinux.Helper1\"/>\
                            </policy></busconfig>";
         assert!(validate_bus_conf(bus_no_root).is_err());
         // Metainfo missing the required <id>.
@@ -2940,17 +2940,17 @@ mod tests {
         // through parse_ini; the higher-level validators must refuse them too.
         assert!(validate_service("[D-Bus Service]\nName=x\nName=y\n").is_err());
         assert!(validate_service("[D-Bus Service]\nName=x\n[D-Bus Service]\nExec=y\n").is_err());
-        assert!(validate_desktop("Exec=rufus-gui\n[Desktop Entry]\nType=Application\n").is_err());
+        assert!(validate_desktop("Exec=furus-gui\n[Desktop Entry]\nType=Application\n").is_err());
         // Missing required keys: Exec in the desktop entry, User in the
         // service. Both otherwise-valid files must still be rejected.
         let no_exec = "[Desktop Entry]\nType=Application\nName=x\nIcon=x\nTerminal=false\nCategories=System;\n";
         assert!(validate_desktop(no_exec).is_err());
         let no_user =
-            "[D-Bus Service]\nName=org.rufuslinux.Helper1\nExec=/usr/libexec/rufus-helper --dbus\n";
+            "[D-Bus Service]\nName=org.furuslinux.Helper1\nExec=/usr/libexec/furus-helper --dbus\n";
         assert!(validate_service(no_user).is_err());
         // A wrong Exec value is rejected as well.
         let wrong_exec =
-            "[D-Bus Service]\nName=org.rufuslinux.Helper1\nExec=/bin/false\nUser=root\n";
+            "[D-Bus Service]\nName=org.furuslinux.Helper1\nExec=/bin/false\nUser=root\n";
         assert!(validate_service(wrong_exec).is_err());
     }
 

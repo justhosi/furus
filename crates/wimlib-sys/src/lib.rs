@@ -27,7 +27,7 @@
 //! lives here, behind this gate, and downstream crates use the
 //! re-exported items (or the S21 safe wrapper built on top of them).
 
-// Unsafe policy (S21, following `rufus-linux`): the workspace lint is
+// Unsafe policy (S21, following `furus-linux`): the workspace lint is
 // `deny` and this crate inherits it. There are exactly two
 // `#[allow(unsafe_code)]` sites in this crate, both documented at the
 // top of their module: `src/ffi.rs` (the raw wimlib declarations, see

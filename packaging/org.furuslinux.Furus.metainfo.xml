@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.furuslinux.Furus.desktop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>furus-linux</name>
+  <summary>Write disk images to USB devices</summary>
+  <description>
+    <p>furus-linux creates bootable USB drives and writes raw disk images to
+    removable devices. It writes FAT32 and exFAT natively and can drive the
+    external formatters for NTFS, ext2/3/4 and UDF through a privileged
+    D-Bus helper.</p>
+  </description>
+  <launchable type="desktop-id">org.furuslinux.Furus.desktop</launchable>
+  <icon type="scalable">org.furuslinux.Furus.svg</icon>
+  <url type="homepage">https://github.com/justhosi/furus</url>
+  <provides>
+    <binary>furus</binary>
+    <binary>furus-gui</binary>
+  </provides>
+</component>

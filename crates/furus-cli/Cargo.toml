@@ -1,0 +1,26 @@
+[package]
+name = "furus-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+furus-core = { workspace = true }
+furus-linux = { workspace = true }
+furus-proto = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "furus"
+path = "src/main.rs"
+
+[lints]
+# Inherit the workspace-wide `unsafe_code = "deny"`; the crate-level
+# `#![forbid(unsafe_code)]` is the stricter statement of the same
+# policy in source.
+workspace = true

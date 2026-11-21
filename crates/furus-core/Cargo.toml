@@ -1,0 +1,37 @@
+[package]
+name = "furus-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+# S03: streaming digests (checksum command, plan confirm support).
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+md-5 = { workspace = true }
+# S08: the table writers consume raw on-disk GUID bytes; the layout
+# planner (S08-B) generates the per-partition unique GUIDs with
+# `Uuid::new_v4()`.
+uuid = { workspace = true }
+# S15: the image container module reports the shared `ImageKind` (one
+# definition, owned by `furus-proto`).
+furus-proto = { workspace = true }
+# S21: the safe wimlib facade behind the Windows image (`windows::wim`)
+# apply layer.
+wimlib-sys = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bench]]
+name = "loc"
+harness = false
+
+[lints]
+# Inherit the workspace-wide `unsafe_code = "deny"`; the crate-level
+# `#![forbid(unsafe_code)]` is the stricter statement of the same
+# policy in source.
+workspace = true

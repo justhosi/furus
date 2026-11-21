@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=furus-linux
+GenericName=USB Image Writer
+Comment=Write disk images to USB devices
+Exec=furus-gui
+Icon=org.furuslinux.Furus
+Terminal=false
+Categories=System;Utility;
+StartupWMClass=furus-gui
+Keywords=usb;image;writer;flash;disk;bootable;furus;

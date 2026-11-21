@@ -13,8 +13,8 @@ ignore = [
     # S24-C C2: every entry below is pulled transitively by the A7-mandated
     # Slint 1.19.0 tree. Each advisory is "unmaintained", not a
     # vulnerability, and upstream states no safe upgrade exists; none of
-    # these crates is used directly by rufus-gui code. Re-review at every
-    # Slint version bump (the exact pins in crates/rufus-gui/Cargo.toml
+    # these crates is used directly by furus-gui code. Re-review at every
+    # Slint version bump (the exact pins in crates/furus-gui/Cargo.toml
     # gate that bump).
     # chrono via i-slint-core.
     { id = "RUSTSEC-2026-0543", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
@@ -22,7 +22,7 @@ ignore = [
     # via i-slint-backend-winit (font fallback for client-side decorations).
     { id = "RUSTSEC-2026-0192", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
     # zvariant via zbus 5.19.0 via i-slint-backend-winit (desktop portal).
-    # Only reachable through Slint's older zbus: rufus-helper already uses
+    # Only reachable through Slint's older zbus: furus-helper already uses
     # zbus 6.2.0, where zvariant is a module rather than a standalone crate.
     { id = "RUSTSEC-2026-0370", reason = "unmaintained (not vulnerable), transitive dep of A7-mandated Slint 1.19.0; no safe upgrade upstream" },
     # zbus_names via zbus via i-slint-backend-winit.
@@ -60,7 +60,7 @@ private = { ignore = true }
 # work free software. The two `LicenseRef-Slint-*` proprietary /
 # royalty-free branches are deliberately NOT accepted. Each exception
 # is scoped to one crate at the exact reviewed version (1.19.0, the
-# exact pin in crates/rufus-gui/Cargo.toml), never a blanket licence
+# exact pin in crates/furus-gui/Cargo.toml), never a blanket licence
 # addition: a Slint upgrade re-opens this list for review.
 
 [[licenses.exceptions]]

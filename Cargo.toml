@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/rufus-core",
-    "crates/rufus-linux",
-    "crates/rufus-proto",
-    "crates/rufus-helper",
-    "crates/rufus-cli",
-    "crates/rufus-gui",
+    "crates/furus-core",
+    "crates/furus-linux",
+    "crates/furus-proto",
+    "crates/furus-helper",
+    "crates/furus-cli",
+    "crates/furus-gui",
     "crates/wimlib-sys",
     "xtask",
 ]
@@ -21,13 +21,13 @@ publish = false
 # member inherits it through `[lints] workspace = true`, instead of
 # trusting each crate to remember its own attribute.
 # S07: "deny" now instead of "forbid" — exactly one module needs unsafe,
-# the kernel ioctl shim in rufus-linux (four block ioctls rustix does
+# the kernel ioctl shim in furus-linux (four block ioctls rustix does
 # not wrap), and it carries the one `#[allow(unsafe_code)]` of the
 # workspace. Every other crate still carries an explicit
 # `#![forbid(unsafe_code)]` at its root, so the shim was then the single
 # place in the tree that compiled unsafe code at all.
 # S21: four allowances now, in two crates that carry no crate-level
-# forbid (the workspace `deny` still applies): rufus-linux keeps the
+# forbid (the workspace `deny` still applies): furus-linux keeps the
 # ioctl shim plus the SIGINT handler install in signal.rs, and
 # wimlib-sys adds the raw wimlib declarations in ffi.rs and the safe
 # facade in safe/bound.rs - the C calls, trampolines and string
@@ -56,7 +56,7 @@ clap = { version = "4", default-features = false, features = ["std", "help", "us
 sha2 = { version = "0.10" }
 sha1 = { version = "0.10" }
 md-5 = { version = "0.10" }
-# S04 (PLAN §4 lists rustix for rufus-linux): safe syscalls for inotify and
+# S04 (PLAN §4 lists rustix for furus-linux): safe syscalls for inotify and
 # poll so the device watcher needs no libc and no unsafe code.
 # S06 adds two features for the privileged helper: `process` (geteuid for
 # the root check) and `thread` (the S06 part 4 instrumentation the worker
@@ -65,9 +65,9 @@ md-5 = { version = "0.10" }
 # (unshare(CLONE_NEWNS) + recursive-private /) and the mount/unmount seam
 # behind it (`mount(2)`/`umount2(2)` with the MNT_DETACH fallback).
 rustix = { version = "1", features = ["fs", "event", "std", "process", "thread", "mount"] }
-# S07 (PLAN §4): only the kernel ioctl shim in rufus-linux uses `libc` —
+# S07 (PLAN §4): only the kernel ioctl shim in furus-linux uses `libc` —
 # the four block ioctls (BLKZEROOUT/BLKDISCARD/BLKRRPART/BLKFLSBUF) that
-# rustix does not wrap; see crates/rufus-linux/src/ioctl.rs.
+# rustix does not wrap; see crates/furus-linux/src/ioctl.rs.
 libc = "0.2"
 # S08 (PLAN §9-S08): GUIDs for the written GPT tables — the layout
 # planner draws fresh per-partition unique GUIDs with `Uuid::new_v4()`
@@ -78,16 +78,16 @@ uuid = { version = "1", features = ["v4"] }
 # drives its `zbus::Connection` with `zbus::block_on` on plain
 # `std::thread`s (the default `default-rt` feature bundles the
 # runtime, so no extra dependency is needed); see
-# `crates/rufus-helper/src/dbus.rs` for the deadlock rule this shape
+# `crates/furus-helper/src/dbus.rs` for the deadlock rule this shape
 # obeys.
 # No direct runtime dependency exists anywhere in the workspace now:
 # no crate names one, and zbus brings the runtime it needs itself.
 zbus = { version = "6" }
 # Internal crates (path form, so workspaces can share them exactly).
-rufus-core = { path = "crates/rufus-core" }
-rufus-proto = { path = "crates/rufus-proto" }
-rufus-linux = { path = "crates/rufus-linux" }
-# S21: the safe wimlib facade for WIM apply (used by rufus-core).
+furus-core = { path = "crates/furus-core" }
+furus-proto = { path = "crates/furus-proto" }
+furus-linux = { path = "crates/furus-linux" }
+# S21: the safe wimlib facade for WIM apply (used by furus-core).
 wimlib-sys = { path = "crates/wimlib-sys" }
 
 [profile.release]
