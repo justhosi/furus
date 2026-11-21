@@ -93,16 +93,6 @@ jobs:
           # x86-only packages, not available or relevant on the ARM runner.
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 ovmf grub-common grub-pc-bin
-          # uefi_ntfs_boot.rs hard-codes Arch's /usr/share/edk2/x64/*.4m.fd
-          # paths; Ubuntu's ovmf package instead installs OVMF_*_4M.fd under
-          # /usr/share/OVMF. Shim the expected names so the UEFI Tier 2 check
-          # boots (and is not skipped) on ubuntu-latest, but only when the
-          # Ubuntu firmware files are actually present.
-          if [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]; then
-            sudo mkdir -p /usr/share/edk2/x64
-            sudo ln -sf /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd
-            sudo ln -sf /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/edk2/x64/OVMF_VARS.4m.fd
-          fi
       # `xtask ci` includes the size-drift gate, whose baseline was recorded on
       # x86_64. Running it on ARM would fail spuriously, so only the x86_64
       # lane runs `ci`; both lanes run `qa`, and `xtask dist` enforces the

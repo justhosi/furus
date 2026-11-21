@@ -1842,28 +1842,54 @@ fn parse_qa_options(args: &[String]) -> Result<QaOptions> {
     Ok(options)
 }
 
-/// First candidate that names a regular file. Used for firmware discovery;
-/// taking the first match keeps OVMF's several installation layouts portable.
-fn first_existing_file<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
-    candidates
+/// OVMF code/vars pairs from the installation layouts we support, in
+/// priority order. Keep in sync with `crates/furus-core/tests/uefi_ntfs_boot.rs`.
+const OVMF_PAIRS: &[(&str, &str)] = &[
+    (
+        "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+        "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+    ),
+    (
+        "/usr/share/edk2/x64/OVMF_CODE.fd",
+        "/usr/share/edk2/x64/OVMF_VARS.fd",
+    ),
+    (
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+    ),
+    (
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/OVMF/OVMF_VARS.fd",
+    ),
+    (
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+    ),
+];
+
+/// First pair whose code AND vars both satisfy `exists`, so the two files
+/// can never come from different installation layouts.
+fn first_existing_pair<'a>(
+    pairs: &'a [(&'a str, &'a str)],
+    exists: impl Fn(&str) -> bool,
+) -> Option<(&'a str, &'a str)> {
+    pairs
         .iter()
         .copied()
-        .find(|path| Path::new(path).is_file())
+        .find(|(code, vars)| exists(code) && exists(vars))
 }
 
 /// Whether a complete OVMF code + vars pair is installed on this host.
 fn ovmf_present() -> bool {
-    const CODE: &[&str] = &[
-        "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
-        "/usr/share/edk2/x64/OVMF_CODE.fd",
-        "/usr/share/OVMF/OVMF_CODE.fd",
-    ];
-    const VARS: &[&str] = &[
-        "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
-        "/usr/share/edk2/x64/OVMF_VARS.fd",
-        "/usr/share/OVMF/OVMF_VARS.fd",
-    ];
-    first_existing_file(CODE).is_some() && first_existing_file(VARS).is_some()
+    let from_code = std::env::var_os("FURUS_OVMF_CODE");
+    let from_vars = std::env::var_os("FURUS_OVMF_VARS");
+    if from_code.is_some() || from_vars.is_some() {
+        return match (from_code, from_vars) {
+            (Some(code), Some(vars)) => Path::new(&code).is_file() && Path::new(&vars).is_file(),
+            _ => false,
+        };
+    }
+    first_existing_pair(OVMF_PAIRS, |path| Path::new(path).is_file()).is_some()
 }
 
 /// Names in `tools` whose `--version` does not run successfully (the same
@@ -3076,16 +3102,32 @@ mod tests {
     }
 
     #[test]
-    fn firmware_discovery_only_accepts_real_files() {
+    fn firmware_discovery_only_accepts_real_pairs() {
         let tmp = TempDir::new("ovmf");
-        let code = tmp.path().join("OVMF_CODE.fd");
-        std::fs::write(&code, b"code").unwrap();
-        let missing = tmp.path().join("missing.fd");
-        let paths = [code.to_str().unwrap(), missing.to_str().unwrap()];
-        // `first_existing_file` is the primitive `ovmf_present` builds on.
-        assert_eq!(first_existing_file(&paths), Some(code.to_str().unwrap()));
-        assert_eq!(first_existing_file(&paths[1..]), None);
-        assert_eq!(first_existing_file(&[]), None);
+        let code_a = tmp.path().join("CODE_A.fd");
+        let vars_a = tmp.path().join("VARS_A.fd");
+        let code_b = tmp.path().join("CODE_B.fd");
+        let vars_b = tmp.path().join("VARS_B.fd");
+        let code_c = tmp.path().join("CODE_C.fd");
+        let vars_c = tmp.path().join("VARS_C.fd");
+        let pairs: &[(&str, &str)] = &[
+            (code_a.to_str().unwrap(), vars_a.to_str().unwrap()),
+            (code_b.to_str().unwrap(), vars_b.to_str().unwrap()),
+            (code_c.to_str().unwrap(), vars_c.to_str().unwrap()),
+        ];
+        // Only the code of pair A and the vars of pair B exist: a mixed
+        // pair must not be accepted.
+        std::fs::write(&code_a, b"code").unwrap();
+        std::fs::write(&vars_b, b"vars").unwrap();
+        assert_eq!(first_existing_pair(pairs, |p| Path::new(p).is_file()), None);
+        // With both files of a later pair present, that pair resolves.
+        std::fs::write(&code_c, b"code").unwrap();
+        std::fs::write(&vars_c, b"vars").unwrap();
+        assert_eq!(
+            first_existing_pair(pairs, |p| Path::new(p).is_file()),
+            Some((code_c.to_str().unwrap(), vars_c.to_str().unwrap()))
+        );
+        assert_eq!(first_existing_pair(&[], |_| true), None);
     }
 
     #[test]

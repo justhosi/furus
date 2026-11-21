@@ -49,8 +49,31 @@ const DISK_BYTES: u64 = 128 * MIB;
 const SECTOR_BYTES: u32 = 512;
 /// Printed by the payload's embedded config (see [`EARLY_CFG`]).
 const MARKER: &str = "UEFI-NTFS-OK";
-const OVMF_CODE: &str = "/usr/share/edk2/x64/OVMF_CODE.4m.fd";
-const OVMF_VARS: &str = "/usr/share/edk2/x64/OVMF_VARS.4m.fd";
+/// OVMF code/vars pairs from the installation layouts we support, in
+/// priority order. A code file must never be paired with a vars file from
+/// a different layout. Keep in sync with `xtask/src/main.rs`.
+const OVMF_PAIRS: &[(&str, &str)] = &[
+    (
+        "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+        "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+    ),
+    (
+        "/usr/share/edk2/x64/OVMF_CODE.fd",
+        "/usr/share/edk2/x64/OVMF_VARS.fd",
+    ),
+    (
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+    ),
+    (
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/OVMF/OVMF_VARS.fd",
+    ),
+    (
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+    ),
+];
 const BOOT_DEADLINE: Duration = Duration::from_secs(60);
 const NEGATIVE_DEADLINE: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(200);
@@ -208,8 +231,78 @@ fn make_ntfs_dirs(image: &Path, mountpoint: &Path, dirs: &str) -> Result<(), Str
     .map(|_| ())
 }
 
+/// The first pair whose code AND vars both satisfy `exists`. Kept pure so
+/// discovery can be tested without touching the filesystem or the environment.
+fn first_existing_pair<'a>(
+    pairs: &'a [(&'a str, &'a str)],
+    exists: impl Fn(&str) -> bool,
+) -> Option<(&'a str, &'a str)> {
+    pairs
+        .iter()
+        .copied()
+        .find(|(code, vars)| exists(code) && exists(vars))
+}
+
+/// Find a complete OVMF code/vars pair. Explicit `FURUS_OVMF_CODE` and
+/// `FURUS_OVMF_VARS` override discovery, but both must be set and valid.
+fn resolve_ovmf_pair() -> Result<(PathBuf, PathBuf), String> {
+    let from_code = std::env::var_os("FURUS_OVMF_CODE");
+    let from_vars = std::env::var_os("FURUS_OVMF_VARS");
+    if from_code.is_some() || from_vars.is_some() {
+        let code = from_code.ok_or_else(|| {
+            "FURUS_OVMF_CODE is not set (set both FURUS_OVMF_CODE and FURUS_OVMF_VARS)".to_string()
+        })?;
+        let vars = from_vars.ok_or_else(|| {
+            "FURUS_OVMF_VARS is not set (set both FURUS_OVMF_CODE and FURUS_OVMF_VARS)".to_string()
+        })?;
+        let code = PathBuf::from(code);
+        let vars = PathBuf::from(vars);
+        if !code.is_file() {
+            return Err(format!(
+                "FURUS_OVMF_CODE path {} is not a file",
+                code.display()
+            ));
+        }
+        if !vars.is_file() {
+            return Err(format!(
+                "FURUS_OVMF_VARS path {} is not a file",
+                vars.display()
+            ));
+        }
+        return Ok((code, vars));
+    }
+    match first_existing_pair(OVMF_PAIRS, |path| Path::new(path).is_file()) {
+        Some((code, vars)) => Ok((PathBuf::from(code), PathBuf::from(vars))),
+        None => Err(
+            "no OVMF code/vars firmware pair found in standard paths (set FURUS_OVMF_CODE and FURUS_OVMF_VARS to override)"
+                .to_string(),
+        ),
+    }
+}
+
+#[test]
+fn ovmf_pair_discovery_never_mixes_layouts() {
+    let pairs: &[(&str, &str)] = &[
+        ("/first/CODE.fd", "/first/VARS.fd"),
+        ("/second/CODE.fd", "/second/VARS.fd"),
+    ];
+    let exists = |path: &str| path == "/first/CODE.fd" || path == "/second/VARS.fd";
+    assert_eq!(
+        first_existing_pair(pairs, exists),
+        None,
+        "one member from each layout is not a pair"
+    );
+    let exists = |path: &str| path.starts_with("/second/");
+    assert_eq!(
+        first_existing_pair(pairs, exists),
+        Some(("/second/CODE.fd", "/second/VARS.fd")),
+        "a whole later pair wins"
+    );
+    assert_eq!(first_existing_pair(&[], |_| true), None);
+}
+
 /// Why this host cannot run the boot test, or `None` when it can.
-fn skip_reason(scratch: &Path) -> Option<String> {
+fn skip_reason(scratch: &Path, ovmf: &Result<(PathBuf, PathBuf), String>) -> Option<String> {
     for program in [
         "qemu-system-x86_64",
         "grub-mkimage",
@@ -222,10 +315,8 @@ fn skip_reason(scratch: &Path) -> Option<String> {
             return Some(format!("{program} is not on PATH on this host"));
         }
     }
-    for firmware in [OVMF_CODE, OVMF_VARS] {
-        if !Path::new(firmware).is_file() {
-            return Some(format!("OVMF firmware {firmware} is not installed"));
-        }
+    if let Err(reason) = ovmf {
+        return Some(reason.clone());
     }
     // Probe the one step that needs the namespace mount, on a throwaway
     // volume, so a host that refuses it skips here and not mid-test.
@@ -268,10 +359,10 @@ fn read_lossy(path: &Path) -> String {
 /// Boot `disk` under OVMF until [`MARKER`] appears on the serial log,
 /// the deadline passes, or QEMU exits; then ask the monitor to quit and
 /// kill and reap the machine.
-fn boot(disk: &Path, work: &Path, deadline: Duration) -> Boot {
+fn boot(disk: &Path, work: &Path, deadline: Duration, ovmf: &(PathBuf, PathBuf)) -> Boot {
     std::fs::create_dir_all(work).expect("the boot work directory");
     let vars = work.join("OVMF_VARS.fd");
-    std::fs::copy(OVMF_VARS, &vars).expect("the OVMF vars copy");
+    std::fs::copy(&ovmf.1, &vars).expect("the OVMF vars copy");
     let serial = work.join("serial.log");
     let monitor = work.join("mon.sock");
     let qemu_stderr = work.join("qemu.stderr");
@@ -290,7 +381,8 @@ fn boot(disk: &Path, work: &Path, deadline: Duration) -> Boot {
         .arg(format!("file:{}", serial.display()))
         .arg("-drive")
         .arg(format!(
-            "if=pflash,format=raw,readonly=on,unit=0,file={OVMF_CODE}"
+            "if=pflash,format=raw,readonly=on,unit=0,file={}",
+            ovmf.0.display()
         ))
         .arg("-drive")
         .arg(format!(
@@ -395,7 +487,15 @@ fn build_payload(dir: &Path) -> PathBuf {
 fn uefi_ntfs_shim_boots_an_ntfs_payload_under_ovmf() {
     let scratch = tempfile::tempdir().expect("a scratch directory for the boot test");
     let dir = scratch.path();
-    if let Some(reason) = skip_reason(dir) {
+    let ovmf = resolve_ovmf_pair();
+    let pair = match &ovmf {
+        Ok(pair) => pair.clone(),
+        Err(reason) => {
+            eprintln!("skip: {reason}");
+            return;
+        }
+    };
+    if let Some(reason) = skip_reason(dir, &ovmf) {
         eprintln!("skip: {reason}");
         return;
     }
@@ -500,7 +600,7 @@ fn uefi_ntfs_shim_boots_an_ntfs_payload_under_ovmf() {
     drop(control);
     drop(disk);
 
-    let positive = boot(&shim_disk, &dir.join("boot-shim"), BOOT_DEADLINE);
+    let positive = boot(&shim_disk, &dir.join("boot-shim"), BOOT_DEADLINE, &pair);
     eprintln!(
         "uefi-ntfs boot, with shim, serial log:\n{}",
         report(&positive.serial)
@@ -509,7 +609,12 @@ fn uefi_ntfs_shim_boots_an_ntfs_payload_under_ovmf() {
         "uefi-ntfs boot, with shim, qemu stderr:\n{}",
         report(&positive.qemu_stderr)
     );
-    let negative = boot(&no_shim_disk, &dir.join("boot-noshim"), NEGATIVE_DEADLINE);
+    let negative = boot(
+        &no_shim_disk,
+        &dir.join("boot-noshim"),
+        NEGATIVE_DEADLINE,
+        &pair,
+    );
     eprintln!(
         "uefi-ntfs boot, no shim, serial log:\n{}",
         report(&negative.serial)
