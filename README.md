@@ -245,6 +245,16 @@ analysed upstream function — the ledger only covers functions and thunks from
 | S28 | CI dependency fix — install fontconfig/winit native build headers on ubuntu-latest so `xtask ci` (clippy) and `xtask qa` both run green | complete (on `main`) |
 | S29 | GUI / IPC verification — single-source D-Bus/polkit/packaging contract with a CI drift check, offscreen Slint render smoke, and a real compiled-helper JSONL/run-state wire test | complete (on `main`) |
 
+#### Update-check fields are dormant (A12)
+
+The `check_updates` and `update_channel` config fields from the S25 row above
+exist only for schema compatibility. They are **dormant no-ops**: persisted and
+round-tripped, but never acted on. No code performs an update check, and there
+is **no HTTP client and no background network call** anywhere in the tree —
+nothing connects to the network because of these fields. This keeps Decision A12
+("telemetry: none; network only on explicit user action", still **proposed**)
+intact; do not read S25's `net` ledger row as a live update-check feature.
+
 ### `analyze` report
 
 `rufus analyze [--json] <image>` reports the S16 image analysis in a

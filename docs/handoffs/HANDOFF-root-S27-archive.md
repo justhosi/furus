@@ -1,3 +1,9 @@
+> **ARCHIVED S27 SNAPSHOT — superseded, do not follow as current state.**
+> This is the historical root `HANDOFF.md` frozen at S27 (HEAD `fa4a0d7`); its
+> "Nothing has been pushed" note is stale — S28/S29 and the release workflow
+> are now on `main`. Current status lives in the README slice-completion matrix
+> and the handoffs in `docs/handoffs/`. The body below is kept intact.
+
 # HANDOFF — furus/ repo, S27 COMPLETE (final state)
 
 Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, HEAD `fa4a0d7`

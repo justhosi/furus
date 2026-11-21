@@ -17,8 +17,8 @@ action IDs would break the running system, so every file and ID here keeps the
 `org.rufuslinux.*` namespace. The required **properties** are still met: the
 polkit action uses `auth_admin_keep`, and a D-Bus system.d configuration
 restricts ownership of the well-known name to root. This is a deliberate,
-documented deviation from the spec's literal names, also recorded in
-`HANDOFF.md`.
+documented deviation from the spec's literal names, also recorded in the
+archived `docs/handoffs/HANDOFF-root-S27-archive.md`.
 
 ## What installs where
 

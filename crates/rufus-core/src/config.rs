@@ -152,9 +152,13 @@ pub struct Config {
     pub locale: Option<String>,
     /// List internal (non-removable) devices too.
     pub show_all: bool,
-    /// Whether the update check may run (network only on explicit action).
+    /// Dormant schema-compatibility field (Decision A12, still proposed).
+    /// Persisted and round-tripped, but no update-check or network code reads
+    /// it: no check is performed and no network call is made because of it.
     pub check_updates: bool,
-    /// Stable or beta update channel.
+    /// Dormant schema-compatibility field (Decision A12, still proposed).
+    /// Persisted and round-tripped, but no update-check or network code reads
+    /// it; it selects no channel and triggers no network call.
     pub update_channel: UpdateChannel,
     /// Last successfully used device path (informational).
     pub last_device: Option<String>,
