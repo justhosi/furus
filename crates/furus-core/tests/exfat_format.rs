@@ -233,35 +233,27 @@ fn fsck_accepts_a_64_mib_image() {
     if let Some(dump) = run_tool("dump.exfat", &[&path.display().to_string()]) {
         let text = dump.combined();
         assert!(dump.status.success(), "dump.exfat failed:\n{text}");
+        // exfatprogs pads these fields with spaces on some versions and
+        // tabs on others (seen on aarch64), so compare on whitespace-
+        // normalised text rather than pinning one tool's column layout.
+        let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
+            format!("Cluster Count: {}", geometry.cluster_count),
+            format!("FAT Length(sectors): {}", geometry.fat_length),
             format!(
-                "Cluster Count:                           {}",
-                geometry.cluster_count
-            ),
-            format!(
-                "FAT Length(sectors):                     {}",
-                geometry.fat_length
-            ),
-            format!(
-                "Cluster Heap Offset (sector offset):     {}",
+                "Cluster Heap Offset (sector offset): {}",
                 geometry.cluster_heap_offset
             ),
-            format!(
-                "Root Cluster (cluster offset):           {}",
-                geometry.root_cluster
-            ),
+            format!("Root Cluster (cluster offset): {}", geometry.root_cluster),
             "FURUSTEST".to_string(),
         ] {
             assert!(
-                text.contains(&needle),
+                normalized.contains(&needle),
                 "dump.exfat lacks {needle:?}:\n{text}"
             );
         }
         assert!(
-            text.contains(&format!(
-                "Upcase table size:                       {}",
-                upcase::TABLE_BYTES
-            )),
+            normalized.contains(&format!("Upcase table size: {}", upcase::TABLE_BYTES)),
             "dump.exfat disagrees about the up-case table:\n{text}"
         );
     }
