@@ -1,20 +1,21 @@
-# S33 — Post-release hygiene — SLICE 7 HANDOFF
+# S33 — Post-release hygiene — SLICE 8 HANDOFF
 
 Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, current HEAD
-`8e9ae92` (S33.5 Part B exfat volume split committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
+`127bbc0` (S33.5 Part B xtask split committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
 with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 This is the authoritative S33 handoff. It is updated as each slice lands.
 Per-slice records may be added alongside it as historical notes.
 
-## Status: Slices 1-7/9 complete and verified, committed locally; nothing pushed
+## Status: Slices 1-8/9 complete and verified, committed locally; nothing pushed
 
 All S33 work is committed locally on top of pushed `da44823`: `8c1ef69`
 (S33.1), `6ce1a51` (S33.2), `cf10532` (S33.3), `191621a` (S33.4), `b06a3d3`
 (handoff through slice 4), `48aaae5` (S33.5 Part A), `9e5361b` (handoff
 through slice 5), `53a1a91` (S33.5 Part B CLI split), `86736cb` (handoff
-through slice 6), `8e9ae92` (S33.5 Part B exfat volume split), plus the two S32
-documentation commits `e4fc6e6` and `3416f1c` which the user chose to keep
+through slice 6), `8e9ae92` (S33.5 Part B exfat volume split), `e020669`
+(handoff through slice 7), `127bbc0` (S33.5 Part B xtask split), plus the two
+S32 documentation commits `e4fc6e6` and `3416f1c` which the user chose to keep
 local. No reset/rebase/amend/push/tag was performed. `v0.1.1` already exists
 as a published tag; S33 does not create or move tags. The user has not
 authorized publishing any of these commits.
@@ -39,7 +40,7 @@ that happens.
 | 5/9 | Part A: extract inline `#[cfg(test)] mod tests` from `pipeline/mod.rs`, `furus-helper/src/dbus.rs`, `furus-gui/src/main.rs` into sibling test files | **Complete, verified** — `48aaae5` |
 | 6/9 | Part B: split `crates/furus-cli/src/main.rs` into `main`, `cli`, `output`, `commands` modules | **Complete, verified** — `53a1a91` |
 | 7/9 | Part B: split `crates/furus-core/src/fs/exfat/volume.rs` into `volume/{mod,format,fat,io,tests}.rs` | **Complete, verified** — `8e9ae92` |
-| 8/9 | Part B: split `xtask/src/main.rs` into `main`, `util`, `assets`, `parity`, `size`, `packaging`, `dist`, `contract`, `ci`, `qa` modules | Pending |
+| 8/9 | Part B: split `xtask/src/main.rs` into `main`, `util`, `assets`, `parity`, `size`, `packaging`, `dist`, `contract`, `ci`, `qa` modules | **Complete, verified** — `127bbc0` |
 | 9/9 | Final full gate, README slice table row, `TECHNICAL.md` S33 section, final handoff | Pending |
 
 ## Slice 1/9 — what changed
@@ -359,10 +360,62 @@ insertions / 4344 deletions (net +16 structural lines).
 - `git diff --check` clean; `git add -A` staged exactly the six in-scope
   files. Working tree clean after commit.
 
+## Slice 8/9 — what changed (commit `127bbc0`)
+
+Split the 3181-line `xtask/src/main.rs` (2476 production / 705 test lines) into
+task submodules. `main.rs` is now 177 lines and retains the crate docs,
+`#![forbid(unsafe_code)]`, the `mod` declarations, `print_usage()` and the CLI
+dispatch. New files: `assets.rs`, `ci.rs`, `contract.rs`, `dist.rs`,
+`packaging.rs`, `parity.rs`, `size.rs`, `util.rs`, `qa.rs`, plus per-module
+`tests.rs` siblings for assets, contract, dist, packaging, parity, qa and size.
+
+The S33.4 OVMF work was preserved exactly: the five ordered `OVMF_PAIRS`,
+`ovmf_present`, `parse_qa_options`, `cmd_qa`, `first_existing_pair`, both
+`FURUS_OVMF_CODE` / `FURUS_OVMF_VARS` env overrides, and the
+`firmware_discovery_only_accepts_real_pairs` test (now in `qa/tests.rs`).
+No CLI flag, output string, exit code, JSON schema or error message changed.
+Visibility widened only where cross-module access required `pub(crate)`; no new
+plain `pub`, no new unsafe, no new production `.unwrap()`, no new dependency.
+Diff stat: 17 files, 3162 insertions / 3024 deletions (net +138 structural
+lines).
+
+## Verification (Slice 8/9 — coder and independent reviewer)
+
+- `cargo fmt --all -- --check` → **clean**.
+- `cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**.
+- `RUSTDOCFLAGS="-D warnings" cargo doc -p xtask --no-deps` → **exit 0**.
+- `cargo test --workspace --all-targets -- --list | grep -cE ': test$'` →
+  **1912** (unchanged); `cargo test --workspace` → **1883 passed, 0 failed,
+  29 ignored**. The 31 xtask leaf test names are an identical multiset (only
+  the module-path prefix changed).
+- `cargo xtask ci` → **all gates passed**; size gate green with no baseline
+  refresh. Only the documented `cargo-audit` not-installed skip and
+  pre-existing duplicate-lock warnings.
+- `cargo xtask qa` → **all suites passed** with real QEMU boots
+  (`PASS tier2/bios-bootloaders`, `PASS tier2/uefi-ntfs-ovmf`); only the
+  documented `tier1/pipeline-loop ... need --privileged` skip.
+- CLI byte-equality: reviewer built the pre-change HEAD (`e020669`) in a
+  detached worktree and compared eight cases (`--help`, `bogus`, no args,
+  `parity --regenerate --check`, `size --bogus`, `assets`, `--version`,
+  `dist --target`) — **identical** in exit code, stdout and stderr.
+  `print_usage()` and `main()` were byte-identical against
+  `git show HEAD:xtask/src/main.rs`.
+- Function multiset 104 = 104, zero added/removed; body-level normalized
+  comparison found only two rustfmt whitespace diffs (`assert!( ` →
+  `assert!(` and `temp_dir() .join` → `temp_dir().join`). `.unwrap()` count
+  identical (91 = 91), all in test code or `#[cfg(test)]` helpers.
+- `git diff --cached --check` clean; `git add -A` staged exactly the 17
+  in-scope files; working tree clean after commit.
+
 ## What remains
 
-Slices 8/9 through 9/9 per the plan table. Each must stay behaviour-preserving:
-no public signature/CLI/JSON/error-message changes, no visibility widening, no
-new unsafe or production `.unwrap()`, and the test count must not drop below
-1912. Keep the no-push / no-tag rule until the user explicitly authorizes
-publication. Slices 6/9 and earlier are committed locally (not pushed).
+Slice 9/9 per the plan table: final full gate (`fmt`, `clippy`,
+`cargo test --workspace`, `cargo xtask ci`, `cargo xtask qa`, `cargo xtask
+dist`), an S33 row in the README slice table, an S33 section in
+`TECHNICAL.md`, and the final version of this handoff confirming that v0.1.1
+is ready for manual sign-off and Publisher tagging. The final slice must stay
+behaviour-preserving: no public signature/CLI/JSON/error-message changes, no
+visibility widening, no new unsafe or production `.unwrap()`, and the test
+count must not drop below 1912. Keep the no-push / no-tag rule until the user
+explicitly authorizes publication. All S33 commits are local only (not
+pushed).
