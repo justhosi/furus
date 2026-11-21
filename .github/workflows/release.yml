@@ -275,6 +275,18 @@ jobs:
           pattern: '*'
           merge-multiple: true
           path: release
+      - name: Flatten artifacts into release/
+        run: |
+          set -euo pipefail
+          cd release
+          # `dist` was uploaded with `path: target/dist/`, so its tarball,
+          # .deb and SHA256SUMS arrive under a <target>/ subdirectory, while
+          # the rpm and arch artifacts are already flat in release/. Move
+          # every file up to the root so the globs below see them, and drop
+          # the dist job's narrower nested SHA256SUMS; the unified one is
+          # regenerated in the next step.
+          find . -mindepth 2 -type f -name SHA256SUMS -delete
+          find . -mindepth 2 -type f -exec mv -t . -- {} +
       - name: Regenerate unified SHA256SUMS and verify
         run: |
           set -euo pipefail
