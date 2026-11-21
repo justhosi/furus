@@ -1,18 +1,20 @@
-# S33 — Post-release hygiene — SLICE 3 HANDOFF
+# S33 — Post-release hygiene — SLICE 4 HANDOFF
 
 Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, current HEAD
-`6ce1a51` (S33.2 committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
+`191621a` (S33.4 committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
 with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 This is the authoritative S33 handoff. It is updated as each slice lands.
 Per-slice records may be added alongside it as historical notes.
 
-## Status: Slices 1-3/9 complete and verified; nothing committed or pushed by this subagent
+## Status: Slices 1-4/9 complete and verified, committed locally; nothing pushed
 
-The local commits `e4fc6e6`, `3416f1c`, `8c1ef69` (S33.1) and `6ce1a51`
-(S33.2, on top of pushed `da44823`) are untouched. Slice 3 is implemented in
-the working tree but deliberately left uncommitted. No reset/rebase/amend/push/tag
-was performed. `v0.1.1` already exists as a published tag; S33 does not create or move tags.
+All S33 work is committed locally on top of pushed `da44823`: `8c1ef69`
+(S33.1), `6ce1a51` (S33.2), `cf10532` (S33.3), `191621a` (S33.4), plus the
+two S32 documentation commits `e4fc6e6` and `3416f1c` which the user chose to
+keep local. No reset/rebase/amend/push/tag was performed. `v0.1.1` already
+exists as a published tag; S33 does not create or move tags. The user has not
+authorized publishing any of these commits.
 
 Guardrails still in force: preserve `unsafe_code = "deny"` in `Cargo.toml` and
 all crate-level `#![forbid(unsafe_code)]`; no new `.unwrap()`/`.expect()` in
@@ -21,23 +23,21 @@ production code; do not rename `furus-linux`, `org.furuslinux.*`,
 
 ## Overall S33 slice plan (1/9 .. 9/9)
 
-The plan below combines the slice IDs handed to the coder with the release-hygiene
-items enumerated in the S33 CHANGELOG entry. The parent session owns the
-authoritative scope for slices whose exact file lists were not passed to this
-subagent; those rows are marked *parent-defined* and must be confirmed before
-work begins on them.
+The plan below is the authoritative scope owned by the parent session. Slices
+5-8 are pure refactors and may be split further; the `N/M` tags are restated as
+that happens.
 
 | Slice | Scope | Status |
 |---|---|---|
-| 1/9 | Unify workspace/package version 0.1.0 → 0.1.1 (Cargo.toml, Cargo.lock, version tests, packaging defaults, CHANGELOG, README artifact names) | **Complete, verified** |
-| 2/9 | Standardize user-facing display/package metadata (`Furus` / `furus`): desktop `Name`, metainfo `<name>` + description, Arch `pkgname` + license dir, release verification path, packaging README, README Arch artifact examples (includes the prefix deferred out of slice 1, item 8) | **Complete, verified** |
-| 3/9 | SIGINT via `sigaction` with explicit `SA_RESTART` | **Complete, verified** (uncommitted in working tree) |
-| 4/9 | Portable OVMF firmware discovery | Pending — parent-defined |
-| 5/9 | Module and test-layout refactor | Pending — parent-defined |
-| 6/9 | Remaining S33 release hygiene | Pending — parent-defined |
-| 7/9 | Remaining S33 release hygiene | Pending — parent-defined |
-| 8/9 | Remaining S33 release hygiene | Pending — parent-defined |
-| 9/9 | Remaining S33 release hygiene / final docs + handoff | Pending — parent-defined |
+| 1/9 | Unify workspace/package version 0.1.0 → 0.1.1 (Cargo.toml, Cargo.lock, version tests, packaging defaults, CHANGELOG, README artifact names) | **Complete, verified** — `8c1ef69` |
+| 2/9 | Standardize user-facing display/package metadata (`Furus` / `furus`): desktop `Name`, metainfo `<name>` + description, Arch `pkgname` + license dir, release verification path, packaging README, README Arch artifact examples | **Complete, verified** — `6ce1a51` |
+| 3/9 | SIGINT via `sigaction` with explicit `SA_RESTART` | **Complete, verified** — `cf10532` |
+| 4/9 | Portable paired OVMF firmware discovery with env overrides, xtask QA parity, removal of the Ubuntu CI symlink shims | **Complete, verified** — `191621a` |
+| 5/9 | Part A: extract inline `#[cfg(test)] mod tests` from `pipeline/mod.rs`, `furus-helper/src/dbus.rs`, `furus-gui/src/main.rs` into sibling test files | Pending |
+| 6/9 | Part B: split `crates/furus-cli/src/main.rs` into `main`, `cli`, `output`, `commands` modules | Pending |
+| 7/9 | Part B: split `crates/furus-core/src/fs/exfat/volume.rs` into `volume/{mod,format,fat,io,tests}.rs` | Pending |
+| 8/9 | Part B: split `xtask/src/main.rs` into `main`, `util`, `assets`, `parity`, `size`, `packaging`, `dist`, `contract`, `ci`, `qa` modules | Pending |
+| 9/9 | Final full gate, README slice table row, `TECHNICAL.md` S33 section, final handoff | Pending |
 
 ## Slice 1/9 — what changed
 
@@ -166,10 +166,55 @@ both glibc and musl; `sigemptyset(*mut sigset_t) -> c_int` and
   --privileged` skip.
 - `git diff --check` → **clean**.
 
+## Slice 4/9 — what changed (commit `191621a`)
+
+Portable, paired OVMF discovery replaced hardcoded Arch paths and removed the
+Ubuntu-only CI symlink workaround. Exactly four files:
+
+- `crates/furus-core/tests/uefi_ntfs_boot.rs` — removed `OVMF_CODE`/`OVMF_VARS`
+  constants; added ordered `OVMF_PAIRS` (Arch 4M, Arch legacy, Ubuntu 4M,
+  Ubuntu legacy, Fedora/RHEL), a pure `first_existing_pair` helper, and
+  `resolve_ovmf_pair()` that honours `FURUS_OVMF_CODE` / `FURUS_OVMF_VARS`
+  (both-or-neither, both must be real files, descriptive errors) and otherwise
+  returns the first pair where BOTH members exist. The resolved pair is threaded
+  through `skip_reason(scratch, &ovmf)` and `boot(disk, work, deadline, &pair)`:
+  the vars copy uses `ovmf.1` and QEMU's pflash code path uses `ovmf.0`.
+  Added pure test `ovmf_pair_discovery_never_mixes_layouts` (no env mutation,
+  parallel-safe).
+- `xtask/src/main.rs` — the same five pairs in the same order, the same pure
+  pair helper, and `ovmf_present()` with the same env-override rules, so QA can
+  never disagree with the boot test. `first_existing_file` was removed; its old
+  test was replaced by `firmware_discovery_only_accepts_real_pairs`, proving
+  mixed code/vars across layouts are rejected. `cmd_qa` unchanged.
+- `.github/workflows/ci.yml` and `.github/workflows/release.yml` — removed the
+  entire `sudo ln -sf` shim blocks and their comments (lines 45-54 and 96-105).
+
+## Verification (Slice 4/9 — all run by coder and independently by reviewer)
+
+- `cargo fmt --all -- --check` → **pass**.
+- `cargo clippy --workspace --all-targets -- -D warnings` → **pass**, zero warnings.
+- `cargo test -p furus-core --test uefi_ntfs_boot -- --nocapture` → **2 passed,
+  0 skipped**: a real QEMU boot printed `UEFI-NTFS-OK` and the negative control
+  showed no marker. The host has both Arch 4M and Ubuntu 4M firmware, so the
+  first (Arch 4M) pair was selected.
+- `cargo xtask ci` → **pass** ("ci: all gates passed"); size gate green with no
+  baseline refresh (no shipped binary changed). Only pre-existing
+  `cargo-audit` not-installed skip and duplicate-`zbus` lock warnings.
+- `cargo xtask qa` → **pass** ("qa: all suites passed");
+  `tier2/uefi-ntfs-ovmf` **PASS** (no longer skipped). Only the pre-existing
+  `tier1/pipeline-loop: loop-device / throughput tests need --privileged` skip.
+- `cargo test --workspace --all-targets -- --list | grep -cE ': test$'` →
+  **1912** (baseline 1910 → 1911 after S33.3 → 1912 after the new pure uefi
+  test; the xtask test replaced the old one).
+- `git diff --check` → **clean**; only the four in-scope files changed. No
+  hardcoded `OVMF_CODE`/`OVMF_VARS` constants and no `ln -sf` shims remain.
+- Not exercised locally: a host with ONLY Ubuntu's `/usr/share/OVMF/OVMF_*_4M.fd`
+  (pair 3 in the list, covered by the pure selection test) — CI now exercises it.
+
 ## What remains
 
-Slices 4/9 through 9/9 per the plan table. Before starting any of them, get the
-exact scope from the parent session (the plan rows for 4/9–9/9 were not supplied
-to this subagent). Keep the no-commit / no-push / no-tag rule until the user
-explicitly authorizes publication. Slice 3 is done and verified but uncommitted;
-the parent decides when to commit it.
+Slices 5/9 through 9/9 per the plan table. Each must stay behaviour-preserving:
+no public signature/CLI/JSON/error-message changes, no visibility widening, no
+new unsafe or production `.unwrap()`, and the test count must not drop below
+1912. Keep the no-push / no-tag rule until the user explicitly authorizes
+publication. Slices 4/9 and earlier are committed locally (not pushed).
