@@ -1,7 +1,7 @@
 //! POSIX Ctrl-C flag for the write pipeline (S17, slice 4).
 //!
 //! Charter: exactly one unsafe operation lives here — the
-//! `libc::signal` call in [`install_handler`], under a single
+//! `libc::sigaction` call in [`install_handler`], under a single
 //! documented `#[allow(unsafe_code)]` matching the `ioctl.rs` precedent.
 //! Everything else (flag, queries, the handler body) is safe code: the
 //! handler performs one lock-free atomic store and touches nothing
@@ -20,13 +20,14 @@
 //! invocation, and the reset at install means a stale Ctrl-C never
 //! poisons the next run.
 //!
-//! Delivery: `libc::signal` keeps BSD semantics (`SA_RESTART`), so a
-//! Ctrl-C during a blocked device write restarts the syscall instead
-//! of failing it — the cancellation lands at the next chunk check,
-//! never as a torn write. The install permanently replaces the default
-//! `SIG_DFL` disposition (which would terminate the process), so a
-//! second Ctrl-C sets the same flag again instead of force-killing a
-//! run that is already unwinding.
+//! Delivery: `libc::sigaction` with an explicit `SA_RESTART` guarantees
+//! a Ctrl-C during a blocked device write restarts the syscall instead
+//! of failing with `EINTR` — on both glibc and musl, no longer relying
+//! on implementation-defined `signal()` semantics. The cancellation
+//! lands at the next chunk check, never as a torn write. The install
+//! permanently replaces the default `SIG_DFL` disposition (which would
+//! terminate the process), so a second Ctrl-C sets the same flag again
+//! instead of force-killing a run that is already unwinding.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -47,15 +48,34 @@ extern "C" fn on_sigint(_signum: libc::c_int) {
 /// Install [`on_sigint`] for SIGINT, refusing the kernel's error.
 #[allow(unsafe_code)]
 fn install_handler() -> Result<()> {
-    // SAFETY: `libc::signal` with the `SIGINT` constant and the
-    // address of `on_sigint`, both verified against the locked libc
-    // 0.2.191 sources (`sighandler_t` is `size_t`, so the pointer
-    // round-trip carries the address unchanged). The handler itself is
-    // safe code that only stores to a lock-free static atomic;
-    // installing it twice reinstalls the identical handler.
-    let previous =
-        unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
-    if previous == libc::SIG_ERR {
+    // SAFETY: verified against the locked libc 0.2.191 sources.
+    // `std::mem::zeroed()` is a valid all-zero `libc::sigaction`: every
+    // field accepts zero (`sa_sigaction`/`sa_flags` are integers,
+    // `sa_mask` is an all-zero `sigset_t`, and `sa_restorer` is an
+    // `Option<extern "C" fn()>` whose nil niche encodes `None`).
+    // `on_sigint as *const () as libc::sighandler_t` round-trips the
+    // code address unchanged because `sighandler_t` is `size_t (usize)`
+    // on unix, the same width as a pointer, and `extern "C" fn(c_int)`
+    // is the ABI `sigaction` expects with `SA_SIGINFO` unset.
+    // `&mut sa.sa_mask` is a valid, aligned pointer to the zeroed
+    // mask, which `sigemptyset` then resets to the empty set so no
+    // signals are blocked during the handler. `SA_RESTART` is set
+    // explicitly (a `c_int` constant on both glibc and musl, so this
+    // is portable) to restart interrupted syscalls; `null_mut()` for
+    // `oldact` discards the previous disposition, which is fine. The
+    // handler body is safe code that only stores to a lock-free static
+    // atomic, and installing twice simply reinstalls the identical
+    // handler (flags are reset by `install`), so the operation is
+    // idempotent.
+    let (empty, installed) = unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sigint as *const () as libc::sighandler_t;
+        sa.sa_flags = libc::SA_RESTART;
+        let empty = libc::sigemptyset(&mut sa.sa_mask);
+        let installed = libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        (empty, installed)
+    };
+    if empty != 0 || installed != 0 {
         return Err(CoreError::invalid("could not install the SIGINT handler"));
     }
     Ok(())
@@ -133,6 +153,14 @@ mod tests {
     #[test]
     fn default_matches_new() {
         let cancel = Cancel::default();
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn install_is_idempotent_and_starts_uncancelled() {
+        let cancel = Cancel::new();
+        assert!(cancel.install().is_ok());
+        assert!(cancel.install().is_ok());
         assert!(!cancel.is_cancelled());
     }
 }

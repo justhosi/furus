@@ -1,17 +1,18 @@
-# S33 — Post-release hygiene — SLICE 2 HANDOFF
+# S33 — Post-release hygiene — SLICE 3 HANDOFF
 
 Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, current HEAD
-`8c1ef69` (S33.1 committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
+`6ce1a51` (S33.2 committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
 with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 This is the authoritative S33 handoff. It is updated as each slice lands.
 Per-slice records may be added alongside it as historical notes.
 
-## Status: Slices 1-2/9 complete and verified; nothing committed or pushed by this subagent
+## Status: Slices 1-3/9 complete and verified; nothing committed or pushed by this subagent
 
-The three local commits `e4fc6e6`, `3416f1c` and `8c1ef69` (S33.1, on top of
-pushed `da44823`) are untouched. No reset/rebase/amend/push/tag was performed.
-`v0.1.1` already exists as a published tag; S33 does not create or move tags.
+The local commits `e4fc6e6`, `3416f1c`, `8c1ef69` (S33.1) and `6ce1a51`
+(S33.2, on top of pushed `da44823`) are untouched. Slice 3 is implemented in
+the working tree but deliberately left uncommitted. No reset/rebase/amend/push/tag
+was performed. `v0.1.1` already exists as a published tag; S33 does not create or move tags.
 
 Guardrails still in force: preserve `unsafe_code = "deny"` in `Cargo.toml` and
 all crate-level `#![forbid(unsafe_code)]`; no new `.unwrap()`/`.expect()` in
@@ -30,7 +31,7 @@ work begins on them.
 |---|---|---|
 | 1/9 | Unify workspace/package version 0.1.0 → 0.1.1 (Cargo.toml, Cargo.lock, version tests, packaging defaults, CHANGELOG, README artifact names) | **Complete, verified** |
 | 2/9 | Standardize user-facing display/package metadata (`Furus` / `furus`): desktop `Name`, metainfo `<name>` + description, Arch `pkgname` + license dir, release verification path, packaging README, README Arch artifact examples (includes the prefix deferred out of slice 1, item 8) | **Complete, verified** |
-| 3/9 | SIGINT via `sigaction` with explicit `SA_RESTART` | Pending — parent-defined |
+| 3/9 | SIGINT via `sigaction` with explicit `SA_RESTART` | **Complete, verified** (uncommitted in working tree) |
 | 4/9 | Portable OVMF firmware discovery | Pending — parent-defined |
 | 5/9 | Module and test-layout refactor | Pending — parent-defined |
 | 6/9 | Remaining S33 release hygiene | Pending — parent-defined |
@@ -104,9 +105,71 @@ target names in `cmd_qa`, left alone). No check was weakened.
 - `git diff --check` → **clean**.
 - `grep -rn "furus-linux" packaging/ README.md .github/workflows/release.yml` → remaining hits are crate descriptions only (`README.md` lines 127/297/315–323/453–455); no display name, package name, license path or artifact example remains.
 
+## Slice 3/9 — what changed
+
+Portable SIGINT installation via `libc::sigaction` with an explicit
+`SA_RESTART`, replacing the implementation-defined `libc::signal` call. Exactly
+two files changed, both deliberately left uncommitted:
+
+- `crates/furus-linux/src/signal.rs` —
+  - Module charter (lines 3–5) now names the `libc::sigaction` call as the
+    single unsafe operation, still under the one documented
+    `#[allow(unsafe_code)]` (no new unsafe site; crate-level
+    `#![forbid(unsafe_code)]` and workspace `unsafe_code = "deny"` unchanged).
+  - Delivery doc (lines 23–25) now states `sigaction` + `SA_RESTART`
+    guarantees a Ctrl-C during a blocked device write restarts the syscall
+    instead of `EINTR` on both glibc and musl, no longer relying on
+    implementation-defined `signal()` semantics.
+  - `install_handler()`: inside ONE `unsafe` block, zero-init a
+    `libc::sigaction`, set `sa_sigaction` to
+    `on_sigint as *const () as libc::sighandler_t`, set `sa_flags` to
+    `libc::SA_RESTART`, call `libc::sigemptyset(&mut sa.sa_mask)` and
+    `libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut())`; return
+    `CoreError::invalid("could not install the SIGINT handler")` if either
+    call returns non-zero, else `Ok(())`. The expanded `// SAFETY:` comment
+    covers struct zero-init validity, the `sighandler_t = size_t (usize)`
+    pointer round-trip and `extern "C" fn(c_int)` ABI (verified against the
+    locked libc 0.2.191 sources), the empty mask, `SA_RESTART` portability on
+    glibc and musl, and that installing twice reinstalls the same handler.
+  - Added one hermetic test `install_is_idempotent_and_starts_uncancelled`
+    asserting two `install()` calls both return `Ok(())` and the flag is
+    clear afterwards; no real SIGINT is raised. The three prior tests are
+    byte-for-byte unchanged.
+
+Verification of field/type claims against the locked libc 0.2.191 sources
+(`~/.cargo/registry/src/index.crates.io-.../libc-0.2.191`):
+`sighandler_t = size_t = usize` (unix/mod.rs:21); `sigaction` fields
+`sa_sigaction: sighandler_t`, `sa_mask: sigset_t`, `sa_flags: c_int`,
+`sa_restorer: Option<extern "C" fn()>` (new/glibc/.../bits/sigaction.rs:8,
+unix/linux_like/linux/musl/mod.rs:91); `SA_RESTART: c_int = 0x10000000` on
+both glibc and musl; `sigemptyset(*mut sigset_t) -> c_int` and
+`sigaction(c_int, *const sigaction, *mut sigaction) -> c_int`.
+
+## Verification (Slice 3/9 — exact commands, all run from repo root)
+
+- `cargo test -p furus-linux signal` → **pass** (4 signal tests, including
+  the new `install_is_idempotent_and_starts_uncancelled`; 0 failed).
+- `cargo clippy -p furus-linux --all-targets -- -D warnings` → **pass**, zero
+  warnings.
+- `git grep 'allow(unsafe_code)' crates/` → confirmed no new unsafe sites:
+  the only *attribute* in `signal.rs` is the single pre-existing one on
+  `install_handler()` (all other hits are doc comments or other crates'
+  already-documented sites).
+- `cargo test --workspace` → **pass**: 1882 passed, 0 failed, 29 ignored
+  across all result lines = **1911 tests** (baseline **1910** → **1911**, the
+  +1 being the new install test).
+- `cargo xtask ci` → **pass** ("ci: all gates passed", exit 0); only the
+  documented `SKIP (not installed): cargo-audit` and pre-existing duplicate
+  `zbus`/`zbus_macros` lock warnings appear; none are failures.
+- `cargo xtask qa` → **pass** ("qa: all suites passed", exit 0); only the
+  documented `tier1/pipeline-loop: loop-device / throughput tests need
+  --privileged` skip.
+- `git diff --check` → **clean**.
+
 ## What remains
 
-Slices 3/9 through 9/9 per the plan table. Before starting any of them, get the
-exact scope from the parent session (the plan rows for 3/9–9/9 were not supplied
+Slices 4/9 through 9/9 per the plan table. Before starting any of them, get the
+exact scope from the parent session (the plan rows for 4/9–9/9 were not supplied
 to this subagent). Keep the no-commit / no-push / no-tag rule until the user
-explicitly authorizes publication.
+explicitly authorizes publication. Slice 3 is done and verified but uncommitted;
+the parent decides when to commit it.
