@@ -244,6 +244,7 @@ analysed upstream function — the ledger only covers functions and thunks from
 | S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | complete (on `main`) |
 | S28 | CI dependency fix — install fontconfig/winit native build headers on ubuntu-latest so `xtask ci` (clippy) and `xtask qa` both run green | complete (on `main`) |
 | S29 | GUI / IPC verification — single-source D-Bus/polkit/packaging contract with a CI drift check, offscreen Slint render smoke, and a real compiled-helper JSONL/run-state wire test | complete (on `main`) |
+| S31 | Native packages in CI — parameterized RPM/Arch recipes and a four-job release workflow that builds `.rpm` and `.pkg.tar.zst` from the single dist tarball under one unified `SHA256SUMS` | complete (on `main`); the workflow has not yet been executed end-to-end |
 
 #### Update-check fields are dormant (A12)
 
@@ -388,6 +389,22 @@ polkit identifiers, and the external formatters (`ntfs-3g`, `e2fsprogs`,
 `udftools`, wimlib) are recommendations or optional dependencies rather than
 hard ones, since decision A4 makes them runtime-checked. `packaging/README.md`
 has the full install-path table and service-verification commands.
+
+### Release assets / install
+
+Every `v*` tag is built automatically by `.github/workflows/release.yml` from
+one `cargo xtask dist` build: the generic tarball, a `.deb`, an `.rpm` and a
+`.pkg.tar.zst` all come from that single set of release binaries, and the
+release also publishes one unified `SHA256SUMS` covering every artifact.
+Install the native package for your distro from the directory holding the
+downloaded files (the `./` makes your package manager use the local file):
+
+* Ubuntu/Debian: `sudo apt install ./rufus-*.deb`
+* Fedora: `sudo dnf install ./rufus-*.rpm`
+* Arch Linux: `sudo pacman -U ./rufus-*.pkg.tar.zst`
+
+`packaging/README.md` has the full install-path table and service-verification
+commands.
 
 ## Tests
 

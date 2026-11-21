@@ -5,6 +5,21 @@ polkit policy, D-Bus service and bus configuration, desktop entry, AppStream
 metainfo and icon. Slice S26-T2 completes these definitions. `xtask dist`
 (S26-T3) validates these files and stages them into the release bundle.
 
+## Install
+
+Install the native package for your distro from the directory holding the
+downloaded files (the `./` makes your package manager use the local file):
+
+* Ubuntu/Debian: `sudo apt install ./rufus-*.deb`
+* Fedora: `sudo dnf install ./rufus-*.rpm`
+* Arch Linux: `sudo pacman -U ./rufus-*.pkg.tar.zst`
+
+The `.rpm` and `.pkg.tar.zst` are no longer just metadata recipes: they are
+built in CI by `.github/workflows/release.yml` from the single `cargo xtask
+dist` tarball, with no Rust recompilation, and published alongside the tarball,
+the `.deb` and a unified `SHA256SUMS` on every `v*` tag. "Verifying the service"
+below covers the post-install D-Bus/polkit checks.
+
 ## Naming: why the files are `org.rufuslinux.*`, not `org.rufus.*`
 
 The S26 specification writes the filenames and IDs as `org.rufus.*`. That
@@ -70,10 +85,11 @@ uses wimlib (`libwim15` on Debian, `wimlib` on Arch). FAT32 and exFAT are
 written natively. These are declared as
 `Recommends: ntfs-3g, e2fsprogs, udftools, libwim15` in `deb/control`, as
 `optdepends` (`ntfs-3g`, `ntfsprogs`, `e2fsprogs`, `udftools`, `wimlib`) in
-`arch/PKGBUILD`, and as `Recommends: ntfs-3g, e2fsprogs, udftools, libwim15`
-in `rpm/rufus.spec`. They are recommendations, not hard dependencies, because
-A4 makes them runtime-checked: images that need no external formatter work
-without them.
+`arch/PKGBUILD`, and as `Recommends: ntfs-3g, e2fsprogs, udftools, wimlib,
+polkit, fontconfig` in `rpm/rufus.spec` (Fedora-correct names; the Debian-only
+wimlib package name does not exist on Fedora). They are recommendations, not
+hard dependencies, because A4 makes them runtime-checked: images that need no
+external formatter work without them.
 
 ## Verifying the service
 

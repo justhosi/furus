@@ -923,3 +923,156 @@ tag. Hardware acceptance in `docs/RELEASE-CHECKLIST.md` (GUI/hotplug on a real
 desktop and UEFI/Legacy BIOS boots of Linux, Windows installer and Windows To Go
 media) is a manual maintainer sign-off, not a CI-verified step. The authoritative
 close-out record is `docs/handoffs/HANDOFF-S30.md`.
+
+## S31 — Native RPM/Arch packages in the release workflow
+
+S31 extends S30's tag-triggered release with first-class Fedora (`.rpm`) and
+Arch (`.pkg.tar.zst`) artifacts. It adds no runtime behaviour, wire format,
+dependency or binary size: the release binaries are byte-for-byte the ones
+measured by the S29/S30 size gate, and the update-check config fields stay
+dormant as documented above (A12 remains **proposed**). The three landed slices
+are `dd891b4`, `467559a` and this documentation commit.
+
+### One dist build, reused by every distro job
+
+`cargo xtask dist` remains the single source of publishable bytes. Its
+deterministic `rufus-<version>-<triple>.tar.gz` and the exact staged `usr/`
+tree are consumed unchanged by the Debian, Fedora and Arch recipes — there is
+no second tarball, no flattened archive and **no Rust recompilation** in any
+downstream job. This is the core invariant of the slice: whichever distro
+artifact a user installs, its binaries come from one build, in one place, so
+the four published artifacts cannot drift apart. `xtask dist` re-checks the
+committed size budgets before it writes anything, so the reused tarball is the
+already-budgeted one.
+
+### Four-job DAG and least privilege
+
+S30's two-job workflow (`build` → `release`) becomes a four-job DAG:
+
+```
+build  (ubuntu-latest, contents: read)
+  ├─ outputs: version, target   (derived from the one dist tarball)
+  ├─ uploads artifact "dist"    (target/dist/ contents)
+  ├─> package-rpm   (fedora:latest,   needs: build, contents: read)
+  │      uploads artifact "rpm"   (*.rpm only)
+  ├─> package-arch  (archlinux:latest, needs: build, contents: read)
+  │      uploads artifact "arch"  (*.pkg.tar.zst only)
+  └─> publish       (ubuntu-latest, needs: all three, contents: write)
+         downloads pattern '*', merge-multiple:true
+         unified SHA256SUMS -> sha256sum -c -> gh release create
+```
+
+`build` still runs everything that touches untrusted inputs (checkout, pinned
+Rust 1.99.0 toolchain, pinned cargo-deny/cargo-audit, the full QA apt list and
+OVMF shim, then `xtask ci` → `xtask qa` → `xtask dist`) and holds only
+`contents: read`. The two packaging jobs also hold only `contents: read`, run
+in parallel, depend solely on `build` (not on each other), and do only native
+package tooling on the already-built tarball. **Only `publish` holds
+`contents: write`**, and it contains no checkout and no compilation — it is
+the same small, auditable release step as in S30, so a compromised build or
+packaging step cannot mint a release. `VERSION` and `TARGET` for the recipes
+come from the build job's `dist-info` step, which derives them from the one
+dist tarball; deriving them from the tag would be wrong because Cargo's package
+version can differ from the tag.
+
+### Parameterization interfaces
+
+The two recipes take their overrides through deliberately different interfaces,
+matching each tool's conventions:
+
+* **RPM uses `rpmbuild --define`.** `packaging/rpm/rufus.spec` reads overridable
+  macros `rufus_version` and `rufus_target` with safe defaults
+  (`0.1.0` / `x86_64-unknown-linux-gnu`), so a plain `rpmbuild -bb` still works.
+  CI passes `--define "rufus_version <VERSION>" --define "rufus_target
+  <TARGET>"`. Environment variables are not the interface for a spec file.
+  The spec uses Fedora-correct dependency names (`wimlib`, `polkit`,
+  `fontconfig`, `ntfs-3g`, `e2fsprogs`, `udftools` — no Debian-only `libwim15`)
+  and `%global debug_package %{nil}`, because nothing is recompiled and there
+  is no debuginfo to split out (an empty auto-generated debugsource package is
+  a fatal `error: Empty %files file` on Fedora 45 / RPM 6.1).
+* **Arch uses environment variables**, `rufus_version=<VERSION>` and
+  `_target=<TARGET>`, passed to `makepkg`. Crucially these are **not `pkgver`**:
+  `/usr/bin/makepkg:1252` unsets `pkgver` (a `pkgbuild_schema_strings` name)
+  before sourcing the PKGBUILD, so `pkgver=${pkgver:-...}` silently falls back
+  to the default. `rufus_version` is a non-schema name (and matches the RPM
+  override name), and `_target` is likewise not unset. `sha256sums=('SKIP')`
+  is deliberate — the workflow already verifies the tarball against
+  `SHA256SUMS` before the recipe sees it, so a second hash would couple the
+  recipe to one artifact build — and `options=(!strip)` stops makepkg from
+  re-stripping the already-stripped dist binaries and emitting misleading
+  `gdb-add-index` errors.
+
+Both preserve all ten install paths (the only cross-distro difference is the
+license path: `licenses/rufus` for RPM, `licenses/rufus-linux` for Arch).
+
+### Smoke-check strategies
+
+Each package job asserts the staged tree before upload, using the native tool
+that can read that format, and prints dependency information for the log:
+
+* RPM: `rpm -qlp <pkg>` lists the package's paths and is compared against the
+  ten expected paths; `rpm -qpR <pkg>` and `rpm -qp --recommends <pkg>` print
+  the derived strong Requires and the declared weak deps (no `libwim15`).
+* Arch: `tar --zstd -tf <pkg>` lists the package's paths for the same ten-path
+  comparison.
+* Debian: `dpkg-deb -c` is the equivalent content check in the dist path.
+
+The Debian check is conditional because `cargo xtask dist` emits a `.deb` only
+when `dpkg-deb` is on PATH; `dpkg-deb` is absent on this development host (so
+`dist` prints `skip .deb: dpkg-deb not available` and still exits 0) but is
+installed on `ubuntu-latest` by the workflow's apt step, so the release really
+produces the `.deb` its glob expects. Every upload step uses
+`if-no-files-found: error`, so a missing or mis-named artifact fails before
+publish rather than leaving an unexpanded glob.
+
+### Unified SHA256SUMS and the `--repo` fix
+
+`publish` downloads all three artifacts with `pattern: '*'` and
+`merge-multiple: true` into one `release/` directory, deletes the dist job's
+narrow tarball-only `SHA256SUMS`, and regenerates a single one covering
+`*.tar.gz *.deb *.rpm *.pkg.tar.zst` with bare filenames. It then runs
+`sha256sum -c SHA256SUMS` in that directory: a mismatch or corruption in the
+upload/download round trip fails the job **before** `gh release create`, so
+the published bits are exactly the built and verified bits. Publication uses
+`gh release create "$TAG" --title "$TAG" --generate-notes --repo
+"${{ github.repository }}"` with `GH_TOKEN: ${{ github.token }}`. The exact
+`--repo "${{ github.repository }}"` argument is a user-mandated fix for the
+prior v0.1.0 release failure `gh: fatal: not a git repository`: the publish job
+has no checkout, so `gh` cannot infer the repository from a Git remote. No
+checkout was added — the fix is on the command itself.
+
+### Dry runs
+
+`workflow_dispatch` gains a boolean input `publish` (default `false`) so manual
+runs are dry runs: `build`, `package-rpm` and `package-arch` still run and
+fully verify their artifacts, but the `Publish GitHub release` step is gated by
+`if: github.event_name == 'push' || inputs.publish`, so nothing is published.
+A pushed `v*` tag always publishes (`TAG = github.ref_name`); a manual run uses
+`TAG = inputs.tag`. One caveat is unchanged from S30: checkout on a manual
+dispatch follows the dispatch branch, not `inputs.tag`, so the branch must
+already contain the intended recipe and tarball-producing code.
+
+### Verification at S31 close
+
+All gates were run from the repo root with
+`export PATH="$HOME/.cargo/bin:$PATH"`:
+
+* `cargo xtask ci` → exit 0, `ci: all gates passed`: the packaging contract
+  still passes with the new `wimlib` token in the RPM validator, and
+  `size` reports `within committed baseline allowance, all budgets OK` with
+  the same bytes as S30 (`rufus` 1,810,152, `rufus-helper` 1,406,296,
+  `rufus-gui` 12,774,280). `cargo-audit` remains a documented `SKIP (not
+  installed)`.
+* `cargo xtask qa` → exit 0, `qa: all suites passed`, with only the documented
+  `tier1/pipeline-loop` skip (loop-device/throughput tests need
+  `--privileged`).
+* `git diff --check` → clean; `git status --short` shows only the in-scope
+  documentation paths.
+
+The recipes themselves were exercised outside GitHub Actions in slice 1 (a
+real `makepkg` build and a real `rpmbuild` build in `fedora:latest`, each
+asserting the ten paths) and the workflow YAML was parsed and statically
+asserted in slice 2, but the workflow has **not** been executed end-to-end:
+`actionlint` is unavailable here, `.deb`/hardware validation is manual, and an
+actual release/dispatch is left to slice 4. The authoritative close-out record
+is `docs/handoffs/HANDOFF-S31.md`.
