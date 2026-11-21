@@ -2,9 +2,9 @@
 
 ## State
 
-Repo: `furus`, branch `main`, HEAD `cc15dca`. Status: **workflow + test fix
-committed and pushed; dry run green; documentation complete here, nothing
-committed by this slice.**
+Repo: `furus`, branch `main`, HEAD `f763fdc`. Status: **dual-architecture
+release published and verified; documentation complete here, nothing committed
+by this slice.**
 
 - `.github/workflows/release.yml` and the exfat test normalization landed in
   `cc15dca` (commit message "test: normalize whitespace in exfat dump
@@ -13,9 +13,12 @@ committed by this slice.**
   finished **success**: both native builds, all four package jobs (two per
   architecture), and `publish`'s download, flatten and checksum steps all
   passed. The final `gh release create` step was correctly skipped.
-- The current public `v0.1.1` release still has the old five assets; it has
-  **not** been replaced with the dual-arch assets. That is the final publishing
-  step (below) and is out of scope here.
+- The old `v0.1.1` release and tag were deleted and `v0.1.1` was republished
+  from `f763fdc` via tag-push run `44933721775`: all six jobs were green, and
+  the new release carries exactly 9 assets (8 packages + unified `SHA256SUMS`).
+  All assets were downloaded; `sha256sum -c SHA256SUMS` passed for all eight
+  packages, and every GitHub asset digest matched the local hash. Publishing is
+  complete.
 
 ## Expected release assets (9)
 
@@ -49,14 +52,17 @@ release should therefore contain **9 assets**.
   so both pass without weakening the values checked.
 - All action SHA pins are unchanged; no new dependency, no version bump.
 
-## Remaining steps
+## Completed steps
 
 1. Docs review of this slice (README release-assets section + S31 row,
    `TECHNICAL.md`, `DECISIONS.md` A3, `CHANGELOG.md`, this handoff). Reviewer
-   checks structure and accuracy; no commit/push from this slice.
-2. (Needs explicit user permission) Publisher replaces the `v0.1.1` release and
-   tag so it carries the dual-arch artifacts, then verifies with
-   `gh release view v0.1.1` that there are **9 assets** and that the downloaded
-   `SHA256SUMS` (8 lines) matches all eight packages.
-3. Keep the legacy handoffs under `docs/handoffs/` as historical records; they
-   describe the earlier five-asset publication and are not edited here.
+   checked structure and accuracy; no commit/push from this slice.
+2. With explicit user permission, the publisher deleted the old `v0.1.1`
+   release and tag and republished `v0.1.1` from `f763fdc` via tag-push run
+   `44933721775`, then verified **9 assets**, that the downloaded `SHA256SUMS`
+   (8 lines) matched all eight packages, and that every GitHub asset digest
+   matched its local hash.
+3. The legacy handoffs under `docs/handoffs/` are kept as historical records of
+   the earlier five-asset publication; they are not edited here.
+
+No publishing work remains: the dual-architecture release is complete.

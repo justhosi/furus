@@ -245,7 +245,7 @@ analysed upstream function — the ledger only covers functions and thunks from
 | S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | complete (on `main`) |
 | S28 | CI dependency fix — install fontconfig/winit native build headers on ubuntu-latest so `xtask ci` (clippy) and `xtask qa` both run green | complete (on `main`) |
 | S29 | GUI / IPC verification — single-source D-Bus/polkit/packaging contract with a CI drift check, offscreen Slint render smoke, and a real compiled-helper JSONL/run-state wire test | complete (on `main`) |
-| S31 | Native packages in CI — parameterized RPM/Arch recipes and a dual-architecture release workflow that builds `.rpm` and `.pkg.tar.zst` natively for x86_64 and aarch64 under one unified `SHA256SUMS` (8 packages + digest = 9 assets) | complete (on `main`); workflow validated end-to-end for both architectures — dry run `44931040759` (publish=false) green; publishing the dual-arch assets to v0.1.1 is the final publishing step |
+| S31 | Native packages in CI — parameterized RPM/Arch recipes and a dual-architecture release workflow that builds `.rpm` and `.pkg.tar.zst` natively for x86_64 and aarch64 under one unified `SHA256SUMS` (8 packages + digest = 9 assets) | complete (on `main`); workflow validated end-to-end for both architectures — dry run `44931040759` (publish=false) green; release v0.1.1 published 2026-11-21 via tag-push run `44933721775` with 9 assets (8 packages + unified `SHA256SUMS`), verified against GitHub asset digests |
 
 #### Update-check fields are dormant (A12)
 

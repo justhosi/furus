@@ -34,7 +34,9 @@ original Windows utility for Linux. Capabilities present in this version:
   x86_64 and aarch64 and publishes eight packages — a generic `.tar.gz`, a
   `.deb`, an `.rpm` and a `.pkg.tar.zst` for each architecture — plus one unified
   `SHA256SUMS` (eight lines, one per package). Both architectures were validated
-  end-to-end in dry run `44931040759`.
+  end-to-end in dry run `44931040759`; the dual-arch release was then published
+  as `v0.1.1` after green tag-push run `44933721775`, with 9 assets (8 packages
+  plus unified `SHA256SUMS`) verified against the GitHub asset digests.
 
 ### Notes
 

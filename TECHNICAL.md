@@ -1264,6 +1264,11 @@ Dry run `44931040759` (`workflow_dispatch`, `publish=false`) on `cc15dca`
 finished green: both native builds, all four package jobs (two per arch), and
 `publish`'s download, flatten and checksum steps passed. The final
 `gh release create` step was correctly skipped. The authoritative process
-record is `docs/handoffs/HANDOFF-aarch64-release.md`. Publishing the dual-arch
-assets by replacing the `v0.1.1` release/tag is the final step and is **not** done
-here.
+record is `docs/handoffs/HANDOFF-aarch64-release.md`.
+
+The final publication was completed by the tag-push run `44933721775`: the old
+`v0.1.1` release and tag were deleted and `v0.1.1` was republished from `f763fdc`
+with all six jobs green. The new release carries exactly 9 assets (8 packages
+plus the unified `SHA256SUMS`); all assets were downloaded, `sha256sum -c
+SHA256SUMS` passed for all eight packages, and every GitHub asset digest matched
+its local hash.
