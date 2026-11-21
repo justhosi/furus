@@ -1,24 +1,29 @@
-# S33 — Post-release hygiene — SLICE 8 HANDOFF
+# S33 — Post-release hygiene — FINAL HANDOFF (slice 9/9 complete)
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, current HEAD
-`127bbc0` (S33.5 Part B xtask split committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
+Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, current code/docs HEAD
+`1760c08` (`docs: record S33 release hygiene and refactors`); this final handoff
+is committed immediately after it. `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
 with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 This is the authoritative S33 handoff. It is updated as each slice lands.
 Per-slice records may be added alongside it as historical notes.
 
-## Status: Slices 1-8/9 complete and verified, committed locally; nothing pushed
+## Status: ALL slices 1-9/9 complete and verified, committed locally; nothing pushed
 
 All S33 work is committed locally on top of pushed `da44823`: `8c1ef69`
 (S33.1), `6ce1a51` (S33.2), `cf10532` (S33.3), `191621a` (S33.4), `b06a3d3`
 (handoff through slice 4), `48aaae5` (S33.5 Part A), `9e5361b` (handoff
 through slice 5), `53a1a91` (S33.5 Part B CLI split), `86736cb` (handoff
 through slice 6), `8e9ae92` (S33.5 Part B exfat volume split), `e020669`
-(handoff through slice 7), `127bbc0` (S33.5 Part B xtask split), plus the two
-S32 documentation commits `e4fc6e6` and `3416f1c` which the user chose to keep
-local. No reset/rebase/amend/push/tag was performed. `v0.1.1` already exists
-as a published tag; S33 does not create or move tags. The user has not
-authorized publishing any of these commits.
+(handoff through slice 7), `127bbc0` (S33.5 Part B xtask split), `d727a51`
+(handoff through slice 8), `1760c08` (final full gate + README/TECHNICAL docs),
+plus this final handoff commit, and the two S32 documentation commits
+`e4fc6e6` and `3416f1c` which the user chose to keep local. No
+reset/rebase/amend/push/tag was performed. The published tag `v0.1.1` exists as
+tag object `4c6e4a6` pointing at commit `f763fdc`; S33 does not create or move
+tags. **The user has not authorized publishing any of these commits — v0.1.1 is
+ready for manual sign-off and Publisher tagging, but nothing may be pushed or
+tagged until that explicit permission is given.**
 
 Guardrails still in force: preserve `unsafe_code = "deny"` in `Cargo.toml` and
 all crate-level `#![forbid(unsafe_code)]`; no new `.unwrap()`/`.expect()` in
@@ -41,7 +46,7 @@ that happens.
 | 6/9 | Part B: split `crates/furus-cli/src/main.rs` into `main`, `cli`, `output`, `commands` modules | **Complete, verified** — `53a1a91` |
 | 7/9 | Part B: split `crates/furus-core/src/fs/exfat/volume.rs` into `volume/{mod,format,fat,io,tests}.rs` | **Complete, verified** — `8e9ae92` |
 | 8/9 | Part B: split `xtask/src/main.rs` into `main`, `util`, `assets`, `parity`, `size`, `packaging`, `dist`, `contract`, `ci`, `qa` modules | **Complete, verified** — `127bbc0` |
-| 9/9 | Final full gate, README slice table row, `TECHNICAL.md` S33 section, final handoff | Pending |
+| 9/9 | Final full gate, README slice table row, `TECHNICAL.md` S33 section, final handoff | **Complete, verified** — `1760c08` (docs/gates) + final handoff commit |
 
 ## Slice 1/9 — what changed
 
@@ -407,15 +412,76 @@ lines).
 - `git diff --cached --check` clean; `git add -A` staged exactly the 17
   in-scope files; working tree clean after commit.
 
-## What remains
+## Slice 9/9 — final gate and documentation (commit `1760c08`)
 
-Slice 9/9 per the plan table: final full gate (`fmt`, `clippy`,
-`cargo test --workspace`, `cargo xtask ci`, `cargo xtask qa`, `cargo xtask
-dist`), an S33 row in the README slice table, an S33 section in
-`TECHNICAL.md`, and the final version of this handoff confirming that v0.1.1
-is ready for manual sign-off and Publisher tagging. The final slice must stay
-behaviour-preserving: no public signature/CLI/JSON/error-message changes, no
-visibility widening, no new unsafe or production `.unwrap()`, and the test
-count must not drop below 1912. Keep the no-push / no-tag rule until the user
-explicitly authorizes publication. All S33 commits are local only (not
-pushed).
+This slice changed documentation only; no production code, CLI, JSON schema,
+exit code, test or dependency changed. Two files:
+
+- `README.md` (`1 +`) — one S33 row added immediately after the S31 row in the
+  `### Slice completion (S21–S29)` table. The heading and all existing rows are
+  untouched. The row records version 0.1.1, the 1912-test floor, green
+  `ci`/`qa`/`dist` gates and the fact that S33 creates no new tag and pushes
+  nothing.
+- `TECHNICAL.md` (`125 +`) — a new `## S33 — Release hygiene, portability and
+  module split` section appended at EOF, documenting S33.1–S33.5 with all eight
+  change commits (`8c1ef69`, `6ce1a51`, `cf10532`, `191621a`, `48aaae5`,
+  `53a1a91`, `8e9ae92`, `127bbc0`), the invariants, test-count history, no size
+  drift, full verification, and the post-release no-tag/no-push stance.
+
+The reviewer corrected three factual errors in the draft before committing:
+(1) the local host has only Arch-layout firmware — `/usr/share/OVMF/OVMF_*_4M.fd`
+are compatibility symlinks back into `/usr/share/edk2/x64/`, not a second
+install, so only the first (Arch 4M) pair is exercised end-to-end; (2) only 7
+of the 9 xtask submodules have a sibling `tests.rs` (`util.rs` keeps tests
+inline, `ci.rs` has none), not all nine; (3) `4c6e4a6` is the annotated tag
+object for `v0.1.1`, which points at commit `f763fdc`, not the commit itself.
+
+## Verification (Slice 9/9 — coder and independent reviewer)
+
+- `cargo fmt --all -- --check` → **exit 0**.
+- `cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**.
+- `cargo test --workspace` → **1883 passed, 0 failed, 29 ignored = 1912**.
+  Full coder log at `/tmp/opencode/s33-test-full.log`.
+- `cargo test --workspace --all-targets -- --list | grep -cE ': test$'` →
+  **1912** (floor unchanged from S33.4 onward; baseline 1910 before S33,
+  1911 after the S33.3 SIGINT test).
+- `cargo xtask ci` → **`ci: all gates passed`**; only the pre-existing
+  `cargo-audit` not-installed skip and duplicate-zbus lock warnings.
+- `cargo xtask qa` → **`qa: all suites passed`**; only the documented
+  `tier1/pipeline-loop: loop-device / throughput tests need --privileged` skip;
+  real `PASS tier2/bios-bootloaders` and `PASS tier2/uefi-ntfs-ovmf`.
+- `cargo xtask dist --out-dir /tmp/opencode/s33-dist` (reviewer re-ran with
+  `/tmp/opencode/s33-dist-review`) → **exit 0**. Artifact
+  `furus-0.1.1-x86_64-unknown-linux-gnu.tar.gz`, **7,905,723 B**, SHA256
+  `17e163783eceae1135ac77cf754165ebfdc83efac172c8457601ae24578e080b`;
+  `sha256sum -c SHA256SUMS` → **OK** in both directories. `.deb` is skipped
+  only because `dpkg-deb` is not installed (environmental).
+- `size-baseline.json` unchanged: furus **1,810,504 B** (budget 3,000,000),
+  furus-helper **1,406,392 B** (2,500,000), furus-gui **12,806,408 B**
+  (14,000,000). No S33 size drift, so no `--write-baseline` was needed.
+- `RUSTDOCFLAGS="-D warnings" cargo doc -p furus-core --no-deps` still reports
+  **226 pre-existing errors** (reviewer re-confirmed on the current tree);
+  these are unchanged from the pre-refactor tree and explicitly out of scope.
+  `cargo doc -p xtask --no-deps` is clean.
+- `git diff --check` → **clean**; only `README.md` and `TECHNICAL.md` were
+  staged in `1760c08`; working tree clean afterwards.
+
+## Final state — ready for manual sign-off, NOT published
+
+- S33 is complete: 1/9 version, 2/9 naming, 3/9 SIGINT, 4/9 OVMF portability,
+  5/9 test extraction, 6/9 CLI split, 7/9 exfat volume split, 8/9 xtask split,
+  9/9 final gate and docs. Every commit carries `Reviewed-by: reviewer`.
+- All S33 commits are **local only**. `origin/main` is still `da44823`; local
+  `main` also carries the two S32 doc commits `e4fc6e6` and `3416f1c` that the
+  user explicitly chose to keep local. Do not include them in any publication
+  without asking again.
+- Tag `v0.1.1` already exists (tag object `4c6e4a6` → commit `f763fdc`) and is
+  published. S33 must **not** create, move, or force-update any tag.
+- **No push and no tag without explicit user permission.** The next step is a
+  human maintainer review of this handoff; if approved, ask the user, then
+  hand to `publisher` for the branch push only if they authorize it.
+- Gotchas for the next context: the only test skips are `cargo-audit` not
+  installed and `tier1/pipeline-loop` needing `--privileged`; the `.deb` skip
+  is due to missing `dpkg-deb`; the 226 furus-core rustdoc errors are
+  pre-existing; the Ubuntu-only firmware layout was never exercised locally
+  (only the pure selection test covers it) — CI now does.
