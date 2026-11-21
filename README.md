@@ -1,9 +1,9 @@
 # furus
 
-A clean implementation of Rufus in Rust, targeting Linux. Rufus is the
-Windows utility for making bootable USB drives. `furus` is the workspace
-name used in the code (see `xtask`); it is a from-scratch implementation
-that keeps Rufus's on-disk formats and behaviour but none of its code.
+A clean implementation of rufus in Rust, targeting Linux. `furus` is a
+from-scratch rewrite that keeps the on-disk formats and behaviour of the
+original Windows utility, but none of its code. The workspace name used in
+the code (see `xtask`) is `furus`, as are the crate, binary and package names.
 
 The work is organised as a slice plan. The plan document itself lives
 outside this repository (module docs cite it as `rust-rewrite/PLAN.md`
@@ -21,7 +21,7 @@ ratified 2026-11-19 as GPL-3.0-or-later (A3 and A5 were ratified the same day).
 The implementation is in progress, one slice at a time. The filesystem
 write side is the most complete part:
 
-* FAT32 and exFAT are formatted natively by `rufus-core` - no mount, no
+* FAT32 and exFAT are formatted natively by `furus-core` - no mount, no
   external tool - with a file API (create, write, read, list,
   timestamps, labels) verified byte-for-byte against the on-disk
   layouts.
@@ -31,7 +31,7 @@ write side is the most complete part:
   reading the volume label back from `$MFT` record 3. A native NTFS
   writer is out of scope. The post-format VBR `HiddenSectors` field is
   now guaranteed by `patch_hidden_sectors` in
-  `crates/rufus-core/src/fs/ntfs.rs`.
+  `crates/furus-core/src/fs/ntfs.rs`.
 * ext2, ext3 and ext4 are written by detecting and driving the external
   `mke2fs` / `mkfs.ext*` tool (the `e2fsprogs` package); the flavour
   decides the journal bit and the fixed 4096-byte block / 256-byte inode
@@ -45,8 +45,8 @@ write side is the most complete part:
   then verifying the volume recognition sequence (BEA01, one NSR
   descriptor, TEA01) at byte 32768 of the image; the label is read back
   with `udfinfo`. A native UDF writer is out of scope (see
-  `crates/rufus-core/src/fs/udf.rs`).
-* A read-only UDF reader (S15) in `crates/rufus-core/src/udf/` reads a
+  `crates/furus-core/src/fs/udf.rs`).
+* A read-only UDF reader (S15) in `crates/furus-core/src/udf/` reads a
   UDF volume back through the same `Volume` abstraction the writer
   produces: the anchor pointer at logical sector 256 (probed at block
   size 2048, then 512), the descriptor sequence (primary, partition,
@@ -62,10 +62,10 @@ write side is the most complete part:
   reader never writes.
 * NTFS, ext and UDF share one external-tool probe (PATH scan,
   executable check, version probe, busy-exec retry) in
-  `crates/rufus-core/src/fs/tool.rs`; the version flag stays per family
+  `crates/furus-core/src/fs/tool.rs`; the version flag stays per family
   (`-V` for ext, `--version` for NTFS), UDF is probed by its usage
   banner instead, and each is passed at its call site.
-* An ISO9660 image reader (S14) in `crates/rufus-core/src/iso/` reads
+* An ISO9660 image reader (S14) in `crates/furus-core/src/iso/` reads
   the volume-descriptor sequence, the primary directory tree, Joliet
   supplementary trees (preferred when present; the highest escape level
   wins), multi-extent files joined in order, and — on the primary tree
@@ -76,7 +76,7 @@ write side is the most complete part:
   with a 64 KiB sector cache rather than mmap — mmap needs `unsafe` or a
   new dependency, both forbidden by the crate — so every access stays
   bounds-checked against the store before any I/O.
-* An image container layer (S15) in `crates/rufus-core/src/image/`
+* An image container layer (S15) in `crates/furus-core/src/image/`
   detects the container family by magic over any `Volume`
   (`ImageKind`), opens a regular file read-only and validates its header
   (`open_image`), then presents the *logical* disk as a read-only
@@ -107,9 +107,9 @@ write side is the most complete part:
   no tree reader — WIM, VHD, VHDX, FFU, qcow2, PE — and a `Copy` plan
   run over the `--device-file` seam, which has no partition node to
   mount). `--device-file` runs the same plan
-  against a regular file for tests. `rufus plan --verify` records a
+  against a regular file for tests. `furus plan --verify` records a
   read-back of the whole image against the plan digest, doubling the
-  I/O; `rufus plan --badblocks` records a surface scan that runs in
+  I/O; `furus plan --badblocks` records a surface scan that runs in
   the wipe step. A chunk write that fails with `EIO`/`ENOSPC` is
   retried three times, five seconds apart (the failing chunk only,
   with the device size re-read before each attempt);
@@ -118,13 +118,13 @@ write side is the most complete part:
   effort, off by default. The plan records `bad_blocks` (and
   `verify`); the retry/reset knobs are runtime recoveries, not plan
   content. The `--json` stream (one `Event` object per stdout line) is
-  documented in `crates/rufus-cli/src/main.rs` and on
-  `rufus_core::pipeline::Event`.
-* The copy engine (S18) is wired into the write path. `rufus plan
+  documented in `crates/furus-cli/src/main.rs` and on
+  `furus_core::pipeline::Event`.
+* The copy engine (S18) is wired into the write path. `furus plan
   --iso-mode` selects `WriteMode::Copy` for ISO and Raw images (the
   recommended mode for bootable sticks); a `Copy` write walks the
   ISO9660 or UDF tree onto the mounted data partition through a mount
-  seam (`Opener::mount_partition`, guarded by `rufus-linux`'s `Mounted`
+  seam (`Opener::mount_partition`, guarded by `furus-linux`'s `Mounted`
   helper with vfat/exfat/ntfs3, `NOSUID|NODEV` and a detach fallback). The
   walk is cancellable, pre-flights free space, enforces the FAT32
   file-size limit, and throttles its progress through the pipeline's
@@ -137,7 +137,7 @@ write side is the most complete part:
   volume; a real `mkudffs`-built volume through the copy arm remains a
   declared follow-up.
 * Bootloader installation (S19/S20) is wired as the `bootloader`
-  pipeline step. `rufus plan --bootloader <mode>` selects the installer
+  pipeline step. `furus plan --bootloader <mode>` selects the installer
   explicitly (`auto`, `syslinux`, `grub2`, `grub4dos`, `uefi-ntfs`,
   `freedos`, `kolibri`, `msdos`, `windows` or `none`); `auto` keeps the write-mode
   pairing (a `Dd` write already laid the image's own boot code, so
@@ -152,7 +152,8 @@ write side is the most complete part:
   GRUB4DOS writes its MBR/SBR and refuses before writing anything
   unless a root `/grldr` already exists (the image's own or a
   caller-supplied one), because resource 451 is GRUB2's `core.img`, not
-  a `grldr` (Rufus downloads the real loader `grub4dos-0.4.6a/grldr`
+  a `grldr` (the original Windows utility downloads the real loader
+  `grub4dos-0.4.6a/grldr`
   and bundles none). `uefi-ntfs` forces `Copy`
   and the two-partition `uefi_ntfs` layout, writing the embedded 1 MiB
   shim image at the ESP offset, and needs an NTFS or exFAT data
@@ -169,7 +170,7 @@ write side is the most complete part:
   `grub>` shell running a config that prints `GRUB2-OK`), and the
   UEFI:NTFS shim boots a real NTFS payload under OVMF
   (`UEFI-NTFS-OK`). No stick has been booted on hardware, and the
-  GRUB4DOS boot test is `#[ignore]`d behind `RUFUS_TEST_GRLDR` because
+  GRUB4DOS boot test is `#[ignore]`d behind `FURUS_TEST_GRLDR` because
   the payload is not bundled; each suite prints one `skip:` line when
   qemu, grub-mkimage, mkntfs, OVMF or another tool is absent.
   `windows` plans a GPT Windows To Go layout (100 MiB ESP, MSR, NTFS
@@ -186,7 +187,7 @@ write side is the most complete part:
   test compares the BIOS (Boot/BCD) store's required elements and loader
   description with the UEFI store. No fresh SeaBIOS Windows boot was run
   in this environment, so no Legacy BIOS boot is claimed as verified.
-* The GUI arrived in S24 and is no longer a stub: `rufus-gui` opens a
+* The GUI arrived in S24 and is no longer a stub: `furus-gui` opens a
   Slint window over the headless `GuiState` (device, boot selection, image
   option, partition scheme, target system, file system, cluster size, labels,
   quick format, bad blocks), refuses to run as root, and stays unprivileged —
@@ -206,13 +207,13 @@ write side is the most complete part:
   enabled while a run is in flight, a form-wide lock freezes every
   configuration control during the run, and a show/hide log drawer renders
   the buffered events and the terminal outcome. The helper is reached through
-  a pkexec reader thread or a D-Bus client on `org.rufuslinux.Helper1`, with
+  a pkexec reader thread or a D-Bus client on `org.furuslinux.Helper1`, with
   one fallback to pkexec when the preferred transport is unavailable. The
   CHECKSUM button now opens a cancellable modal that streams MD5, SHA-1,
   SHA-256 and SHA-512 digests at once through the core hasher with bounded
   progress, rather than echoing the single digest analysis already computed.
   A Language combo selects the display locale (from the system `.loc` asset
-  or a small embedded fallback, with translation through `rufus_core::i18n`),
+  or a small embedded fallback, with translation through `furus_core::i18n`),
   and Arabic, Hebrew, Persian and Urdu get RTL text alignment; the locale,
   advanced-section visibility and which of the four digests the modal shows
   are persisted as GUI preferences in a `[gui]` table of the core-owned TOML
@@ -244,7 +245,7 @@ analysed upstream function — the ledger only covers functions and thunks from
 | S27 | Automated QA gate — the two-tier `cargo xtask qa` release gate | complete (on `main`) |
 | S28 | CI dependency fix — install fontconfig/winit native build headers on ubuntu-latest so `xtask ci` (clippy) and `xtask qa` both run green | complete (on `main`) |
 | S29 | GUI / IPC verification — single-source D-Bus/polkit/packaging contract with a CI drift check, offscreen Slint render smoke, and a real compiled-helper JSONL/run-state wire test | complete (on `main`) |
-| S31 | Native packages in CI — parameterized RPM/Arch recipes and a four-job release workflow that builds `.rpm` and `.pkg.tar.zst` from the single dist tarball under one unified `SHA256SUMS` | complete (on `main`); the workflow has not yet been executed end-to-end |
+| S31 | Native packages in CI — parameterized RPM/Arch recipes and a four-job release workflow that builds `.rpm` and `.pkg.tar.zst` from the single dist tarball under one unified `SHA256SUMS` | complete (on `main`); workflow validated end-to-end — release v0.1.1 published 2026-11-21 with 5 assets and matching `SHA256SUMS` |
 
 #### Update-check fields are dormant (A12)
 
@@ -258,7 +259,7 @@ intact; do not read S25's `net` ledger row as a live update-check feature.
 
 ### `analyze` report
 
-`rufus analyze [--json] <image>` reports the S16 image analysis in a
+`furus analyze [--json] <image>` reports the S16 image analysis in a
 `report` object next to the four long-standing image keys (`path`,
 `size_bytes`, `sha256`, `kind`), which keep their names, order and
 values. The human output summarises the report as one `report:` line
@@ -283,25 +284,25 @@ a broken ISO never turns `analyze` into an error.
 
 A Cargo workspace (edition 2024, `resolver = "3"`):
 
-* `rufus-proto` - versioned plan/progress types shared by the CLI, GUI
+* `furus-proto` - versioned plan/progress types shared by the CLI, GUI
   and helper: the `Plan` contract and its `Plan::confirm` hash, plus the
   helper event stream.
-* `rufus-core` - the safe, non-privileged foundation and the filesystem
+* `furus-core` - the safe, non-privileged foundation and the filesystem
   write side: error/config/paths/i18n/hash/units, MBR + GPT table
   readers and writers, the FAT32/exFAT/NTFS/ext2/3/4/UDF formatters,
   the ISO9660/Joliet/Rock Ridge image reader (`iso/`), the read-only
   UDF reader (`udf/`) and the image container layer (`image/`),
   superblock probing and the safety verdict.
 * `wimlib-sys` - FFI bindings to wimlib, for applying WIM/ESD images.
-* `rufus-linux` - the only crate that touches `/sys` and `/run/udev`:
+* `furus-linux` - the only crate that touches `/sys` and `/run/udev`:
   device discovery, mount/swap/holder introspection, and the
   block-ioctl shim.
-* `rufus-helper` - the privileged write helper: validates a plan and
+* `furus-helper` - the privileged write helper: validates a plan and
   runs it, exposed over D-Bus behind polkit; it runs as root, the GUI
   never does.
-* `rufus-cli` - the `rufus` command-line front end: version, checksum,
+* `furus-cli` - the `furus` command-line front end: version, checksum,
   analyze, plan, list, write.
-* `rufus-gui` - the Slint desktop front end (S24: the window, the headless
+* `furus-gui` - the Slint desktop front end (S24: the window, the headless
   `GuiState` it renders, the `std::thread` device watch and the background
   image analyzer; S25: the confirmation-gated run flow, the cancellable
   four-algorithm checksum modal, the locale and GUI-preference bridges, and
@@ -311,26 +312,26 @@ A Cargo workspace (edition 2024, `resolver = "3"`):
   per-binary size gate, CI ordering, `dist` (release bundles - see Build
   below), and `qa` (the two-tier end-to-end release gate - see Tests below).
 
-The crate layering keeps privileged I/O in `rufus-linux` /
-`rufus-helper` and the formatter logic in `rufus-core`, which never
-depends on `rufus-linux` (see `crates/rufus-core/src/fs/mod.rs`).
+The crate layering keeps privileged I/O in `furus-linux` /
+`furus-helper` and the formatter logic in `furus-core`, which never
+depends on `furus-linux` (see `crates/furus-core/src/fs/mod.rs`).
 
-Safety and dependencies: the workspace denies unsafe code; `rufus-linux`
+Safety and dependencies: the workspace denies unsafe code; `furus-linux`
 carries two documented allowances - the four block ioctls
 (BLKZEROOUT/BLKDISCARD/BLKRRPART/BLKFLSBUF) in
-`crates/rufus-linux/src/ioctl.rs` that rustix does not wrap, and the
-SIGINT handler install in `crates/rufus-linux/src/signal.rs` (one atomic
+`crates/furus-linux/src/ioctl.rs` that rustix does not wrap, and the
+SIGINT handler install in `crates/furus-linux/src/signal.rs` (one atomic
 store, nothing else) - and `wimlib-sys` carries two more (the raw FFI
 declarations in `src/ffi.rs` and the safe facade in `src/safe/bound.rs`
 with its C calls, trampolines and string decoding). Every other crate
 root keeps `#![forbid(unsafe_code)]`. The one exception in spelling is
-the `rufus-gui` binary target, which uses `#![deny(unsafe_code)]`:
+the `furus-gui` binary target, which uses `#![deny(unsafe_code)]`:
 `slint::include_modules!()` expands to vtables that hardcode
 `#[allow(unsafe_code)]`, and an `allow` under a crate-level `forbid` is a
-hard error (E0453). The `rufus-gui` library root keeps the `forbid`, no
-hand-written `rufus-gui` line contains `unsafe` or `#[allow(unsafe_code)]`,
+hard error (E0453). The `furus-gui` library root keeps the `forbid`, no
+hand-written `furus-gui` line contains `unsafe` or `#[allow(unsafe_code)]`,
 and the workspace lint would reject one (see `TECHNICAL.md` section 3.7).
-`rufus-core` is dependency-light by design: no async runtime, no logging
+`furus-core` is dependency-light by design: no async runtime, no logging
 framework, no regex.
 
 ## Build
@@ -349,8 +350,8 @@ system linkers; it never rewrites the baseline):
 
     CARGO_NET_OFFLINE=true cargo xtask size
 
-At the S25 tip it reports `rufus` 1,810,152 bytes (budget 3,000,000),
-`rufus-helper` 1,406,296 (2,500,000) and `rufus-gui` 12,774,280
+At the S25 tip it reports `furus` 1,810,152 bytes (budget 3,000,000),
+`furus-helper` 1,406,296 (2,500,000) and `furus-gui` 12,774,280
 (14,000,000 — raised from 12 MB in S25 to absorb the two zbus versions and
 the rest of the S25 GUI growth), `size: within committed baseline allowance,
 all budgets OK`.
@@ -362,7 +363,7 @@ Building is not the same as shipping: `cargo xtask dist [--target <triple>]
 budgets, validates the eleven finalized `packaging/` files (XML via quick-xml,
 INI via a hand-written parser, plus distro-token checks), stages an exact
 twelve-file FHS tree, and writes a deterministic
-`rufus-<version>-<triple>.tar.gz` alongside a `SHA256SUMS`. The default target
+`furus-<version>-<triple>.tar.gz` alongside a `SHA256SUMS`. The default target
 is the rustc host triple and the default output directory is
 `target/dist/<triple>`; `sha256sum -c SHA256SUMS` verifies a bundle. Entries
 are sorted and uid/gid/mtime and the gzip mtime are zeroed so the tarball is
@@ -373,18 +374,18 @@ A `.deb` is built only where `dpkg-deb` is installed (`dpkg-deb
 --root-owner-group`); elsewhere the command prints `skip .deb: dpkg-deb not
 available` and still succeeds with the tarball and digest file - this host has
 no `dpkg-deb`, so `.deb` generation is not verified here. The staged tree puts
-the CLI and GUI at `/usr/bin/rufus` and `/usr/bin/rufus-gui` and the privileged
-helper at `/usr/libexec/rufus-helper` (root-owned, 0755): the GUI never runs as
+the CLI and GUI at `/usr/bin/furus` and `/usr/bin/furus-gui` and the privileged
+helper at `/usr/libexec/furus-helper` (root-owned, 0755): the GUI never runs as
 root, so writes happen only in the helper, gated by the polkit action, and the
 D-Bus system.d configuration restricts who may own the well-known name. The
 polkit policy, D-Bus files, desktop entry, AppStream metainfo, icon and licence
 texts install under `/usr/share`; only the `.deb` uses `DEBIAN/control` and
 `DEBIAN/postinst`.
 
-The Arch `PKGBUILD` and RPM `rufus.spec` consume that same single tarball and
+The Arch `PKGBUILD` and RPM `furus.spec` consume that same single tarball and
 its staged `usr/` tree, so the artifact name and layout are a contract - no
 second tarball, no flattened archive. The packaging files keep the
-`org.rufuslinux.*` namespace because the GUI and helper hardcode those bus and
+`org.furuslinux.*` namespace because the GUI and helper hardcode those bus and
 polkit identifiers, and the external formatters (`ntfs-3g`, `e2fsprogs`,
 `udftools`, wimlib) are recommendations or optional dependencies rather than
 hard ones, since decision A4 makes them runtime-checked. `packaging/README.md`
@@ -399,9 +400,9 @@ release also publishes one unified `SHA256SUMS` covering every artifact.
 Install the native package for your distro from the directory holding the
 downloaded files (the `./` makes your package manager use the local file):
 
-* Ubuntu/Debian: `sudo apt install ./rufus-*.deb`
-* Fedora: `sudo dnf install ./rufus-*.rpm`
-* Arch Linux: `sudo pacman -U ./rufus-*.pkg.tar.zst`
+* Ubuntu/Debian: `sudo apt install ./furus-*.deb`
+* Fedora: `sudo dnf install ./furus-*.rpm`
+* Arch Linux: `sudo pacman -U ./furus-*.pkg.tar.zst`
 
 `packaging/README.md` has the full install-path table and service-verification
 commands.
@@ -412,29 +413,29 @@ The formatters are verified against real external tools, which the
 suites use when present and skip (with an explicit `skip:` line, never a
 silent pass) when absent:
 
-* `crates/rufus-core/tests/fat32_format.rs` - `fsck.fat -n` must accept
+* `crates/furus-core/tests/fat32_format.rs` - `fsck.fat -n` must accept
   the written image at 64 MiB, 2 GiB, 32 GiB and the 2 TiB limit.
-* `crates/rufus-core/tests/exfat_format.rs` - `fsck.exfat`,
+* `crates/furus-core/tests/exfat_format.rs` - `fsck.exfat`,
   `dump.exfat` and `exfatlabel` (exfatprogs) must call the image clean
   and read back the geometry and label.
-* `crates/rufus-core/tests/ntfs_format.rs` - `mkntfs`, `ntfsfix -n` and
+* `crates/furus-core/tests/ntfs_format.rs` - `mkntfs`, `ntfsfix -n` and
   `ntfslabel` must agree with the written volume; the VBR-declared
   bounds and the `$MFT` record-3 label read are pinned.
-* `crates/rufus-core/tests/udf_format.rs` - `mkudffs`, `udfinfo` and a
+* `crates/furus-core/tests/udf_format.rs` - `mkudffs`, `udfinfo` and a
   kernel mount must agree with the written volume across the block-size
   matrix (512/2048), the label shapes (short, 126-byte ceiling,
   default) and the pinned `--udfrev=0x0201` revision.
 
 The kernel-mount tests are `#[ignore]`d: they need root and a loop
 device, run on demand with `sudo -E $(which cargo) test --offline
--p rufus-core --test <suite> -- --ignored --nocapture`, or inside the
+-p furus-core --test <suite> -- --ignored --nocapture`, or inside the
 documented privileged container (an `archlinux` image; the NTFS suite's
 module doc records the `pacman -Sy --noconfirm ntfs-3g ntfsprogs`
 package split). Two further suites exercise the mount and boot seams:
-`crates/rufus-linux/tests/mount_seam.rs` mounts FAT32, exFAT and NTFS
+`crates/furus-linux/tests/mount_seam.rs` mounts FAT32, exFAT and NTFS
 through the real kernel (`#[ignore]`d, root + loop devices, run with
-`-p rufus-linux --test mount_seam`), and
-`crates/rufus-core/tests/uefi_ntfs_boot.rs` boots the UEFI:NTFS shim
+`-p furus-linux --test mount_seam`), and
+`crates/furus-core/tests/uefi_ntfs_boot.rs` boots the UEFI:NTFS shim
 against a real NTFS volume in OVMF (unprivileged; it runs in the normal
 suite and skips with one `skip:` line when qemu, grub-mkimage, mkntfs,
 ntfscp, unshare, ntfs-3g or the OVMF images are absent).
@@ -487,12 +488,12 @@ server, a real block device or a new dependency:
 
 * **Contract identifiers** — `cargo xtask contract --check`, wired into
   `cargo xtask ci` between parity and size, reads the D-Bus / polkit / packaging
-  identifiers single-sourced in `rufus-proto::service` and fails on any drift
+  identifiers single-sourced in `furus-proto::service` and fails on any drift
   in the GUI, helper or packaging copies.
-* **Offscreen render smoke** — `cargo test -p rufus-gui --test render_smoke`
+* **Offscreen render smoke** — `cargo test -p furus-gui --test render_smoke`
   instantiates the Slint window through the software renderer with every
   overlay visible, renders a non-blank frame and needs no window system.
-* **Real helper wire** — `cargo test -p rufus-gui --test helper_wire` launches
+* **Real helper wire** — `cargo test -p furus-gui --test helper_wire` launches
   the compiled helper under `unshare -Ur`, drives its real JSONL event stream
   through the GUI's parser and run state machine, and asserts a
   `not_a_block_device` refusal with no device I/O or writes (root exists only
@@ -510,8 +511,8 @@ and the non-fatal duplicate-crate warnings from `cargo-deny` are pre-existing.
 * `docs/handoffs/` - archived handoff notes from earlier slices, including
   `HANDOFF-windows-verification.md` (QEMU/OVMF UEFI boot acceptance) and
   `HANDOFF-boot-c0000001.md` (the resolved `0xc0000001` BCD boot-store bug).
-* `LICENSES.md` - asset licence audit for the Rufus 4.15 resources the
-  implementation reuses; the code licence is GPL-3.0-or-later (decision
-  A1, approved 2026-11-19).
+* `LICENSES.md` - asset licence audit for the 4.15 resources of the original
+  Windows utility that the implementation reuses; the code licence is
+  GPL-3.0-or-later (decision A1, approved 2026-11-19).
 * `assets/`, `data/`, `packaging/` and the `tests/` fixtures carry their
   own READMEs.

@@ -2,14 +2,14 @@
 
 `analyze-report.json` is the `report` object (only that object, not the
 whole `analyze` output) for 4096 bytes of `0xAA` — the `RAW_SHA256`
-constant in `crates/rufus-cli/tests/cli.rs`. Regenerate it with
-`json.dumps(report, indent=2)` from `rufus analyze --json` over those
+constant in `crates/furus-cli/tests/cli.rs`. Regenerate it with
+`json.dumps(report, indent=2)` from `furus analyze --json` over those
 bytes.
 
 `plan-v6.json` is the exact `--json` output of
 
 ```sh
-rufus plan --dry-run --json --target bios --filesystem fat32 \
+furus plan --dry-run --json --target bios --filesystem fat32 \
     --image fixture.iso --device /dev/null
 ```
 
@@ -37,7 +37,7 @@ and never enables show-all — and `layout` is `"single"`, the
 `--bootloader auto` default.
 
 The test (`plan_dry_run_matches_golden_v6`, which lives in
-`crates/rufus-cli/tests/cli.rs`) rebuilds
+`crates/furus-cli/tests/cli.rs`) rebuilds
 the same temp image from code (32,780 zero bytes with `CD001` at 0x8001 —
 it must be ≥ 0x8006 bytes or the magic physically does not fit), runs the
 binary with the same flags, applies the same normalisations, recomputes
@@ -53,7 +53,7 @@ buf = bytearray(32_780)
 buf[0x8001:0x8006] = b"CD001"
 
 # Run the CLI once (image path points into a scratch dir):
-#   rufus plan --dry-run --json --target bios --filesystem fat32 \
+#   furus plan --dry-run --json --target bios --filesystem fat32 \
 #      --image /tmp/fixture.iso --device /dev/null > raw.json
 plan = json.load(open("raw.json"))
 plan["image"]["path"] = "fixture.iso"
@@ -61,7 +61,7 @@ plan["created_by"] = "<created_by>"
 plan["confirm"] = ""
 plan["confirm"] = "sha256:" + hashlib.sha256(
     json.dumps(plan, separators=(",", ":")).encode()).hexdigest()
-open("crates/rufus-cli/tests/golden/plan-v6.json", "w").write(
+open("crates/furus-cli/tests/golden/plan-v6.json", "w").write(
     json.dumps(plan, indent=2) + "\n")
 EOF
 ```
@@ -70,5 +70,5 @@ EOF
 hand when the plan schema changes **or** when a reviewed change to the
 plan's content changes the output (as happened when the bootloader step
 started pairing with the write mode, at the same schema version); a
-schema change must ship with a bumped `PLAN_VERSION` (see `rufus-proto`
+schema change must ship with a bumped `PLAN_VERSION` (see `furus-proto`
 docs on field order and confirm hashes).

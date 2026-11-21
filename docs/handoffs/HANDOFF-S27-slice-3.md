@@ -5,7 +5,7 @@ S27-T3 is implemented, reviewed and committed locally at `fa4a0d7`; all three
 S27 slices are complete. The final slice (4/4, documentation only) brought the
 root `HANDOFF.md` to the completed state. **Nothing has been pushed.**
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, HEAD `fa4a0d7`.
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, HEAD `fa4a0d7`.
 cargo/rustc 1.99.0 live in `~/.cargo/bin`; prefix cargo commands with
 `PATH="$HOME/.cargo/bin:$PATH"`. Do not commit or push without explicit user
 permission; `coder` never pushes.

@@ -10,7 +10,7 @@ under QEMU/OVMF to OOBE ("Starting services"/"Getting ready") with **no manual
 Microsoft-side repair**. Acceptance is:
 
 ```
-./target/release/rufus write --plan /tmp/opencode/wtg-plan.json --yes
+./target/release/furus write --plan /tmp/opencode/wtg-plan.json --yes
 ```
 
 produces an image that boots under QEMU/OVMF without `0xc0000001`.
@@ -18,7 +18,7 @@ produces an image that boots under QEMU/OVMF without `0xc0000001`.
 ## Current state (read this first)
 
 ### Git state
-- Working dir: `/home/hosi/dev/REA-Rufus/furus`
+- Working dir: `/home/hosi/dev/REA-Furus/furus`
 - HEAD = `a3c2154`, **9 commits ahead of `origin/main`, nothing pushed**.
 - Commit chain (newest first):
   - `a3c2154` `fix: strip setup-template elements from the boot store`
@@ -29,16 +29,16 @@ produces an image that boots under QEMU/OVMF without `0xc0000001`.
   `?? HANDOFF.md` (plus this new handoff). Do NOT stage/commit handoff files.
 
 ### The blocker — NEW BUG introduced by the strip fix
-The most recent `rufus write` **failed at the bootloader step** (it was not merely
+The most recent `furus write` **failed at the bootloader step** (it was not merely
 cancelled by a server restart). Exact error from `/tmp/opencode/write4.log`:
 
 ```
 info: applied 152980 entries (10404700292 bytes)
-rufus: step 'bootloader': invalid input: bcd subkey list at file offset 0x6d80 cannot shrink
+furus: step 'bootloader': invalid input: bcd subkey list at file offset 0x6d80 cannot shrink
 ```
 
 The `remove_child` primitive added in `a3c2154` (in
-`crates/rufus-core/src/windows/regf.rs`, around line 1836) refuses to shrink an
+`crates/furus-core/src/windows/regf.rs`, around line 1836) refuses to shrink an
 lf/lh subkey-list cell at file offset `0x6d80`. This blocks the whole write. The
 image is currently in a **partial state**: NTFS applied 100%, but the
 bootloader/BCD step failed — it is NOT a valid bootable image and must be rebuilt
@@ -50,7 +50,7 @@ from scratch after the fix.
 - `/dev/loop1p3` is **auto-mounted rw at `/run/media/hosi/05E8320825D489D2`** by
   udisks2 — unmount it before detaching loop1. `/dev/loop1p1` (ESP) may also be
   mounted at `/mnt/esp2`.
-- Image mtime ~Nov 17 11:01 (partial write). No rufus/qemu processes running.
+- Image mtime ~Nov 17 11:01 (partial write). No furus/qemu processes running.
 - Passwordless `sudo -n` works — use it for all root ops.
 
 ## What has been established (do not re-derive)
@@ -103,7 +103,7 @@ suspect for `0xc0000001` was `45000001` DeviceType confusing bootmgfw.
 1. **Diagnose the shrink bug** (this is a "when something is broken" situation —
    inspect + reproduce, state root cause, THEN change code):
    - Read `remove_child` (~line 1836) and `write_subkey_list` in
-     `crates/rufus-core/src/windows/regf.rs`, plus `list_insert` (~1679) which it
+     `crates/furus-core/src/windows/regf.rs`, plus `list_insert` (~1679) which it
      mirrors. Find where the "cannot shrink" error is raised and why the compacted
      lf/lh list at file offset `0x6d80` is rejected.
    - Likely cause: `write_subkey_list` computes a new cell size from
@@ -113,14 +113,14 @@ suspect for `0xc0000001` was `45000001` DeviceType confusing bootmgfw.
      that guard after removing template elements.
    - Reproduce against the real captured template:
      `/tmp/opencode/tmpl/BCD-Template` (the ignored test
-     `real_template_builds_both_variants` / `RUFUS_TEST_BCD_TEMPLATE` exercises it,
+     `real_template_builds_both_variants` / `FURUS_TEST_BCD_TEMPLATE` exercises it,
      but note: the unit-test path passed while the real write failed — so the
      reproduction must use the real template, not `template_fixture()`).
 
 2. **Fix via coder → reviewer**, one slice at a time, tagged `Slice N/M`:
    - Hand coder the exact diagnosis, scope (regf.rs `remove_child` / shrink path),
      and acceptance: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-     `cargo test -p rufus-core` green, AND a real-template reproduction that no
+     `cargo test -p furus-core` green, AND a real-template reproduction that no
      longer errors at 0x6d80. Coder does NOT commit/push.
    - Hand the result to reviewer (review structure + security, commit only, never push).
    - If reviewer reports blockers, send back to coder; only proceed when clean.
@@ -129,8 +129,8 @@ suspect for `0xc0000001` was `45000001` DeviceType confusing bootmgfw.
    - Unmount `/dev/loop1p3` (`sudo umount /run/media/hosi/05E8320825D489D2`) and any
      `/mnt/esp2`, then `sudo -n losetup -d /dev/loop1`.
    - Re-attach: `sudo -n losetup -P /dev/loop1 /home/hosi/.cache/rscratch/wintogo.img`.
-   - Rebuild release binary: `export PATH="$HOME/.cargo/bin:$PATH" && cd /home/hosi/dev/REA-Rufus/furus && cargo build --release -p rufus-cli`.
-   - Write: `cd /home/hosi/dev/REA-Rufus/furus && sudo -n systemd-inhibit --what=sleep:idle --mode=block ./target/release/rufus write --plan /tmp/opencode/wtg-plan.json --yes > /tmp/opencode/write5.log 2>&1`
+   - Rebuild release binary: `export PATH="$HOME/.cargo/bin:$PATH" && cd /home/hosi/dev/REA-Furus/furus && cargo build --release -p furus-cli`.
+   - Write: `cd /home/hosi/dev/REA-Furus/furus && sudo -n systemd-inhibit --what=sleep:idle --mode=block ./target/release/furus write --plan /tmp/opencode/wtg-plan.json --yes > /tmp/opencode/write5.log 2>&1`
      — **run this with NO tool timeout** (background, no `timeout` field); the full
      non-quick surface zero takes ~12 min. Confirm "bootloader" step completes with
      no "cannot shrink" error.
@@ -171,19 +171,19 @@ suspect for `0xc0000001` was `45000001` DeviceType confusing bootmgfw.
   and tell the user.
 
 ## Tooling gotchas
-- `export PATH="$HOME/.cargo/bin:$PATH"`; build with `cargo build --release -p rufus-cli`
-  (not `-p rufus`); crate is `furus/crates/rufus-core`.
+- `export PATH="$HOME/.cargo/bin:$PATH"`; build with `cargo build --release -p furus-cli`
+  (not `-p furus`); crate is `furus/crates/furus-core`.
 - No `xxd` — use `od -A x -t x1z`.
 - Python must run from `/home/hosi` (stray `/tmp/opencode/struct.py` shadows stdlib).
 - `losetup -P` mandatory; unmount all loop1 partitions before detach.
-- Use `sudo -n systemd-inhibit --what=sleep:idle --mode=block` around rufus write.
+- Use `sudo -n systemd-inhibit --what=sleep:idle --mode=block` around furus write.
 - QEMU screenshot: HMP monitor socket `/tmp/opencode/qemu-mon.sock` via socat.
 - PE tooling if needed: `/tmp/opencode/pe-start.sh`, `/home/hosi/sendtype.py` (sendkey
   shift-f10, type with `python3 /home/hosi/sendtype.py '<text>'`).
 
 ## Key artifacts
-- `furus/crates/rufus-core/src/windows/regf.rs` — `remove_child` (~1836), `write_subkey_list`, `list_insert` (~1679), `free_cell` (~1181). **Fix target.**
-- `furus/crates/rufus-core/src/windows/bcd.rs` — `build_store`, strip step, resume wiring.
+- `furus/crates/furus-core/src/windows/regf.rs` — `remove_child` (~1836), `write_subkey_list`, `list_insert` (~1679), `free_cell` (~1181). **Fix target.**
+- `furus/crates/furus-core/src/windows/bcd.rs` — `build_store`, strip step, resume wiring.
 - `/tmp/opencode/write4.log` — the failing write log ("cannot shrink" at 0x6d80).
 - `/tmp/opencode/tmpl/BCD-Template` — real captured template for reproduction.
 - `/tmp/opencode/bcd_new` + `/tmp/opencode/bcd_new.txt` — known-good bcdboot store/dump.

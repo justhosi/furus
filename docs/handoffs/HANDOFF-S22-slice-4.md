@@ -4,7 +4,7 @@
 Committed as `2279698` — `test: check 10k randomized regf mutations against a shadow model`. Pushed: no (Publisher step, requires explicit user permission).
 
 ## Scope
-Only `crates/rufus-core/src/windows/regf.rs` — the `#[cfg(test)] mod tests` block (1 import line + ~479 new lines). Zero production-code changes. The untracked handoff docs for slices 1–3 are NOT part of this slice's commit.
+Only `crates/furus-core/src/windows/regf.rs` — the `#[cfg(test)] mod tests` block (1 import line + ~479 new lines). Zero production-code changes. The untracked handoff docs for slices 1–3 are NOT part of this slice's commit.
 
 ## What was implemented
 - `Rng`: local xorshift64* PRNG with a fixed seed `0x243F_6A88_85A3_08D3` — no dependencies, no entropy, identical sequence every run.
@@ -18,8 +18,8 @@ The spec asked for payload sizes 4 B – 16 KiB. This regf editor's `alloc()` (r
 
 ## Verification (coder; reviewer to re-run)
 - `cargo fmt --all -- --check` → 0
-- `cargo clippy -p rufus-core --all-targets -- -D warnings` → 0
-- `cargo test -p rufus-core --lib windows::regf` → 3 passed, 0 failed (`prop_hive_mutations` 1.2–1.6 s; ~6.1 s including compile)
+- `cargo clippy -p furus-core --all-targets -- -D warnings` → 0
+- `cargo test -p furus-core --lib windows::regf` → 3 passed, 0 failed (`prop_hive_mutations` 1.2–1.6 s; ~6.1 s including compile)
 - Determinism: two identical runs both reported `500 sequences, 10000 verified steps, max 8 hbin bins`.
 
 ## Reviewer decision on the 16 KiB deviation

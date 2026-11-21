@@ -2,17 +2,17 @@
 
 This file records S28, a workflow-only fix to make both CI gates green on
 `ubuntu-latest`. The single code change is committed and pushed as
-`dee5c9e ci: install fontconfig and winit dev headers for rufus-gui`; it is the
+`dee5c9e ci: install fontconfig and winit dev headers for furus-gui`; it is the
 only code change in this slice. This handoff (plus the README and TECHNICAL.md
 updates) is the documentation-only publishing step for S28.
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`. cargo/rustc 1.99.0 live
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`. cargo/rustc 1.99.0 live
 in `~/.cargo/bin`; prefix cargo commands with `PATH="$HOME/.cargo/bin:$PATH"`.
 
 ## Objective
 
 `cargo xtask ci` (specifically `cargo clippy --workspace --all-targets`, which
-builds `rufus-gui`) failed on GitHub Actions `ubuntu-latest` because the native
+builds `furus-gui`) failed on GitHub Actions `ubuntu-latest` because the native
 system libraries that Slint/winit link against were not installed. The goal was
 to make both `Run xtask ci` and `Run xtask qa` pass on the runner **without**
 changing shipped code, relaxing a gate, loosening a size budget or skipping a
@@ -69,7 +69,7 @@ so Tier 2 UEFI boots on `ubuntu-latest` instead of skipping.
 
 **`libwim-dev` was deliberately NOT added.** `wimlib-sys` already builds
 gracefully without the FFI library on this host, and installing it would change
-the link behaviour of `rufus` and disturb the committed size baseline. No
+the link behaviour of `furus` and disturb the committed size baseline. No
 source, `Cargo.toml`, `xtask` or size-baseline file was touched.
 
 ## Constraints honoured
@@ -80,7 +80,7 @@ source, `Cargo.toml`, `xtask` or size-baseline file was touched.
   were installed instead of worked around.
 * **No size-gate loosening.** `size-baseline.json` was not edited. The size gate
   checks growth only: the only delta larger than the 4 KiB allowance is a
-  *shrink* (`rufus`), and the handoff constraints forbid loosening size gates.
+  *shrink* (`furus`), and the handoff constraints forbid loosening size gates.
 * **No skipped QA.** Every suite that ran on the host also ran on CI; the sole
   `SKIP` remains `tier1/pipeline-loop`, which needs `--privileged` by documented
   default and is not a regression from this change.
@@ -120,9 +120,9 @@ https://github.com/justhosi/furus/actions/runs/44816900917
 
   | Binary | CI bytes | Baseline bytes | Delta |
   |---|---|---|---|
-  | `rufus` | 1,805,736 | 1,810,152 | −4,416 (shrink) |
-  | `rufus-gui` | 12,774,672 | 12,774,280 | +392 |
-  | `rufus-helper` | 1,406,568 | 1,406,296 | +272 |
+  | `furus` | 1,805,736 | 1,810,152 | −4,416 (shrink) |
+  | `furus-gui` | 12,774,672 | 12,774,280 | +392 |
+  | `furus-helper` | 1,406,568 | 1,406,296 | +272 |
 
   All three are inside budget and inside the 4 KiB growth allowance. The only
   delta above that allowance is a shrink, so there is no reason to rewrite

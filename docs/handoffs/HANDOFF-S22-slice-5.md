@@ -21,14 +21,14 @@ Modified (uncommitted): `TECHNICAL.md`, `DECISIONS.md`, `size-baseline.json`. Un
 
 | Binary | Before | After | Δ |
 |---|---|---|---|
-| rufus | 1,793,104 | 1,809,016 | +15,912 |
-| rufus-gui | 284,008 | 284,008 | 0 |
-| rufus-helper | 1,385,080 | 1,385,080 | 0 |
+| furus | 1,793,104 | 1,809,016 | +15,912 |
+| furus-gui | 284,008 | 284,008 | 0 |
+| furus-helper | 1,385,080 | 1,385,080 | 0 |
 
-All within budget (rufus 3M, helper 2.5M, gui 12M).
+All within budget (furus 3M, helper 2.5M, gui 12M).
 
 ## Verification
-`cargo xtask ci` → exit 0, `ci: all gates passed`. rufus-core lib 1300 passed / 0 failed / 6 ignored; all integration suites green; assets 86/86; parity fresh (2709 rows, S22 = 14); size within refreshed baseline. `cargo-deny` / `cargo-audit` SKIPped (not installed) — xtask's expected behaviour.
+`cargo xtask ci` → exit 0, `ci: all gates passed`. furus-core lib 1300 passed / 0 failed / 6 ignored; all integration suites green; assets 86/86; parity fresh (2709 rows, S22 = 14); size within refreshed baseline. `cargo-deny` / `cargo-audit` SKIPped (not installed) — xtask's expected behaviour.
 
 ## S22 complete — commit map
 - `d2eb819` — wimlib-sys `strict-link` feature (slice 1/5)

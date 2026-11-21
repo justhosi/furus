@@ -10,16 +10,16 @@ separately as its own commit, immediately before this one.
 ## Scope (as landed — two source paths, plus docs)
 | Path | Change |
 |---|---|
-| `crates/rufus-gui/src/main.rs` | +~629 lines: `CancelBridge`, `RunView`/`run_view`, pure formatters, `Session` owns `Run` + bridge + `run_started`, worker/dispatcher threads, START/confirm/cancel/discard callbacks, terminal + log rendering, 5 new tests |
-| `crates/rufus-gui/ui/main.slint` | +~98 lines: `form-enabled` on every config control, `step-text`, log toggle + drawer, CANCEL, confirmation overlay (`confirm-facts`, `confirm-clicked`/`discard-clicked`) |
+| `crates/furus-gui/src/main.rs` | +~629 lines: `CancelBridge`, `RunView`/`run_view`, pure formatters, `Session` owns `Run` + bridge + `run_started`, worker/dispatcher threads, START/confirm/cancel/discard callbacks, terminal + log rendering, 5 new tests |
+| `crates/furus-gui/ui/main.slint` | +~98 lines: `form-enabled` on every config control, `step-text`, log toggle + drawer, CANCEL, confirmation overlay (`confirm-facts`, `confirm-clicked`/`discard-clicked`) |
 
 Docs in the same commit: `TECHNICAL.md` §3.8 (new slice-5 wiring paragraph,
 "Accepted open decision — D-Bus mid-run death", transport-seam wording updated
 to two shipped transports, slice-5 coverage + gates in §4), this file.
 
 The separate commit immediately before this one carries exactly four paths —
-`Cargo.lock`, `crates/rufus-gui/Cargo.toml`,
-`crates/rufus-gui/src/ipc/mod.rs`, `crates/rufus-gui/src/ipc/dbus.rs` — the
+`Cargo.lock`, `crates/furus-gui/Cargo.toml`,
+`crates/furus-gui/src/ipc/mod.rs`, `crates/furus-gui/src/ipc/dbus.rs` — the
 audited slice-3 D-Bus transport + fallback work. No other source, Cargo or doc
 file was touched by the coder.
 
@@ -71,7 +71,7 @@ file was touched by the coder.
 
 ## Gotchas
 - `env -u APPDIR` is required for tests: this shell exports `APPDIR` at a
-  missing AppImage asset dir, which breaks 7 unrelated `rufus-core` tests.
+  missing AppImage asset dir, which breaks 7 unrelated `furus-core` tests.
   Do not edit `paths.rs`. Prefix cargo with `PATH=/home/hosi/.cargo/bin:$PATH`.
 - **Unsendable / live-bus unverified.** The D-Bus path is exercised only with
   in-process signal-conversion tests and injected fakes; no system bus, polkit
@@ -90,7 +90,7 @@ file was touched by the coder.
 
 ## Verification (re-run by the reviewer, in this tree)
 ```
-env -u APPDIR cargo test -p rufus-gui
+env -u APPDIR cargo test -p furus-gui
   -> lib 74 passed; bin 12 passed; doc 0 passed; 0 failed
 cargo fmt --all -- --check
   -> exit 0, clean

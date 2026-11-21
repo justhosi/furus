@@ -27,11 +27,11 @@ NOT pushed (Publisher step, requires explicit user permission).
 - `cargo check --workspace` → 0
 
 ## Remaining / exact next steps
-1. Slice 2/5 (S22-T2): add `max(64 MiB, required/50)` NTFS overhead reserve to both pre-flight paths in `crates/rufus-core/src/windows/apply.rs`, with exact-fit / under-margin / ample-space unit tests. One command to coder, then reviewer.
+1. Slice 2/5 (S22-T2): add `max(64 MiB, required/50)` NTFS overhead reserve to both pre-flight paths in `crates/furus-core/src/windows/apply.rs`, with exact-fit / under-margin / ample-space unit tests. One command to coder, then reviewer.
 2. Slice 3/5 (S22-T1): dynamic locale + template GUID fallback.
 3. Slice 4/5 (S22-T4): regf property tests.
 4. Slice 5/5: docs, size baseline, full `cargo xtask ci`, then ask the user before publishing.
 
 ## Acceptance criteria still open
-- All S22 verification commands must exit 0: `cargo test -p rufus-core windows::`, `cargo test -p wimlib-sys`, `cargo xtask size --write-baseline`, `cargo xtask ci`.
-- No unsafe in `rufus-core`, no new dependencies, no async runtime.
+- All S22 verification commands must exit 0: `cargo test -p furus-core windows::`, `cargo test -p wimlib-sys`, `cargo xtask size --write-baseline`, `cargo xtask ci`.
+- No unsafe in `furus-core`, no new dependencies, no async runtime.

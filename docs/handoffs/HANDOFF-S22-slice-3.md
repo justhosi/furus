@@ -11,9 +11,9 @@ Non-blocking reviewer nits: `.mui` detection is name-only (doc wording slightly 
 
 ## Scope
 Only three source files:
-- `crates/rufus-core/src/windows/bcd.rs`
-- `crates/rufus-core/src/windows/boot_files.rs`
-- `crates/rufus-core/src/windows/to_go.rs`
+- `crates/furus-core/src/windows/bcd.rs`
+- `crates/furus-core/src/windows/boot_files.rs`
+- `crates/furus-core/src/windows/to_go.rs`
 
 The untracked handoff docs for slices 1–2 are NOT part of this slice's commit.
 
@@ -49,12 +49,12 @@ Main session fixed three unverified test bugs:
 
 ## Verification (main session; reviewer to re-run)
 - `cargo fmt --all -- --check` → 0
-- `cargo clippy -p rufus-core --all-targets -- -D warnings` → 0
-- `cargo test -p rufus-core --lib windows::` → 106 passed, 0 failed, 5 ignored
-- `cargo test -p rufus-core windows::` (all targets) → 0 failures
+- `cargo clippy -p furus-core --all-targets -- -D warnings` → 0
+- `cargo test -p furus-core --lib windows::` → 106 passed, 0 failed, 5 ignored
+- `cargo test -p furus-core windows::` (all targets) → 0 failures
 - targeted `objects_count_mismatch_refuses_promptly` → 1 passed in 0.00s (no hang)
 
 ## Next steps
 1. Reviewer verifies non-tautology, preserved error strings, unchanged fresh GUIDs, no unsafe/deps, and commits only the three source files.
-2. Slice 4/5: S22-T4 deterministic 500+ sequence randomized regf hive mutation property test in `crates/rufus-core/src/windows/regf.rs` (reparse + header checksum + `check_bins` after every step), fix any real bugs found.
+2. Slice 4/5: S22-T4 deterministic 500+ sequence randomized regf hive mutation property test in `crates/furus-core/src/windows/regf.rs` (reparse + header checksum + `check_bins` after every step), fix any real bugs found.
 3. Slice 5/5: TECHNICAL.md/DECISIONS.md updates, commit all handoff docs, `cargo xtask size --write-baseline`, full `cargo xtask ci`, then request explicit user permission before any publish.

@@ -8,15 +8,15 @@ permission. All three acceptance gates re-run by the reviewer pass.
 ## Scope (as landed — two source paths, plus docs)
 | Path | Change |
 |---|---|
-| `crates/rufus-gui/src/run.rs` | **new**, 952 lines: `Run` state machine, `StepLabel`, `CancelRequest`, `RunError`, helpers and 8 tests |
-| `crates/rufus-gui/src/lib.rs` | one line: `pub mod run;` |
+| `crates/furus-gui/src/run.rs` | **new**, 952 lines: `Run` state machine, `StepLabel`, `CancelRequest`, `RunError`, helpers and 8 tests |
+| `crates/furus-gui/src/lib.rs` | one line: `pub mod run;` |
 
 Docs in the same commit: `TECHNICAL.md` §3.8 (new slice-4 paragraph, narrowed
 "What S25 still owes", slice-4 coverage + gates), this file.
 
 **Out of scope / untouched:** the uncommitted slice-3 work in `Cargo.lock`,
-`crates/rufus-gui/Cargo.toml`, `crates/rufus-gui/src/ipc/mod.rs` and
-`crates/rufus-gui/src/ipc/dbus.rs`. Do not commit or revert it here.
+`crates/furus-gui/Cargo.toml`, `crates/furus-gui/src/ipc/mod.rs` and
+`crates/furus-gui/src/ipc/dbus.rs`. Do not commit or revert it here.
 
 ## What was done
 - `Run` owns one plan's lifecycle: `Idle --start()--> Confirming --confirm()-->
@@ -29,13 +29,13 @@ Docs in the same commit: `TECHNICAL.md` §3.8 (new slice-4 paragraph, narrowed
   returns `ConfirmationRequired` in `Idle`/`Confirming`, so START alone can
   never yield a runnable plan.
 - **Wire op labels.** `StepLabel::from_op` accepts exactly the seven
-  `rufus-helper` `op_tag` values `wipe/mklabel/mkpart/mkfs/write/bootloader/
+  `furus-helper` `op_tag` values `wipe/mklabel/mkpart/mkfs/write/bootloader/
   finalize` and renders `wipe/table/partition/format/write/bootloader/finalise`;
   an unknown tag keeps the last known label.
 - **Rate/ETA from an explicit clock.** `apply(&Event, Duration)` is the only
   input; no `Instant`, `SystemTime` or wall clock in the crate. Rate is `done`
   over the time since the step's first sample; ETA is remaining units at that
-  rate, both via `rufus_core::units`. `total: None`, zero elapsed and zero rate
+  rate, both via `furus_core::units`. `total: None`, zero elapsed and zero rate
   all yield `None`.
 - **Monotonic display.** Earlier-step and fewer-units samples are ignored;
   percent never decreases within a step (a step advance legitimately restarts
@@ -55,7 +55,7 @@ Docs in the same commit: `TECHNICAL.md` §3.8 (new slice-4 paragraph, narrowed
 
 ## Gotchas
 - `env -u APPDIR` is required for tests: this shell exports `APPDIR` at a
-  nonexistent AppImage asset dir, which breaks 7 unrelated `rufus-core` tests.
+  nonexistent AppImage asset dir, which breaks 7 unrelated `furus-core` tests.
   Do not edit `paths.rs`. `cargo` needs `PATH=/home/hosi/.cargo/bin:$PATH`.
 - `apply()` is a no-op unless the state is `Running`; do not try to feed events
   before `confirm()`.
@@ -65,9 +65,9 @@ Docs in the same commit: `TECHNICAL.md` §3.8 (new slice-4 paragraph, narrowed
 
 ## Verification (run in this tree)
 ```
-env -u APPDIR cargo test -p rufus-gui              # 74 + 7 + 0 passed, 0 failed
+env -u APPDIR cargo test -p furus-gui              # 74 + 7 + 0 passed, 0 failed
 cargo fmt --all -- --check                         # exit 0, clean
-env -u APPDIR cargo clippy -p rufus-gui --all-targets -- -D warnings  # exit 0, clean
+env -u APPDIR cargo clippy -p furus-gui --all-targets -- -D warnings  # exit 0, clean
 ```
 All 8 `run::tests` pass. No test opens a device, a display, a helper, pkexec,
 polkit or a bus; no `unsafe`, no async, no threads and no new dependency.

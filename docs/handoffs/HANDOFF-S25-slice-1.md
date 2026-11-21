@@ -13,16 +13,16 @@ thread/spawn/network code was added by the fix round.
 ## Scope (as landed — four paths)
 | Path | Change |
 |---|---|
-| `crates/rufus-proto/src/events.rs` | `LineError`, `Completion::check_version`, `from_jsonl_line`, 4 new tests (+175 lines) |
-| `crates/rufus-proto/src/lib.rs` | crate-root re-export of `LineError` and `from_jsonl_line` |
-| `crates/rufus-gui/src/ipc.rs` | **new**, 333 lines: `IpcError`, `CancelHandle`, `Started`, `EventStream`, `HelperTransport`, `MockTransport`, 6 tests |
-| `crates/rufus-gui/src/lib.rs` | one line: `pub mod ipc;` |
+| `crates/furus-proto/src/events.rs` | `LineError`, `Completion::check_version`, `from_jsonl_line`, 4 new tests (+175 lines) |
+| `crates/furus-proto/src/lib.rs` | crate-root re-export of `LineError` and `from_jsonl_line` |
+| `crates/furus-gui/src/ipc.rs` | **new**, 333 lines: `IpcError`, `CancelHandle`, `Started`, `EventStream`, `HelperTransport`, `MockTransport`, 6 tests |
+| `crates/furus-gui/src/lib.rs` | one line: `pub mod ipc;` |
 
 Docs in the same commit: `TECHNICAL.md` (§3.8 and the S25 coverage block),
 `DECISIONS.md` (dated S25 amendment, A9/A8), this file.
 
 ## What was done
-### The parser (shared, in `rufus-proto`)
+### The parser (shared, in `furus-proto`)
 - `from_jsonl_line(&str) -> Result<Event, LineError>` strips a trailing `\r`
   and surrounding ASCII whitespace, rejects the empty line, parses to
   `serde_json::Value`, names an unknown `kind` tag (`progress`, `log`, `done`
@@ -40,7 +40,7 @@ Docs in the same commit: `TECHNICAL.md` (§3.8 and the S25 coverage block),
   `"\u{0}"`, 8 MiB message → `Ok`, 4,096 nested `[` → `Json`, no panic or stack
   overflow) and one serialise→parse round trip per `Event` variant.
 
-### The seam (client, in `rufus-gui::ipc`)
+### The seam (client, in `furus-gui::ipc`)
 - `HelperTransport::start(&mut self, &Plan) -> Result<Started, IpcError>`;
   `Started { session, events, cancel }`; `events: EventStream` is a **blocking
   `Iterator<Item = Result<Event, IpcError>>`** (`impl Iterator`, not an inherent
@@ -58,17 +58,17 @@ Docs in the same commit: `TECHNICAL.md` (§3.8 and the S25 coverage block),
   and `assert_send::<EventStream>()` are pinned in a test.
 
 ## The two intended transports (not implemented yet)
-1. **pkexec reader thread** — `rufus-helper --plan <file> --progress jsonl`
+1. **pkexec reader thread** — `furus-helper --plan <file> --progress jsonl`
    spawned under `pkexec`; the child's stdout is read line by line on a plain
    `std::thread` and pushed through `from_jsonl_line`. `IpcError::Spawn`/
    `Unavailable` belong here.
-2. **zbus 6 client** — `org.rufuslinux.Helper1` on the system bus:
+2. **zbus 6 client** — `org.furuslinux.Helper1` on the system bus:
    `Execute(plan_json) -> session_id`, `Cancel(session_id)`, signals
    `progress`/`log`/`done`. zbus 6 has **no blocking API**, so the client must
    drive its proxy with `zbus::block_on` on its **own** thread (never on a
    runtime task — `zbus::block_on` panics if called from a task the runtime
-   drives; see the measured note in `crates/rufus-helper/src/dbus.rs`), then
-   feed events to the same `Iterator`. Adding `zbus` to `rufus-gui` is a
+   drives; see the measured note in `crates/furus-helper/src/dbus.rs`), then
+   feed events to the same `Iterator`. Adding `zbus` to `furus-gui` is a
    dependency decision for that slice, not taken here.
 
 ## What remains (slices 2–7)
@@ -88,16 +88,16 @@ Docs in the same commit: `TECHNICAL.md` (§3.8 and the S25 coverage block),
 ```
 cargo clippy --workspace --all-targets -- -D warnings   # exit 0, clean  (the round-1 blocker)
 cargo fmt --all -- --check                              # exit 0, clean
-cargo build -p rufus-gui                                # exit 0
-env -u APPDIR cargo test -p rufus-proto -p rufus-gui    # 21 + 36 + 7 passed, 0 failed
+cargo build -p furus-gui                                # exit 0
+env -u APPDIR cargo test -p furus-proto -p furus-gui    # 21 + 36 + 7 passed, 0 failed
 git status --porcelain                                  # only the four slice paths (+ docs)
 ```
 
 ## Gotchas
 - **`APPDIR` trap**: this shell exports `APPDIR=/tmp/.mount_DeepAIHbAgCA`, and
-  `rufus-core`'s `paths.rs` prefers `$APPDIR/usr/share/rufus-linux/assets`,
+  `furus-core`'s `paths.rs` prefers `$APPDIR/usr/share/furus-linux/assets`,
   which does not exist. That causes **7 pre-existing, environmental
-  `rufus-core` test failures** under `cargo test --workspace`. They are not
+  `furus-core` test failures** under `cargo test --workspace`. They are not
   slice regressions and `paths.rs` must not be touched: always run
   `env -u APPDIR cargo test …`.
 - `cargo` needs `PATH="$HOME/.cargo/bin:$PATH"` in this shell.

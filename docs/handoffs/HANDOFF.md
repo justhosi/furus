@@ -15,7 +15,7 @@ AND boot past 0xc0000001. Fixes found during testing still go through coder → 
 
 ## 2. Repository & commit state (CLEAN, do not re-do)
 
-- Repo: `/home/hosi/dev/REA-Rufus/furus`. `origin/main` = `083dffe`.
+- Repo: `/home/hosi/dev/REA-Furus/furus`. `origin/main` = `083dffe`.
 - HEAD = `b7ca5a9` — "fix: compute the Windows To Go apply capacity from the plan, not the volume"
   (Reviewed-by trailer, NOT pushed). Working tree CLEAN.
 - 5 UNPUSHED commits: `a417a83`, `f566798`, `74fb14d`, `de990c5`, `b7ca5a9`.
@@ -34,7 +34,7 @@ AND boot past 0xc0000001. Fixes found during testing still go through coder → 
 - p3 data 31.9G NTFS (`ebd0a0a2` type, GUID `796dfc6f-d7b7-443b-82d2-6a5dba19687c`), start sector
   239616, 66869214 sectors
 - Disk GUID `aab49039-87ff-4fd1-836f-c3d42b90cac9`
-- Written with `sudo -n systemd-inhibit --what=sleep:idle --mode=block ./target/release/rufus write --plan /tmp/opencode/wtg-plan.json --yes`
+- Written with `sudo -n systemd-inhibit --what=sleep:idle --mode=block ./target/release/furus write --plan /tmp/opencode/wtg-plan.json --yes`
   (the inhibit is REQUIRED — host suspend killed an earlier mid-mkfs write).
 
 **Image has been mutated during debugging** (all reversible; originals saved):
@@ -82,7 +82,7 @@ needs a host debugger). Do not sink more time here.
 ### Prime remaining hypothesis (ACTIVE — this is where the previous session stopped)
 
 The BCD **device element binary format** written by `partition_device()` in
-`crates/rufus-core/src/windows/bcd.rs` (line 477) may be WRONG. If bootmgr cannot parse the
+`crates/furus-core/src/windows/bcd.rs` (line 477) may be WRONG. If bootmgr cannot parse the
 partition device element, it can't locate the partition → 0xc0000001. Inspect:
 - `partition_device()` writes an 88-byte REG_BINARY: 16 zero bytes, **type 6** u32@0x10, zero@0x14,
   len 0x48 u32@0x18, zero@0x1C, then GPT: partition_guid 16B@0x20 + 8 zeros + disk_guid 16B@0x38.

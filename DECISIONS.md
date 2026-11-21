@@ -1,4 +1,4 @@
-# DECISIONS.md — Rufus for Linux (Rust rewrite), slice S00
+# DECISIONS.md — furus for Linux (Rust rewrite), slice S00
 
 Status of the plan: **approved in principle. Decision A4 is settled (approved
 2026-10-27): external tools are allowed.** Sections 1–3 are the S00 record as
@@ -16,18 +16,18 @@ A1–A12 is rejected, stop and revise the plan before S01.
 
 | ID | Decision | Value | Status | Rationale |
 |----|----------|-------|--------|-----------|
-| A1 | Licence | **GPL-3.0-or-later** | approved 2026-11-19 | Rufus is GPLv3; a derivative must stay GPLv3. |
-| A2 | Public name | **new name** (working name `rufus-linux`) | proposed | GPL covers code, not the "Rufus" trademark. Keep attribution, avoid confusion. |
+| A1 | Licence | **GPL-3.0-or-later** | approved 2026-11-19 | The original Windows utility is GPLv3; a derivative must stay GPLv3. |
+| A2 | Public name | **new name** (working name `furus-linux`) | proposed | GPL covers code, not the original utility's trademark. Keep attribution, avoid confusion. |
 | A3 | Targets | x86_64 + aarch64, glibc ≥ 2.31; static musl for CLI/helper | approved 2026-11-19 | Covers Debian 11+, Ubuntu 20.04+, Fedora, Arch, Raspberry Pi. |
 | A4 | External tools | **allowed** (approved 2026-10-27): `mke2fs`, `mkntfs`, `mkudffs`, behind a runtime check. FAT32/exFAT are written natively. | **approved 2026-10-27** | Pure-Rust ext4/NTFS/UDF writers are multi-year projects. |
 | A5 | C libraries | **wimlib** (LGPL-3.0-or-later) linked for WIM/ESD; optional `libext2fs` feature | approved 2026-11-19 | Only sane way to apply Windows images correctly. |
-| A6 | Assets | reuse Rufus's GPLv3 embedded assets, with provenance + licence audit (this slice's `LICENSES.md` and `assets/manifest.json`) | proposed | FreeDOS, Syslinux, GRUB4DOS, UEFI:NTFS, `rufus.loc`, icons. |
+| A6 | Assets | reuse the original utility's GPLv3 embedded assets, with provenance + licence audit (this slice's `LICENSES.md` and `assets/manifest.json`) | proposed | FreeDOS, Syslinux, GRUB4DOS, UEFI:NTFS, the upstream `.loc` database, icons. |
 | A7 | GUI | **Slint** (GPLv3), software renderer, no GPU, no webview, no GTK | proposed | Smallest native toolkit with this widget set; ~4–6 MB. |
 | A8 | Concurrency | threads + channels, **no async runtime** | proposed | Async buys nothing here; saves ~1 MB and startup time. |
 | A9 | Privilege | GUI never runs as root; a small helper does device writes | proposed | Matches Linux expectations and is testable. |
-| A10 | Config | TOML under `$XDG_CONFIG_HOME/rufus-linux/`, portable mode `./rufus.toml` | proposed | Replaces the Windows registry; no root needed. |
-| A11 | Locales | reuse `rufus.loc` (pollock format), English fallback | proposed | Keeps the 50+ existing translations. |
-| A12 | Telemetry | none; network only on explicit user action | proposed | Matches Rufus behaviour. |
+| A10 | Config | TOML under `$XDG_CONFIG_HOME/furus-linux/`, portable mode `./furus.toml` | proposed | Replaces the Windows registry; no root needed. |
+| A11 | Locales | reuse the upstream `.loc` database (pollock format), English fallback | proposed | Keeps the 50+ existing translations. |
+| A12 | Telemetry | none; network only on explicit user action | proposed | Matches the original utility's behaviour. |
 
 Note on A4: the runtime check behind A4 covers `mke2fs`, `mkntfs`, `mkudffs`
 with a clear package hint when absent. Wimlib linkage is recorded under **A5**,
@@ -35,11 +35,12 @@ not A4, and follows A5's status (approved 2026-11-19).
 
 ## 2. Trademark and naming
 
-The code is **GPLv3, so GPLv3 applies to this rewrite, but "Rufus" is a
-trademark of its author (Pete Batard / Akeo Consulting)**. Public distribution
-must therefore use a **different name**; attribution is kept and no name is
-chosen that suggests an official Rufus product. The **working name is
-`rufus-linux`** (decision A2) until the user picks one. The GPLv3
+The code is **GPLv3, so GPLv3 applies to this rewrite, but the original
+Windows utility's name is a trademark of its author (Pete Batard / Akeo
+Consulting)**. Public distribution must therefore use a **different name**;
+attribution is kept and no name is chosen that suggests an official product
+of the original utility. The **working name is `furus-linux`** (decision A2)
+until the user picks one. The GPLv3
 corresponding-source duty is honoured by keeping this repository public; the
 repository itself is the source offer.
 
@@ -73,11 +74,11 @@ check with a package hint. Measured against the tree at `618821c`:
 
 | Tool | Used for | Where |
 |---|---|---|
-| `mke2fs`, `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` | ext2/3/4 format | `crates/rufus-core/src/fs/ext.rs` |
+| `mke2fs`, `mkfs.ext2`, `mkfs.ext3`, `mkfs.ext4` | ext2/3/4 format | `crates/furus-core/src/fs/ext.rs` |
 | `e2fsck` | ext verification (`-f -n`) | same |
 | `debugfs` | ext persistence file write (`-w -R`) and read-back (`-R`) | same |
-| `mkntfs`, `mkfs.ntfs` | NTFS format | `crates/rufus-core/src/fs/ntfs.rs` |
-| `mkudffs`, `mkfs.udf` | UDF format | `crates/rufus-core/src/fs/udf.rs` |
+| `mkntfs`, `mkfs.ntfs` | NTFS format | `crates/furus-core/src/fs/ntfs.rs` |
+| `mkudffs`, `mkfs.udf` | UDF format | `crates/furus-core/src/fs/udf.rs` |
 
 The runtime tools above are also driven directly by the suites. The other
 external programs (`fsck.fat`, `fsck.exfat`, `dump.exfat`, `exfatlabel`,
@@ -102,8 +103,8 @@ values above is changed.
 * **A11 (Locales) — BCD only**: BCD store locale handling is now dynamic — a
   locale supplied from the applied tree (`.mui` detection) → the BCD-Template's
   `12000005` → `en-us`, written verbatim to all four locale sites. This is a BCD
-  implementation detail; the A11 GUI locale policy (`rufus.loc`, English
-  fallback) is unchanged.
+  implementation detail; the A11 GUI locale policy (upstream `.loc` database,
+  English fallback) is unchanged.
 * **A5/WIM apply**: the apply pre-flight reserves NTFS overhead —
   `required + max(64 MiB, required / 50)` — on both free-space checks before any
   write, because exact NTFS metadata/compression overhead cannot be predicted
@@ -118,17 +119,17 @@ These record where S23 put existing logic; none of the A1–A12 values above is
 changed and no dependency is added.
 
 * **Layering (A9/A7 support)**: provisional plan construction lives in
-  `rufus-core::planner`, not in a front end, so the CLI and the S24 Slint GUI
-  build the same `rufus_proto::Plan` from the same rules. `rufus-core` keeps its
-  hard boundary: it never depends on `rufus-linux` and never reads `/sys`.
+  `furus-core::planner`, not in a front end, so the CLI and the S24 Slint GUI
+  build the same `furus_proto::Plan` from the same rules. `furus-core` keeps its
+  hard boundary: it never depends on `furus-linux` and never reads `/sys`.
   Platform facts cross the boundary as pure data — a `planner::DeviceProbe`
-  filled by `rufus-linux::probe_device` (or `plan_device_ref` for a selected
+  filled by `furus-linux::probe_device` (or `plan_device_ref` for a selected
   `Device`), graded in core. `clap` stays a CLI-only concern: the CLI keeps a
   `ValueEnum` twin of the selector and converts at the call site.
 * **Wire contract (A8 support)**: `PLAN_VERSION` stays 6 and the plan JSON,
   the CLI flags and exit codes 0–7 are unchanged by the move; the builder's
   refusals are classified as `planner::PlanError` (`Device` → exit 2, `Safety` →
-  3, `Usage` → 1, `Confirm` → 4/`json`) and mapped back in `rufus-cli`.
+  3, `Usage` → 1, `Confirm` → 4/`json`) and mapped back in `furus-cli`.
 * **Module layout**: `pipeline::bootloader` is a directory of private arm
   submodules (`syslinux`, `grub2`, `grub4dos`, `dos_kolibri`, `uefi_ntfs`,
   `windows`) behind an unchanged `pub(crate)` surface (`Installed`,
@@ -152,9 +153,9 @@ A7-mandated toolkit is added.
   (`std`, `process`) purely to read the effective uid for A9, because `std`
   cannot do it without `unsafe`. Consequence accepted with the pin: the lock
   grows 102 → 567 packages and duplicates crates that cannot unify across
-  majors (`zbus` 5.19.0 for Slint next to `zbus` 6.2.0 for `rufus-helper`,
+  majors (`zbus` 5.19.0 for Slint next to `zbus` 6.2.0 for `furus-helper`,
   `rustix` 0.38.44/1.1.6, `thiserror` 1/2, `toml` 0.8/1.x), and the winit
-  backend drags in async plumbing (`zbus`'s `async-io`) that no `rufus-gui`
+  backend drags in async plumbing (`zbus`'s `async-io`) that no `furus-gui`
   code calls — there is still no `tokio`, no `async-std` and no `async` code in
   the crate, so A8 stands for our own code. The A7 planning estimate in
   section 1 (~4–6 MB) proved low: with the mandated feature set the release
@@ -169,13 +170,13 @@ A7-mandated toolkit is added.
   Windows-only and provably absent from the Linux graph. Six RUSTSEC
   advisories are scoped-ignored; all six are `informational = "unmaintained"`
   with `patched = []`, so no ignore hides a fixable vulnerability.
-* **No unsafe (contract 0.4.4), clarified**: `crates/rufus-gui/src/lib.rs`
+* **No unsafe (contract 0.4.4), clarified**: `crates/furus-gui/src/lib.rs`
   keeps `#![forbid(unsafe_code)]`; the binary target uses
   `#![deny(unsafe_code)]` because `slint::include_modules!()` emits
   `#[allow(unsafe_code)]` inside generated vtables and an `allow` under a
   crate-level `forbid` is a hard error (E0453). This is a narrowing of how the
   constraint is spelled, not of what it guarantees: there is no `unsafe` block
-  and no `#[allow(unsafe_code)]` in hand-written `rufus-gui` source, and the
+  and no `#[allow(unsafe_code)]` in hand-written `furus-gui` source, and the
   workspace `unsafe_code = "deny"` still rejects any that appears. Isolating
   `include_modules!()` in a second internal crate was rejected — it relocates
   the generated unsafe outside the audited crate and adds a workspace member
@@ -185,16 +186,16 @@ A7-mandated toolkit is added.
   split; there is no override flag or environment variable. `--version`,
   `--help`/`-h` short-circuit before both the Slint and the euid check, so they
   still work with no display (contract 0.4.6).
-* **Size (contract 0.4.8)**: no budget changed. Measured `rufus-gui` 284,008 →
-  11,541,312 bytes (budget 12,000,000) and `rufus-helper` 1,385,080 →
+* **Size (contract 0.4.8)**: no budget changed. Measured `furus-gui` 284,008 →
+  11,541,312 bytes (budget 12,000,000) and `furus-helper` 1,385,080 →
   1,405,992. The helper delta is cargo feature unification, established by
   measurement rather than assumed: the same tree built with
-  `-p rufus-helper` alone is 1,384,904 bytes, under `--workspace` 1,405,992,
+  `-p furus-helper` alone is 1,384,904 bytes, under `--workspace` 1,405,992,
   because `rustix` 1.1.6 is one package instance shared with the Slint/winit
   tree and gains `mm`, `shm`, `system` there. `size-baseline.json` was
-  refreshed with the measured values only; C3 and C4 then took `rufus-gui` to
+  refreshed with the measured values only; C3 and C4 then took `furus-gui` to
   11,566,272 (+24,960) and 11,602,240 (+35,968), the value at the S24 tip,
-  leaving 397,760 bytes of headroom, and `rufus` moved 1,810,200 → 1,809,576
+  leaving 397,760 bytes of headroom, and `furus` moved 1,810,200 → 1,809,576
   (−624) against the same lock refresh. `BINARY_BUDGETS` (3,000,000 /
   2,500,000 / 12,000,000) is unchanged.
 
@@ -203,22 +204,22 @@ A7-mandated toolkit is added.
 These record where the client half of the helper wire contract lives; none of
 the A1–A12 values above is changed and no dependency is added.
 
-* **A9 (privilege split) — client-side wire parsing lives in `rufus-proto`**:
+* **A9 (privilege split) — client-side wire parsing lives in `furus-proto`**:
   the helper emits one JSONL `Event` per line (`--plan … --progress jsonl`) and
-  the same three events as D-Bus signals (`org.rufuslinux.Helper1`:
+  the same three events as D-Bus signals (`org.furuslinux.Helper1`:
   `Execute`/`Cancel` plus `progress`/`log`/`done`), so *reading* that stream is
   a client concern while its *contract* is shared by both halves of the split.
   `events::from_jsonl_line` and `events::LineError` therefore live in
-  `rufus-proto` next to the types they parse, re-exported from its crate root
-  (`rufus_proto::{from_jsonl_line, LineError}`), instead of being re-implemented
-  in `rufus-gui` or owned by the privileged helper: the client keeps no tag list
+  `furus-proto` next to the types they parse, re-exported from its crate root
+  (`furus_proto::{from_jsonl_line, LineError}`), instead of being re-implemented
+  in `furus-gui` or owned by the privileged helper: the client keeps no tag list
   of its own, so the two halves cannot disagree about what a valid line is.
   Adding an `Event` variant remains a schema change that bumps
   `EVENT_STREAM_VERSION`, and `Completion::check_version` is the single home of
   that rule (the shared parser applies it to every `Done` line; only newer
   streams are refused).
 * **A8 (threads + channels, no async runtime), restated for the seam**:
-  `rufus-gui::ipc` exposes a sync `HelperTransport::start` returning a blocking
+  `furus-gui::ipc` exposes a sync `HelperTransport::start` returning a blocking
   `Iterator` of events plus a `CancelHandle`, so both intended transports fit
   with no executor — the pkexec child's stdout is read on a plain
   `std::thread`, and a zbus 6 client (async-only, no blocking API) drives its
@@ -251,7 +252,7 @@ A1–A12 value changes and no dependency is added.
   (`new()`/`Default`) always uses the constant.
 * **A9 — the plan file is user-private and swept narrowly**: the plan handed to
   the privileged helper is written to `std::env::temp_dir()` as
-  `rufus-plan-<gui-pid>-<counter>-<nanos>.json`, created with `create_new(true)`
+  `furus-plan-<gui-pid>-<counter>-<nanos>.json`, created with `create_new(true)`
   and mode `0600`, and removed on every exit path. Because it lives in a
   world-writable directory, the constructor sweep deletes a file only when it
   (a) parses as that canonical name, (b) is a regular file, not a symlink,
@@ -271,7 +272,7 @@ tree already ships. Only these three status cells change; their values and
 rationales in section 1 are unchanged, and no other A-number is touched.
 
 * **A1 (Licence) — GPL-3.0-or-later, approved**: the rewrite is GPL-3.0-or-later,
-  as upstream Rufus is GPLv3 and a derivative must stay GPLv3. This is not a new
+  as the original Windows utility is GPLv3 and a derivative must stay GPLv3. This is not a new
   commitment: `LICENSES.md`'s audit of all 86 embedded assets already records
   that baseline, and `deny.toml` already accepts only the `GPL-3.0-only`
   copyleft branch of the tri-licensed Slint crates (pinned to `=1.19.0`), never
@@ -298,8 +299,8 @@ rationales in section 1 are unchanged, and no other A-number is touched.
 
 * **A2 and A6–A12 remain proposed and are outside S26's authorization.**
   Ratifying them would require user decisions that were never given — the
-  public name (A2) specifically still awaits the user, because "Rufus" is a
-  trademark and only the user can pick the release name. Consequently the
+  public name (A2) specifically still awaits the user, because the original
+  utility's name is a trademark and only the user can pick the release name. Consequently the
   specification's broad phrase "no unratified S00 architecture items
   remaining" is not literally achievable without fabricating those decisions;
   after S26 the accurate statement is that A1, A3, A4 and A5 are approved and

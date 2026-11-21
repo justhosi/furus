@@ -6,7 +6,7 @@
 
 # HANDOFF — furus/ repo, S27 COMPLETE (final state)
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, HEAD `fa4a0d7`
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, HEAD `fa4a0d7`
 (`ci(qa): install QA tools and run xtask qa on push and PR`). All three S27
 slices are implemented, reviewed and **committed locally — nothing has been
 pushed**. This file is self-contained for a fresh context.

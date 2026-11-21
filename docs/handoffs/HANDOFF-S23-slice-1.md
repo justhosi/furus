@@ -13,7 +13,7 @@ on-disk bootloader behaviour, no exit-code change.
 ## Commit map
 | Commit | Subject |
 |---|---|
-| `06b8e26` | `refactor: extract the shared plan builder into rufus-core` (S23-T1) |
+| `06b8e26` | `refactor: extract the shared plan builder into furus-core` (S23-T1) |
 | `254f866` | `refactor: split the bootloader pipeline into arm submodules` (S23-T2) |
 | `ef2cbfa` | `docs: reconcile bad-blocks with the full-format path` (S23-T3) |
 | `c7832cd` | `fix: restore the bootloader module tree and drop the empty test module` (review fix, on top of `ef2cbfa`) |
@@ -21,24 +21,24 @@ on-disk bootloader behaviour, no exit-code change.
 
 ## What was done
 
-### T1 — shared planner (`crates/rufus-core/src/planner/mod.rs`, 1,186 lines)
-`rufus-cli`'s plan builder (`plan.rs`, 1,162 lines) and its image preamble moved
-into `rufus-core` so the S24 Slint GUI can build the same `Plan`:
+### T1 — shared planner (`crates/furus-core/src/planner/mod.rs`, 1,186 lines)
+`furus-cli`'s plan builder (`plan.rs`, 1,162 lines) and its image preamble moved
+into `furus-core` so the S24 Slint GUI can build the same `Plan`:
 
 * `BootloaderOpt` (`mode()`, `layout()`), `Options`, `write_mode()`, `steps()`,
   `build()` — logic and refusal strings are the pre-extraction ones, verified
-  token-for-token against `git show 3545058:crates/rufus-cli/src/plan.rs`.
-* `DeviceProbe`/`DeviceFacts` replace the direct `rufus_linux::enumerate` call:
-  `rufus-core` only grades the facts, `rufus-linux` fills them
-  (`probe_device(path, sysfs)`, `plan_device_ref(&Device)`). `rufus-core` still
-  does not depend on `rufus-linux`.
-* `PlanError { Device, Safety, Usage, Confirm }` replaces `rufus_cli::Fail`
+  token-for-token against `git show 3545058:crates/furus-cli/src/plan.rs`.
+* `DeviceProbe`/`DeviceFacts` replace the direct `furus_linux::enumerate` call:
+  `furus-core` only grades the facts, `furus-linux` fills them
+  (`probe_device(path, sysfs)`, `plan_device_ref(&Device)`). `furus-core` still
+  does not depend on `furus-linux`.
+* `PlanError { Device, Safety, Usage, Confirm }` replaces `furus_cli::Fail`
   inside the builder; `main.rs::fail_from_plan` maps it to exit 2/3/1/4 with the
   same `device`/`safety`/`usage`/`json` kinds.
-* Image inspection moved to `rufus_core::image::{inspect, file_size,
-  detect_file}` → `ImageInfo`; `crates/rufus-cli/src/image.rs` is a 9-line
+* Image inspection moved to `furus_core::image::{inspect, file_size,
+  detect_file}` → `ImageInfo`; `crates/furus-cli/src/image.rs` is a 9-line
   re-export surface keeping the `image_size` spelling.
-* `crates/rufus-cli/src/plan.rs` is 85 lines: the `clap::ValueEnum` twin plus
+* `crates/furus-cli/src/plan.rs` is 85 lines: the `clap::ValueEnum` twin plus
   `From<BootloaderOpt> for CoreBootloaderOpt` and one test that walks all ten
   variants.
 
@@ -72,24 +72,24 @@ that finishes before table/partition/format. Pinned by
 ## Verification (reviewer, at the committed tip)
 * `cargo fmt --all --check` — clean.
 * `cargo clippy --workspace --all-targets -- -D warnings` — clean.
-* `cargo test --workspace` — 1,747 passed / 0 failed / 29 ignored; `rufus-core`
-  lib 1,316 passed / 6 ignored. `cargo test -p rufus-core --lib -- --list`
+* `cargo test --workspace` — 1,747 passed / 0 failed / 29 ignored; `furus-core`
+  lib 1,316 passed / 6 ignored. `cargo test -p furus-core --lib -- --list`
   shows 61 `pipeline::bootloader` tests (52 unit + 5 `end_to_end` + 4
   `end_to_end::qemu_boot`); the 4 QEMU tests run — 3 pass
   (`syslinux_407_…`, `freedos_…`, `grub2_bios_…`) and
   `grub4dos_boots_to_its_prompt_in_qemu` stays `#[ignore]`d behind
-  `RUFUS_TEST_GRLDR` exactly as before the split.
+  `FURUS_TEST_GRLDR` exactly as before the split.
 * `cargo xtask parity --check` — 2,709 rows, S23 = 42, data fresh.
-* `cargo xtask ci` — `ci: all gates passed`; assets 86/86; size rufus
+* `cargo xtask ci` — `ci: all gates passed`; assets 86/86; size furus
   1,810,200 / helper 1,385,080 / gui 284,008, all within budget, matching the
   refreshed baseline; `cargo-deny`/`cargo-audit` SKIPped (not installed).
 * All of the above were run with
   `export PATH="$HOME/.cargo/bin:$PATH"` and
-  `export RUFUS_ASSETS="$PWD/assets/resources"`. The variable is a *runtime*
-  asset override (`rufus_core::paths`); the test suites resolve fixtures through
+  `export FURUS_ASSETS="$PWD/assets/resources"`. The variable is a *runtime*
+  asset override (`furus_core::paths`); the test suites resolve fixtures through
   `CARGO_MANIFEST_DIR/../../assets/resources` and do not need it, so a bare
   `cargo test` works too.
-* `cargo doc -p rufus-core --no-deps` — 225 pre-existing warnings; the only new
+* `cargo doc -p furus-core --no-deps` — 225 pre-existing warnings; the only new
   one is `pipeline/mkfs.rs:23` (`[`Wipe`](super::wipe::run)` links to a private
   item), the same warning class `badblocks.rs:19` has carried since S09. Doc
   warnings are not gated.
@@ -116,10 +116,10 @@ that finishes before table/partition/format. Pinned by
 ## Next steps
 1. Published: `main` pushed to `origin` at `f12be17` by the publisher under the
    user's explicit S23 publish permission.
-2. S24 (Slint GUI) can now call `rufus_core::planner` directly:
-   `Options` + `BootloaderOpt` from the form, `rufus_linux::plan_device_ref` for
+2. S24 (Slint GUI) can now call `furus_core::planner` directly:
+   `Options` + `BootloaderOpt` from the form, `furus_linux::plan_device_ref` for
    a selected `Device` (or `probe_device` for a typed path), and
-   `rufus_core::image::inspect` for the image — no rule has to be duplicated.
+   `furus_core::image::inspect` for the image — no rule has to be duplicated.
 3. Open follow-ups, all non-blocking: give `qemu.rs` a real `//!` module doc
    (its header is still a `///` block attached to the first `use`); make
    `mkfs.rs:23`'s `Wipe` link point at a public item (or use plain backticks);

@@ -1,6 +1,6 @@
 # S30 — slice 3/4: CHANGELOG + release checklist
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD `3d49f33`.
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, base HEAD `3d49f33`.
 cargo/rustc 1.99.0 lives in `~/.cargo/bin`; prefix cargo commands with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
 
@@ -21,8 +21,8 @@ Documentation only — no source, workflow, dependency or size-baseline changes.
 1. **NEW `CHANGELOG.md`** (repo root) — short Keep-a-Changelog-style file with
    one `## [0.1.0]` section. It summarizes the capabilities actually present in
    the tree (native FAT32/exFAT; NTFS/ext/UDF via external tools; MBR/GPT; UEFI
-   + Legacy BIOS Windows To Go; Slint GUI; privileged `rufus-helper` over D-Bus
-   with a pkexec transport; `rufus` CLI + `rufus-proto`; `cargo xtask dist`/`qa`)
+   + Legacy BIOS Windows To Go; Slint GUI; privileged `furus-helper` over D-Bus
+   with a pkexec transport; `furus` CLI + `furus-proto`; `cargo xtask dist`/`qa`)
    and the release-workflow readiness from slice 1. Notes record the dormant A12
    config fields and that hardware acceptance is a manual maintainer sign-off.
    No release date or future promise is asserted.
@@ -30,9 +30,9 @@ Documentation only — no source, workflow, dependency or size-baseline changes.
    checklist. Before tagging: export PATH, `cargo xtask ci`, `cargo xtask qa`,
    `cargo xtask dist`, `sha256sum -c SHA256SUMS`, and inspect tarball/`.deb`
    contents with the expected `/usr/bin`, `/usr/libexec` and `/usr/share` layout.
-   Hardware acceptance: launch `rufus-gui` on a real X11/Wayland desktop and
+   Hardware acceptance: launch `furus-gui` on a real X11/Wayland desktop and
    confirm the device list populates and USB plug/unplug hotplug is reflected;
-   flash a 32 GB Linux hybrid ISO via pkexec/D-Bus `rufus-helper` and boot it on
+   flash a 32 GB Linux hybrid ISO via pkexec/D-Bus `furus-helper` and boot it on
    real hardware (UEFI and Legacy BIOS where applicable); flash a Windows 11
    installer and a Windows To Go image to 32 GB USB and verify UEFI + Legacy
    BIOS boot on real hardware. A lead note states plainly that these need

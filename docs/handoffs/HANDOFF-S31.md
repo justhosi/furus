@@ -1,6 +1,6 @@
 # S31 — Native RPM/Arch packages in the release workflow — FINAL HANDOFF (3/4 complete; slice 4 dispatch/push pending)
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`. cargo/rustc 1.99.0 lives
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`. cargo/rustc 1.99.0 lives
 in `~/.cargo/bin`; prefix cargo commands with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
 
@@ -18,8 +18,8 @@ are untouched (decision A12 stays **proposed**).
 
 | Slice | Commit | Scope |
 |---|---|---|
-| 1/4 | `dd891b4` | Parameterized `packaging/rpm/rufus.spec` (`rpmbuild --define 'rufus_version …' --define 'rufus_target …'`, defaults `0.1.0` / `x86_64-unknown-linux-gnu`; Fedora-correct deps `wimlib`, `polkit`, `fontconfig`, `ntfs-3g`, `e2fsprogs`, `udftools`, no Debian-only `libwim15`; `%global debug_package %{nil}`) and `packaging/arch/PKGBUILD` (env `rufus_version` / `_target`, **not** `pkgver`, which makepkg unsets; `sha256sums=('SKIP')`; `options=(!strip)`; polkit/fontconfig `optdepends`). All ten install paths preserved. xtask RPM validator now requires `wimlib`; the deb validator keeps `libwim15` (correct for Debian) and the Arch validator is unchanged. |
-| 2/4 | `467559a` | `.github/workflows/release.yml` refactored from 2 jobs into a 4-job DAG: `build` (ubuntu-latest, `contents: read`, `xtask ci`→`qa`→`dist`, uploads `target/dist/`, emits `version`/`target` outputs) → parallel `package-rpm` (fedora:latest, `contents: read`, `rpmbuild` with the two defines, `rpm -qlp`/`rpm -qpR` ten-path checks, uploads `*.rpm`) and `package-arch` (archlinux:latest, `contents: read`, non-root builder, env `rufus_version`/`_target` `makepkg`, `tar --zstd -tf` ten-path checks, uploads `*.pkg.tar.zst`) → `publish` (needs all three, sole `contents: write`, downloads `pattern: '*'` + `merge-multiple: true`, regenerates ONE unified `SHA256SUMS` over `.tar.gz`/`.deb`/`.rpm`/`.pkg.tar.zst`, `sha256sum -c` gate, then `gh release create "$TAG" --title "$TAG" --generate-notes --repo "${{ github.repository }}"` … with `GH_TOKEN`, guarded by `if: github.event_name == 'push' \|\| inputs.publish`). New `workflow_dispatch` boolean input `publish` (default `false`) so manual dry runs do not publish. The exact `--repo "${{ github.repository }}"` is the user-mandated fix for the prior v0.1.0 `fatal: not a git repository` failure. No checkout in `publish`; no Rust compiled in the container jobs. |
+| 1/4 | `dd891b4` | Parameterized `packaging/rpm/furus.spec` (`rpmbuild --define 'furus_version …' --define 'furus_target …'`, defaults `0.1.0` / `x86_64-unknown-linux-gnu`; Fedora-correct deps `wimlib`, `polkit`, `fontconfig`, `ntfs-3g`, `e2fsprogs`, `udftools`, no Debian-only `libwim15`; `%global debug_package %{nil}`) and `packaging/arch/PKGBUILD` (env `furus_version` / `_target`, **not** `pkgver`, which makepkg unsets; `sha256sums=('SKIP')`; `options=(!strip)`; polkit/fontconfig `optdepends`). All ten install paths preserved. xtask RPM validator now requires `wimlib`; the deb validator keeps `libwim15` (correct for Debian) and the Arch validator is unchanged. |
+| 2/4 | `467559a` | `.github/workflows/release.yml` refactored from 2 jobs into a 4-job DAG: `build` (ubuntu-latest, `contents: read`, `xtask ci`→`qa`→`dist`, uploads `target/dist/`, emits `version`/`target` outputs) → parallel `package-rpm` (fedora:latest, `contents: read`, `rpmbuild` with the two defines, `rpm -qlp`/`rpm -qpR` ten-path checks, uploads `*.rpm`) and `package-arch` (archlinux:latest, `contents: read`, non-root builder, env `furus_version`/`_target` `makepkg`, `tar --zstd -tf` ten-path checks, uploads `*.pkg.tar.zst`) → `publish` (needs all three, sole `contents: write`, downloads `pattern: '*'` + `merge-multiple: true`, regenerates ONE unified `SHA256SUMS` over `.tar.gz`/`.deb`/`.rpm`/`.pkg.tar.zst`, `sha256sum -c` gate, then `gh release create "$TAG" --title "$TAG" --generate-notes --repo "${{ github.repository }}"` … with `GH_TOKEN`, guarded by `if: github.event_name == 'push' \|\| inputs.publish`). New `workflow_dispatch` boolean input `publish` (default `false`) so manual dry runs do not publish. The exact `--repo "${{ github.repository }}"` is the user-mandated fix for the prior v0.1.0 `fatal: not a git repository` failure. No checkout in `publish`; no Rust compiled in the container jobs. |
 | 3/4 | this documentation commit (HEAD at S31 close) | `README.md` (release-assets/install subsection with the three exact one-line commands, plus a complete S31 slice-matrix row that notes the workflow has not run end-to-end), `packaging/README.md` (same three commands; RPM metadata corrected from `libwim15` to `wimlib`; note that RPM/Arch packages are now CI-built from the dist tarball), `TECHNICAL.md` (S31 design section), and this final handoff. No source, Cargo manifest, `.github/workflows/`, `size-baseline.json`, `DECISIONS.md`, spec/PKGBUILD or slice-1/slice-2 handoff was touched. |
 | 4/4 | pending (slice 4) | Reviewer commits slice 3; publisher pushes **`main` only — NO tag**; slice 4 runs a `workflow_dispatch` dry run (`publish: false`) and reports the exact artifact filenames. This row is not yet complete. |
 
@@ -29,10 +29,10 @@ push; **no tag is pushed as part of S31**.
 ## What landed (detail lives in the per-slice handoffs)
 
 * **Slice 1 — offline/native recipes.** Both recipes build a ready-to-install
-  binary package entirely from the pre-built `target/dist/<triple>/rufus-<version>-<triple>.tar.gz`,
+  binary package entirely from the pre-built `target/dist/<triple>/furus-<version>-<triple>.tar.gz`,
   with no Rust recompilation and no rpmbuild/makepkg warnings or errors. RPM is
   parameterized with `--define` macros (with safe defaults, so a plain
-  `rpmbuild -bb` still works); Arch is parameterized with `rufus_version` and
+  `rpmbuild -bb` still works); Arch is parameterized with `furus_version` and
   `_target` environment variables because makepkg unsets `pkgver` before
   sourcing the PKGBUILD. `sha256sums=('SKIP')` is intentional (the workflow
   verifies the tarball first), and `options=(!strip)` / `%global debug_package
@@ -58,8 +58,8 @@ host step, reboot, network action, tag push or release publish was used in this
 slice.
 
 * `cargo xtask ci` → **exit 0, `ci: all gates passed`**. Sizes unchanged and
-  within the committed baseline allowance (`rufus` 1,810,152 B,
-  `rufus-helper` 1,406,296 B, `rufus-gui` 12,774,280 B). The packaging contract
+  within the committed baseline allowance (`furus` 1,810,152 B,
+  `furus-helper` 1,406,296 B, `furus-gui` 12,774,280 B). The packaging contract
   still passes with the new `wimlib` token in the RPM validator; the deb
   validator still requires `libwim15` (correct for Debian). `SKIP (not
   installed): cargo-audit` is pre-existing and reported as a skip, not a
@@ -127,11 +127,11 @@ tracked step below.
   `docs/RELEASE-CHECKLIST.md`; CI does not perform them. Do not claim them as
   verified here.
 * **Arch/RPM version-target overrides differ.** RPM takes `--define` macros;
-  Arch takes `rufus_version`/`_target` env vars, never `pkgver`. `_target`
+  Arch takes `furus_version`/`_target` env vars, never `pkgver`. `_target`
   selects the tarball, not the package architecture, and RPM `BuildArch` is
   still hardcoded to `x86_64` (aarch64 is a separate, out-of-scope change).
-* **License paths differ.** RPM uses `usr/share/licenses/rufus/LICENSES.md`,
-  Arch uses `usr/share/licenses/rufus-linux/LICENSES.md`; the smoke-check loops
+* **License paths differ.** RPM uses `usr/share/licenses/furus/LICENSES.md`,
+  Arch uses `usr/share/licenses/furus-linux/LICENSES.md`; the smoke-check loops
   account for this.
 * **Stale historical lines.** `HANDOFF-S31-slice-1.md` and
   `HANDOFF-S31-slice-2.md` still say "not committed, not pushed" and "not run",
@@ -147,7 +147,7 @@ tracked step below.
    all four jobs build and verify their artifacts and that **no** GitHub release
    is created.
 4. Slice 4 reports the exact artifact filenames produced (for example
-   `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`, the `.deb`, the `.rpm` and the
+   `furus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`, the `.deb`, the `.rpm` and the
    `.pkg.tar.zst`), and confirms the unified `SHA256SUMS` lists all of them.
 5. Only after explicit user permission does a real publish happen; a real tag
    push is a separate, explicit decision and is **not** part of S31.

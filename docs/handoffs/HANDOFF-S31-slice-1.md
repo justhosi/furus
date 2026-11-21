@@ -1,6 +1,6 @@
 # S31 — slice 1/4: offline/local RPM + Arch recipes from the dist tarball
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD `aab6f79`
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, base HEAD `aab6f79`
 (`aab6f7965776e84e8ec5242012d2617bbe72370f`).
 cargo/rustc 1.99.0 lives in `~/.cargo/bin`; prefix cargo commands with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
@@ -14,41 +14,41 @@ slice can wire them into offline/local CI. **Nothing was committed or pushed.**
 
 ### Command executed
 
-Make `packaging/rpm/rufus.spec` and `packaging/arch/PKGBUILD` build a
+Make `packaging/rpm/furus.spec` and `packaging/arch/PKGBUILD` build a
 ready-to-install binary package entirely from the pre-built
-`target/dist/<triple>/rufus-<version>-<triple>.tar.gz` emitted by
+`target/dist/<triple>/furus-<version>-<triple>.tar.gz` emitted by
 `cargo xtask dist`, with no Rust recompilation and no rpmbuild/makepkg
 warnings or errors. Update the one xtask validator whose token contract has to
 change. Record this handoff.
 
 ### Exact changes (only these four files)
 
-1. **`packaging/rpm/rufus.spec`** (modified)
+1. **`packaging/rpm/furus.spec`** (modified)
    - Added overridable macros with safe defaults:
-     `%{!?rufus_version:%global rufus_version 0.1.0}` and
-     `%{!?rufus_target:%global rufus_target x86_64-unknown-linux-gnu}`.
+     `%{!?furus_version:%global furus_version 0.1.0}` and
+     `%{!?furus_target:%global furus_target x86_64-unknown-linux-gnu}`.
      Both are set *before* spec parsing by
-     `rpmbuild --define 'rufus_version X' --define 'rufus_target T'`, so the
+     `rpmbuild --define 'furus_version X' --define 'furus_target T'`, so the
      defaults fire only when the define is absent.
-   - `Version: %{rufus_version}`; `%global dist_target %{rufus_target}`;
-     `Source0: rufus-%{version}-%{dist_target}.tar.gz` still names the exact
-     dist tarball. `%setup -q -c -n rufus-%{version}` and all ten `install -D`
+   - `Version: %{furus_version}`; `%global dist_target %{furus_target}`;
+     `Source0: furus-%{version}-%{dist_target}.tar.gz` still names the exact
+     dist tarball. `%setup -q -c -n furus-%{version}` and all ten `install -D`
      lines and all ten `%files` entries are unchanged.
    - `Recommends:` now reads
      `ntfs-3g, e2fsprogs, udftools, wimlib, polkit, fontconfig` — Fedora-correct
      names; Debian-only `libwim15` is gone (also updated in `%description`).
      The three originally required tokens stay on the `Recommends:` line.
    - Added `%global debug_package %{nil}`. Without it Fedora 45 / RPM 6.1
-     auto-generates a `rufus-debugsource` subpackage whose `debugsourcefiles.list`
+     auto-generates a `furus-debugsource` subpackage whose `debugsourcefiles.list`
      is empty (the dist binaries carry no debuginfo), which is a **fatal**
      `error: Empty %files file`. Disabling it is correct here: nothing is
      recompiled, so there is no debuginfo to split out.
    - `BuildArch: x86_64` is unchanged (see Gotchas).
 2. **`packaging/arch/PKGBUILD`** (modified)
-   - `pkgver=${rufus_version:-0.1.0}`. It deliberately does **not** read the
+   - `pkgver=${furus_version:-0.1.0}`. It deliberately does **not** read the
      `pkgver` environment variable: `/usr/bin/makepkg:1252` unsets `pkgver`
      (a `pkgbuild_schema_strings` name) before sourcing PKGBUILD, so
-     `pkgver=${pkgver:-...}` silently falls back to the default. `rufus_version`
+     `pkgver=${pkgver:-...}` silently falls back to the default. `furus_version`
      is a non-schema name and also matches the RPM recipe's override name.
    - `_target=${_target:-x86_64-unknown-linux-gnu}` (already present) keeps
      selecting the dist tarball; `_target` is not unset by makepkg and its
@@ -82,16 +82,16 @@ All from the repo root with `export PATH="$HOME/.cargo/bin:$PATH"` unless noted.
 
 1. `cargo xtask ci` → **exit 0; `ci: all gates passed`**. Notable lines:
    `contract: all identifiers match the single source of truth` (including
-   `PASS packaging/arch/PKGBUILD` and `PASS packaging/rpm/rufus.spec` for
-   `/usr/libexec/rufus-helper`), `size: within committed baseline allowance,
+   `PASS packaging/arch/PKGBUILD` and `PASS packaging/rpm/furus.spec` for
+   `/usr/libexec/furus-helper`), `size: within committed baseline allowance,
    all budgets OK`, `advisories ok, bans ok, licenses ok, sources ok`.
    `SKIP (not installed): cargo-audit` is pre-existing in this environment and
-   treated as a skip, not a failure. Size numbers unchanged: rufus 1,810,152 B,
-   rufus-helper 1,406,296 B, rufus-gui 12,774,280 B.
+   treated as a skip, not a failure. Size numbers unchanged: furus 1,810,152 B,
+   furus-helper 1,406,296 B, furus-gui 12,774,280 B.
 2. `cargo xtask dist` → **exit 0**. Output includes
    `dist: validated 11 packaging files` (so the updated RPM validator passes
    against the real spec), and
-   `dist: wrote .../target/dist/x86_64-unknown-linux-gnu/rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`.
+   `dist: wrote .../target/dist/x86_64-unknown-linux-gnu/furus-0.1.0-x86_64-unknown-linux-gnu.tar.gz`.
    `skip .deb: dpkg-deb not available` locally (pre-existing; the release
    workflow installs `dpkg`). Tarball SHA256 before and after a second dist run
    was identical: `835947d600402c060fbcde8e3eae0d27e0f2c67132c6f5d41e3ed213f23fcc7d`
@@ -103,29 +103,29 @@ All from the repo root with `export PATH="$HOME/.cargo/bin:$PATH"` unless noted.
    T=/tmp/opencode/s31-arch-test
    rm -rf "$T"; mkdir -p "$T"
    cp packaging/arch/PKGBUILD "$T/"
-   cp target/dist/x86_64-unknown-linux-gnu/rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz "$T/"
+   cp target/dist/x86_64-unknown-linux-gnu/furus-0.1.0-x86_64-unknown-linux-gnu.tar.gz "$T/"
    cd "$T"
    makepkg -f --noconfirm --skipchecksums
    ```
 
-   → **exit 0**, `Making package: rufus-linux 0.1.0-1`,
-   `Finished making: rufus-linux 0.1.0-1`, produced
-   `rufus-linux-0.1.0-1-x86_64.pkg.tar.zst`. No gdb-add-index errors. The single
+   → **exit 0**, `Making package: furus-linux 0.1.0-1`,
+   `Finished making: furus-linux 0.1.0-1`, produced
+   `furus-linux-0.1.0-1-x86_64.pkg.tar.zst`. No gdb-add-index errors. The single
    `WARNING: Skipping verification of source file checksums` comes only from the
    explicit `--skipchecksums` flag; a separate run with plain
    `makepkg -f --noconfirm` also exited 0 with **no warnings at all**, because
    `sha256sums=('SKIP')` is present. `tar --zstd -tf` confirmed all ten paths:
-   `usr/bin/rufus`, `usr/bin/rufus-gui`, `usr/libexec/rufus-helper`,
-   `usr/share/polkit-1/actions/org.rufuslinux.policy`,
-   `usr/share/dbus-1/system-services/org.rufuslinux.Helper1.service`,
-   `usr/share/dbus-1/system.d/org.rufuslinux.Helper1.conf`,
-   `usr/share/applications/org.rufuslinux.Rufus.desktop`,
-   `usr/share/metainfo/org.rufuslinux.Rufus.metainfo.xml`,
-   `usr/share/icons/hicolor/scalable/apps/org.rufuslinux.Rufus.svg`,
-   `usr/share/licenses/rufus-linux/LICENSES.md`.
+   `usr/bin/furus`, `usr/bin/furus-gui`, `usr/libexec/furus-helper`,
+   `usr/share/polkit-1/actions/org.furuslinux.policy`,
+   `usr/share/dbus-1/system-services/org.furuslinux.Helper1.service`,
+   `usr/share/dbus-1/system.d/org.furuslinux.Helper1.conf`,
+   `usr/share/applications/org.furuslinux.Furus.desktop`,
+   `usr/share/metainfo/org.furuslinux.Furus.metainfo.xml`,
+   `usr/share/icons/hicolor/scalable/apps/org.furuslinux.Furus.svg`,
+   `usr/share/licenses/furus-linux/LICENSES.md`.
    `.PKGINFO` confirms `pkgver = 0.1.0-1` and all seven `optdepend` entries.
-   Override checks: `rufus_version=9.9.9 _target=x86_64-unknown-linux-gnu
-   makepkg -f --noconfirm --skipchecksums` produced `rufus-linux-9.9.9-1-x86_64.pkg.tar.zst`;
+   Override checks: `furus_version=9.9.9 _target=x86_64-unknown-linux-gnu
+   makepkg -f --noconfirm --skipchecksums` produced `furus-linux-9.9.9-1-x86_64.pkg.tar.zst`;
    `_target=aarch64-unknown-linux-gnu` successfully consumed a tarball renamed
    to that target (see Gotchas for the produced package arch).
 4. Fedora RPM test in Docker (daemon 29.9.2, `fedora:latest` pulled —
@@ -135,36 +135,36 @@ All from the repo root with `export PATH="$HOME/.cargo/bin:$PATH"` unless noted.
    docker run -d --name s31-fedora fedora:latest sleep 3600
    docker exec s31-fedora dnf install -y rpm-build tar gzip
    mkdir -p /work/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-   # docker cp packaging/rpm/rufus.spec -> /work/SPECS/rufus.spec
+   # docker cp packaging/rpm/furus.spec -> /work/SPECS/furus.spec
    # docker cp the dist .tar.gz          -> /work/SOURCES/
    docker exec s31-fedora rpmbuild -bb --define '_topdir /work' \
-     --define 'rufus_version 0.1.0' \
-     --define 'rufus_target x86_64-unknown-linux-gnu' /work/SPECS/rufus.spec
+     --define 'furus_version 0.1.0' \
+     --define 'furus_target x86_64-unknown-linux-gnu' /work/SPECS/furus.spec
    ```
 
-   → **exit 0**, `Wrote: /work/RPMS/x86_64/rufus-0.1.0-1.fc45.x86_64.rpm`.
+   → **exit 0**, `Wrote: /work/RPMS/x86_64/furus-0.1.0-1.fc45.x86_64.rpm`.
    A grep for genuine `warning:` / `error:` / `RPM build errors` lines returned
    `(none)`; `check-files` reported no unpackaged files. No `cargo`/`rustc`/
    `Compiling` line appears anywhere in the build log — the `%build` section is
    only comments, so there is zero Rust recompilation.
    `rpm -qlp` listed exactly the same ten paths as the Arch package (with the
-   RPM license path `usr/share/licenses/rufus/LICENSES.md`).
+   RPM license path `usr/share/licenses/furus/LICENSES.md`).
    `rpm -qpR` shows `glibc >= 2.31` plus ELF-derived needs including
    `libfontconfig.so.1` and `libwim.so.15`; `rpm -qp --recommends` shows exactly
    `e2fsprogs fontconfig ntfs-3g polkit udftools wimlib` — no `libwim15`.
    Re-running with no `--define` produced the same default
-   `rufus-0.1.0-1.fc45.x86_64.rpm`; re-running with
-   `--define 'rufus_version 9.9.9'` produced `rufus-9.9.9-1.fc45.x86_64.rpm`,
+   `furus-0.1.0-1.fc45.x86_64.rpm`; re-running with
+   `--define 'furus_version 9.9.9'` produced `furus-9.9.9-1.fc45.x86_64.rpm`,
    confirming both override paths.
 5. `git diff --check` → clean (no output, exit 0).
 
 ### Gotchas
 
-- **Arch override variable is `rufus_version`, not `pkgver`.** makepkg unsets
+- **Arch override variable is `furus_version`, not `pkgver`.** makepkg unsets
   `pkgver` before sourcing the PKGBUILD, so `pkgver=... makepkg ...` is silently
-  ignored. Slice 2 must set `rufus_version` and `_target` in the environment.
+  ignored. Slice 2 must set `furus_version` and `_target` in the environment.
 - **RPM overrides are `--define`, not env vars.** Use
-  `--define 'rufus_version <v>' --define 'rufus_target <triple>'`; plain
+  `--define 'furus_version <v>' --define 'furus_target <triple>'`; plain
   `rpmbuild -bb` still works via the safe defaults.
 - **`BuildArch` is still hardcoded to `x86_64`.** Version and target are
   parameterized, but architecture is not. An aarch64 RPM still needs the spec
@@ -199,5 +199,5 @@ All from the repo root with `export PATH="$HOME/.cargo/bin:$PATH"` unless noted.
 3. Slice 3/4 is expected to update the documentation (including
    `packaging/README.md`, which still says `libwim15` for RPM — not touched here
    because it is out of scope). Slice 4/4 handles publication.
-4. If a later change adds a `rufus_arch` define, revisit `BuildArch` and the
+4. If a later change adds a `furus_arch` define, revisit `BuildArch` and the
    aarch64 path; nothing in this slice assumed cross-compilation.

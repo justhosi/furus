@@ -13,10 +13,10 @@ introduced by the fix round.
 ## Scope (as landed — four source paths)
 | Path | Change |
 |---|---|
-| `crates/rufus-gui/src/ipc.rs` | **deleted** (333 lines) — split into the module below, byte-identical outside the two added lines |
-| `crates/rufus-gui/src/ipc/mod.rs` | **new**, 341 lines: the slice-1 seam verbatim, plus `pub mod pkexec`, the `PkexecTransport` re-export and the blocking-`start` contract on the trait |
-| `crates/rufus-gui/src/ipc/pkexec.rs` | **new**, 1,042 lines: `PkexecTransport` (spawn, readers, timeout, cancel, terminal synthesis, temp-plan sweep) and 13 tests |
-| `crates/rufus-proto/src/lib.rs` | `Plan::to_json` (writes `confirm` verbatim) + 2 tests |
+| `crates/furus-gui/src/ipc.rs` | **deleted** (333 lines) — split into the module below, byte-identical outside the two added lines |
+| `crates/furus-gui/src/ipc/mod.rs` | **new**, 341 lines: the slice-1 seam verbatim, plus `pub mod pkexec`, the `PkexecTransport` re-export and the blocking-`start` contract on the trait |
+| `crates/furus-gui/src/ipc/pkexec.rs` | **new**, 1,042 lines: `PkexecTransport` (spawn, readers, timeout, cancel, terminal synthesis, temp-plan sweep) and 13 tests |
+| `crates/furus-proto/src/lib.rs` | `Plan::to_json` (writes `confirm` verbatim) + 2 tests |
 
 Docs in the same commit: `TECHNICAL.md` (§3.8, including the sentence that
 wrongly claimed no transport ships), `DECISIONS.md` (two S25 slice-2
@@ -25,11 +25,11 @@ amendments), this file.
 ## What was done
 ### The transport
 - `PkexecTransport::new()` / `Default` spawn
-  `<program> <prefix…> rufus-helper --plan <file> --progress jsonl` with only
+  `<program> <prefix…> furus-helper --plan <file> --progress jsonl` with only
   stdout and stderr piped; the production prefix is empty, so the real command
-  is `pkexec rufus-helper …`.
-- stdout is read line by line on a `rufus-helper-stdout` thread through the
-  shared `from_jsonl_line`; stderr on a `rufus-helper-stderr` thread; both feed
+  is `pkexec furus-helper …`.
+- stdout is read line by line on a `furus-helper-stdout` thread through the
+  shared `from_jsonl_line`; stderr on a `furus-helper-stderr` thread; both feed
   the existing `EventStream`, so session demultiplexing, the exactly-one-`Done`
   rule and `IpcError::Protocol` are unchanged.
 - **Blocking `start()`**: `first_message` applies one `recv_timeout` over a
@@ -49,7 +49,7 @@ amendments), this file.
 - **stderr**: capped at the **last** 8 KiB (`STDERR_LIMIT`), `from_utf8_lossy`
   + `escape_debug`, tail-truncated at a `char` boundary, appended to the
   synthesised message — control bytes never reach the UI raw.
-- **Temp plan**: `Plan::to_json` → `$TMPDIR/rufus-plan-<gui-pid>-<counter>-
+- **Temp plan**: `Plan::to_json` → `$TMPDIR/furus-plan-<gui-pid>-<counter>-
   <nanos>.json` via `create_new(true)` + mode `0600`; removed before the
   terminal event, on reader error, on timeout, on spawn failure and on `Drop`.
 - **Sweep**: every constructor removes only *canonical-name, regular-file,
@@ -69,12 +69,12 @@ amendments), this file.
 | 6 | temp plans survive abnormal death | the constructor sweep above, with a test proving a dead-pid file is removed and a live-pid file is preserved. |
 
 ## What slices 3–7 still owe
-- **The D-Bus client** (`org.rufuslinux.Helper1`): zbus 6 has no blocking API, so
+- **The D-Bus client** (`org.furuslinux.Helper1`): zbus 6 has no blocking API, so
   it must drive its proxy with `zbus::block_on` on its **own** thread. Two
   mappings are still unwritten: `done` carries no stream version (supply
   `Completion.version` from `EVENT_STREAM_VERSION`, or grow the signal), and
   `progress` sends `total: i64`/`percent: i16` (`None`/`-1` conventions) where
-  JSONL uses `Option<u64>`/`Option<u8>`. Adding `zbus` to `rufus-gui` is a
+  JSONL uses `Option<u64>`/`Option<u8>`. Adding `zbus` to `furus-gui` is a
   dependency decision for that slice.
 - **Wiring**: nothing in the UI calls a transport yet — START still only
   *describes* a plan. A polkit-gated start, a real cancel button and
@@ -89,9 +89,9 @@ amendments), this file.
 ```
 cargo clippy --workspace --all-targets -- -D warnings   # exit 0, clean
 cargo fmt --all -- --check                              # exit 0, clean
-cargo build -p rufus-gui                                # exit 0
-env -u APPDIR cargo test -p rufus-proto -p rufus-gui    # 23 + 49 + 7 passed, 0 failed
-ls /tmp/rufus-plan-*                                    # prints nothing
+cargo build -p furus-gui                                # exit 0
+env -u APPDIR cargo test -p furus-proto -p furus-gui    # 23 + 49 + 7 passed, 0 failed
+ls /tmp/furus-plan-*                                    # prints nothing
 git status --porcelain --untracked-files=all            # only the four slice paths (+ docs)
 ```
 The 13 transport tests spawn `/bin/sh -c` stubs only; none invokes pkexec,
@@ -99,9 +99,9 @@ polkit, the bus, a display or a device.
 
 ## Gotchas
 - **`APPDIR` trap**: this shell exports `APPDIR=/tmp/.mount_DeepAIHbAgCA`, and
-  `rufus-core`'s `paths.rs` prefers `$APPDIR/usr/share/rufus-linux/assets`,
+  `furus-core`'s `paths.rs` prefers `$APPDIR/usr/share/furus-linux/assets`,
   which does not exist. That causes **7 pre-existing, environmental
-  `rufus-core` test failures** under `cargo test --workspace`. They are not
+  `furus-core` test failures** under `cargo test --workspace`. They are not
   slice regressions and `paths.rs` must not be touched: always run
   `env -u APPDIR cargo test …`.
 - `cargo` needs `PATH="$HOME/.cargo/bin:$PATH"` in this shell.
@@ -112,7 +112,7 @@ polkit, the bus, a display or a device.
 - **The sweep is a delete loop in a world-writable directory.** Do not widen it:
   the canonical-name parse, the regular-file (no-symlink) check, the
   owner + mode `0600` check and the `/proc/<pid>/stat` gone-or-zombie proof are
-  each load-bearing. Never remove "any `rufus-plan-*`".
+  each load-bearing. Never remove "any `furus-plan-*`".
 - The transport tests share one process temp dir and assert on
   `prefixed_plan_files()`, so they all take a `TEST_LOCK`; new tests must take
   it too or they will flake against each other.

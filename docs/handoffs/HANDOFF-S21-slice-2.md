@@ -2,7 +2,7 @@
 
 ## Status
 Committed locally as `5b9e585` (`test: assert BIOS BCD parity with the UEFI store`).
-Only `crates/rufus-core/src/windows/bcd.rs` changed (+141 lines, test module only).
+Only `crates/furus-core/src/windows/bcd.rs` changed (+141 lines, test module only).
 NOT pushed. (Pushing requires explicit user permission — Publisher's job.)
 
 ## What was done
@@ -20,8 +20,8 @@ NOT pushed. (Pushing requires explicit user permission — Publisher's job.)
 
 ## Verification
 - `cargo fmt --all -- --check` → 0
-- `cargo clippy -p rufus-core --all-targets -- -D warnings` → 0
-- `cargo test -p rufus-core --lib` → 1276 passed, 0 failed, 6 ignored
+- `cargo clippy -p furus-core --all-targets -- -D warnings` → 0
+- `cargo test -p furus-core --lib` → 1276 passed, 0 failed, 6 ignored
 - `cargo test ... windows::bcd::tests::bios_bcd_has_parity_with_uefi_bcd --exact` → 1 passed
 
 ## Next steps

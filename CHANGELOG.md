@@ -6,8 +6,8 @@ is `0.1.0` (see `Cargo.toml`); no release date is recorded here.
 
 ## [0.1.0]
 
-Initial, in-progress implementation of `furus`, a clean Rust rewrite of Rufus
-for Linux. Capabilities present in this version:
+Initial, in-progress implementation of `furus`, a clean Rust rewrite of the
+original Windows utility for Linux. Capabilities present in this version:
 
 ### Added
 
@@ -17,13 +17,13 @@ for Linux. Capabilities present in this version:
 - UEFI and Legacy BIOS Windows To Go: GPT layout, WIM apply via wimlib, BCD
   stores for both firmware types built without Windows tools, and offline
   `SanPolicy=4`.
-- `rufus-gui`, an unprivileged Slint desktop front end with device discovery
+- `furus-gui`, an unprivileged Slint desktop front end with device discovery
   and hotplug, image analysis, a confirmation-gated write flow and progress UI.
-- `rufus-helper`, the privileged write helper exposed over D-Bus with a pkexec
+- `furus-helper`, the privileged write helper exposed over D-Bus with a pkexec
   transport, so the GUI never runs as root; polkit and D-Bus policy files live
   under `packaging/`.
-- The `rufus` CLI (version, checksum, analyze, plan, list, write) and the shared
-  `rufus-proto` plan/progress contract.
+- The `furus` CLI (version, checksum, analyze, plan, list, write) and the shared
+  `furus-proto` plan/progress contract.
 - `cargo xtask dist` (deterministic tarball, a `.deb` where `dpkg-deb` exists,
   and `SHA256SUMS`) and `cargo xtask qa` (the two-tier automated QA gate).
 - Tag-triggered `.github/workflows/release.yml`: on a `v*` tag it builds via

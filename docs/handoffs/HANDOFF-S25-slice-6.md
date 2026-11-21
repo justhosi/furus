@@ -6,7 +6,7 @@ change and no doc change from the coder; the reviewer added the `TECHNICAL.md`
 note and this handoff.
 
 ## What was done
-- New headless engine `crates/rufus-gui/src/checksum.rs`, exported with one
+- New headless engine `crates/furus-gui/src/checksum.rs`, exported with one
   `pub mod checksum;` line in `lib.rs`. It owns the four streaming digests,
   incremental progress, one-shot cancellation and the stale-result guard.
 - `main.rs` gained the checksum session state, an event-loop dispatcher, the
@@ -23,7 +23,7 @@ note and this handoff.
   `checksum(&GuiState)` note path was removed from the GUI (no `show_checksum`,
   no import, no `self.note` write). The core function itself is untouched.
 - **Real hashing only.** All four digests come from
-  `rufus_core::hash::hash_reader` with `Algo::{Md5,Sha1,Sha256,Sha512}` (the
+  `furus_core::hash::hash_reader` with `Algo::{Md5,Sha1,Sha256,Sha512}` (the
   same 1 MiB-chunk loop as the core). No hand-rolled hash, no new crate, no
   `unsafe`, no async, no network.
 - **Progress is derived from `4 x file length`** (four passes over the file). A
@@ -41,7 +41,7 @@ note and this handoff.
   property, not written to `self.note` or appended to the global status text.
 
 ## Verification
-- Headless only: `env -u APPDIR cargo test -p rufus-gui` passes 81 library
+- Headless only: `env -u APPDIR cargo test -p furus-gui` passes 81 library
   (incl. 7 new checksum tests) + 13 binary (incl. 1 formatter test), 0 failed.
   `cargo fmt --all -- --check` clean;
   `env -u APPDIR cargo clippy --workspace --all-targets -- -D warnings` exit 0.

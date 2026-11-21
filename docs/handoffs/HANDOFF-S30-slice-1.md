@@ -1,6 +1,6 @@
 # S30 — slice 1/4: tag-triggered release workflow
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD `a00a537`.
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, base HEAD `a00a537`.
 cargo/rustc 1.99.0 lives in `~/.cargo/bin`; prefix cargo commands with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
 

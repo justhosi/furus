@@ -7,7 +7,7 @@ already committed at `75563b4`; S27-T3 (CI wiring in `.github/workflows/ci.yml`)
 is the remaining slice. The coder touched only the five in-scope files below;
 `xtask/src/main.rs` and `.github/workflows/ci.yml` were deliberately untouched.
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`. `cargo`/`rustc` 1.99.0
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`. `cargo`/`rustc` 1.99.0
 live in `~/.cargo/bin`; prefix cargo commands with
 `PATH="$HOME/.cargo/bin:$PATH"`. Nothing was committed or pushed — do neither
 without explicit user permission.
@@ -29,7 +29,7 @@ without explicit user permission.
 - `TECHNICAL.md`: appended `## S27 — Automated QA gate (\`cargo xtask qa\`)`
   with T1–T3 scope, data flow, and every decision/trade-off: reuse of existing
   suites (root cause is automation, not missing functionality), no
-  `rufus-core` dependency in `xtask`, the hand-assembled 512-byte MBR with a
+  `furus-core` dependency in `xtask`, the hand-assembled 512-byte MBR with a
   COM1 marker versus VGA capture, OVMF delegation to the existing
   `uefi_ntfs_boot` harness, strict deadline + `ChildGuard` kill/reap against
   CI hangs, `APPDIR` removal at spawn, parity ledger intentionally unchanged,

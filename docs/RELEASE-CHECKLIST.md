@@ -44,7 +44,7 @@ GitHub release.
    cargo xtask dist
    ```
 
-   It prints the output directory. Expect one `rufus-*.tar.gz`, one `rufus-*.deb`
+   It prints the output directory. Expect one `furus-*.tar.gz`, one `furus-*.deb`
    (only where `dpkg-deb` is installed), and `SHA256SUMS` under
    `target/dist/<triple>/`. `<triple>` is a placeholder — replace it with the
    host Rust target triple the command reports, for example
@@ -63,12 +63,12 @@ GitHub release.
    `<triple>` as above:
 
    ```
-   tar -tzf rufus-<version>-<triple>.tar.gz
-   dpkg-deb -c rufus-<version>-<triple>.deb
+   tar -tzf furus-<version>-<triple>.tar.gz
+   dpkg-deb -c furus-<version>-<triple>.deb
    ```
 
-   Confirm the staged layout: the CLI and GUI at `/usr/bin/rufus` and
-   `/usr/bin/rufus-gui`, the privileged helper at `/usr/libexec/rufus-helper`,
+   Confirm the staged layout: the CLI and GUI at `/usr/bin/furus` and
+   `/usr/bin/furus-gui`, the privileged helper at `/usr/libexec/furus-helper`,
    and the polkit policy, D-Bus files, desktop entry, AppStream metainfo, icon
    and licence texts under `/usr/share`. If `dpkg-deb` is unavailable, the
    `.deb` step is skipped — note that on the sign-off rather than assuming it
@@ -80,12 +80,12 @@ These need a real machine and a real USB drive. Record the hardware, firmware
 mode and result for each item. Where a mode does not apply to the machine or
 image, mark it N/A with the reason.
 
-1. **GUI on a real desktop.** Launch `rufus-gui` on a real X11 or Wayland
+1. **GUI on a real desktop.** Launch `furus-gui` on a real X11 or Wayland
    desktop. Confirm the window renders and the device list populates. Insert a
    USB stick while the window is open — it must appear in the list — then remove
    it — it must disappear. That confirms plug/unplug hotplug is reflected.
 2. **Linux hybrid ISO → boot.** Flash a 32 GB USB drive with a Linux hybrid ISO
-   through `rufus-gui`, which runs the privileged `rufus-helper` via
+   through `furus-gui`, which runs the privileged `furus-helper` via
    pkexec/D-Bus (approve the polkit prompt). Boot the stick on real hardware in
    UEFI mode, and in Legacy BIOS mode where the machine supports it. Confirm it
    reaches the distro's boot menu in each mode.

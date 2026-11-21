@@ -1,6 +1,6 @@
 # S30 — Release workflow / A12 dormancy / v0.1.0 readiness — FINAL HANDOFF (4/4 complete)
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`. cargo/rustc 1.99.0 lives
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`. cargo/rustc 1.99.0 lives
 in `~/.cargo/bin`; prefix cargo commands with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
 
@@ -16,7 +16,7 @@ changes no runtime behaviour, no wire format, no dependency and no binary size.
 | Slice | Commit | Scope |
 |---|---|---|
 | 1/4 | `eff1b70` | NEW `.github/workflows/release.yml`: `v*` tag push or manual dispatch with required `tag` input; read-only `build` job mirrors `ci.yml` (pinned actions, Rust 1.99.0, rustfmt/clippy, cargo-deny 0.20.2, cargo-audit 0.22.2, full apt incl. S28 headers + OVMF shim, plus `dpkg`) and runs `ci` → `qa` → `dist`, uploading `target/dist/`; separate `release` job (the only `contents: write` job) flattens `*.tar.gz` / `*.deb` / `SHA256SUMS`, runs `sha256sum -c SHA256SUMS`, then `gh release create` with the built-in token. |
-| 2/4 | `3d49f33` | `check_updates` / `update_channel` declared dormant schema-compatibility no-ops in `README.md` and `crates/rufus-core/src/config.rs` doc comments (behaviour, types, defaults, serde and tests untouched). Stale root `HANDOFF.md` archived to `docs/handoffs/HANDOFF-root-S27-archive.md`; `packaging/README.md` link repointed. A12 stays **proposed**; zero telemetry/network code. |
+| 2/4 | `3d49f33` | `check_updates` / `update_channel` declared dormant schema-compatibility no-ops in `README.md` and `crates/furus-core/src/config.rs` doc comments (behaviour, types, defaults, serde and tests untouched). Stale root `HANDOFF.md` archived to `docs/handoffs/HANDOFF-root-S27-archive.md`; `packaging/README.md` link repointed. A12 stays **proposed**; zero telemetry/network code. |
 | 3/4 | `6aa51b5` | NEW `CHANGELOG.md` (v0.1.0) and NEW `docs/RELEASE-CHECKLIST.md` with pre-tag automated gates and physical USB / real-hardware acceptance as a **manual maintainer sign-off** (not CI-verified). |
 | 4/4 | this documentation commit (HEAD at S30 close) | `TECHNICAL.md` S30 wrap-up (release workflow, dist/SHA256SUMS, conditional `.deb`, dormant A12, verification, unchanged sizes) and this final handoff. No source, `Cargo.toml`, CI, `size-baseline.json`, `DECISIONS.md`, `README.md`, `CHANGELOG.md`, release checklist or slice 1–3 file touched. |
 
@@ -68,7 +68,7 @@ host step, reboot, network action, tag push or release publish was used.
   0 failed; 6 ignored` in the core suite); `==> assets --check` `86 entries, 86
   files verified`; `==> parity --check` `2709 data rows`; `==> contract --check`
   green; `==> size` `within committed baseline allowance, all budgets OK`
-  (`rufus: 1810152 / 3000000`, `rufus-helper: 1406296 / 2500000`, `rufus-gui:
+  (`furus: 1810152 / 3000000`, `furus-helper: 1406296 / 2500000`, `furus-gui:
   12774280 / 14000000`); `==> cargo-deny` `advisories ok, bans ok, licenses ok,
   sources ok`; `SKIP (not installed): cargo-audit`. Non-fatal
   `warning[duplicate]` lines from `Cargo.lock` appeared during the deny step.
@@ -82,13 +82,13 @@ host step, reboot, network action, tag push or release publish was used.
   GRUB4DOS, 29.61 s), `tier2/uefi-ntfs-ovmf` (1 passed, 17.76 s).
 * `cargo xtask dist` → **exit 0**. Output directory:
   `target/dist/x86_64-unknown-linux-gnu/`. Tarball produced:
-  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz` (staging tree at
+  `furus-0.1.0-x86_64-unknown-linux-gnu.tar.gz` (staging tree at
   `target/dist-staging/x86_64-unknown-linux-gnu/`). No `.deb` locally —
   `skip .deb: dpkg-deb not available`. `SHA256SUMS` contained one line,
-  `<64-hex digest>  rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz` (two spaces,
+  `<64-hex digest>  furus-0.1.0-x86_64-unknown-linux-gnu.tar.gz` (two spaces,
   bare filename, no path component); run from the dist directory,
   `sha256sum -c SHA256SUMS` printed
-  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz: OK` (exit 0).
+  `furus-0.1.0-x86_64-unknown-linux-gnu.tar.gz: OK` (exit 0).
 * `cargo fmt --all -- --check` → **exit 0**, clean.
 * `git diff --check` → clean (no output, exit 0). After this docs edit,
   `git status --short` shows **only the two in-scope paths**:

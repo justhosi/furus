@@ -2,7 +2,7 @@
 
 ## Status
 Committed as `2f7889a` (`feat: reserve NTFS overhead in the WIM apply pre-flight`).
-One file: `crates/rufus-core/src/windows/apply.rs` (+279/−10). NOT pushed.
+One file: `crates/furus-core/src/windows/apply.rs` (+279/−10). NOT pushed.
 
 ## What was done
 - Added private `required_with_ntfs_overhead(required: u64) -> u64` = `required.saturating_add(max(64 * 1024 * 1024, required / 50))` — 64 MiB floor or 2% slack, whichever is larger, plus the payload total; saturating, no panic path.
@@ -19,9 +19,9 @@ One file: `crates/rufus-core/src/windows/apply.rs` (+279/−10). NOT pushed.
 
 ## Verification (all passed)
 - `cargo fmt --all -- --check` → 0 (no other files reformatted)
-- `cargo clippy -p rufus-core --all-targets -- -D warnings` → 0
-- `cargo test -p rufus-core --lib windows::apply` → 19 passed, 0 failed
-- `cargo test --workspace` → green (rufus-core lib 1285 passed / 6 ignored; all other suites green)
+- `cargo clippy -p furus-core --all-targets -- -D warnings` → 0
+- `cargo test -p furus-core --lib windows::apply` → 19 passed, 0 failed
+- `cargo test --workspace` → green (furus-core lib 1285 passed / 6 ignored; all other suites green)
 
 ## Remaining / exact next steps
 1. Slice 3/5 (S22-T1): dynamic locale discovery in `bcd.rs`/`boot_files.rs`, template `Description\Type` fallback resolver, `to_go.rs` wiring, de-DE/custom-GUID tests.
@@ -29,5 +29,5 @@ One file: `crates/rufus-core/src/windows/apply.rs` (+279/−10). NOT pushed.
 3. Slice 5/5: docs, size baseline, full CI gate, then ask before publishing.
 
 ## Acceptance criteria still open
-- `cargo test -p rufus-core windows::`, `cargo test -p wimlib-sys`, `cargo xtask size --write-baseline`, `cargo xtask ci` all exit 0.
+- `cargo test -p furus-core windows::`, `cargo test -p wimlib-sys`, `cargo xtask size --write-baseline`, `cargo xtask ci` all exit 0.
 - No unsafe in core, no new dependencies, no async runtime.

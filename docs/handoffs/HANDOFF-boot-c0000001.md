@@ -11,7 +11,7 @@
 - **Goal:** the rebuilt Windows To Go image must boot past the `0xc0000001` recovery
   screen under QEMU/OVMF **without any manual Microsoft-side repair** (no WinPE
   `bcdedit`/`chkdsk`/`bcdboot`).
-- **Acceptance:** `./target/release/rufus write --plan ...` produces an image that boots
+- **Acceptance:** `./target/release/furus write --plan ...` produces an image that boots
   into Windows OOBE ("Getting ready") in the standard QEMU harness, with no `0xc0000001`.
 - Secondary acceptance: all code fixes go through `coder` → `reviewer` slices, one
   command at a time, tagged `Slice N/M`; `TECHNICAL.md` and handoff docs stay current;
@@ -44,7 +44,7 @@ repointed `{bootmgr}` `23000003`/`24000001`/`23000006` + `en-us` casing + `GuidC
 
 ## 3. Git / slice state
 
-- Repo: `/home/hosi/dev/REA-Rufus/furus` (the top-level `REA-Rufus` dir is NOT a git repo).
+- Repo: `/home/hosi/dev/REA-Furus/furus` (the top-level `REA-Furus` dir is NOT a git repo).
 - HEAD = **`c9832de`**. Commits made this campaign:
   - `3921d51` `feat: pass the partition geometry to mkntfs so it writes a bootable VBR`
   - `c9832de` `feat: hand the planned partition start to the ntfs mkfs arm`
@@ -123,7 +123,7 @@ and `Recovery`.
 ## 7. Tooling gotchas (learned the hard way)
 
 - `export PATH="$HOME/.cargo/bin:$PATH"`; binary is built with `cargo build --release -p
-  rufus-cli` (binary `target/release/rufus`); **`-p rufus` does not exist**.
+  furus-cli` (binary `target/release/furus`); **`-p furus` does not exist**.
 - No `xxd` — use `od -A x -t x1z`. `convert`, `tesseract` available. `hivexsh`/`chntpw` not.
 - Python scripts must run from `/home/hosi` (stray `/tmp/opencode/struct.py` shadows stdlib
   when a script lives in `/tmp/opencode`). A stray model-pricing banner may print — ignore.
@@ -146,7 +146,7 @@ and `Recovery`.
 - FAT32 ESP gets dirty after a hard QEMU `quit` → Linux vfat `Input/output error`. Fix:
   `umount /mnt/esp2`, `fsck.vfat -n /dev/loop1p1`, remount ro.
 - Rebuild command:
-  `sudo -n systemd-inhibit --what=sleep:idle --mode=block ./target/release/rufus write --plan /tmp/opencode/wtg-plan.json --yes`
+  `sudo -n systemd-inhibit --what=sleep:idle --mode=block ./target/release/furus write --plan /tmp/opencode/wtg-plan.json --yes`
   (inhibit is REQUIRED — host suspend once killed a mid-mkfs run).
 
 ---
@@ -171,7 +171,7 @@ and `Recovery`.
 2. **Identify the minimal change** to `windows/bcd.rs` that makes our store behave like
    bcdboot's. Likely: create a fresh OS loader object + resume object (with device
    elements) and repoint `{bootmgr}`'s `23000003`/`24000001`/`23000006`, instead of reusing
-   the BCD-Template's `{b012b84d}`/`{0c334284}` objects. Read `crates/rufus-core/src/windows/bcd.rs`
+   the BCD-Template's `{b012b84d}`/`{0c334284}` objects. Read `crates/furus-core/src/windows/bcd.rs`
    (1897 lines): `build_store` (~line 575+), `StoreRequest`, `partition_device`, and the
    module doc (~lines 41-75, 192-205). Call site: `windows/to_go.rs` (~294-299) —
    `Request.identity` comes from `pipeline/bootloader/windows.rs::windows_identity`, using

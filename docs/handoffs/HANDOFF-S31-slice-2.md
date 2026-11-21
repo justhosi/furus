@@ -1,6 +1,6 @@
 # S31 — slice 2/4: four-job release workflow (RPM + Arch + guarded publish)
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, base HEAD
 `dd891b4f55278c86b970d21bf2ef93d246b794c2`. cargo/rustc 1.99.0 live in
 `~/.cargo/bin`; prefix cargo commands with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
@@ -34,20 +34,20 @@ handoff.
      `ea165f8d…` with `if-no-files-found: error`). Added `outputs.version` /
      `outputs.target` from a new `id: dist-info` step that reads the one dist
      tarball: `target` = `rustc -vV` host triple (what `xtask dist` used),
-     `version` = tarball stem minus `rufus-` and `-<target>`. Fails if the
+     `version` = tarball stem minus `furus-` and `-<target>`. Fails if the
      tarball count is not exactly one or either value cannot be derived.
    - New `package-rpm` (`container: fedora:latest`, `needs: build`,
      `contents: read`): `dnf install rpm-build tar gzip git`, checkout, download
      `dist`, copy tarball to `~/rpmbuild/SOURCES/`, run
-     `rpmbuild -bb --define "rufus_version $RUFUS_VERSION" --define
-     "rufus_target $RUFUS_TARGET" packaging/rpm/rufus.spec`, assert all ten RPM
+     `rpmbuild -bb --define "furus_version $FURUS_VERSION" --define
+     "furus_target $FURUS_TARGET" packaging/rpm/furus.spec`, assert all ten RPM
      paths via `rpm -qlp`, print `rpm -qpR` and `rpm -qp --recommends`, upload
      only `out/*.rpm` with `if-no-files-found: error`.
    - New `package-arch` (`container: archlinux:latest`, `needs: build`,
      `contents: read`): `pacman -Syu` + `base-devel zstd tar git`, checkout,
      download `dist`, create non-root `builder`, copy `PKGBUILD` + tarball into
      `/work` and chown it, run as builder
-     `rufus_version=… _target=… makepkg -f --noconfirm --skipchecksums`, assert
+     `furus_version=… _target=… makepkg -f --noconfirm --skipchecksums`, assert
      the ten Arch paths via `tar --zstd -tf`, upload only `out/*.pkg.tar.zst`
      with `if-no-files-found: error`.
    - `release` → `publish`: `needs: [build, package-rpm, package-arch]`,
@@ -91,24 +91,24 @@ and depend only on `build`, not on each other.
 ### Interface details used from slice 1
 
 - **RPM overrides are `--define` macros**, passed on the `rpmbuild` command:
-  `--define "rufus_version <VERSION>" --define "rufus_target <TARGET>"`. The
+  `--define "furus_version <VERSION>" --define "furus_target <TARGET>"`. The
   spec has safe defaults (`0.1.0` / `x86_64-unknown-linux-gnu`) when absent.
-  `Source0` = `rufus-%{version}-%{dist_target}.tar.gz`, resolved from
+  `Source0` = `furus-%{version}-%{dist_target}.tar.gz`, resolved from
   `~/rpmbuild/SOURCES/`. Fedora names are used (no Debian-only `libwim15`).
-- **Arch overrides are ENV vars** `rufus_version=<VERSION>` and
+- **Arch overrides are ENV vars** `furus_version=<VERSION>` and
   `_target=<TARGET>` passed to `makepkg`. Crucially **not `pkgver`** — makepkg
   unsets `pkgver` at `/usr/bin/makepkg:1252` before sourcing the PKGBUILD.
   `sha256sums=('SKIP')` and `options=(!strip)` are left as slice 1 set them;
   `--skipchecksums` is used because the tarball is already verified by the
   workflow.
-- Dist artifact names: `rufus-<VERSION>-<TARGET>.tar.gz`,
-  `rufus-<VERSION>-<TARGET>.deb`, and `SHA256SUMS` (lines `<digest>  <name>`).
+- Dist artifact names: `furus-<VERSION>-<TARGET>.tar.gz`,
+  `furus-<VERSION>-<TARGET>.deb`, and `SHA256SUMS` (lines `<digest>  <name>`).
   VERSION/TARGET for the recipes come from the build job's tarball, so they
   match the artifact name exactly for any `v*` tag (Cargo's package version can
   differ from the tag; deriving from the tag would be wrong).
 - Ten asserted paths differ only in the license location:
-  RPM `usr/share/licenses/rufus/LICENSES.md`; Arch
-  `usr/share/licenses/rufus-linux/LICENSES.md`.
+  RPM `usr/share/licenses/furus/LICENSES.md`; Arch
+  `usr/share/licenses/furus-linux/LICENSES.md`.
 
 ### The `--repo` fix
 
@@ -172,15 +172,15 @@ All static; **the workflow was not executed** (slice 4 will run the dry dispatch
 
 - **Container jobs have no checkout by default.** We added `actions/checkout`
   to both package jobs (after installing `git`, which the base images lack)
-  solely to obtain `packaging/rpm/rufus.spec` / `packaging/arch/PKGBUILD`. The
+  solely to obtain `packaging/rpm/furus.spec` / `packaging/arch/PKGBUILD`. The
   alternative would have been to pass the recipes through an extra artifact;
   checkout is simpler and guarantees the recipe matches the same commit the
   build job used. No cargo command is added to either job.
 - **Checkout ref on manual dispatch** is the dispatch branch, not `inputs.tag`;
   the build likewise runs from that branch, so the recipes and the tarball stay
   consistent. This is pre-existing workflow design, unchanged here.
-- **License path differs** between the two packages (`licenses/rufus` vs
-  `licenses/rufus-linux`); the assertion loops account for that.
+- **License path differs** between the two packages (`licenses/furus` vs
+  `licenses/furus-linux`); the assertion loops account for that.
 - **`sha256sum` uses bare filenames** (no `./`) so `sha256sum -c` resolves in
   `release/`; the `gh release create` file arguments use `./` as specified.
 - **All four artifact globs must match.** `build` installs `dpkg` so the `.deb`

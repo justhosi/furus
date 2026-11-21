@@ -1,6 +1,6 @@
 # S30 — slice 2/4: A12 config-field clarification + stale root handoff archive
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD `eff1b70`
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, base HEAD `eff1b70`
 (`ci(release): add tag-triggered release workflow`). cargo/rustc 1.99.0 lives
 in `~/.cargo/bin`; prefix cargo commands with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
@@ -25,7 +25,7 @@ handoff so no live `HANDOFF.md` reference dangles after the move.
    no-ops that are persisted/round-tripped but never acted on, that **no HTTP
    client and no background network call** exist in the tree, and that Decision
    A12 stays **proposed**. No other README text changed (the S25 row is intact).
-2. **`crates/rufus-core/src/config.rs`** — DOC COMMENTS ONLY on the two fields
+2. **`crates/furus-core/src/config.rs`** — DOC COMMENTS ONLY on the two fields
    in `pub struct Config`: both now say "Dormant schema-compatibility field
    (Decision A12, still proposed)" and that no update-check/network code reads
    them so no check or network call happens because of them. Types, defaults
@@ -51,7 +51,7 @@ behaviour, `size-baseline.json` or other file was changed. A12 remains
 
 All run from the repo root with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
-1. `cargo test -p rufus-core --lib config` → **ok. 22 passed; 0 failed**
+1. `cargo test -p furus-core --lib config` → **ok. 22 passed; 0 failed**
    (1301 filtered out; ~29.7s).
 2. `cargo xtask ci` → **exit 0; `ci: all gates passed`**. Every gate green:
    `fmt`, `clippy` (`-D warnings`), workspace `test` (all suites 0 failed),

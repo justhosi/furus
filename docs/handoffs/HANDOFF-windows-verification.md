@@ -5,14 +5,14 @@ records the final state for a fresh context; there is no active task except the
 final documentation commit and push (Slice 4/4), which the user authorized to
 run autonomously ("make all the decisions yourself and at the end push the repo").
 
-Working dir: `/home/hosi/dev/REA-Rufus/furus` (git repo, branch `main`,
+Working dir: `/home/hosi/dev/REA-Furus/furus` (git repo, branch `main`,
 origin `https://github.com/justhosi/furus`). At the time of writing, HEAD is
 `4d22a12` and the repo is ~14 commits ahead of `origin/main`, NOT yet pushed.
-Release binary `target/release/rufus` is built from `4d22a12` (mtime 07:20:26).
+Release binary `target/release/furus` is built from `4d22a12` (mtime 07:20:26).
 
 ## Goal / acceptance
 
-`./target/release/rufus write --plan /tmp/opencode/wtg-plan.json --yes` must
+`./target/release/furus write --plan /tmp/opencode/wtg-plan.json --yes` must
 produce an image that boots under QEMU/OVMF past the boot manager with **no
 `0xc0000001`** and no manual `bcdedit` / `chkdsk` / `bcdboot` repair.
 
@@ -55,8 +55,8 @@ boot (`memdiag` only launches from the boot menu); left as-is, not worth a round
 
 ## Verification (all passed)
 
-1. **Build/test**: `cargo fmt --all -- --check`, `cargo clippy -p rufus-core
-   --all-targets -- -D warnings`, `cargo test -p rufus-core` (1271 lib passed, 0
+1. **Build/test**: `cargo fmt --all -- --check`, `cargo clippy -p furus-core
+   --all-targets -- -D warnings`, `cargo test -p furus-core` (1271 lib passed, 0
    failed, 6 ignored; all integration binaries green), `cargo build --release`.
 2. **Clean write** (`write11`, quick-format plan
    `/tmp/opencode/wtg-plan.json`, confirm

@@ -1,6 +1,6 @@
 # S31 follow-up — slice 1/2: flatten release artifacts before hashing
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`.
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`.
 Reviewer committed `e9a5c43` (`ci(release): flatten artifacts before hashing in
 publish`) on top of `5510c1a`. **Not pushed.** The two docs edits below
 (`TECHNICAL.md`, this handoff) are written but **not committed** — the publisher
@@ -84,8 +84,8 @@ Acceptance for Slice 2:
   one `.pkg.tar.zst`, one `SHA256SUMS`.
 - `SHA256SUMS` has four lines (one per artifact kind) and
   `sha256sum -c SHA256SUMS` passes after downloading the assets.
-- README install commands (`sudo apt install ./rufus-*.deb`,
-  `sudo dnf install ./rufus-*.rpm`, `sudo pacman -U ./rufus-*.pkg.tar.zst`)
+- README install commands (`sudo apt install ./furus-*.deb`,
+  `sudo dnf install ./furus-*.rpm`, `sudo pacman -U ./furus-*.pkg.tar.zst`)
   work against the downloaded assets, at least structurally (`dpkg-deb -I`,
   `rpm -qlp`, `tar --zstd -tf`).
 

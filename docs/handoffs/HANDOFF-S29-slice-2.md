@@ -1,6 +1,6 @@
 # S29 — slice 2/4: headless offscreen Slint render smoke test
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD `571ca4b`.
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, base HEAD `571ca4b`.
 cargo/rustc 1.99.0 lives in `~/.cargo/bin`; prefix cargo commands with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
 
@@ -13,12 +13,12 @@ This file is the handoff after **slice 2/4**. Slices are gated one at a time
 ### Command executed
 
 Implement an unprivileged, headless offscreen Slint software-renderer smoke
-test that instantiates `crates/rufus-gui/ui/main.slint`, sets representative
+test that instantiates `crates/furus-gui/ui/main.slint`, sets representative
 state, renders at least one frame, and asserts no panic / no missing bindings.
 
 ### What changed
 
-1. **NEW `crates/rufus-gui/tests/render_smoke.rs`** — one `#[test]` integration
+1. **NEW `crates/furus-gui/tests/render_smoke.rs`** — one `#[test]` integration
    test binary (a single test keeps the platform-install per process race-free).
    - Installs a minimal `Platform` (`TestPlatform`) whose
      `create_window_adapter` hands out one shared
@@ -86,12 +86,12 @@ No other files were modified. `Cargo.toml` (workspace and crate),
 
 ```
 export PATH="$HOME/.cargo/bin:$PATH"
-cd /home/hosi/dev/REA-Rufus/furus
-cargo test -p rufus-gui --test render_smoke
+cd /home/hosi/dev/REA-Furus/furus
+cargo test -p furus-gui --test render_smoke
 ```
 
 ```
-   Compiling rufus-gui v0.1.0 (/home/hosi/dev/REA-Rufus/furus/crates/rufus-gui)
+   Compiling furus-gui v0.1.0 (/home/hosi/dev/REA-Furus/furus/crates/furus-gui)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 5.93s
      Running tests/render_smoke.rs (target/debug/deps/render_smoke-b42c32859e639fcc)
 
@@ -108,7 +108,7 @@ cargo xtask ci
 Final line: `ci: all gates passed` (exit 0). Gate sections observed:
 
 - `==> fmt` — clean (after applying `cargo fmt --all` to the new file; only
-  `crates/rufus-gui/tests/render_smoke.rs` changed).
+  `crates/furus-gui/tests/render_smoke.rs` changed).
 - `==> clippy` — clean under `-D warnings` (no warnings).
 - `==> test` — all workspace test binaries passed, including the new
   `render_smoke` test.

@@ -1,6 +1,6 @@
 # S29 — slice 3/4: compiled-helper JSONL / run-state wire test
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, base HEAD `c3fb0b2`
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`, base HEAD `c3fb0b2`
 (after slice 2). cargo/rustc 1.99.0 lives in `~/.cargo/bin`; every cargo
 command below was prefixed with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
@@ -13,14 +13,14 @@ This file is the handoff after **slice 3/4**. Slices are gated one at a time
 ### Command executed
 
 Add one real subprocess integration test that launches the **compiled**
-`rufus-helper`, drives it through the GUI's production JSONL parser and run
+`furus-helper`, drives it through the GUI's production JSONL parser and run
 state machine against an unprivileged, nonexistent `/dev` node, and proves a
 `not_a_block_device` refusal with zero writes and no root outside a user
 namespace.
 
 ### What changed (only the two in-scope files)
 
-1. **NEW `crates/rufus-gui/tests/helper_wire.rs`** — one `#[test]` binary,
+1. **NEW `crates/furus-gui/tests/helper_wire.rs`** — one `#[test]` binary,
    `compiled_helper_refusal_drives_the_gui_parser_and_run_state_machine`,
    following the required flow verbatim:
    1. Build a fixture `GuiState::default()` and assign its public `device` /
@@ -34,9 +34,9 @@ namespace.
    2. `Run::start(&mut gui)` → assert `Confirming`.
    3. `Run::confirm()` → assert the all-`None` `Running` state and clone the
       confirmed `Plan`.
-   4. `locate_helper()` derives `<target>/<profile>/rufus-helper` from
+   4. `locate_helper()` derives `<target>/<profile>/furus-helper` from
       `current_exe().parent().parent()` (works for debug/release/custom
-      target dirs); if missing, runs `cargo build -p rufus-helper` once from
+      target dirs); if missing, runs `cargo build -p furus-helper` once from
       the workspace root (`CARGO_MANIFEST_DIR`'s parent's parent) and retries,
       with an explicit panic message if still absent.
    5. Probe `unshare -Ur true`; on any failure `eprintln!` a SKIP reason and
@@ -65,36 +65,36 @@ new files.
 
 ### Seams chosen (all pre-existing and public)
 
-- `rufus_gui::ipc::PkexecTransport::with_command(program, args_prefix)` — the
+- `furus_gui::ipc::PkexecTransport::with_command(program, args_prefix)` — the
   documented test seam. It spawns
-  `<program> <args_prefix> rufus-helper --plan <FILE> --progress jsonl`.
+  `<program> <args_prefix> furus-helper --plan <FILE> --progress jsonl`.
 - `HelperTransport::start(&Plan)` / `Started.events: EventStream` — the EventStream
-  parses every stdout line with `rufus_proto::from_jsonl_line` and filters by
+  parses every stdout line with `furus_proto::from_jsonl_line` and filters by
   session, so consuming it exercises the production GUI parser.
-- `rufus_gui::run::{Run, RunState}` and `rufus_gui::state::{GuiState,
+- `furus_gui::run::{Run, RunState}` and `furus_gui::state::{GuiState,
   DeviceSelection, BootSelection}` public fields — a fixture can be built
   without any real image inspection; `ImageReport::default()` exists.
-- `rufus_proto::{Event, Completion, Outcome}` — pattern-matched directly.
+- `furus_proto::{Event, Completion, Outcome}` — pattern-matched directly.
 - Helper `validate::device_node_checks` (validate.rs:317): `symlink_metadata`
   on the nonexistent `/dev/...` path returns `not_a_block_device` before
   `collect_candidates`, `check_image` or any executor step. Helper `main.rs`
   does the root check first (line 290), then load → validate → the single
   terminal `Done` (line 374).
 - `current_exe()`-based binary discovery, with a one-shot `cargo build`
-  fallback, because `CARGO_BIN_EXE_rufus-helper` is not set for a rufus-gui
+  fallback, because `CARGO_BIN_EXE_furus-helper` is not set for a furus-gui
   integration test.
 
 ### Gotchas / decisions
 
 - **The suggested `shift` in the wrapper script was corrected.** The task
   text proposed `shift; exec unshare -Ur '<path>' "$@"` on the premise that
-  `shift` drops the literal `rufus-helper`. This is not how `sh -c` works:
+  `shift` drops the literal `furus-helper`. This is not how `sh -c` works:
   with `sh -c SCRIPT name arg...`, POSIX puts `name` in `$0` (not `$1`) and
   `$@` is already `arg...`. Verified locally:
   ```
   $ /bin/sh -c 'echo "zero=[$0]"; echo "at=[$@]"; shift; echo "after=[$@]"' \
-      rufus-helper --plan /tmp/x.json --progress jsonl
-  zero=[rufus-helper]
+      furus-helper --plan /tmp/x.json --progress jsonl
+  zero=[furus-helper]
   at=[--plan /tmp/x.json --progress jsonl]
   after=[/tmp/x.json --progress jsonl]
   ```
@@ -112,21 +112,21 @@ new files.
   is enough for the helper's `geteuid() == 0` check and creates no host root.
   The test still skips cleanly where user namespaces are disabled.
 - Unverified branches: the SKIP branch (not taken — `unshare -Ur true`
-  returns 0 here) and the `cargo build -p rufus-helper` fallback (not taken —
-  `target/debug/rufus-helper` was present). The fallback may be susceptible
+  returns 0 here) and the `cargo build -p furus-helper` fallback (not taken —
+  `target/debug/furus-helper` was present). The fallback may be susceptible
   to the parent cargo's target-dir lock in a cold build; if that ever bites,
   build the helper before running this test rather than changing the test.
 
 ### Verification (exact commands and results)
 
-Run from `/home/hosi/dev/REA-Rufus/furus` with
+Run from `/home/hosi/dev/REA-Furus/furus` with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 ```
-cargo test -p rufus-gui --test helper_wire
+cargo test -p furus-gui --test helper_wire
 ```
 ```
-   Compiling rufus-gui v0.1.0 (/home/hosi/dev/REA-Rufus/furus/crates/rufus-gui)
+   Compiling furus-gui v0.1.0 (/home/hosi/dev/REA-Furus/furus/crates/furus-gui)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 1.77s
      Running tests/helper_wire.rs (target/debug/deps/helper_wire-92f093d71506c7ea)
 
@@ -139,7 +139,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 `String`; fixed to `["-c", script.as_str()]`. No other code change.)
 
 ```
-cargo test -p rufus-helper
+cargo test -p furus-helper
 ```
 ```
 test result: ok. 111 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 4.19s   (unit tests)
@@ -158,8 +158,8 @@ Final line: `ci: all gates passed` (exit 0). Gates observed:
 - `==> parity --check` — `parity: 2,709 data rows`, address sets match.
 - `==> contract --check` — `contract: all identifiers match the single source
   of truth` (slice-1 gate still green).
-- `==> size` — `rufus: 1810152 / 3000000`, `rufus-helper: 1406296 / 2500000`,
-  `rufus-gui: 12774280 / 14000000`, total 15990728;
+- `==> size` — `furus: 1810152 / 3000000`, `furus-helper: 1406296 / 2500000`,
+  `furus-gui: 12774280 / 14000000`, total 15990728;
   `size: within committed baseline allowance, all budgets OK`. These bytes
   are identical to `size-baseline.json` — **no size change**.
 - `==> cargo-deny` — `advisories ok, bans ok, licenses ok, sources ok`;

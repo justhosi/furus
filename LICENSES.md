@@ -1,8 +1,8 @@
-# LICENSES.md — asset licence audit for the 86 resources of Rufus 4.15
+# LICENSES.md — asset licence audit for the 86 resources of the original Windows utility (4.15)
 
 Subject of this audit: the 86 payloads extracted verbatim from
-`rufus-4.15.exe` (Rufus 4.15.2396), listed in `../example/resources/README.md`
-and fingerprinted in `assets/manifest.json` (sizes + SHA-256). Identification
+the original Windows utility's 4.15 installer (version 4.15.2396), listed
+in `../example/resources/README.md` and fingerprinted in `assets/manifest.json` (sizes + SHA-256). Identification
 method: static reverse engineering (`../example/ANALYSIS.md`); where the build
 manifest is not embedded in the payload, resource names are content-based
 inferences. No lawyer was consulted — this is an engineering sanity pass, as
@@ -16,11 +16,11 @@ licences below use SPDX identifiers.
 
 | Component | SPDX | Role |
 |---|---|---|
-| Rufus itself (code, dialogs, icons, glyphs, `rufus.loc`, `rufus.com`, setup wrapper) | `GPL-3.0-or-later` | The upstream program we reuse as data. |
+| The original Windows utility itself (code, dialogs, icons, glyphs, `.loc` translation database, console launcher, setup wrapper) | `GPL-3.0-or-later` | The upstream program we reuse as data. |
 | FreeDOS (`COMMAND.COM`, `KERNEL.SYS`, `DISPLAY`, `KEYB`, `MODE`, keyboard layouts, EGA codepage fonts) | `GPL-2.0-or-later` | DOS boot payloads written to the target. |
 | Syslinux 4.07 / 6.04 | `GPL-2.0-or-later` | Bootloader payloads written to the target. |
 | GRUB4DOS | `GPL-2.0-or-later` | Legacy boot helper payload. |
-| ms-sys (`br_fat32fd_0x52.h`, `br_fat32kos_0x52.h`, `br_fat32_0x0.h`) | `GPL-2.0-or-later` | FreeDOS and KolibriOS FAT32 boot records transcribed into `crates/rufus-core/src/boot/records.rs`. |
+| ms-sys (`br_fat32fd_0x52.h`, `br_fat32kos_0x52.h`, `br_fat32_0x0.h`) | `GPL-2.0-or-later` | FreeDOS and KolibriOS FAT32 boot records transcribed into `crates/furus-core/src/boot/records.rs`. |
 | GRUB2 | `GPL-3.0-or-later` | Bootloader payload read from the image's own `/boot/grub` tree in S19; the bundled `core.img` fallback is RCDATA 451. |
 | UEFI:NTFS (`uefi-ntfs.img`) | `GPL-3.0-or-later` | NTFS UEFI driver payload written to the target. |
 | wimlib (not embedded; linked per A5) | `LGPL-3.0-or-later` | C library for WIM/ESD apply. |
@@ -33,21 +33,22 @@ licences below use SPDX identifiers.
 
 What: RT_ICON RGBA icons (256/96/64/48/32/16 px, PNG-compressed inside) and the
 RT_GROUP_ICON directory referencing them. Licence: **`GPL-3.0-or-later`**
-(Rufus's own icon set). Uncertainty: the per-file size→icon mapping is not
+(the original utility's own icon set). Uncertainty: the per-file size→icon mapping is not
 verified element-by-element; irrelevant to licensing.
 
 ### Dialogs `101–110` (10 payloads)
 
 What: `DLGTEMPLATEEX` dialog templates (main window, About, message box,
 choice, license, log, update policy, check-for-updates, checksums, list).
-Licence: **`GPL-3.0-or-later`** (Rufus UI definitions). No uncertainty. On
+Licence: **`GPL-3.0-or-later`** (original utility UI definitions). No uncertainty. On
 Linux they are reimplemented in Slint (A7); the templates serve as the
 behavioural spec.
 
 ### `VERSION_1` (1 payload)
 
-What: `VS_VERSION_INFO` block ("Rufus 4.15.2396", © 2011–2026 Pete Batard,
-GPL v3, Akeo Consulting). Licence: **`GPL-3.0-or-later`** (Rufus metadata).
+What: `VS_VERSION_INFO` block (upstream version 4.15.2396, © 2011–2026 Pete
+Batard, GPL v3, Akeo Consulting). Licence: **`GPL-3.0-or-later`** (upstream
+metadata).
 Used only as provenance data; do not copy version strings into our binary.
 
 ### `MANIFEST_1` (1 payload)
@@ -60,13 +61,13 @@ metadata, unused at runtime on Linux.
 
 What: modern flat toolbar/status glyphs loaded by `ui.c` through
 `FindResourceA` + `LockResource` into `ImageList`/GDI+. Licence:
-**`GPL-3.0-or-later`** (Rufus artwork). No uncertainty beyond licensing
+**`GPL-3.0-or-later`** (original utility artwork). No uncertainty beyond licensing
 conservatism: if we reuse them in the Linux GUI (A6/A7), they stay under our
 GPLv3 umbrella; if we draw our own glyphs, these payloads are not distributed.
 
 ### FreeDOS — RCDATA `300–326` (27 payloads)
 
-What: DOS boot set used by Rufus's FreeDOS target, re-verified in S20 against
+What: DOS boot set used by the original utility's FreeDOS target, re-verified in S20 against
 the `v4.15` tag (`res_name[]`, `src/dos.c:346-351`): `COMMAND.COM` (300),
 `KERNEL.SYS` (301), `DISPLAY.EXE` (302), `KEYB.EXE` (303), `MODE.COM` (304),
 the 4-part keyboard layout library (305–308, Jiri Malak / Henrique Peron) and
@@ -76,12 +77,12 @@ GPLv3-or-later use. S20 corrected the manifest's earlier content-based
 guesses: ids 309–326 are UPX-compressed EGA codepage fonts, not "utilities",
 and id 304 is `MODE.COM`, not a boot stub. The boot record itself is not in
 this set: it comes from ms-sys (see the next section), transcribed into
-`crates/rufus-core/src/boot/records.rs`.
+`crates/furus-core/src/boot/records.rs`.
 
 ### ms-sys FAT32 boot records — transcribed (not extracted)
 
 What: the FreeDOS and KolibriOS FAT32 boot records in
-`crates/rufus-core/src/boot/records.rs`, transcribed programmatically from the
+`crates/furus-core/src/boot/records.rs`, transcribed programmatically from the
 readable upstream ms-sys headers (nothing was retyped or carved out of the
 unpacked exe): the FreeDOS body is the first 430 bytes of
 `src/ms-sys/inc/br_fat32fd_0x52.h`, the KolibriOS body the 430 bytes of
@@ -90,7 +91,7 @@ unpacked exe): the FreeDOS body is the first 430 bytes of
 bootstrap named in that header's comment, adapted for FreeDOS; the KolibriOS
 code carries the `MTLD_F32` loader name. Licence: **`GPL-2.0-or-later`**
 (ms-sys), compatible with GPLv3 use. The reconstructed sectors were verified
-byte-identical against the records Rufus generates, so the ms-sys source is
+byte-identical against the records the original utility generates, so the ms-sys source is
 the authoritative transcription source for both records. No uncertainty.
 
 ### Syslinux — RCDATA `400–404` (5 payloads)
@@ -108,46 +109,50 @@ binaries) are GPLv2+ data/code reused, not absorbed.
 What: `grldr.mbr` (450) is the GRUB4DOS MBR/SBR used for legacy boot of
 UEFI-only media. Resource 451 was first catalogued as GRUB4DOS's
 `grldr` but is in fact GRUB2's embedded `core.img` (the code names it
-`Resource::Grub2CoreImg`); Rufus downloads the real GRUB4DOS loader
+`Resource::Grub2CoreImg`); the original utility downloads the real GRUB4DOS loader
 `grub4dos-0.4.6a/grldr` and bundles none, so the GRUB4DOS arm refuses
 unless the volume already carries a root `/grldr`. Resource 452 is the
 ANSI-art "ERROR: BIOS/LEGACY BOOT OF UEFI-ONLY MEDIA" screen.
 
 Licence: **`GPL-2.0-or-later`** for `grldr.mbr` (450, GRUB4DOS per
-decision A6); **`GPL-3.0-or-later`** for 451 (GRUB2) and 452 (Rufus's
-own file, resolved below).
+decision A6); **`GPL-3.0-or-later`** for 451 (GRUB2) and 452 (the original
+utility's own file, resolved below).
 
 452 is resolved, not third-party GRUB4DOS artwork: upstream
-`src/resource.h:68` defines `IDR_SBR_MSG 452` and `src/rufus.rc:475`
-maps it to RCDATA of `../res/mbr/msg.txt`; the v4.15 file is 1244
-bytes with LF endings, and converting every `\n` to CRLF gives 1265
+`src/resource.h:68` defines `IDR_SBR_MSG 452` and its resource
+script (line 475) maps it to RCDATA of `../res/mbr/msg.txt`; the v4.15 file
+is 1244 bytes with LF endings, and converting every `\n` to CRLF gives 1265
 bytes with SHA-256
 `8d39acfbb9c662a891ed897659631f17e9b837286bcd2d9976cc319db6977667`,
-byte-identical to `assets/resources/RCDATA_452.bin`. It is Rufus's own
-GPL-3.0-or-later file, and no code in this port consumes it (no
+byte-identical to `assets/resources/RCDATA_452.bin`. It is the original
+utility's own GPL-3.0-or-later file, and no code in this port consumes it (no
 `Resource` variant).
 
-### `RCDATA_500` — `rufus.loc` (1 payload)
+### `RCDATA_500` — the upstream `.loc` translation database (1 payload)
 
 What: the `pollock v1.0`-generated translation database (v4.14 header), all
-languages shipped by Rufus. Licence: **`GPL-3.0-or-later`** (Rufus project
-asset; its translations are contributed under the project's terms). Reused
-only if A11 (reuse `rufus.loc`) is confirmed. Uncertainty: none for licensing
+languages shipped by the original utility. Licence: **`GPL-3.0-or-later`**
+(upstream project asset; its translations are contributed under the project's
+terms). Reused only if A11 (reuse of the upstream `.loc` database) is
+confirmed. Uncertainty: none for licensing
 at audit level; distribution note — the `.loc` must ship complete with the
 GPLv3 source offer, unmodified.
 
-### `RCDATA_501` — `rufus.com` console launcher (1 payload)
+### `RCDATA_501` — the upstream console launcher (1 payload)
 
-What: 2 KB PE32 console launcher/"hogger" that re-launches Rufus on the
-console command line (parsed by `cregex_parse.c`). Licence:
-**`GPL-3.0-or-later`** (Rufus's own code). Linux: not used; the rewrite has a
-native `rufus` CLI (S03). Keep only as behavioural reference.
+What: 2 KB PE32 console launcher/"hogger" that re-launches the original utility on
+the console command line (parsed by `cregex_parse.c`). Licence:
+**`GPL-3.0-or-later`** (the original utility's own code). Linux: not used;
+the rewrite has a native `furus` CLI (S03). Keep only as behavioural
+reference.
 
 ### `RCDATA_502` — `uefi-ntfs.img` (1 payload)
 
-What: 1 MiB FAT12 image (`mkfs.fat`, label `RUFUS_BOOT`) holding the
+What: 1 MiB FAT12 image (`mkfs.fat`, with a pinned upstream volume label
+kept byte-identical in the protected asset) holding the
 `uefi-ntfs.efi` NTFS UEFI driver. Licence: **`GPL-3.0-or-later`** (the
-UEFI:NTFS project, per decision A6; same author as Rufus). Compatible. No
+UEFI:NTFS project, per decision A6; same author as the original utility).
+Compatible. No
 distribution problem: the whole FAT image ships as data under GPLv3. S20 wires
 it into the `uefi-ntfs` bootloader mode as `Resource::UefiNtfsImage` (manifest
 id 502), written verbatim at the ESP partition offset.
@@ -156,7 +161,7 @@ id 502), written verbatim at the ESP partition offset.
 
 What: Windows-only `setup.exe` wrapper (x64 503, ARM64 504) that bypasses
 Windows 11 requirement checks during Windows To Go/unattended setup. Licence:
-**`GPL-3.0-or-later`** (Rufus's own code, same as the rest of the program).
+**`GPL-3.0-or-later`** (the original utility's own code, same as the rest of the program).
 These are Windows PE assets **written as data to the target drive**; plan
 constraint 4 (`PLAN.md` §2) forbids executing them on Linux. No licence issue.
 
@@ -169,7 +174,7 @@ from the booted media. Licence: **`GPL-3.0-or-later`** (Pete Batard's
 project). Compatible. Uncertainty: the licence id is taken from the public
 uefi-md5sum project, not from the binary itself; confirm when the payloads are
 copied into `assets/` in S01 and during the S23 rebuild. Note ID 5 (`605`) is
-absent in Rufus 4.15's resource tree — do not invent it.
+absent in the 4.15 resource tree — do not invent it.
 
 ### Microsoft KEK/DB certificates — RCDATA `701–704` (4 payloads)
 
@@ -187,9 +192,10 @@ would own any certificate refresher).
 
 A `GPL-3.0-or-later` application (A1) may include **all** of the above:
 
-* The Rufus-owned assets (icons, dialogs, VERSION, MANIFEST, glyphs 121–146,
-  `rufus.loc`, `rufus.com`, uefi-ntfs.img, the setup wrapper 503/504) are the
-  same licence as the rewrite itself — inclusion is trivially fine, with
+* The original-utility-owned assets (icons, dialogs, VERSION, MANIFEST,
+  glyphs 121–146, the `.loc` translation database, console launcher,
+  uefi-ntfs.img, the setup wrapper 503/504) are the same licence as the
+  rewrite itself — inclusion is trivially fine, with
   preserved attribution and the GPLv3 source offer.
 * FreeDOS, Syslinux, GRUB4DOS and the transcribed ms-sys boot records are
   `GPL-2.0-or-later`. "or-later" allows redistribution under GPL-3.0, and the
@@ -215,5 +221,6 @@ licence conflict but an attribution/identification task for S23.
    re-verify in **S23**.
 2. uefi-md5sum licence id: confirm from the public project when copying
    assets in S01 and rebuilding in **S23**.
-3. Trademark: the public name is not "Rufus" (decision A2; working name
-   `rufus-linux`). Keep "Rufus" out of the distributed product identity.
+3. Trademark: the public name deliberately differs from the original Windows
+   utility's (decision A2; working name `furus-linux`). Keep the original
+   trademark out of the distributed product identity.

@@ -1,6 +1,6 @@
 # S29 — GUI / IPC verification — FINAL HANDOFF (4/4 complete)
 
-Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`. cargo/rustc 1.99.0 lives
+Repo: `/home/hosi/dev/REA-Furus/furus`, branch `main`. cargo/rustc 1.99.0 lives
 in `~/.cargo/bin`; prefix cargo commands with
 `export PATH="$HOME/.cargo/bin:$PATH"`.
 
@@ -14,9 +14,9 @@ format and adds no dependency.
 
 | Slice | Commit | Scope |
 |---|---|---|
-| 1/4 | `571ca4b` | Single-source D-Bus/polkit/packaging identifiers in `rufus-proto::service`; `xtask contract --check` scans packaging literals and is wired into `cmd_ci` between parity and size. |
-| 2/4 | `c3fb0b2` | Offscreen Slint software-renderer smoke test (`crates/rufus-gui/tests/render_smoke.rs`). |
-| 3/4 | `450c8fe` | Real compiled-helper JSONL / run-state wire test (`crates/rufus-gui/tests/helper_wire.rs`). |
+| 1/4 | `571ca4b` | Single-source D-Bus/polkit/packaging identifiers in `furus-proto::service`; `xtask contract --check` scans packaging literals and is wired into `cmd_ci` between parity and size. |
+| 2/4 | `c3fb0b2` | Offscreen Slint software-renderer smoke test (`crates/furus-gui/tests/render_smoke.rs`). |
+| 3/4 | `450c8fe` | Real compiled-helper JSONL / run-state wire test (`crates/furus-gui/tests/helper_wire.rs`). |
 | 4/4 | this documentation commit (HEAD at S29 close) | `README.md`, `TECHNICAL.md`, this handoff; no source, Cargo.toml, CI, `size-baseline.json` or slice 1–3 file touched. |
 
 Nothing is pushed. Reviewer/publisher own commit and push.
@@ -25,11 +25,11 @@ Nothing is pushed. Reviewer/publisher own commit and push.
 
 * **Slice 1.** Ten `pub const &str` identifiers (`BUS_NAME`, `OBJECT_PATH`,
   `INTERFACE_NAME`, `POLKIT_ACTION`, four `ERROR_*`, `HELPER_BIN_PATH`,
-  `HELPER_DBUS_ARG`) in `crates/rufus-proto/src/service.rs`, re-exported from
+  `HELPER_DBUS_ARG`) in `crates/furus-proto/src/service.rs`, re-exported from
   the crate root; GUI and helper import them (helper keeps thin aliases).
-  `cmd_contract` reads this file directly — `xtask` has no `rufus-proto`
+  `cmd_contract` reads this file directly — `xtask` has no `furus-proto`
   dependency — validates packaging literals and the zbus interface macro, and
-  rejects the legacy `org.rufus.` namespace and old helper path.
+  rejects the legacy `org.furus.` namespace and old helper path.
   `packaging/README.md` is skipped by the negative scan because it discusses
   that rejected namespace in prose. The const spelling
   `pub const NAME: &str = "...";` must stay stable for the scanner.
@@ -60,8 +60,8 @@ Run from the repo root with `export PATH="$HOME/.cargo/bin:$PATH"`.
   (including both new GUI tests); `==> assets --check` `86 entries, 86 files
   verified`; `==> parity --check` `2,709 data rows`, address sets match;
   `==> contract --check` `contract: all identifiers match the single source of
-  truth`; `==> size` `rufus: 1810152 / 3000000`, `rufus-helper: 1406296 /
-  2500000`, `rufus-gui: 12774280 / 14000000`, `size: within committed baseline
+  truth`; `==> size` `furus: 1810152 / 3000000`, `furus-helper: 1406296 /
+  2500000`, `furus-gui: 12774280 / 14000000`, `size: within committed baseline
   allowance, all budgets OK`; `==> cargo-deny` `advisories ok, bans ok, licenses
   ok, sources ok`; `SKIP (not installed): cargo-audit`.
 * `env -u APPDIR cargo xtask qa` → **exit 0, `qa: all suites passed`**.
@@ -100,7 +100,7 @@ network action was used.
 * **SKIP branch not exercised.** `unshare -Ur true` succeeds here, so the
   helper-wire test's SKIP path is untested; it skips cleanly where user
   namespaces are disabled.
-* **`cargo build` fallback not exercised.** `target/debug/rufus-helper` was
+* **`cargo build` fallback not exercised.** `target/debug/furus-helper` was
   already present, so the one-shot build fallback did not run; it could be
   sensitive to the parent cargo's target-dir lock on a cold build — build the
   helper first if that ever bites, rather than changing the test.
