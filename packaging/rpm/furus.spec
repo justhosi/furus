@@ -1,9 +1,9 @@
 Name:           furus
 # Version and target are overridable by the offline/local CI recipe build:
-#   rpmbuild --define 'furus_version 0.1.0' \
+#   rpmbuild --define 'furus_version 0.1.1' \
 #            --define 'furus_target x86_64-unknown-linux-gnu' -bb furus.spec
 # With no --define the defaults below keep a plain `rpmbuild -bb` working.
-%{!?furus_version:%global furus_version 0.1.0}
+%{!?furus_version:%global furus_version 0.1.1}
 %{!?furus_target:%global furus_target x86_64-unknown-linux-gnu}
 # BuildArch is overridable so the aarch64 lane can tag its RPM aarch64; the
 # default keeps a plain `rpmbuild -bb` working as before.

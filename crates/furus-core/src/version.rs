@@ -3,7 +3,7 @@
 //! `GIT_HASH` is baked in at compile time by `crates/furus-core/build.rs`
 //! (`git rev-parse --short HEAD`, `"unknown"` when git is unavailable).
 
-/// Crate version (workspace version, e.g. `"0.1.0"`).
+/// Crate version (workspace version, e.g. `"0.1.1"`).
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -29,14 +29,17 @@ mod tests {
 
     #[test]
     fn version_is_pinned_workspace_version() {
-        assert_eq!(version(), "0.1.0");
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
     fn hash_and_agent_are_non_empty() {
         assert!(!git_hash().is_empty());
         let agent = user_agent();
-        assert!(agent.starts_with("furus-linux/0.1.0 ("), "{agent}");
+        assert!(
+            agent.starts_with(&format!("furus-linux/{} (", env!("CARGO_PKG_VERSION"))),
+            "{agent}"
+        );
         assert!(agent.ends_with(')'), "{agent}");
     }
 }

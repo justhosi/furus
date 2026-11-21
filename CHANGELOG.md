@@ -2,7 +2,28 @@
 
 All notable changes to this project are recorded here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The workspace version
-is `0.1.0` (see `Cargo.toml`); no release date is recorded here.
+is `0.1.1` (see `Cargo.toml`); no release date is recorded here.
+
+## [0.1.1]
+
+### Added
+
+- Dual-architecture release artifacts: the workflow now builds natively for
+  x86_64 and aarch64 and publishes eight packages — a generic `.tar.gz`, a
+  `.deb`, an `.rpm` and a `.pkg.tar.zst` for each architecture — plus one unified
+  `SHA256SUMS` (eight lines, one per package). Both architectures were validated
+  end-to-end in dry run `44931040759`; the dual-arch release was then published
+  as `v0.1.1` after green tag-push run `44933721775`, with 9 assets (8 packages
+  plus unified `SHA256SUMS`) verified against the GitHub asset digests.
+
+### Changed
+
+- S33 release hygiene: unified the workspace/package version to `0.1.1` across
+  `Cargo.toml`, the deb/rpm/Arch packaging defaults and the version assertions
+  in tests, which now read the version from `CARGO_PKG_VERSION`.
+- Handle SIGINT via `sigaction` with an explicit `SA_RESTART`.
+- Portable OVMF firmware discovery.
+- Module and test-layout refactor.
 
 ## [0.1.0]
 
@@ -30,13 +51,6 @@ original Windows utility for Linux. Capabilities present in this version:
   `cargo xtask dist`, re-verifies `SHA256SUMS`, and publishes the release assets
   as a GitHub release. `docs/RELEASE-CHECKLIST.md` records the manual hardware
   sign-off that must precede tagging.
-- Dual-architecture release artifacts: the workflow now builds natively for
-  x86_64 and aarch64 and publishes eight packages — a generic `.tar.gz`, a
-  `.deb`, an `.rpm` and a `.pkg.tar.zst` for each architecture — plus one unified
-  `SHA256SUMS` (eight lines, one per package). Both architectures were validated
-  end-to-end in dry run `44931040759`; the dual-arch release was then published
-  as `v0.1.1` after green tag-push run `44933721775`, with 9 assets (8 packages
-  plus unified `SHA256SUMS`) verified against the GitHub asset digests.
 
 ### Notes
 

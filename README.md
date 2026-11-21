@@ -407,13 +407,13 @@ holding the downloaded files (the `./` makes your package manager use the local
 file, and the glob matches whichever architecture you downloaded):
 
 * Ubuntu/Debian: `sudo apt install ./furus-*.deb`
-  (e.g. `furus-0.1.0-x86_64-unknown-linux-gnu.deb` or
-  `furus-0.1.0-aarch64-unknown-linux-gnu.deb`)
+  (e.g. `furus-0.1.1-x86_64-unknown-linux-gnu.deb` or
+  `furus-0.1.1-aarch64-unknown-linux-gnu.deb`)
 * Fedora: `sudo dnf install ./furus-*.rpm`
-  (e.g. `furus-0.1.0-1.fc45.x86_64.rpm` or `furus-0.1.0-1.fc45.aarch64.rpm`)
+  (e.g. `furus-0.1.1-1.fc45.x86_64.rpm` or `furus-0.1.1-1.fc45.aarch64.rpm`)
 * Arch Linux: `sudo pacman -U ./furus-*.pkg.tar.zst`
-  (e.g. `furus-linux-0.1.0-1-x86_64.pkg.tar.zst` or
-  `furus-linux-0.1.0-1-aarch64.pkg.tar.zst`)
+  (e.g. `furus-linux-0.1.1-1-x86_64.pkg.tar.zst` or
+  `furus-linux-0.1.1-1-aarch64.pkg.tar.zst`)
 
 The single `SHA256SUMS` has one line per package (eight in total). Verify your
 downloads against it from the same directory:

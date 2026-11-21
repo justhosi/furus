@@ -223,7 +223,11 @@ fn version_human_and_json() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert_eq!(
         out.stdout.trim_end(),
-        format!("furus 0.1.0 ({})", furus_core::git_hash()),
+        format!(
+            "furus {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            furus_core::git_hash()
+        ),
         "stdout: {:?}",
         out.stdout
     );
@@ -231,7 +235,7 @@ fn version_human_and_json() {
     let out = run(&["version", "--json"]);
     assert_eq!(out.code, 0);
     let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("version json");
-    assert_eq!(value["version"], "0.1.0");
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(value["plan_version"], 6);
     assert!(!value["git_hash"].as_str().expect("hash").is_empty());
 }

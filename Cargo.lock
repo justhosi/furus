@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "furus-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "furus-core",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "furus-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "furus-proto",
  "md-5",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "furus-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "furus-core",
  "furus-linux",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "furus-helper"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "furus-core",
  "furus-linux",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "furus-linux"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "furus-core",
  "furus-proto",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "furus-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5130,7 +5130,7 @@ dependencies = [
 
 [[package]]
 name = "wimlib-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tempfile",
 ]
@@ -5598,7 +5598,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "csv",
