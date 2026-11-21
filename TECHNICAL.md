@@ -1375,3 +1375,128 @@ was fixed by `cargo fmt --all` in commit `052aa4e`. With those two corrections,
 `cargo xtask ci` and `cargo xtask qa` both pass on `main`. End-to-end dialog
 behavior still requires a real display session; CI exercises the pure logic,
 headless CLI paths, offscreen render smoke test and all release gates.
+
+## S33 — Release hygiene, portability and module split
+
+S33 is post-release hygiene on top of the published v0.1.1 tree. It changes no
+user-visible behavior: version and naming are made internally consistent, two
+portability hazards (the SIGINT handler and OVMF firmware discovery) are fixed,
+and three large source files are split into modules by pure refactor. All work
+is local on `main`; the tag `v0.1.1` already exists (tag object `4c6e4a6`,
+pointing at commit `f763fdc`) and is published. S33 creates or moves no tags
+and pushes nothing without explicit maintainer authorization. There is no new
+release artifact from S33 itself.
+
+### S33.1 — Unified version 0.1.1 (`8c1ef69`)
+
+Every place that states the version now agrees on `0.1.1`: the workspace
+`Cargo.toml` and `Cargo.lock`, the `version.rs` assertions which read
+`env!("CARGO_PKG_VERSION")` rather than a duplicated literal, the Debian
+`control`, the RPM spec and the Arch PKGBUILD defaults, `CHANGELOG`, and the
+artifact filename examples in `README.md`. An audit of the tree found no stale
+literal `0.1.0`. Using `env!("CARGO_PKG_VERSION")` in the assertions keeps the
+binary's self-reported version derived from the Cargo manifest, so a future
+bump cannot silently desynchronize the checks.
+
+### S33.2 — Naming standardization (`6ce1a51`)
+
+User-facing and packaging names are standardized consistently: `Furus` is the
+desktop `Name` and the metainfo application name, while `furus` is the Arch
+`pkgname`, the license install destination, the license paths referenced in
+`release.yml` and the packaging `README`, and the prefix of README artifact
+examples. This was deliberately scoped to names only. Explicit non-goals: no
+crate rename (the Rust crates keep their `furus-*` names), no change to the
+`org.furuslinux.*` D-Bus or polkit identifiers, and no change to the runtime
+paths `/run/furus-linux` or `$XDG_*_HOME/furus-linux`. Changing any of those
+would alter IPC or on-disk contracts and was out of scope.
+
+### S33.3 — Portable SIGINT handler (`cf10532`)
+
+The SIGINT handler is now installed through a single `unsafe` block. It builds
+a zeroed `libc::sigaction`, sets `sa_sigaction = on_sigint as *const () as
+libc::sighandler_t`, sets `SA_RESTART`, initializes the mask with
+`sigemptyset(&mut sa.sa_mask)`, and calls `sigaction(SIGINT, &sa, null_mut())`.
+Any non-zero return is reported as
+`Err(CoreError::invalid("could not install the SIGINT handler"))`. This form is
+portable across glibc and musl: libc 0.2.191 exposes `sa_sigaction` on both,
+so the previous platform-specific assumption is gone. One test was added
+confirming that installing the handler twice is `Ok` and that the flag clears;
+the original three tests were left untouched.
+
+### S33.4 — Distro-portable paired OVMF discovery (`191621a`)
+
+Firmware discovery no longer hardcodes Arch-specific paths. It now walks an
+ordered list of PAIRED candidates: Arch 4M, Arch legacy, Ubuntu 4M
+(`/usr/share/OVMF/OVMF_CODE_4M.fd` + `OVMF_VARS_4M.fd`), Ubuntu legacy, and
+Fedora/RHEL. Code and VARS are always taken as a pair — layouts are never
+mixed. The `FURUS_OVMF_CODE` and `FURUS_OVMF_VARS` environment overrides must
+be given both-or-neither and must both point at existing files; otherwise an
+exact no-pair error is reported. A pure `first_existing_pair` helper implements
+the selection rule and is used both by the integration test and by the xtask
+`ovmf_present()` probe, so QA can never disagree with the test about which
+pair is available. The `sudo ln -sf` firmware shims were removed from
+`.github/workflows/ci.yml` and `.github/workflows/release.yml`. On this host the
+real firmware lives in the Arch layout (`/usr/share/edk2/x64/`); the
+Ubuntu-named paths under `/usr/share/OVMF/` are compatibility symlinks into
+those same Arch files, not a second firmware installation. The first (Arch 4M)
+pair is therefore the one exercised end-to-end here; the pure test covers the
+selection rule independently of the host.
+
+### S33.5 — Pure-refactor module splits
+
+All splits in this subsection are behavior-preserving: CLI flags, exit codes,
+JSON schemas, error messages and disk bytes are unchanged. `unsafe_code =
+"deny"` remains a workspace lint, the four allowed-unsafe files are unchanged,
+and no production `.unwrap()` was added.
+
+- **Part A, test extraction (`48aaae5`).** Inline test modules were extracted
+  to sibling files through `#[cfg(test)] #[path = "..."] mod tests;`:
+  `pipeline/tests.rs`, `dbus_tests.rs` and `main_tests.rs`. Production prefixes
+  are byte-identical; rustfmt reflowed five lines and one trailing comma as the
+  only textual changes.
+
+- **Part B, `furus-cli` (`53a1a91`).** `furus-cli/src/main.rs` shrank from 2,130
+  to 452 lines. New files `cli.rs`, `output.rs`, `commands/mod.rs` and
+  per-module `tests.rs` take up the extracted code. Only `pub(crate)` widening
+  was needed, plus three doc-link-only retargets. `--help` for the main command
+  and all seven subcommands is byte-identical; `version --json` differs only in
+  the build-time `git_hash` field.
+
+- **Part B, `exfat/volume` (`8e9ae92`).** `exfat/volume.rs` (4,344 lines) became
+  `volume/{mod.rs,format.rs,fat.rs,io.rs,tests.rs}`. Fourteen items were given
+  `pub(super)` to allow calls across the new sibling submodules, and a `use
+  crate::fs::exfat::format as fmt;` alias was required because the new `mod
+  format` collides with the existing `format` name. Public re-exports in
+  `exfat/mod.rs` are unchanged and all 39 tests are identical.
+
+- **Part B, `xtask` (`127bbc0`).** `xtask/src/main.rs` went from 3,181 lines
+  (2,476 production / 705 test) to a 177-line `main.rs` plus nine submodules —
+  `util`, `assets`, `parity`, `size`, `packaging`, `dist`, `contract`, `ci` and
+  `qa`. Seven of the nine have a sibling `tests.rs`; `util` keeps its tests
+  inline and `ci` has no tests. The S33.4 OVMF logic was preserved exactly, and
+  all eight CLI cases are byte-identical to the pre-change HEAD.
+
+### Test counts and cost
+
+The test count moved 1910 before S33 → 1911 after S33.3 (the added SIGINT
+test) → 1912 from S33.4 onward (the pure OVMF-pair test). The final 1912 tests
+break down as 1883 passed / 0 failed / 29 ignored. There is no size-baseline
+drift: `size-baseline.json` still records furus at 1,810,504 bytes, furus-gui
+at 12,806,408 bytes and furus-helper at 1,406,392 bytes, so no
+`--write-baseline` was needed.
+
+### Verification
+
+The full gate is green: fmt check, clippy with `-D warnings`, the workspace
+test suite, the 1912-test listing count, `cargo xtask ci`, `cargo xtask qa` and
+`cargo xtask dist`. `dist` emits the deterministic tarball plus `SHA256SUMS`
+(verified with `sha256sum -c`); the `.deb` is skipped only because `dpkg-deb` is
+not installed in this environment. The `cargo-audit` skip and the duplicate-zbus
+(and other duplicate-crate) lock warnings are pre-existing and unrelated to
+S33. One known pre-existing rustdoc situation is not an S33 regression:
+`cargo doc -p furus-core --no-deps` with `-D warnings` reports 226 pre-existing
+errors on both the pre-change and post-change trees (the diagnostics were
+relocated by the module split, not introduced); `cargo doc -p xtask --no-deps`
+is clean. As with S32, end-to-end device behavior still needs a real display
+and loop devices; CI covers the pure logic, headless paths, render smoke and
+release gates.
