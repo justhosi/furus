@@ -804,3 +804,122 @@ documented `tier1/pipeline-loop` SKIP and both QEMU/UEFI Tier 2 tiers).
 host) and the one-shot `cargo build` fallback (the helper binary was already
 present); the pre-existing non-fatal `cargo-deny` duplicate-crate warnings
 (zbus 5/6, thiserror 1/2, toml, windows-sys, …) remain unchanged.
+
+---
+
+## S30 — Release workflow, A12 dormancy and v0.1.0 readiness
+
+S30 makes the project releasable without changing what the binaries do. It adds
+a tag-triggered GitHub Actions workflow, documents the two update-check config
+fields as dormant, and writes the user-facing v0.1.0 changelog and release
+checklist. No runtime behaviour, wire format, dependency or binary size changes:
+the release binaries are byte-for-byte the ones measured by the S29 size gate.
+The three landed slices are `eff1b70`, `3d49f33` and `6aa51b5`; this wrap-up and
+the final handoff close the series.
+
+### Two-job release workflow and least privilege
+
+`.github/workflows/release.yml` triggers on a pushed `v*` tag, or on a manual
+`workflow_dispatch` where the operator must supply the existing tag in a
+required `tag` input (on a manual run `github.ref_name` is a branch, not a tag).
+The workflow has exactly two jobs, and the split is a security boundary, not a
+stylistic choice:
+
+* **`build`** holds only `contents: read` (as does the workflow top level). It
+  runs all the work that touches untrusted inputs — checkout, pinned Rust
+  1.99.0 toolchain with rustfmt/clippy, pinned cargo-deny 0.20.2 and cargo-audit
+  0.22.2 installs, the full QA apt package list, the OVMF 4M firmware symlink
+  shim, then `cargo xtask ci`, `cargo xtask qa` and `cargo xtask dist`. It
+  uploads `target/dist/` as one artifact.
+* **`release`** (`needs: build`) is the **only** job with `contents: write`. It
+  downloads that artifact, flattens it, re-verifies the digests and publishes
+  the GitHub release with the built-in `github.token`.
+
+Keeping build and publish apart means a compromised build script, dependency or
+toolchain step cannot mint a release: those steps never see a write token. Only
+the small, auditable publish job does. Both jobs use full-SHA-pinned actions;
+the checkout and rust-toolchain pins are inherited from `ci.yml`, and the
+artifact upload/download pins were resolved deliberately (dates recorded in the
+workflow comments), not by blind bumping.
+
+### Dist artifacts, SHA256SUMS and cross-job verification
+
+`cargo xtask dist` is the single source of publishable bytes. It builds the
+release workspace and re-checks the committed binary size budgets, validates the
+packaging files, stages a clean install tree (`/usr/bin/rufus`,
+`/usr/bin/rufus-gui`, `/usr/libexec/rufus-helper` and the polkit/D-Bus/desktop/
+AppStream/icon/licence files under `/usr/share`), writes a deterministic
+`rufus-<version>-<triple>.tar.gz` and reads it back to confirm it matches the
+staging tree. With no `--target` it builds the host triple, so there is one
+`SHA256SUMS` per run under `target/dist/<triple>/`.
+
+`SHA256SUMS` has one line per produced artifact in the form
+`<64-hex digest>  <bare filename>` — two spaces, a bare filename with no
+directory component, stable artifact order. On this host the only artifact is
+the tarball, so the file has a single line. The release job exploits that: after
+downloading `dist/` (which mirrors `target/dist/<triple>/`) it copies the
+`*.tar.gz`, `*.deb` and `SHA256SUMS` files into one `release/` directory so the
+bare names resolve, then runs `sha256sum -c SHA256SUMS` there. A mismatch or
+corruption in the upload/download round trip fails the job **before**
+`gh release create` runs, so the bits published are exactly the bits built and
+verified. `gh` is preinstalled on the runner, which avoids a third-party release
+action and any secret beyond `github.token`.
+
+### Why the `.deb` is conditional
+
+`cargo xtask dist` builds a `.deb` only when `dpkg-deb` is on PATH. On this
+development host `dpkg-deb` is absent, so the command prints
+`skip .deb: dpkg-deb not available` and still exits 0 with the tarball plus
+`SHA256SUMS` — the `.deb` is optional to the build, never a hard failure. The
+release workflow adds `dpkg` to its apt list (one short comment explains why),
+so `dpkg-deb` is present on `ubuntu-latest` and the runner genuinely produces
+the `.deb` that the release job's glob expects. If that apt entry were removed,
+the release would break at publication time even though local `dist` would keep
+passing; that coupling is why the checklist asks the maintainer to note a local
+`.deb` skip rather than assume the artifact exists.
+
+### Dormant A12 config fields
+
+The `check_updates` and `update_channel` fields on `rufus-core`'s `Config` exist
+only for **schema compatibility**: they are persisted and round-tripped so
+existing TOML configs keep deserialising, but no code reads them to perform an
+update check. They have no defaults change, no behaviour and no new types —
+only their doc comments (and the README's "dormant fields" note) now say so
+explicitly. There is no HTTP client and no background network call anywhere in
+the tree; nothing connects to the network because of these fields. Decision A12
+("telemetry: none; network only on explicit user action") therefore stays
+**proposed** — S30 documents that policy, it does not implement or approve a
+telemetry feature. The `net` row in `data/parity.csv` is a ledger assignment,
+not a live update-check feature.
+
+### Verification at S30 close
+
+All gates were run from the repo root with
+`export PATH="$HOME/.cargo/bin:$PATH"`:
+
+* `cargo xtask ci` → exit 0, `ci: all gates passed`: fmt and clippy
+  (`-D warnings`) clean; all workspace test suites green; `assets --check`
+  `86 entries, 86 files verified`; `parity --check` `2709 data rows`;
+  `contract --check` green; `size` within the committed baseline allowance,
+  all budgets OK; `cargo-deny` `advisories ok, bans ok, licenses ok, sources ok`.
+  `cargo-audit` → `SKIP (not installed)` (pre-existing, reported as a skip, not
+  a failure), with pre-existing non-fatal `warning[duplicate]` lines from
+  `Cargo.lock` during the deny step.
+* `cargo xtask qa` → exit 0, `qa: all suites passed`: all Tier 1 structural
+  suites and all Tier 2 headless QEMU/SeaBIOS/OVMF suites pass; the only skip is
+  the documented `tier1/pipeline-loop: loop-device / throughput tests need
+  --privileged`.
+* `cargo xtask dist` → exit 0: `target/dist/x86_64-unknown-linux-gnu/` contains
+  `rufus-0.1.0-x86_64-unknown-linux-gnu.tar.gz` and `SHA256SUMS`; the `.deb` is
+  skipped locally (`dpkg-deb` absent). Each `SHA256SUMS` line is
+  `<digest>  <bare filename>`, and `sha256sum -c SHA256SUMS` passes from that
+  directory.
+* `cargo fmt --all -- --check` → clean; `git diff --check` → clean.
+
+The binary sizes are unchanged from `size-baseline.json` (`rufus` 1,810,152,
+`rufus-helper` 1,406,296, `rufus-gui` 12,774,280 bytes). The release workflow
+itself was **not** executed locally: that needs a GitHub runner and a real `v*`
+tag. Hardware acceptance in `docs/RELEASE-CHECKLIST.md` (GUI/hotplug on a real
+desktop and UEFI/Legacy BIOS boots of Linux, Windows installer and Windows To Go
+media) is a manual maintainer sign-off, not a CI-verified step. The authoritative
+close-out record is `docs/handoffs/HANDOFF-S30.md`.
