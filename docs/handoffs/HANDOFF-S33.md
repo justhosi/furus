@@ -1,17 +1,18 @@
-# S33 — Post-release hygiene — SLICE 5 HANDOFF
+# S33 — Post-release hygiene — SLICE 6 HANDOFF
 
 Repo: `/home/hosi/dev/REA-Rufus/furus`, branch `main`, current HEAD
-`48aaae5` (S33.5 Part A committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
+`53a1a91` (S33.5 Part B CLI split committed). `cargo`/`rustc` live in `~/.cargo/bin`; prefix every cargo command
 with `export PATH="$HOME/.cargo/bin:$PATH"`.
 
 This is the authoritative S33 handoff. It is updated as each slice lands.
 Per-slice records may be added alongside it as historical notes.
 
-## Status: Slices 1-5/9 complete and verified, committed locally; nothing pushed
+## Status: Slices 1-6/9 complete and verified, committed locally; nothing pushed
 
 All S33 work is committed locally on top of pushed `da44823`: `8c1ef69`
 (S33.1), `6ce1a51` (S33.2), `cf10532` (S33.3), `191621a` (S33.4), `b06a3d3`
-(handoff through slice 4), `48aaae5` (S33.5 Part A), plus the two S32
+(handoff through slice 4), `48aaae5` (S33.5 Part A), `9e5361b` (handoff
+through slice 5), `53a1a91` (S33.5 Part B CLI split), plus the two S32
 documentation commits `e4fc6e6` and `3416f1c` which the user chose to keep
 local. No reset/rebase/amend/push/tag was performed. `v0.1.1` already exists
 as a published tag; S33 does not create or move tags. The user has not
@@ -35,7 +36,7 @@ that happens.
 | 3/9 | SIGINT via `sigaction` with explicit `SA_RESTART` | **Complete, verified** — `cf10532` |
 | 4/9 | Portable paired OVMF firmware discovery with env overrides, xtask QA parity, removal of the Ubuntu CI symlink shims | **Complete, verified** — `191621a` |
 | 5/9 | Part A: extract inline `#[cfg(test)] mod tests` from `pipeline/mod.rs`, `furus-helper/src/dbus.rs`, `furus-gui/src/main.rs` into sibling test files | **Complete, verified** — `48aaae5` |
-| 6/9 | Part B: split `crates/furus-cli/src/main.rs` into `main`, `cli`, `output`, `commands` modules | Pending |
+| 6/9 | Part B: split `crates/furus-cli/src/main.rs` into `main`, `cli`, `output`, `commands` modules | **Complete, verified** — `53a1a91` |
 | 7/9 | Part B: split `crates/furus-core/src/fs/exfat/volume.rs` into `volume/{mod,format,fat,io,tests}.rs` | Pending |
 | 8/9 | Part B: split `xtask/src/main.rs` into `main`, `util`, `assets`, `parity`, `size`, `packaging`, `dist`, `contract`, `ci`, `qa` modules | Pending |
 | 9/9 | Final full gate, README slice table row, `TECHNICAL.md` S33 section, final handoff | Pending |
@@ -253,10 +254,54 @@ by the coder; this section was added by the parent afterwards.
   replaced it with a normal `git add -A`, and the commit contains all three new
   files with full content.
 
+## Slice 6/9 — what changed (commit `53a1a91`)
+
+Split the 2130-line `crates/furus-cli/src/main.rs` into eight files while
+preserving every behavior:
+
+- `src/main.rs` (452 lines) — crate docs, `#![forbid(unsafe_code)]`, module
+  declarations, `Exit`/`Fail`/`fail_from_plan`/`to_pretty`/`json_error`,
+  `HostPaths`, `dispatch`, `main`.
+- NEW `src/cli.rs` (347) — `Cli`, `Command`, the four parsers.
+- NEW `src/output.rs` (432) — all JSON structs, `report_summary`,
+  `verdict_json`, both reporters, `print_human_plan`, `human_*`, `describe_step`.
+- NEW `src/commands/mod.rs` (754) — all 13 command/helper functions.
+- NEW `src/main_tests.rs` (74), `src/cli/tests.rs` (36),
+  `src/commands/tests.rs` (110), `src/output/tests.rs` (19) — the original
+  eight tests plus the `derivation_plan` helper, distributed to the module
+  they exercise.
+
+Visibility widened only to `pub(crate)` where a sibling module needs access;
+no new plain `pub`, no new unsafe, no production `.unwrap()`, no dependency or
+CLI/exit-code/JSON/error-message change. Three doc-only deviations (two
+intra-doc link retargets plus `` `furus-core::hash` `` → `` `furus_core::hash` ``
+in prose). Diff stat: 8 files, 1791 insertions / 1697 deletions.
+
+## Verification (Slice 6/9 — coder and independent reviewer)
+
+- `cargo fmt --all -- --check` → **clean** after one `cargo fmt --all`
+  (which touched only the eight in-scope files).
+- `cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**.
+- `RUSTDOCFLAGS="-D warnings" cargo doc -p furus-cli --no-deps` → **exit 0**.
+- `cargo test --workspace --all-targets -- --list | grep -cE ': test$'` →
+  **1912** (unchanged).
+- `cargo test --workspace` → **1883 passed, 0 failed, 29 ignored**.
+- `cargo xtask ci` / `cargo xtask qa` → **pass**; size gate green with no
+  baseline refresh; only the documented `cargo-audit` and privileged-loop
+  skips. `tier2/uefi-ntfs-ovmf` PASS.
+- CLI behavior: `main --help` and all seven subcommand `--help` outputs
+  byte-identical to the pre-change HEAD (reviewer built HEAD in a temporary
+  worktree and compared); `version --json` matches apart from the build-time
+  `git_hash` (`9e5361b` vs `3416f1c`).
+- Reviewer independently compared 52 moved top-level items against `HEAD`
+  (51/51 non-test items verbatim modulo imports/`pub(crate)`/reflow; the test
+  module verified separately, all 8 tests identical).
+- `git diff --check` clean; `git add -A` staged exactly eight files.
+
 ## What remains
 
-Slices 6/9 through 9/9 per the plan table. Each must stay behaviour-preserving:
+Slices 7/9 through 9/9 per the plan table. Each must stay behaviour-preserving:
 no public signature/CLI/JSON/error-message changes, no visibility widening, no
 new unsafe or production `.unwrap()`, and the test count must not drop below
 1912. Keep the no-push / no-tag rule until the user explicitly authorizes
-publication. Slices 5/9 and earlier are committed locally (not pushed).
+publication. Slices 6/9 and earlier are committed locally (not pushed).
