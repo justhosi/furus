@@ -1,24 +1,38 @@
 Name:           rufus
-Version:        0.1.0
+# Version and target are overridable by the offline/local CI recipe build:
+#   rpmbuild --define 'rufus_version 0.1.0' \
+#            --define 'rufus_target x86_64-unknown-linux-gnu' -bb rufus.spec
+# With no --define the defaults below keep a plain `rpmbuild -bb` working.
+%{!?rufus_version:%global rufus_version 0.1.0}
+%{!?rufus_target:%global rufus_target x86_64-unknown-linux-gnu}
+# The dist binaries are pre-built release binaries with no debuginfo. Fedora's
+# automatic debuginfo/debugsource subpackages would otherwise fail on an empty
+# debugsourcefiles.list; disable them instead of recompiling anything here.
+%global debug_package %{nil}
+Version:        %{rufus_version}
 Release:        1%{?dist}
 Summary:        Native USB image writer for Linux
 License:        GPL-3.0-or-later
 URL:            https://github.com/justhosi/furus
 # `cargo xtask dist` emits one exact-name bundle, rufus-<version>-<triple>.tar.gz,
-# whose root is the staged FHS tree (usr/, DEBIAN/), not loose files.
-%global dist_target x86_64-unknown-linux-gnu
+# whose root is the staged FHS tree (usr/, DEBIAN/), not loose files. dist_target
+# follows rufus_target, so Source0 always names the exact pre-built dist bundle.
+%global dist_target %{rufus_target}
 Source0:        rufus-%{version}-%{dist_target}.tar.gz
-# For an aarch64 rebuild set dist_target=aarch64-unknown-linux-gnu and BuildArch: aarch64.
+# For an aarch64 rebuild pass --define 'rufus_target aarch64-unknown-linux-gnu'
+# and set BuildArch: aarch64.
 BuildArch:      x86_64
 
 Requires:       glibc >= 2.31
-Recommends:     ntfs-3g, e2fsprogs, udftools, libwim15
+# Fedora names: wimlib (not Debian's libwim15); polkit/fontconfig are needed by
+# the D-Bus helper and the Slint GUI at runtime. No Rust is rebuilt here.
+Recommends:     ntfs-3g, e2fsprogs, udftools, wimlib, polkit, fontconfig
 
 %description
 rufus is a native utility for writing disk images to USB devices, with a
 root-owned D-Bus helper mediating device access. FAT32 and exFAT are written
 natively; NTFS, ext2/3/4, UDF and WIM/ESD images need the recommended external
-tools (ntfs-3g, e2fsprogs, udftools, libwim15) available at write time.
+tools (ntfs-3g, e2fsprogs, udftools, wimlib) available at write time.
 
 %prep
 # The archive has no leading directory; -c creates it and cds into it.

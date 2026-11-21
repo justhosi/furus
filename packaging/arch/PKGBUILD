@@ -1,16 +1,28 @@
 # Maintainer: furus maintainers <mohamadzadeh@outlook.com>
 pkgname=rufus-linux
-pkgver=0.1.0
+# Both are overridable by the offline/local CI recipe build, e.g.
+#   rufus_version=0.1.0 _target=x86_64-unknown-linux-gnu makepkg -f --noconfirm
+# With no override, the same safe defaults as the dist bundle apply. `pkgver`
+# itself cannot be used here: makepkg unsets that name before sourcing PKGBUILD.
+pkgver=${rufus_version:-0.1.0}
 pkgrel=1
 pkgdesc="Native USB image writer for Linux"
 arch=('x86_64' 'aarch64')
 url="https://github.com/justhosi/furus"
 license=('GPL-3.0-or-later')
+# The binaries arrive already stripped from `cargo xtask dist`. makepkg's tidy
+# step would otherwise re-strip them and run gdb-add-index, which prints
+# misleading "No debugging symbols" errors and tampers with verified bytes.
+options=(!strip)
 # `cargo xtask dist` emits one exact-name bundle, rufus-<version>-<triple>.tar.gz,
 # whose root is the staged FHS tree (usr/, DEBIAN/), not loose files. Override
 # _target=aarch64-unknown-linux-gnu for an aarch64 build. Nothing is downloaded.
 _target=${_target:-x86_64-unknown-linux-gnu}
 source=("rufus-${pkgver}-${_target}.tar.gz")
+# The dist tarball is already verified against SHA256SUMS by the release
+# workflow before it reaches this recipe; `SKIP` is deliberate, not a missing
+# entry (makepkg requires one hash per source). Verify it there, not here.
+sha256sums=('SKIP')
 depends=('glibc>=2.31')
 optdepends=(
   'ntfs-3g'
@@ -18,6 +30,8 @@ optdepends=(
   'e2fsprogs'
   'udftools'
   'wimlib'
+  'polkit'
+  'fontconfig'
 )
 
 package() {

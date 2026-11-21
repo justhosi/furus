@@ -1078,7 +1078,9 @@ fn validate_rpm_spec(text: &str) -> Result<()> {
     require_tokens(
         recommends,
         "rpm spec Recommends",
-        &["ntfs-3g", "e2fsprogs", "udftools", "libwim15"],
+        // Fedora uses `wimlib`; `libwim15` is the Debian name kept only in the
+        // deb control validator above.
+        &["ntfs-3g", "e2fsprogs", "udftools", "wimlib"],
     )
 }
 
