@@ -9,6 +9,7 @@ use std::sync::PoisonError;
 use std::time::Duration;
 
 use furus_core::hash::hash_file;
+use furus_linux::Device;
 use furus_linux::SysfsRoot;
 use furus_proto::DeviceRef;
 use furus_proto::Event;
@@ -25,6 +26,8 @@ use furus_proto::Target as Firmware;
 use crate::exec;
 use crate::pipeline::PlanRunner;
 use crate::progress::ProgressSink;
+use crate::unmount::UnmountRefusal;
+use crate::unmount::Unmounter;
 use crate::validate;
 
 use super::Authorizer;
@@ -304,18 +307,56 @@ impl PlanRunner for StubRunner {
     }
 }
 
+/// The hermetic host-unmount seam: no syscalls, no events. The fixture env
+/// carries no real mounts of the target, so the live step would find nothing
+/// to do; this stub makes that independence explicit and keeps every service
+/// test off the live mount table.
+struct NoopUnmounter;
+
+impl Unmounter for NoopUnmounter {
+    fn unmount(
+        &self,
+        _device: &Device,
+        _env: &validate::Env,
+        _sink: &mut dyn ProgressSink,
+        _session: &str,
+    ) -> Result<(), UnmountRefusal> {
+        Ok(())
+    }
+}
+
+/// A unmount seam that always refuses, for the post-unmount refusal path.
+/// The refusal is returned verbatim so the worker's `protected_path` mapping
+/// (Refused vs Failed) and its single terminal `Done` can be pinned.
+struct FailingUnmounter {
+    refusal: UnmountRefusal,
+}
+
+impl Unmounter for FailingUnmounter {
+    fn unmount(
+        &self,
+        _device: &Device,
+        _env: &validate::Env,
+        _sink: &mut dyn ProgressSink,
+        _session: &str,
+    ) -> Result<(), UnmountRefusal> {
+        Err(self.refusal.clone())
+    }
+}
+
 fn registry_with(
     env: validate::Env,
     authorization: Arc<dyn Authorizer>,
     sessions: &tempfile::TempDir,
 ) -> (Registry, VecEmitter) {
     let emitter = VecEmitter::new();
-    let registry = Registry::with_runner(
+    let registry = Registry::with_unmounter(
         sessions.path().to_path_buf(),
         env,
         authorization,
         Arc::new(emitter.clone()),
         Arc::new(StubRunner),
+        Arc::new(NoopUnmounter),
     );
     (registry, emitter)
 }
@@ -946,6 +987,79 @@ fn a_wiped_plan_reports_a_failed_done_from_the_placeholder_executor() {
         "the wipe step reported progress before the refusal"
     );
     assert!(registry.is_idle());
+}
+
+// -- the host-unmount refusal path --------------------------------------
+
+#[test]
+fn a_failing_unmount_ends_the_run_with_one_done_and_the_right_outcome() {
+    // A protected-system-path refusal is a safety refusal (Outcome::Refused);
+    // every other unmount failure is an execution failure (Outcome::Failed).
+    // Both still end the stream on exactly one `Done` carrying the id.
+    for (label, code, message, protected) in [
+        (
+            "a protected mount is a safety refusal",
+            "protected_mount",
+            "refusing to unmount /home: it is a protected system path",
+            true,
+        ),
+        (
+            "a busy mount is an execution failure",
+            "busy",
+            "cannot unmount /media/usb: device is busy",
+            false,
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let (good, env, _device) = fixture.good(true);
+        let plan = finalize_only(good);
+        let sessions = tempfile::tempdir().expect("sessions root");
+        let emitter = VecEmitter::new();
+        let refusal = UnmountRefusal {
+            code: code.to_string(),
+            message: message.to_string(),
+            protected_path: protected,
+        };
+        let expected = if protected {
+            furus_proto::Outcome::Refused {
+                code: code.to_string(),
+                message: message.to_string(),
+            }
+        } else {
+            furus_proto::Outcome::Failed {
+                code: code.to_string(),
+                message: message.to_string(),
+            }
+        };
+        let registry = Registry::with_unmounter(
+            sessions.path().to_path_buf(),
+            env,
+            Arc::new(FixedAuthorizer(true)),
+            Arc::new(emitter.clone()),
+            Arc::new(StubRunner),
+            Arc::new(FailingUnmounter { refusal }),
+        );
+
+        let id = registry
+            .execute("com.example.gui", &execute_json(&plan))
+            .expect("a valid plan is accepted immediately");
+        wait_idle(&registry);
+
+        let completions = wait_completions(&emitter);
+        assert_eq!(completions.len(), 1, "exactly one Done: {label}");
+        assert_eq!(completions[0].session, id, "{label}");
+        assert_eq!(completions[0].version, EVENT_STREAM_VERSION, "{label}");
+        assert_eq!(completions[0].outcome, expected, "{label}");
+
+        // The session is gone even though the plan never ran.
+        assert_eq!(
+            fs::read_dir(sessions.path())
+                .expect("the sessions root exists")
+                .count(),
+            0,
+            "the refusal reclaimed the session: {label}"
+        );
+    }
 }
 
 // -- the Handoff (the one-shot accept bridge) ----------------------------

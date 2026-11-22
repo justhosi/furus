@@ -660,11 +660,36 @@ fn check_steps(plan: &Plan) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Rule 8: the independent safety re-check. Mount/swap tables come from
-/// the `Env` fixture paths or their live `/proc` paths; a read or parse
-/// failure refuses with `"unreadable"` — the helper never passes a
-/// device silently on rot it can see.
+/// Rule 8: the independent safety re-check for fast validation. Mount/
+/// swap tables come from the `Env` fixture paths or their live `/proc`
+/// paths; the auto-unmount policy (`allow_auto_unmount = true`) lets an
+/// ordinary mount on removable media through because the caller owns the
+/// unmount step (S35.2b). Every other reason stays unconditional.
 fn judge_target(plan: &Plan, env: &Env, device: &Device) -> Result<Target, Reject> {
+    judge_target_impl(plan, env, device, true)
+}
+
+/// The strict post-unmount re-check (S35.2b). Both entry points call this
+/// after the host unmount and *before* entering the private mount
+/// namespace: it re-reads mountinfo from `env` (`None` means the live
+/// `/proc/self/mountinfo`) and judges with the strict policy, so a device
+/// still mounted — the unmount failed, or something remounted it — is a
+/// clean [`Reject`] carrying the reason's own code (`"mounted"`, ...).
+/// The validated device (path/name/serial) is reused unchanged; only the
+/// mount view is fresh.
+pub fn recheck_strict(validated: &Validated, env: &Env) -> Result<(), Reject> {
+    judge_target_impl(&validated.plan, env, &validated.device, false).map(|_| ())
+}
+
+/// One independent safety re-check, parameterised by the caller's mount
+/// policy. [`judge_target`] passes `true` for fast validation;
+/// [`recheck_strict`] passes `false` for the strict `judge` verdict.
+fn judge_target_impl(
+    plan: &Plan,
+    env: &Env,
+    device: &Device,
+    allow_auto_unmount: bool,
+) -> Result<Target, Reject> {
     let mount_table = MountTable::read(env.mountinfo.as_deref()).map_err(|source| {
         reject(
             "unreadable",
@@ -698,11 +723,7 @@ fn judge_target(plan: &Plan, env: &Env, device: &Device) -> Result<Target, Rejec
             confirmed_serial: plan.options.confirmed_serial.as_deref(),
         },
     );
-    // Fast validation owns the auto-unmount step: an ordinary mount on
-    // removable media is allowed here, and the strict re-check after the
-    // unmount (next slice) will call plain `judge` again. Protected
-    // system mounts and every other reason still refuse above.
-    match judge_with_policy(&inspected.target, true) {
+    match judge_with_policy(&inspected.target, allow_auto_unmount) {
         SafetyVerdict::Safe => Ok(inspected.target),
         SafetyVerdict::Refuse(reason) => Err(reject(reason.code(), reason.to_string())),
     }
@@ -1831,6 +1852,38 @@ mod tests {
             &format!("{}\n", Fixture::mount_line(PART_DEVNUM, "/run/media/usb")),
         ));
         validate(&plan, &env).expect("an ordinary partition mount is auto-unmounted");
+    }
+
+    /// The strict re-check is the second enforcement point: the very
+    /// mount fast validation tolerates is refused here until the host
+    /// unmount has actually removed it from a freshly read mount table.
+    #[test]
+    fn strict_recheck_fails_while_mounted_and_passes_after_unmount() {
+        let fixture = Fixture::new();
+        let (plan, mut env, _device) = fixture.good(true);
+        env.mountinfo = Some(fixture.write_text(
+            "mountinfo.tsv",
+            &format!(
+                "{}\n",
+                Fixture::mount_line(DISK_DEVNUM, "/media/user/STICK")
+            ),
+        ));
+        let validated = validate(&plan, &env).expect("fast validation owns the unmount step");
+        assert_eq!(
+            validated.target.mounted_at.as_deref(),
+            Some("/media/user/STICK")
+        );
+
+        let still_mounted = super::recheck_strict(&validated, &env)
+            .expect_err("the strict verdict refuses a live mount");
+        assert_eq!(still_mounted.code, "mounted");
+        assert!(still_mounted.message.contains("/media/user/STICK"));
+
+        // Simulate a successful host unmount: a fresh read of the
+        // mountinfo fixture with the target's line gone.
+        env.mountinfo = Some(fixture.foreign_mountinfo());
+        super::recheck_strict(&validated, &env)
+            .expect("an unmounted target passes the strict judge");
     }
 
     /// Paths outside the core's protected list are ordinary mounts, and

@@ -82,7 +82,8 @@
 //! ```
 //!
 //! The run itself follows the argv pipeline one step per worker:
-//! [`session::Session::create`] (session id + directory) →
+//! [`session::Session::create`] (session id + directory) → the host
+//! unmount ([`Unmounter`], S35.2b) → the strict post-unmount re-check →
 //! [`namespace::enter_mount_namespace`] → the run's
 //! [`PlanRunner`](crate::pipeline::PlanRunner) (the real core pipeline
 //! in production), every [`Event`] forwarded through the
@@ -127,6 +128,8 @@ use crate::pipeline::PlanRunner;
 use crate::pipeline::RealRunner;
 use crate::progress::ProgressSink;
 use crate::session;
+use crate::unmount::LiveUnmounter;
+use crate::unmount::Unmounter;
 use crate::validate;
 
 // These identifiers are the single-sourced GUI / helper / packaging contract
@@ -334,6 +337,10 @@ struct WorkerRun {
     /// The validated run: plan (confirm intact), device, verdict
     /// input.
     plan: validate::Validated,
+    /// The validation facts (fixture or live sysfs/mountinfo). The
+    /// unmount step and the strict post-unmount re-check read the same
+    /// view validation used, so a fixture test stays hermetic.
+    env: validate::Env,
     /// The claim's cancel flag (sharing state with the slot on
     /// purpose: one flag per run).
     cancel: exec::Cancel,
@@ -341,6 +348,9 @@ struct WorkerRun {
     /// How this run executes its plan: the real pipeline in the
     /// service, a hermetic stub in the fixtures.
     runner: Arc<dyn PlanRunner>,
+    /// The injectable host-unmount step (S35.2b): [`LiveUnmounter`] in
+    /// the service, a no-op stub in the fixtures.
+    unmounter: Arc<dyn Unmounter>,
     /// The one shot to report [`Opening`] back to `execute`.
     tx: mpsc::Sender<Opening>,
     /// The pause hook ([`Registry::new`] leaves it `None`).
@@ -349,7 +359,8 @@ struct WorkerRun {
 
 impl WorkerRun {
     /// The whole run, on its own thread. See the module docs for the
-    /// pinned order (create → isolate → loop → exactly one `Done`).
+    /// pinned order (create → unmount → recheck → isolate → loop → exactly
+    /// one `Done`).
     fn run(self) {
         // Destructured once: the claim's state and the cancel flag are
         // the only things shared back out, via the guard's `Arc`.
@@ -357,9 +368,11 @@ impl WorkerRun {
             state,
             root,
             plan,
+            env,
             cancel,
             emitter,
             runner,
+            unmounter,
             tx,
             pause,
         } = self;
@@ -398,6 +411,41 @@ impl WorkerRun {
         // `Done`, goes through the emitter (delivery breakage is
         // recorded, never propagated — see [`SignalSink`]).
         let mut sink = SignalSink::new(emitter.clone());
+
+        // S35.3 inserts streamed digest verification here, before any
+        // device byte is touched.
+        //
+        // S35.2b: release this disk's mounts on the HOST namespace
+        // before isolating ourselves, then re-check strictly that none
+        // remain. Both failures end here with the run's one `Done`.
+        if let Err(refusal) = unmounter.unmount(&plan.device, &env, &mut sink, &id) {
+            let message = refusal.message;
+            let outcome = if refusal.protected_path {
+                Outcome::Refused {
+                    code: refusal.code,
+                    message,
+                }
+            } else {
+                Outcome::Failed {
+                    code: refusal.code,
+                    message,
+                }
+            };
+            finish_run(session, &id, &mut sink, outcome);
+            return;
+        }
+        if let Err(reject) = validate::recheck_strict(&plan, &env) {
+            finish_run(
+                session,
+                &id,
+                &mut sink,
+                Outcome::Refused {
+                    code: reject.code,
+                    message: reject.message,
+                },
+            );
+            return;
+        }
 
         // Privileged only (see the module docs): the mount isolation,
         // before anything of the plan happens — the argv pipeline's
@@ -519,6 +567,10 @@ pub struct Registry {
     /// pipeline; the fixtures select the hermetic stub through
     /// [`Registry::with_runner`].
     runner: Arc<dyn PlanRunner>,
+    /// How each accepted run releases the target's host mounts before
+    /// isolation (S35.2b). `new` wires [`LiveUnmounter`]; the fixtures
+    /// select a no-op stub through [`Registry::with_unmounter`].
+    unmounter: Arc<dyn Unmounter>,
     /// The test pause hook — see [`RunPause`] and `install_run_pause`.
     pause: Mutex<Option<RunPause>>,
 }
@@ -549,8 +601,10 @@ impl Registry {
 
     /// The same registry with an explicit runner. Production uses
     /// [`Registry::new`]; tests pass a stub so no fixture needs root
-    /// or a real block device. The authorization, claim, session and
-    /// `Done` semantics are identical for every runner.
+    /// or a real block device. The unmount step is the live one here;
+    /// fixtures that need to stub it use [`Registry::with_unmounter`].
+    /// The authorization, claim, session and `Done` semantics are
+    /// identical for every runner.
     #[must_use]
     pub fn with_runner(
         sessions_root: PathBuf,
@@ -559,6 +613,28 @@ impl Registry {
         emitter: Arc<dyn EventEmitter>,
         runner: Arc<dyn PlanRunner>,
     ) -> Registry {
+        Self::with_unmounter(
+            sessions_root,
+            env,
+            authorization,
+            emitter,
+            runner,
+            Arc::new(LiveUnmounter),
+        )
+    }
+
+    /// The same registry with explicit runner *and* unmounter seams.
+    /// The D-Bus fixtures use a no-op unmounter so they never touch a
+    /// real mount; production reaches this through [`Registry::new`].
+    #[must_use]
+    pub fn with_unmounter(
+        sessions_root: PathBuf,
+        env: validate::Env,
+        authorization: Arc<dyn Authorizer>,
+        emitter: Arc<dyn EventEmitter>,
+        runner: Arc<dyn PlanRunner>,
+        unmounter: Arc<dyn Unmounter>,
+    ) -> Registry {
         Registry {
             sessions_root,
             env,
@@ -566,6 +642,7 @@ impl Registry {
             emitter,
             state: Arc::new(Mutex::new(None)),
             runner,
+            unmounter,
             pause: Mutex::new(None),
         }
     }
@@ -659,9 +736,11 @@ impl Registry {
             state: self.state.clone(),
             root: self.sessions_root.clone(),
             plan,
+            env: self.env.clone(),
             cancel,
             emitter: self.emitter.clone(),
             runner: self.runner.clone(),
+            unmounter: self.unmounter.clone(),
             tx,
             pause,
         };
