@@ -1,14 +1,15 @@
 //! The step loop and the executor seam (S06).
 //!
-//! [`run_plan`] is the whole S06 part 3 executor: it walks the plan's
-//! steps in order, reports per-step progress and log lines through the
+//! [`run_plan`] is the S06 step loop: it walks the plan's steps in
+//! order, reports per-step progress and log lines through the
 //! [`ProgressSink`](crate::progress::ProgressSink) the caller chose,
 //! honours cancellation between steps, and maps every executor outcome
 //! onto the [`furus_proto::Outcome`] the front end's `Done` event
 //! carries. It performs **no** block I/O of its own — real step work is
-//! plugged in below via [`StepExecutor`], which is what S07/S17 build
-//! on. Neither this loop nor [`CurrentExecutor`] spawns processes,
-//! issues mounts or opens devices.
+//! plugged in below via [`StepExecutor`]. Production runs the
+//! [`crate::pipeline::RealRunner`] instead; this loop and the
+//! test-only [`CurrentExecutor`] spawn no processes, issue no mounts
+//! and open no devices.
 //!
 //! # Grammar of the loop (pinned by tests)
 //!
@@ -21,14 +22,14 @@
 //! never a `Done` event (the caller emits that, after `run_plan`
 //! returns, also for pre-run refusals).
 //!
-//! # The current executor is a documented refusal
+//! # The placeholder executor is a test seam
 //!
-//! [`CurrentExecutor`] is the S06 placeholder that S17 replaces.
-//! Shipping a build with it means **no plan can write a device**: every
-//! step except `Finalize` is refused with code `"unsupported"`. That is
-//! the honest state — a helper that runs nothing exists so the wiring
-//! (argv, validation, session, events) is testable end to end before a
-//! single byte of media is at risk.
+//! [`CurrentExecutor`] (`#[cfg(test)]` only) keeps the historical
+//! refusal for step-loop fixtures: every step except `Finalize` is
+//! refused with code `"unsupported"`. Production runs the real core
+//! pipeline through [`crate::pipeline::RealRunner`]; the placeholder
+//! exists so the hermetic event-grammar tests stay independent of
+//! devices and root.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -48,7 +49,8 @@ use crate::validate::Reject;
 
 /// The one reserved executor rejection code: a step that chose to stop
 /// because the user cancelled maps to [`Outcome::Cancelled`], not to a
-/// failure.
+/// failure. Only the hermetic step-loop fixtures use this now.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const CANCELLED_CODE: &str = "cancelled";
 
 /// Cooperative cancellation flag shared by `run_plan`, the executors
@@ -105,6 +107,7 @@ pub struct StepCtx<'a> {
 
 /// Real step work behind [`run_plan`]. The S06 placeholder is
 /// [`CurrentExecutor`]; S07+S17 will implement a writing one.
+#[cfg_attr(not(test), allow(dead_code))]
 pub trait StepExecutor {
     /// Execute step `index` of `plan.steps`. Returning
     /// [`Reject`] with code [`CANCELLED_CODE`] means "stop, cancelled",
@@ -118,6 +121,7 @@ pub trait StepExecutor {
 /// Mirrors the `#[serde(tag = "op", rename_all = "snake_case")]` tags
 /// of [`Step`]; the tests compare both constants against
 /// `serde_json::to_value`, so they cannot drift.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn op_tag(step: &Step) -> &'static str {
     match step {
         Step::Wipe => "wipe",
@@ -136,6 +140,7 @@ pub fn op_tag(step: &Step) -> &'static str {
 /// terminal event: the caller (in S06 part 3, `main`) emits the final
 /// `Event::Done`, also for pre-run refusals — so an event stream always
 /// ends off exactly one `Done`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_plan(
     plan: &Plan,
     device: &furus_linux::Device,
@@ -216,19 +221,25 @@ pub fn run_plan(
     Outcome::Ok
 }
 
-/// The S06 placeholder executor (see the module docs): the loop, the
-/// event grammar and the fail-closed posture are live, the actual step
-/// work is not until S07+S17 arrive. `Finalize` is accepted (it would
-/// flush nothing on this build), everything else refuses.
+/// The S06 placeholder executor, kept only for hermetic tests: the
+/// event grammar and the fail-closed posture are pinned by the loop,
+/// while the real step work lives in
+/// [`crate::pipeline::RealRunner`]. `Finalize` is accepted (it would
+/// flush nothing), everything else refuses with the historical
+/// S07-pipeline message the fixtures assert. Never wired into either
+/// production entry point.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CurrentExecutor;
 
+#[cfg(test)]
 impl Default for CurrentExecutor {
     fn default() -> Self {
         Self
     }
 }
 
+#[cfg(test)]
 impl StepExecutor for CurrentExecutor {
     fn execute(&mut self, _index: usize, step: &Step, ctx: &mut StepCtx<'_>) -> Result<(), Reject> {
         if matches!(step, Step::Finalize) {

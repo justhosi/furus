@@ -83,8 +83,9 @@
 //!
 //! The run itself follows the argv pipeline one step per worker:
 //! [`session::Session::create`] (session id + directory) →
-//! [`namespace::enter_mount_namespace`] → [`exec::run_plan`] with
-//! [`exec::CurrentExecutor`], every [`Event`] forwarded through the
+//! [`namespace::enter_mount_namespace`] → the run's
+//! [`PlanRunner`](crate::pipeline::PlanRunner) (the real core pipeline
+//! in production), every [`Event`] forwarded through the
 //! [`EventEmitter`], and exactly one final
 //! `Event::Done`([`Completion`]).
 //!
@@ -97,9 +98,8 @@
 //! and always isolate; the gate exists so unprivileged *unit* runs
 //! (which must not root, per this crate's test contract) can execute
 //! the rest of the pipeline truthfully. Nothing is weakened: a
-//! non-root run that got here could still write nothing (the plan
-//! rules stand, executors refuse), and 5b's service starts as root
-//! exactly like `main`'s argv path.
+//! non-root run that got here still faces every plan rule, and 5b's
+//! service starts as root exactly like `main`'s argv path.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -123,6 +123,8 @@ use furus_proto::service;
 
 use crate::exec;
 use crate::namespace;
+use crate::pipeline::PlanRunner;
+use crate::pipeline::RealRunner;
 use crate::progress::ProgressSink;
 use crate::session;
 use crate::validate;
@@ -272,9 +274,8 @@ pub trait EventEmitter: Send + Sync {
 /// A worker pause hook between the session existing and the plan
 /// running. [`Registry::new`] never sets one; tests do (see
 /// `install_run_pause`), so they can cancel or probe the claim at a
-/// deterministic point — the S06 placeholder executor finishes every
-/// step in microseconds, and a real mid-step pause belongs to
-/// S07/S17's step executors honouring the `ctx.cancel` flag.
+/// deterministic point — a pause hook here avoids any dependency on
+/// how fast the runner happens to execute its steps.
 type RunPause = Arc<dyn Fn() + Send + Sync>;
 
 /// The one live run: from `execute`'s claim to the worker's end.
@@ -337,6 +338,9 @@ struct WorkerRun {
     /// purpose: one flag per run).
     cancel: exec::Cancel,
     emitter: Arc<dyn EventEmitter>,
+    /// How this run executes its plan: the real pipeline in the
+    /// service, a hermetic stub in the fixtures.
+    runner: Arc<dyn PlanRunner>,
     /// The one shot to report [`Opening`] back to `execute`.
     tx: mpsc::Sender<Opening>,
     /// The pause hook ([`Registry::new`] leaves it `None`).
@@ -355,6 +359,7 @@ impl WorkerRun {
             plan,
             cancel,
             emitter,
+            runner,
             tx,
             pause,
         } = self;
@@ -419,18 +424,11 @@ impl WorkerRun {
             return;
         }
 
-        // The step loop (S06 part 3) with the placeholder executor:
-        // every step but `Finalize` refuses until S07/S17 arrive,
-        // which is the honest state of this build.
-        let mut executor = exec::CurrentExecutor;
-        let outcome = exec::run_plan(
-            &plan.plan,
-            &plan.device,
-            &mut executor,
-            &mut sink,
-            &cancel,
-            &id,
-        );
+        // The real write pipeline (a hermetic stub in the fixtures).
+        // The runner owns the event grammar and the outcome mapping;
+        // this worker only owns the session, the sink and the cancel
+        // flag it probes.
+        let outcome = runner.run(&plan, &mut sink, &cancel, &id);
         finish_run(session, &id, &mut sink, outcome);
     }
 }
@@ -517,6 +515,10 @@ pub struct Registry {
     /// last line — except for the refusals `execute` releases itself
     /// (invalid plan, launch failure).
     state: Arc<Mutex<Option<Claim>>>,
+    /// How each accepted run executes its plan. `new` wires the real
+    /// pipeline; the fixtures select the hermetic stub through
+    /// [`Registry::with_runner`].
+    runner: Arc<dyn PlanRunner>,
     /// The test pause hook — see [`RunPause`] and `install_run_pause`.
     pause: Mutex<Option<RunPause>>,
 }
@@ -532,12 +534,38 @@ impl Registry {
         authorization: Arc<dyn Authorizer>,
         emitter: Arc<dyn EventEmitter>,
     ) -> Registry {
+        // The validation env already knows which sysfs root the
+        // device came from; the runner reuses it, so no run
+        // re-enumerates the system.
+        let sysfs = env.sysfs.clone();
+        Self::with_runner(
+            sessions_root,
+            env,
+            authorization,
+            emitter,
+            Arc::new(RealRunner::new(sysfs)),
+        )
+    }
+
+    /// The same registry with an explicit runner. Production uses
+    /// [`Registry::new`]; tests pass a stub so no fixture needs root
+    /// or a real block device. The authorization, claim, session and
+    /// `Done` semantics are identical for every runner.
+    #[must_use]
+    pub fn with_runner(
+        sessions_root: PathBuf,
+        env: validate::Env,
+        authorization: Arc<dyn Authorizer>,
+        emitter: Arc<dyn EventEmitter>,
+        runner: Arc<dyn PlanRunner>,
+    ) -> Registry {
         Registry {
             sessions_root,
             env,
             authorization,
             emitter,
             state: Arc::new(Mutex::new(None)),
+            runner,
             pause: Mutex::new(None),
         }
     }
@@ -633,6 +661,7 @@ impl Registry {
             plan,
             cancel,
             emitter: self.emitter.clone(),
+            runner: self.runner.clone(),
             tx,
             pause,
         };

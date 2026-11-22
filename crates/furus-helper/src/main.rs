@@ -44,6 +44,7 @@ mod exec;
 #[allow(unused_imports)]
 pub(crate) use furus_linux::mount;
 mod namespace;
+mod pipeline;
 mod process;
 mod progress;
 mod session;
@@ -61,7 +62,7 @@ use furus_proto::EVENT_STREAM_VERSION;
 use furus_proto::Event;
 use furus_proto::Outcome;
 
-use exec::CurrentExecutor;
+use pipeline::PlanRunner;
 use progress::JsonlSink;
 use progress::NullSink;
 use progress::ProgressSink;
@@ -311,7 +312,10 @@ fn run(args: &RunArgs) -> i32 {
                 message: reject.message,
             },
             Ok(validated) => {
-                let mut executor = CurrentExecutor;
+                // The device was discovered through `env.sysfs`, so
+                // the real runner opens it under the same root — no
+                // re-enumeration, no second view of the system.
+                let runner = pipeline::RealRunner::new(env.sysfs.clone());
                 match session::Session::create(Path::new(session::SESSION_ROOT), &validated.plan) {
                     Err(err) => Outcome::Failed {
                         code: err.code,
@@ -341,10 +345,8 @@ fn run(args: &RunArgs) -> i32 {
                             Ok(()) => {
                                 session_id = session.id().to_string();
                                 let cancel = exec::Cancel::new();
-                                let outcome = exec::run_plan(
-                                    &validated.plan,
-                                    &validated.device,
-                                    &mut executor,
+                                let outcome = runner.run(
+                                    &validated,
                                     sink_for(&mut sink, &mut discard),
                                     &cancel,
                                     &session_id,

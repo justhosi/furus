@@ -22,6 +22,9 @@ use furus_proto::Scheme;
 use furus_proto::Step;
 use furus_proto::Target as Firmware;
 
+use crate::exec;
+use crate::pipeline::PlanRunner;
+use crate::progress::ProgressSink;
 use crate::validate;
 
 use super::Authorizer;
@@ -276,17 +279,43 @@ fn wait_idle(registry: &Registry) {
 // /run/furus-linux), the fixture env, and the caller's authoriser.
 // ----------------------------------------------------------------------
 
+/// The hermetic runner: the pinned step loop and the test-only
+/// placeholder executor, with no device I/O and no root. Every
+/// assertion here stays about the service layer, not the write
+/// pipeline.
+struct StubRunner;
+
+impl PlanRunner for StubRunner {
+    fn run(
+        &self,
+        validated: &validate::Validated,
+        sink: &mut dyn ProgressSink,
+        cancel: &exec::Cancel,
+        session: &str,
+    ) -> furus_proto::Outcome {
+        exec::run_plan(
+            &validated.plan,
+            &validated.device,
+            &mut exec::CurrentExecutor,
+            sink,
+            cancel,
+            session,
+        )
+    }
+}
+
 fn registry_with(
     env: validate::Env,
     authorization: Arc<dyn Authorizer>,
     sessions: &tempfile::TempDir,
 ) -> (Registry, VecEmitter) {
     let emitter = VecEmitter::new();
-    let registry = Registry::new(
+    let registry = Registry::with_runner(
         sessions.path().to_path_buf(),
         env,
         authorization,
         Arc::new(emitter.clone()),
+        Arc::new(StubRunner),
     );
     (registry, emitter)
 }
