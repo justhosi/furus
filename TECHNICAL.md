@@ -1575,3 +1575,124 @@ verified by `sha256sum -c SHA256SUMS`), `cargo xtask size` and
 `git diff --check` — is green. End-to-end dialog and write behavior still
 needs a real desktop; the manual sign-off checklist is in
 `docs/handoffs/HANDOFF-S33.md`.
+
+## S34 — pkexec helper path and themed log drawer
+
+S34 fixes two live-desktop bugs observed after S33. It is a two-commit code
+change plus this documentation slice; it changes no version, tag, packaging
+contract or release workflow. All work is local on `main`; `v0.1.1` was tagged
+and published earlier and S34 creates or moves no tags and pushes nothing.
+Publication is left entirely to manual maintainer / Publisher sign-off. The
+work was delivered one slice at a time with coder then independent reviewer.
+
+### S34.1 — resolve the installed `furus-helper` path for `pkexec` (`6aaefd4`)
+
+Only `crates/furus-gui/src/ipc/pkexec.rs` changed. `PkexecTransport::start`
+used to pass the bare name `"furus-helper"` to `pkexec`. `pkexec` sanitizes
+`PATH` and the resulting search path does not include `/usr/libexec`, so on an
+installed system the helper could not be found and the spawn failed with exit
+127 (`Cannot run program furus-helper: No such file or directory`). Local
+`target/release` / `cargo run` builds happened to work because the helper sat
+next to the GUI binary on a PATH-like lookup, which is why the bug only showed
+up on a real installed desktop.
+
+The fix does not introduce a second copy of the install path. The workspace
+already has a single source of truth, `furus_proto::HELPER_BIN_PATH`
+(`/usr/libexec/furus-helper`), defined in
+`crates/furus-proto/src/service.rs` and re-exported from `furus_proto`; the D-Bus
+service file `packaging/dbus/org.furuslinux.Helper1.service` already used the
+matching `Exec=/usr/libexec/furus-helper --dbus`. The GUI now imports that
+constant and adds a `helper_program: PathBuf` field to `PkexecTransport`.
+
+`new()` calls the pure helper `resolve_helper_program(current_exe,
+Path::new(HELPER_BIN_PATH))`, which applies three ordered rules:
+
+1. if the installed path (`HELPER_BIN_PATH`) is a file, use it;
+2. otherwise, if a `furus-helper` sibling exists next to
+   `std::env::current_exe()`, use that (supports local `target/release` and
+   `cargo run` builds);
+3. otherwise fall back to the bare `"furus-helper"`.
+
+`start()` now passes `.arg(&self.helper_program)`, so installed systems launch
+the absolute `/usr/libexec/furus-helper` that survives `pkexec`'s PATH
+sanitization. The pure resolver takes its inputs as arguments rather than
+reading the environment itself, so it is trivially unit-testable without root
+and without ever touching `/usr/libexec`.
+
+The test-seam constructors (`with_command` and
+`with_command_and_authorization_timeout`) deliberately keep setting the bare
+`"furus-helper"` as `helper_program`. Those constructors drive the existing
+argv/wire protocol tests with a command stub, not a real pkexec; keeping the
+bare name there leaves every existing argv assertion and the helper JSONL /
+run-state wire test byte-for-byte unchanged, so the fix is isolated to the
+production launch path. Three new hermetic unit tests use unique `temp_dir()`
+fixtures (installed-file-wins even when a sibling is present, sibling fallback,
+and bare fallback both with and without `current_exe`) and never create files
+under `/usr/libexec`. No packaging change was needed; the `xtask ci` contract
+check still passes.
+
+### S34.2 — theme the log drawer with Palette colors (`d241942`)
+
+Only `crates/furus-gui/ui/main.slint` and
+`crates/furus-gui/tests/render_smoke.rs` changed. The `Show log` drawer used a
+hard-coded `background: #f6f6f6` while the log text inherited the dark theme's
+light foreground, producing light-on-white text that was effectively invisible.
+The drawer is now a themed container: an outer `Rectangle` with
+`min-height: 120px`, `background: Palette.alternate-background`,
+`border-width: 1px`, `border-color: Palette.border`, `border-radius: 4px` and
+`clip: true`; an inner `Flickable` with `width/height: 100%` and
+`content-height: log-text.preferred-height + 16px` so long logs scroll instead
+of overflowing; and a `log-text` `Text` at `x/y: 8px`,
+`width: parent.width - 16px`, `color: Palette.foreground`, `wrap: word-wrap`,
+with an empty-state fallback of `"No log entries yet."`. `Palette` was already
+imported from `std-widgets.slint`. A color audit confirms the only remaining
+`#` colors in `main.slint` are `#000000aa` on the two intentional modal scrims
+(the confirm and checksum dialogs).
+
+The third render-smoke test, `log_drawer_renders_with_contrast`, renders a
+closed-log baseline into an `RgbPixel` buffer, opens the drawer with two log
+lines (both modals closed), re-renders into the same `ReusedBuffer`, diffs the
+two frames to locate the changed band, and asserts that the frame changed, the
+band is at least 100 px tall, and the band contains at least 3 distinct colors.
+As with S33.8's modal test, Slint 1.19's platform context is thread-local, so
+the test installs the software adapter once per test thread with a thread-local
+`Once` and serializes window rendering with a global `Mutex`. A reviewer
+mutation test in a throwaway worktree confirmed the assertion catches the
+regression: removing the drawer collapses the band to a 12 px button-label
+region (fails the ≥100 px height check), and a constant-fill drawer yields only
+2 colors (fails the ≥3 colors check).
+
+**Reviewer nit (non-blocking).** The test guards the *outcome* — visible
+contrast and not a constant fill — rather than the specific theme choice. Its
+≥3 distinct colors are dominated by antialiasing grays, and the same assertion
+would also pass against the old `#f6f6f6` drawer because the text still renders
+over it. Dark/light theme readability therefore is not proven by this test and
+remains a manual desktop check in `docs/handoffs/HANDOFF-S34.md`.
+
+### Test counts, size and gate
+
+The workspace listing count moved 1917 (final S33) → **1921**: +3 resolver
+tests from S34.1 and +1 log-drawer test from S34.2. `cargo test --workspace`
+reports 1892 passed / 0 failed / 29 ignored = 1921. In `furus-gui`, after S34.1
+`cargo test -p furus-gui pkexec` reported 16 passed and `cargo test -p
+furus-gui` reported 113 passed; after S34.2 the whole crate reported 114
+passed (96 lib + 14 bin + 1 helper_wire + 3 render_smoke) and the
+`render_smoke` target alone reported 3 passed.
+
+`size-baseline.json` is **unchanged** — no `--write-baseline` was needed. It
+still records furus 1,810,504 B, furus-helper 1,406,392 B and furus-gui
+12,806,408 B. Current release binaries are furus 1,810,264 B (budget 3,000,000),
+furus-helper 1,406,296 B (budget 2,500,000) and furus-gui 12,790,408 B (budget
+14,000,000); all are within budget and within the committed allowance (furus-gui
+grew by 768 B from the S34.1 launch-path code). The final gate is green: fmt
+check, clippy with `-D warnings`, the 1921-test workspace suite, the 1921-test
+listing count, `cargo xtask ci`, `cargo xtask qa`, `cargo xtask dist` and
+`cargo xtask size`. `dist` emits
+`furus-0.1.1-x86_64-unknown-linux-gnu.tar.gz`, 7,902,790 B, SHA256
+`f83cbf60ecf51d1e4227ba9203c01725f7e818d897ff8692a9bea51c3a216dde`, verified
+with `sha256sum -c SHA256SUMS`; the `.deb` step is skipped only because
+`dpkg-deb` is not installed. The only skips/warnings are pre-existing and
+unrelated: `cargo-audit` not installed, the privileged loop-device/throughput
+QA tier, and duplicate-`zbus` lock warnings. As with S33, end-to-end desktop
+behavior still needs a real display and Polkit session; the manual sign-off
+checklist is in `docs/handoffs/HANDOFF-S34.md`.
