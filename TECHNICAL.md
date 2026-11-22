@@ -165,7 +165,7 @@ One observable side effect: the four QEMU boot tests are now at `pipeline::bootl
 
 **Hotplug path (C3).** `devices.rs` owns discovery (`sysfs::enumerate` + `sysfs::filter`, with the internal-disk warning), a `DeviceWatcher` worker on a `std::thread`, an injectable publish seam and the `DeviceListState` reducer; it has no Slint import, so it is tested headless against fake snapshots. `main.rs` keeps everything Slint: the worker sends `DeviceUpdate` snapshots over `std::sync::mpsc` to a dispatcher thread whose only job is `slint::invoke_from_event_loop`, so every `GuiState` and model mutation, and every `render()`, runs on the event loop — the session is an `Arc<Mutex<…>>` whose lock exists only to make the handle `Send`/`Sync`. The watcher is bounded by a 100 ms wait, so a CLOSE (or the window manager closing the only window) ends `ui.run()` and is followed by a joined worker and a joined dispatcher (the closed channel ends the dispatcher). Selection stability is by stable identity (`Device::identity`), never by index: an accepted snapshot keeps the selected device while it is still present and clears it — through `GuiState::clear_device`, so the plan and START follow — when it is gone. A snapshot is discarded when its epoch differs from the current selection epoch or its sequence is not newer than the last accepted; the worker tags a snapshot with the epoch it reads when the wait completes, so work that began before a user choice but finished after it still lands (with the choice preserved), while a publication already queued before the choice cannot overwrite it. A *rejected* snapshot is dropped rather than requeued, so the list can lag until the next real device change; the window is one epoch load wide and the watcher only publishes changes.
 
-**Image analyzer (C4).** `analyzer.rs` is Slint-free: `AnalyzerWorker` is a `std::thread` fed by `std::sync::mpsc`, and the production seam (`spawn_production`) is `furus_core::image::inspect` — size, SHA-256 and container kind — followed by `furus_core::report::analyze_file` for the Windows-ness, BIOS/UEFI boot paths, distro, labels and WIM editions. The worker drains queued selections and analyses only the newest one, so a burst of clicks cannot queue unbounded work behind a long hash. `AnalysisCoordinator` owns a monotonically increasing request id that is assigned at selection, *before* the selection reaches the worker, together with the selected path; a published `AnalysisResult` is applied only when both the id and the path still match the latest pending request, and is otherwise discarded without mutating anything at all — not the facts, status text, progress, enabled flags or the provisional plan (a re-selection of the same file is told apart by the id alone, a mis-routed result by the path alone). An accepted result clears the pending request and then either applies the facts through `GuiState::apply_image_analysis` or a named failure through `GuiState::fail_image_analysis`, so a later selection always starts from a clean pending slot. The analyzer supplies facts only: `GuiState` still owns every default and enabled flag and `planner::build` still owns every compatibility rule. CHECKSUM displays the digest the analysis already computed — it never re-reads the file and touches no network. `main.rs` keeps the Slint half: the worker publishes into a channel drained by a dispatcher thread that only calls `slint::invoke_from_event_loop`; START is gated by `GuiState::start_enabled()` and pressing it reports the plan or the planner's refusal (it writes nothing). `AnalyzerWorker::shutdown` sends `Stop` and joins after a 2 s bounded wait, so a worker still inside one analysis is detached rather than joined unbounded, and a closed publish channel ends the worker without a panic.
+**Image analyzer (C4).** `analyzer.rs` is Slint-free: `AnalyzerWorker` is a `std::thread` fed by `std::sync::mpsc`, and the production seam (`spawn_production`) is two-phase since S33.7: phase 1 runs `furus_core::image::inspect_metadata` — file size and magic-only container kind, no hashing — plus `furus_core::report::analyze_file` for the Windows-ness, BIOS/UEFI boot paths, distro, labels and WIM editions, published as `AnalysisPhase::MetadataReady` so the form populates in <50 ms; phase 2 is a cancellable streaming SHA-256 via `furus_core::hash::hash_file_cancellable` on the same worker, emitting throttled `DigestProgress` updates and then `DigestReady`, stored on `BootSelection.sha256: Option<String>`. `GuiState::build_plan` refuses a missing or non-64-lowercase-hex digest so no placeholder hash is ever sealed, and re-selecting an ISO cancels the in-flight hash. The worker drains queued selections and analyses only the newest one, so a burst of clicks cannot queue unbounded work behind a long hash. `AnalysisCoordinator` owns a monotonically increasing request id that is assigned at selection, *before* the selection reaches the worker, together with the selected path; a published `AnalysisResult` is applied only when both the id and the path still match the latest pending request, and is otherwise discarded without mutating anything at all — not the facts, status text, progress, enabled flags or the provisional plan (a re-selection of the same file is told apart by the id alone, a mis-routed result by the path alone). An accepted phase clears the pending request and applies it through `GuiState::apply_image_metadata` (then `apply_image_digest` when `DigestReady` arrives) or a named failure through `GuiState::fail_image_analysis`, so a later selection always starts from a clean pending slot. The analyzer supplies facts only: `GuiState` still owns every default and enabled flag and `planner::build` still owns every compatibility rule. CHECKSUM displays the digest the analysis already computed — it never re-reads the file and touches no network. `main.rs` keeps the Slint half: the worker publishes into a channel drained by a dispatcher thread that only calls `slint::invoke_from_event_loop`; START is gated by `GuiState::start_enabled()` and pressing it reports the plan or the planner's refusal (it writes nothing); if pressed while the digest is still pending it sets `start_pending_digest` and the confirmation dialog opens automatically once `DigestReady` arrives, never sealing a placeholder. `AnalyzerWorker::shutdown` sends `Stop` and joins after a 2 s bounded wait, so a worker still inside one analysis is detached rather than joined unbounded, and a closed publish channel ends the worker without a panic.
 
 **Dependency pin (A7).** `slint = "=1.19.0"` with `default-features = false` and exactly `std`, `compat-1-2`, `backend-winit`, `renderer-software`; `slint-build = "=1.19.0"` compiles `ui/main.slint` from `build.rs`; `rustix = "=1.1.6"` (`std` + `process`) supplies `geteuid` because `std` cannot report the effective uid without `unsafe`. Verified feature set at build time: `slint v1.19.0 backend-winit,compat-1-18,compat-1-2,renderer-software,std` — no femtovg/skia renderer, no Qt, no GTK, no webview. Cost of that pin, all of it transitively forced: the lock grows 102 → 567 packages and duplicates a few crates that cannot be unified across majors (`zbus` 5.19.0 for Slint's portal support next to `zbus` 6.2.0 for `furus-helper`; `rustix` 0.38.44/1.1.6, `thiserror` 1/2, `toml` 0.8/1.x), and the winit backend pulls async plumbing (`zbus`'s `async-io`) that this crate never calls — there is no `tokio`, no `async-std` and no `async` code in `furus-gui`.
 
@@ -175,7 +175,7 @@ One observable side effect: the four QEMU boot tests are now at `pipeline::bootl
 
 **Startup policy (A9, contract 0.4.6).** `--version`, `--help` and `-h` are matched on `argv[1]` and return from `main` before any Slint call, before the display is touched and before the euid check, which is why they work with both `DISPLAY` and `WAYLAND_DISPLAY` unset. Otherwise `startup_refusal(process::geteuid().as_raw())` decides: a pure `fn(u32) -> Option<String>` that returns the refusal text for euid 0 and `None` for anything else, so the rule is unit-testable on a normal desktop. The text names both halves of the split (unprivileged GUI, `furus-helper` for privileged work) and states there is no override flag; no environment variable or argument can bypass it.
 
-**Device access (contract 0.4.5).** Reads only: `sysfs::enumerate`/`sysfs::filter` for the startup device list and a read-only `inotify`/poll watch on `/sys/class/block` through `furus_linux::DeviceWatcher` (C3; the crate's only `/sys` literal is `SysfsRoot::new("/sys")` in `start_live_watcher`), `/proc/self/mounts` for the mount summary, and `furus_core::image::inspect` plus `furus_core::report::analyze_file` on the selected image, both on the analyzer worker thread (C4). There is no `open(..., O_RDWR)`, no `OpenOptions::write`, no `mkfs` and no `ioctl` in the crate (the only `OpenOptions`/`fs::write` calls are test fixtures under `std::env::temp_dir()`). Image selection is owned by `crates/furus-gui/src/picker.rs` (S32): it first calls the native XDG Desktop Portal `FileChooser.OpenFile` over a session-bus connection via the already-present zbus crate, and only falls back to spawning `zenity` or `kdialog` with `std::process::Command` and no shell when the portal is unavailable. C4 replaced the synchronous *analysis* of the picked path; S32 replaced the picker itself with a portal-first chain. No new external dependency was added, so the dependency budget stays closed.
+**Device access (contract 0.4.5).** Reads only: `sysfs::enumerate`/`sysfs::filter` for the startup device list and a read-only `inotify`/poll watch on `/sys/class/block` through `furus_linux::DeviceWatcher` (C3; the crate's only `/sys` literal is `SysfsRoot::new("/sys")` in `start_live_watcher`), `/proc/self/mounts` for the mount summary, and, on the selected image, `furus_core::image::inspect_metadata` plus `furus_core::report::analyze_file` in a fast phase-1 pass followed by a cancellable `furus_core::hash::hash_file_cancellable` SHA-256 in phase 2, all on the analyzer worker thread (C4, S33.7). There is no `open(..., O_RDWR)`, no `OpenOptions::write`, no `mkfs` and no `ioctl` in the crate (the only `OpenOptions`/`fs::write` calls are test fixtures under `std::env::temp_dir()`). Image selection is owned by `crates/furus-gui/src/picker.rs` (S32): it first calls the native XDG Desktop Portal `FileChooser.OpenFile` over a session-bus connection via the already-present zbus crate, and only falls back to spawning `zenity` or `kdialog` with `std::process::Command` and no shell when the portal is unavailable. C4 replaced the synchronous *analysis* of the picked path; S32 replaced the picker itself with a portal-first chain. No new external dependency was added, so the dependency budget stays closed.
 
 **Size (contract 0.4.8).** `furus-gui` went 284,008 → 11,541,312 bytes against the unchanged 12,000,000 budget (≈458 KB headroom), and 11,541,312 → 11,566,272 (+24,960) once C3 added the device list and watcher, leaving ≈434 KB headroom, and 11,566,272 → 11,602,240 (+35,968) once C4 added the analyzer worker and its wiring, leaving 397,760 bytes of headroom. `furus-helper` moved 1,385,080 → 1,405,992, which is *not* a source or dependency change: the same tree built alone with its own `CARGO_TARGET_DIR` gives 1,384,904 bytes (`cargo build --release -p furus-helper`) and 1,405,992 under `--workspace` (+21,088). `rustix` 1.1.6 is a single package instance shared by `furus-helper` (direct) and the Slint/winit tree, so `--workspace` unifies features and adds `mm`, `shm` and `system` to the shared build. The A7 pin cannot remove that. `furus` also moved 1,810,200 → 1,809,576 (−624) against the same lock refresh; no CLI source changed. `BINARY_BUDGETS` is untouched and every baseline value came from `cargo xtask size --write-baseline` on the reviewed tree.
 
@@ -1479,9 +1479,10 @@ and no production `.unwrap()` was added.
 ### Test counts and cost
 
 The test count moved 1910 before S33 → 1911 after S33.3 (the added SIGINT
-test) → 1912 from S33.4 onward (the pure OVMF-pair test). The final 1912 tests
-break down as 1883 passed / 0 failed / 29 ignored. There is no size-baseline
-drift: `size-baseline.json` still records furus at 1,810,504 bytes, furus-gui
+test) → 1912 from S33.4 onward (the pure OVMF-pair test). The 1912 tests at
+that point (through S33.5) break down as 1883 passed / 0 failed / 29 ignored.
+There is no size-baseline drift: `size-baseline.json` still records furus at
+1,810,504 bytes, furus-gui
 at 12,806,408 bytes and furus-helper at 1,406,392 bytes, so no
 `--write-baseline` was needed.
 
@@ -1500,3 +1501,77 @@ relocated by the module split, not introduced); `cargo doc -p xtask --no-deps`
 is clean. As with S32, end-to-end device behavior still needs a real display
 and loop devices; CI covers the pure logic, headless paths, render smoke and
 release gates.
+
+### S33.6–S33.8 — live GUI fixes (final S33 status)
+
+This subsection is the final S33 status and supersedes the intermediate
+`Test counts and cost` and `Verification` figures above, which describe the
+tree through S33.5. The no-tag/no-push stance is unchanged: `v0.1.1` was
+tagged and published earlier, S33 creates or moves no tags, pushes nothing,
+and leaves all publication to manual maintainer / Publisher sign-off.
+
+- **S33.6 — portal-first, non-blocking picker (was S32; no new work here).**
+  The XDG Desktop Portal `FileChooser.OpenFile` picker and the non-blocking
+  worker-thread delivery in `crates/furus-gui/src/picker.rs` landed earlier
+  during S32 as commits `fafb7a5`, `9f39890` and `052aa4e`. S33.7 and S33.8
+  add no new dependency and do not depend on the picker code; `furus-gui`
+  already carried `zbus`, so the closed dependency budget holds.
+
+- **S33.7 — two-phase ISO analysis with background cancellable SHA-256
+  (`6f790a9`).** Selecting an ISO no longer blocks on a full-file hash.
+  `furus_core::image::inspect_metadata` reads only the file size and a
+  magic-only container kind, and `furus_core::report::analyze_file` supplies
+  the distro/boot facts; together they are published as
+  `AnalysisPhase::MetadataReady` so the form populates in <50 ms while the
+  digest is still `BootSelection.sha256 = None`. The worker then streams
+  SHA-256 through `furus_core::hash::hash_file_cancellable`, throttling
+  `AnalysisPhase::DigestProgress { percent }` and finishing with
+  `AnalysisPhase::DigestReady { sha256 }`. A newer `request_id` or worker
+  shutdown flips the cancellation flag immediately, so re-selecting an ISO
+  abandons the old multi-GB read instead of queuing behind it; stale
+  `DigestReady` results for a superseded id are ignored. The invariant is
+  that `GuiState::build_plan` refuses any digest that is absent or is not
+  exactly 64 lowercase hex characters, so no placeholder hash can ever be
+  sealed or confirmed. START pressed while hashing is pending sets
+  `start_pending_digest` and the CONFIRM dialog opens automatically when the
+  genuine digest arrives. New hermetic tests cover exact `inspect_metadata`
+  size/kind, throttled cancellable-hash progress, `MetadataReady` populating
+  the form while the plan still returns `Err`, stale `DigestReady` being
+  discarded, and a real 64-hex `DigestReady` letting the plan succeed.
+
+- **S33.8 — themed, bounded confirm and checksum modals (`40f4bcc`).** The
+  blank-white-dialog regression came from hard-coded white backgrounds and
+  dynamic `if` overlays in `ui/main.slint`. Both overlays are now persistent
+  scrim `Rectangle`s toggled with `visible:`, carrying an explicit
+  `x: 0; y: 0; width: 100%; height: 100%` and a full-size `TouchArea` that
+  traps clicks behind the dialog. Each inner card uses `Palette.background`,
+  `Palette.border` and `Palette.foreground` (imported from
+  `std-widgets.slint`) so it is readable in both dark and light themes, and
+  is centered rather than stretched. Because Slint `Rectangle` fills its
+  parent by default, the card is bounded by an explicit
+  `height: <layout>.preferred-height` binding on both the confirm and
+  checksum cards; that binding, not `width` alone, is what produces a
+  bounded centered card. `render_smoke.rs` now records real RGB pixels and
+  asserts at least three distinct colors inside the 700×640 central dialog
+  region (contrast, not just "something was drawn"); because Slint 1.19's
+  platform context is thread-local, the test uses a thread-local `Once` to
+  install the software adapter per test thread plus a global `Mutex` to
+  serialize window rendering. The offscreen all-overlays smoke test is kept.
+
+**Final test counts and size.** The listing count moved 1912 (through S33.5)
+→ 1916 after S33.7 (four new analysis tests) → **1917** after S33.8 (the RGB
+contrast smoke test). The final `cargo test --workspace` run is 1888 passed /
+0 failed / 29 ignored = 1917. Current release binary sizes are furus
+1,810,264 B (budget 3,000,000), furus-helper 1,406,296 B (budget 2,500,000)
+and furus-gui 12,789,640 B (budget 14,000,000); all are within budget and
+within the committed allowance. `size-baseline.json` is **unchanged** (it
+still records the S33.5 values 1,810,504 / 1,406,392 / 12,806,408), so no
+`--write-baseline` was needed. The final gate — fmt check, clippy with
+`-D warnings`, the workspace tests, the 1917-test listing count,
+`cargo xtask ci`, `cargo xtask qa`, `cargo xtask dist` (artifact
+`furus-0.1.1-x86_64-unknown-linux-gnu.tar.gz`, SHA256
+`76e3bc6dd3ab4b79f5f4967e95f5b2d5378603def88cf389929adfe307f6dc4d`,
+verified by `sha256sum -c SHA256SUMS`), `cargo xtask size` and
+`git diff --check` — is green. End-to-end dialog and write behavior still
+needs a real desktop; the manual sign-off checklist is in
+`docs/handoffs/HANDOFF-S33.md`.

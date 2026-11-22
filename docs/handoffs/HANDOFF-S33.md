@@ -485,3 +485,96 @@ object for `v0.1.1`, which points at commit `f763fdc`, not the commit itself.
   is due to missing `dpkg-deb`; the 226 furus-core rustdoc errors are
   pre-existing; the Ubuntu-only firmware layout was never exercised locally
   (only the pure selection test covers it) — CI now does.
+
+---
+
+## Follow-on: live GUI fixes — Slice 3/3 final (code HEAD `40f4bcc`)
+
+Everything above remains the authoritative record for S33.1–S33.5. This
+section records the three live GUI fixes that complete S33 and the final
+acceptance gate. Working tree: branch `main`, code HEAD `40f4bcc`; no new
+commit, push or tag was made in this slice (the reviewer commits after review).
+
+### New commits (and the S32 picker note)
+
+- **S33.6** was delivered earlier under S32, not in the S33 commit series:
+  `fafb7a5`, `9f39890`, `052aa4e` (native XDG portal picker, non-blocking
+  worker-thread delivery, and the rustfmt fix). No new work was needed here;
+  S33.7/S33.8 add no dependency and do not depend on picker changes.
+- **S33.7** — `6f790a9` `feat(gui): two-phase ISO analysis with background
+  cancellable SHA-256`: `furus-core/src/hash.rs` (cancellable streaming
+  `hash_file_cancellable`), `image/mod.rs` (`inspect_metadata`), and
+  `furus-gui` `analyzer.rs`/`state.rs`/`main.rs` (phases, digest state,
+  `start_pending_digest`).
+- **S33.8** — `40f4bcc` `fix(gui): render themed, centered confirm/checksum
+  modals`: `furus-gui/ui/main.slint` (Palette theming, persistent scrims,
+  bounded centered cards with explicit `height: <layout>.preferred-height`)
+  and `tests/render_smoke.rs` (real RGB contrast/bounds assertions;
+  thread-local `Once` + per-thread window + global `Mutex`).
+
+### Test counts and size-baseline delta
+
+- Listing count: **1912** (through S33.5) → **1916** after S33.7 (four new
+  analysis tests) → **1917** after S33.8 (the RGB contrast smoke test).
+- `cargo test --workspace`: **1888 passed / 0 failed / 29 ignored = 1917**.
+- `size-baseline.json`: **no delta** (unchanged; no `--write-baseline`). It
+  still records furus 1,810,504 B, furus-helper 1,406,392 B and furus-gui
+  12,806,408 B. Current release binaries are furus **1,810,264 B** (budget
+  3,000,000), furus-helper **1,406,296 B** (budget 2,500,000) and furus-gui
+  **12,789,640 B** (budget 14,000,000); all within budget and within the
+  committed allowance.
+
+### Final acceptance gate — exact results (all run from repo root, `export PATH="$HOME/.cargo/bin:$PATH"`)
+
+- `cargo fmt --all -- --check` → **exit 0** (clean).
+- `cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**, no warnings.
+- `cargo test --workspace` → **exit 0**: 1888 passed / 0 failed / 29 ignored =
+  **1917** (full log `/tmp/opencode/s33-final-test.log`).
+- `cargo test --workspace --all-targets -- --list | grep -cE ': test$'` →
+  **1917**.
+- `cargo xtask ci` → **exit 0, "ci: all gates passed"** (log
+  `/tmp/opencode/s33-final-ci.log`); only the pre-existing duplicate-`zbus`/
+  `zvariant` lock warnings and `SKIP (not installed): cargo-audit` appear.
+- `cargo xtask qa` → **exit 0, "qa: all suites passed"** (log
+  `/tmp/opencode/s33-final-qa.log`); real `PASS tier2/bios-bootloaders` and
+  `PASS tier2/uefi-ntfs-ovmf`; only the documented `tier1/pipeline-loop:
+  loop-device / throughput tests need --privileged` skip.
+- `cargo xtask dist --out-dir /tmp/opencode/s33-final-dist` → **exit 0**
+  (log `/tmp/opencode/s33-final-dist.log`). Artifact
+  `furus-0.1.1-x86_64-unknown-linux-gnu.tar.gz`, **7,902,205 B**, SHA256
+  `76e3bc6dd3ab4b79f5f4967e95f5b2d5378603def88cf389929adfe307f6dc4d`
+  (from `SHA256SUMS`); `sha256sum -c SHA256SUMS` → **OK**. `.deb` skipped only
+  because `dpkg-deb` is not installed (environmental). This hash/size differs
+  from the earlier handoff (7,905,723 B / `17e16378…`) because S33.7/S33.8
+  changed shipped source.
+- `cargo xtask size` → **exit 0, "within committed baseline allowance, all
+  budgets OK"**: furus 1,810,264/3,000,000, furus-helper 1,406,296/2,500,000,
+  furus-gui 12,789,640/14,000,000, total 16,006,200 B.
+- `git diff --check` → **exit 0**, clean.
+
+### Manual desktop sign-off checklist — maintainer BEFORE Publisher tags v0.1.1
+
+Unchecked on purpose; these need a real display session and cannot be proven
+by CI. Check each box after testing on the target desktop (dark and light
+theme where relevant):
+
+- [ ] SELECT opens the XDG Desktop Portal `FileChooser` (and falls back to
+  `zenity`/`kdialog` when the portal is unavailable) without freezing the UI.
+- [ ] Cancel is reported cleanly — no false "no picker found" error and no
+  fall-through to the next backend.
+- [ ] Selecting a multi-GB ISO populates the form instantly and shows live
+  SHA-256 digest progress.
+- [ ] START pressed while the digest is pending auto-opens CONFIRM DESTRUCTIVE
+  WRITE when the genuine digest is ready, and never seals a placeholder hash.
+- [ ] The confirm dialog is readable and centered in both dark and light
+  themes, with clickable GO BACK / CONFIRM AND WRITE buttons.
+- [ ] The CHECKSUM modal is readable, themed and shows live progress.
+- [ ] A live write through `furus-helper`/Polkit actually starts.
+
+### Publication stance (reiterated)
+
+No push and no tag. S33 is complete and locally reviewed, but leaves all
+publication to manual maintainer / `Publisher` sign-off. Do not create, move
+or force-update `v0.1.1`, and do not push any local commits, until the user
+explicitly authorizes it. The manual checklist above is the last gate before
+Publisher may tag.
