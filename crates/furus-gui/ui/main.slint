@@ -12,7 +12,7 @@
 // *value* string (combo models, status text, volume label, device info)
 // comes from Rust.
 
-import { Button, CheckBox, ComboBox, LineEdit, ProgressIndicator } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, Palette, ProgressIndicator } from "std-widgets.slint";
 
 export component MainWindow inherits Window {
     title: "Furus";
@@ -374,37 +374,64 @@ export component MainWindow inherits Window {
 
     // Destructive confirmation overlay. The facts are Rust-provided; this
     // layer only shows them and forwards the two choices. No rule lives here.
-    if root.confirm-visible : Rectangle {
+    // The scrim is a persistent element toggled with `visible:` (S33.8): a
+    // dynamic `if` overlay let the inner VerticalLayout stretch the card to
+    // the full window, which rendered as a blank white sheet in the software
+    // renderer. A direct child with an implicit, content-sized height stays
+    // bounded and centered.
+    Rectangle {
+        visible: root.confirm-visible;
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
         background: #000000aa;
-        VerticalLayout {
-            padding: 24px;
-            spacing: 12px;
-            Rectangle {
-                background: #ffffff;
-                border-radius: 8px;
-                VerticalLayout {
-                    padding: 20px;
-                    spacing: 12px;
-                    Text {
-                        text: "CONFIRM DESTRUCTIVE WRITE";
-                        font-weight: 700;
-                        font-size: 16px;
+
+        // Trap clicks outside the card so they cannot reach the form behind
+        // the modal. The later sibling card draws above this TouchArea.
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
+
+        Rectangle {
+            width: min(parent.width - 48px, 560px);
+            // A plain Rectangle defaults to filling its parent, so the height
+            // must be bound explicitly to the content's preferred height —
+            // otherwise the card stretches to the full window again (S33.8).
+            height: confirm-content.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.background;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 8px;
+            clip: true;
+
+            confirm-content := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: "CONFIRM DESTRUCTIVE WRITE";
+                    color: Palette.foreground;
+                    font-weight: 700;
+                    font-size: 16px;
+                }
+                Text {
+                    text: root.confirm-facts;
+                    color: Palette.foreground;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "GO BACK";
+                        clicked => { root.discard-clicked(); }
                     }
-                    Text {
-                        text: root.confirm-facts;
-                        wrap: word-wrap;
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        alignment: end;
-                        Button {
-                            text: "GO BACK";
-                            clicked => { root.discard-clicked(); }
-                        }
-                        Button {
-                            text: "CONFIRM AND WRITE";
-                            clicked => { root.confirm-clicked(); }
-                        }
+                    Button {
+                        text: "CONFIRM AND WRITE";
+                        clicked => { root.confirm-clicked(); }
                     }
                 }
             }
@@ -414,115 +441,137 @@ export component MainWindow inherits Window {
     // Checksum modal. Rust owns the algorithms, progress, cancellation and
     // stale-result decisions; this layer only displays the four digests in
     // read-only (still selectable/copyable) fields and forwards two clicks.
-    if root.checksum-visible : Rectangle {
+    // Same persistent-scrim + centered-card shape as the confirm modal.
+    Rectangle {
+        visible: root.checksum-visible;
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
         background: #000000aa;
-        VerticalLayout {
-            padding: 24px;
-            spacing: 12px;
-            Rectangle {
-                background: #ffffff;
-                border-radius: 8px;
-                VerticalLayout {
-                    padding: 20px;
-                    spacing: 10px;
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
+
+        Rectangle {
+            width: min(parent.width - 48px, 560px);
+            height: checksum-content.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Palette.background;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 8px;
+            clip: true;
+
+            checksum-content := VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text {
+                    text: "CHECKSUM";
+                    color: Palette.foreground;
+                    font-weight: 700;
+                    font-size: 16px;
+                }
+                Text {
+                    text: root.checksum-status;
+                    color: Palette.foreground;
+                    wrap: word-wrap;
+                }
+                ProgressIndicator {
+                    progress: root.checksum-progress;
+                }
+                // Which digests are shown is a persisted GUI preference.
+                // The checkboxes only toggle display; hashing still runs
+                // for all four algorithms in the Rust worker.
+                HorizontalLayout {
+                    spacing: 8px;
+                    CheckBox {
+                        text: "MD5";
+                        checked <=> root.hash-md5-checked;
+                        toggled => { root.hash-md5-toggled(); }
+                    }
+                    CheckBox {
+                        text: "SHA-1";
+                        checked <=> root.hash-sha1-checked;
+                        toggled => { root.hash-sha1-toggled(); }
+                    }
+                    CheckBox {
+                        text: "SHA-256";
+                        checked <=> root.hash-sha256-checked;
+                        toggled => { root.hash-sha256-toggled(); }
+                    }
+                    CheckBox {
+                        text: "SHA-512";
+                        checked <=> root.hash-sha512-checked;
+                        toggled => { root.hash-sha512-toggled(); }
+                    }
+                }
+                if root.hash-md5-checked : HorizontalLayout {
+                    spacing: 8px;
                     Text {
-                        text: "CHECKSUM";
-                        font-weight: 700;
-                        font-size: 16px;
+                        text: "MD5";
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        width: 70px;
                     }
+                    LineEdit {
+                        text: root.checksum-digests[0];
+                        read-only: true;
+                    }
+                }
+                if root.hash-sha1-checked : HorizontalLayout {
+                    spacing: 8px;
                     Text {
-                        text: root.checksum-status;
-                        wrap: word-wrap;
+                        text: "SHA-1";
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        width: 70px;
                     }
-                    ProgressIndicator {
-                        progress: root.checksum-progress;
+                    LineEdit {
+                        text: root.checksum-digests[1];
+                        read-only: true;
                     }
-                    // Which digests are shown is a persisted GUI preference.
-                    // The checkboxes only toggle display; hashing still runs
-                    // for all four algorithms in the Rust worker.
-                    HorizontalLayout {
-                        spacing: 8px;
-                        CheckBox {
-                            text: "MD5";
-                            checked <=> root.hash-md5-checked;
-                            toggled => { root.hash-md5-toggled(); }
-                        }
-                        CheckBox {
-                            text: "SHA-1";
-                            checked <=> root.hash-sha1-checked;
-                            toggled => { root.hash-sha1-toggled(); }
-                        }
-                        CheckBox {
-                            text: "SHA-256";
-                            checked <=> root.hash-sha256-checked;
-                            toggled => { root.hash-sha256-toggled(); }
-                        }
-                        CheckBox {
-                            text: "SHA-512";
-                            checked <=> root.hash-sha512-checked;
-                            toggled => { root.hash-sha512-toggled(); }
-                        }
+                }
+                if root.hash-sha256-checked : HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "SHA-256";
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        width: 70px;
                     }
-                    if root.hash-md5-checked : HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "MD5";
-                            vertical-alignment: center;
-                            width: 70px;
-                        }
-                        LineEdit {
-                            text: root.checksum-digests[0];
-                            read-only: true;
-                        }
+                    LineEdit {
+                        text: root.checksum-digests[2];
+                        read-only: true;
                     }
-                    if root.hash-sha1-checked : HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "SHA-1";
-                            vertical-alignment: center;
-                            width: 70px;
-                        }
-                        LineEdit {
-                            text: root.checksum-digests[1];
-                            read-only: true;
-                        }
+                }
+                if root.hash-sha512-checked : HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "SHA-512";
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        width: 70px;
                     }
-                    if root.hash-sha256-checked : HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "SHA-256";
-                            vertical-alignment: center;
-                            width: 70px;
-                        }
-                        LineEdit {
-                            text: root.checksum-digests[2];
-                            read-only: true;
-                        }
+                    LineEdit {
+                        text: root.checksum-digests[3];
+                        read-only: true;
                     }
-                    if root.hash-sha512-checked : HorizontalLayout {
-                        spacing: 8px;
-                        Text {
-                            text: "SHA-512";
-                            vertical-alignment: center;
-                            width: 70px;
-                        }
-                        LineEdit {
-                            text: root.checksum-digests[3];
-                            read-only: true;
-                        }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "CANCEL";
+                        enabled: root.checksum-cancel-enabled;
+                        clicked => { root.checksum-cancel-clicked(); }
                     }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        alignment: end;
-                        Button {
-                            text: "CANCEL";
-                            enabled: root.checksum-cancel-enabled;
-                            clicked => { root.checksum-cancel-clicked(); }
-                        }
-                        Button {
-                            text: "CLOSE";
-                            clicked => { root.checksum-close-clicked(); }
-                        }
+                    Button {
+                        text: "CLOSE";
+                        clicked => { root.checksum-close-clicked(); }
                     }
                 }
             }
