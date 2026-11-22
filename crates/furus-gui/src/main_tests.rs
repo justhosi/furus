@@ -226,25 +226,36 @@ fn selected_image_is_analysed_off_thread_and_a_superseded_result_is_discarded() 
     assert!(session.state.status_text().contains("Analyzing"));
     let first = publish_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("worker publishes the first analysis");
+        .expect("worker publishes first metadata");
     assert_eq!(
         session.analyzer.latest_pending_id(),
         Some(first.request_id),
         "the request id is assigned at selection, before the worker publishes"
     );
+    let first_digest = publish_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("worker publishes first digest");
 
     session.select_image(image_b, &sender);
     assert!(
         !session.apply_analysis(first),
-        "a result for a superseded selection is discarded"
+        "metadata for a superseded selection is discarded"
+    );
+    assert!(
+        !session.apply_analysis(first_digest),
+        "digest for a superseded selection is discarded"
     );
     assert!(session.state.image.is_none());
     assert!(session.state.status_text().contains("Analyzing"));
 
     let second = publish_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("worker publishes the second analysis");
+        .expect("worker publishes second metadata");
     assert!(session.apply_analysis(second));
+    let second_digest = publish_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("worker publishes second digest");
+    assert!(session.apply_analysis(second_digest));
     assert!(
         session
             .state

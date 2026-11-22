@@ -55,6 +55,8 @@ fn compiled_helper_refusal_drives_the_gui_parser_and_run_state_machine() {
             sha256: "0".repeat(64),
             kind: ImageKind::Iso,
         },
+        sha256: Some("0".repeat(64)),
+        digest_progress: None,
         is_windows: false,
         report: ImageReport::default(),
     });

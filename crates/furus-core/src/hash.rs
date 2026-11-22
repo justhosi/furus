@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use md5::Md5;
 use sha1::Sha1;
@@ -140,6 +141,39 @@ pub fn hash_file_with(algo: Algo, path: &Path) -> Result<String> {
     }
 }
 
+/// Stream SHA-256 from `path`, checking `cancelled` between reads and
+/// reporting the number of bytes consumed against the file length. Returns
+/// `Ok(None)` when cancelled; I/O failures retain the supplied path.
+pub fn hash_file_cancellable(
+    path: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<Option<String>> {
+    let mut file = File::open(path).map_err(|source| error::CoreError::io(path, source))?;
+    let total = file
+        .metadata()
+        .map_err(|source| error::CoreError::io(path, source))?
+        .len();
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; CHUNK];
+    let mut done = 0u64;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let n = file
+            .read(&mut buf)
+            .map_err(|source| error::CoreError::io(path, source))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        progress(done, total);
+    }
+    Ok(Some(hex(&hasher.finalize())))
+}
+
 /// Hash the file at `path` with the default algorithm (SHA-256).
 ///
 /// Explicit-algorithm callers use [`hash_file_with`] instead.
@@ -222,6 +256,27 @@ mod tests {
         assert_eq!(Algo::Sha1.as_str(), "sha1");
         assert_eq!(Algo::Sha256.as_str(), "sha256");
         assert_eq!(Algo::Sha512.as_str(), "sha512");
+    }
+
+    #[test]
+    fn cancellable_file_hash_reports_progress_and_stops_after_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("cancellable.bin");
+        let data = vec![0x5A; CHUNK * 2];
+        std::fs::write(&path, &data).expect("seed file");
+        let cancelled = AtomicBool::new(false);
+        let mut progress = Vec::new();
+
+        let digest = hash_file_cancellable(&path, &cancelled, |done, total| {
+            progress.push((done, total));
+            cancelled.store(true, Ordering::Release);
+        })
+        .expect("read succeeds");
+
+        assert_eq!(digest, None, "cancelled work must not publish a digest");
+        assert_eq!(progress, vec![(CHUNK as u64, (CHUNK * 2) as u64)]);
     }
 
     #[test]

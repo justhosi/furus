@@ -47,6 +47,10 @@ pub struct DeviceSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootSelection {
     pub image: ImageRef,
+    /// The real SHA-256 only after background hashing has completed.
+    pub sha256: Option<String>,
+    /// Latest background digest progress, when hashing is pending.
+    pub digest_progress: Option<u8>,
     pub is_windows: bool,
     pub report: ImageReport,
 }
@@ -136,18 +140,21 @@ impl GuiState {
         self.status = format!("Analyzing image '{}'…", path.display());
     }
 
-    /// Apply facts produced by the background analyzer. This method adds no
-    /// planning rules; it maps report facts into the existing view model.
-    pub fn apply_image_analysis(&mut self, info: image::ImageInfo, report: ImageReport) {
+    /// Apply fast image facts before the background digest is available.
+    pub fn apply_image_metadata(&mut self, metadata: image::ImageMetadata, report: ImageReport) {
         let is_windows = report.is_windows;
         let volume_label = report.labels.best().map(str::to_string);
         self.image = Some(BootSelection {
             image: ImageRef {
-                path: info.path,
-                size_bytes: info.size_bytes,
-                sha256: info.sha256,
-                kind: info.kind,
+                path: metadata.path,
+                size_bytes: metadata.size_bytes,
+                // Empty only in the view model while `sha256` is `None`; the
+                // planner is explicitly gated until a genuine digest arrives.
+                sha256: String::new(),
+                kind: metadata.kind,
             },
+            sha256: None,
+            digest_progress: Some(0),
             is_windows,
             report,
         });
@@ -163,8 +170,57 @@ impl GuiState {
         };
         let image = self.image.as_ref().expect("image was just assigned");
         self.volume_label = volume_label;
+        self.status = format!("{} (computing SHA-256… 0%)", analysis_summary(image));
+        self.last_error = None;
+    }
+
+    /// Update digest progress for the currently selected image.
+    pub fn update_image_digest_progress(&mut self, percent: u8) {
+        let Some(image) = self.image.as_mut() else {
+            return;
+        };
+        if image.sha256.is_some() {
+            return;
+        }
+        image.digest_progress = Some(percent);
+        self.status = format!(
+            "{} (computing SHA-256… {percent}%)",
+            analysis_summary(image)
+        );
+    }
+
+    /// Store the completed real digest and make planning available.
+    pub fn apply_image_digest(&mut self, sha256: String) {
+        let Some(image) = self.image.as_mut() else {
+            return;
+        };
+        image.image.sha256.clone_from(&sha256);
+        image.sha256 = Some(sha256);
+        image.digest_progress = None;
         self.status = analysis_summary(image);
         self.last_error = None;
+    }
+
+    /// Apply facts produced by the synchronous inspector, which already
+    /// includes a completed digest.
+    pub fn apply_image_analysis(&mut self, info: image::ImageInfo, report: ImageReport) {
+        self.apply_image_metadata(
+            image::ImageMetadata {
+                path: info.path,
+                size_bytes: info.size_bytes,
+                kind: info.kind,
+            },
+            report,
+        );
+        self.apply_image_digest(info.sha256);
+    }
+
+    /// Whether a digest is still being computed for the current image.
+    #[must_use]
+    pub fn image_digest_pending(&self) -> bool {
+        self.image
+            .as_ref()
+            .is_some_and(|image| image.sha256.is_none())
     }
 
     /// Apply a named analyzer failure, leaving the selected image absent.
@@ -292,6 +348,20 @@ impl GuiState {
             .image
             .as_ref()
             .ok_or_else(|| self.last_error.clone().unwrap_or(GuiError::NoImage))?;
+        let Some(sha256) = image.sha256.as_deref() else {
+            return Err(GuiError::ImageInspection(
+                "Image SHA-256 is still being computed.".to_string(),
+            ));
+        };
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(GuiError::ImageInspection(
+                "Image SHA-256 is not a valid lowercase hexadecimal digest.".to_string(),
+            ));
+        }
         let probe = DeviceProbe {
             path: device.path.clone(),
             exists: true,

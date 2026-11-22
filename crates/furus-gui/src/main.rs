@@ -713,6 +713,8 @@ struct Session {
     checksum: ChecksumCoordinator,
     checksum_visible: bool,
     checksum_result: Option<ChecksumResult>,
+    /// START requested while the current selection's SHA-256 was pending.
+    start_pending_digest: bool,
     /// Locale catalog and active tag: text/flags only, never a business rule.
     bridge: Arc<LocaleCatalog>,
     lang: String,
@@ -761,6 +763,7 @@ impl Session {
             checksum: ChecksumCoordinator::default(),
             checksum_visible: false,
             checksum_result: None,
+            start_pending_digest: false,
             bridge,
             lang,
             prefs,
@@ -820,6 +823,7 @@ impl Session {
     }
 
     fn select_image(&mut self, path: PathBuf, sender: &AnalyzerSender) {
+        self.start_pending_digest = false;
         self.note = None;
         let request_id = self.analyzer.begin(&mut self.state, &path);
         if let Err(error) = sender.submit(request_id, path.clone()) {
@@ -835,8 +839,15 @@ impl Session {
     }
 
     fn apply_analysis(&mut self, result: AnalysisResult) -> bool {
+        let is_digest_ready = matches!(
+            result.result,
+            Ok(furus_gui::analyzer::AnalysisPhase::DigestReady { .. })
+        );
         let applied = self.analyzer.apply(&mut self.state, result);
-        if applied {
+        if applied && is_digest_ready && self.start_pending_digest {
+            self.start_pending_digest = false;
+            self.start();
+        } else if applied {
             self.note = self
                 .state
                 .clone()
@@ -892,6 +903,11 @@ impl Session {
         if matches!(self.run.state(), RunState::Finished(_)) {
             self.new_run();
         }
+        if self.state.image_digest_pending() {
+            self.start_pending_digest = true;
+            self.note = Some("START queued — computing image SHA-256…".to_string());
+            return;
+        }
         match self.run.start(&mut self.state) {
             Ok(()) => {
                 let plan = self.run.plan().expect("START prepared a plan");
@@ -945,6 +961,7 @@ impl Session {
 
     fn discard(&mut self) {
         self.new_run();
+        self.start_pending_digest = false;
         self.note = None;
     }
 

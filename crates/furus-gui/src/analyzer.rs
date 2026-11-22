@@ -1,14 +1,16 @@
 //! Slint-free image-analysis worker and latest-request reducer.
 //!
-//! Tests inject a tiny fake analyzer; production uses the shared read-only
-//! image inspector and report analyzer. No UI toolkit is referenced here.
+//! Production publishes fast metadata before streaming the full-file digest;
+//! tests inject a tiny fake analyzer. No UI toolkit is referenced here.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use furus_core::image::{self, ImageInfo};
+use furus_core::image::{self, ImageInfo, ImageMetadata};
 use furus_core::report::{self, ImageReport};
 
 use crate::state::GuiState;
@@ -20,16 +22,55 @@ pub struct Analysis {
     pub report: ImageReport,
 }
 
-/// Analysis result tagged with its originating user request.
+/// One phase of an image-analysis request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalysisPhase {
+    /// Fast facts used to populate the form before hashing completes.
+    MetadataReady {
+        metadata: ImageMetadata,
+        report: ImageReport,
+    },
+    /// Throttled streaming digest progress.
+    DigestProgress { percent: u8 },
+    /// The completed genuine SHA-256 digest.
+    DigestReady { sha256: String },
+    /// Compatibility phase for tests and injected, already-complete analysis.
+    Completed(Analysis),
+}
+
+/// Analysis phase tagged with its originating user request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalysisResult {
     pub request_id: u64,
     pub path: PathBuf,
-    pub result: Result<Analysis, String>,
+    pub result: Result<AnalysisPhase, String>,
 }
 
-type Analyze = Box<dyn Fn(&Path) -> Result<Analysis, String> + Send + 'static>;
+type Analyze = Box<dyn Fn(&Path) -> Result<AnalysisWork, String> + Send + 'static>;
+type Digest = Box<
+    dyn Fn(&Path, &AtomicBool, &mut dyn FnMut(u64, u64)) -> Result<Option<String>, String>
+        + Send
+        + 'static,
+>;
 type Publish = Box<dyn FnMut(AnalysisResult) -> bool + Send + 'static>;
+
+enum DigestSource {
+    Ready(String),
+    Pending,
+}
+
+struct AnalysisWork {
+    metadata: ImageMetadata,
+    report: ImageReport,
+    digest: DigestSource,
+}
+
+#[derive(Default)]
+struct WorkerControl {
+    latest_request_id: AtomicU64,
+    current_cancel: Mutex<Option<(u64, Arc<AtomicBool>)>>,
+    stopped: AtomicBool,
+}
 
 enum WorkerCommand {
     Analyze { request_id: u64, path: PathBuf },
@@ -39,17 +80,30 @@ enum WorkerCommand {
 /// A single sequential analyzer worker with an injectable analysis seam.
 pub struct AnalyzerWorker {
     sender: Sender<WorkerCommand>,
+    control: Arc<WorkerControl>,
     thread: Option<JoinHandle<()>>,
     finished: Receiver<()>,
 }
 
 /// Cloneable, non-blocking submission handle for UI callbacks.
 #[derive(Clone)]
-pub struct AnalyzerSender(Sender<WorkerCommand>);
+pub struct AnalyzerSender {
+    sender: Sender<WorkerCommand>,
+    control: Arc<WorkerControl>,
+}
 
 impl AnalyzerSender {
     pub fn submit(&self, request_id: u64, path: PathBuf) -> Result<(), String> {
-        self.0
+        self.control
+            .latest_request_id
+            .store(request_id, Ordering::Release);
+        if let Ok(current) = self.control.current_cancel.lock()
+            && let Some((current_id, cancel)) = current.as_ref()
+            && *current_id != request_id
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        self.sender
             .send(WorkerCommand::Analyze { request_id, path })
             .map_err(|_| "image analyzer worker is closed".to_string())
     }
@@ -57,39 +111,83 @@ impl AnalyzerSender {
 
 impl AnalyzerWorker {
     /// Spawn a worker that receives work over std mpsc and publishes through
-    /// the injected closure. Production should keep the closure limited to
-    /// forwarding the result into a UI-dispatch channel.
+    /// the injected closure. This seam represents precomputed digests; the
+    /// production worker uses `spawn_work` to hash only after metadata.
     pub fn spawn<A, P>(analyze: A, publish: P) -> Self
     where
         A: Fn(&Path) -> Result<Analysis, String> + Send + 'static,
         P: FnMut(AnalysisResult) -> bool + Send + 'static,
     {
-        let (sender, receiver) = mpsc::channel();
-        let (finished_tx, finished) = mpsc::channel();
-        let thread = thread::spawn(move || {
-            worker_loop(receiver, Box::new(analyze), Box::new(publish));
-            let _ = finished_tx.send(());
-        });
-        Self {
-            sender,
-            thread: Some(thread),
-            finished,
-        }
+        Self::spawn_work(
+            move |path| {
+                let analysis = analyze(path)?;
+                Ok(AnalysisWork {
+                    metadata: ImageMetadata {
+                        path: analysis.info.path,
+                        size_bytes: analysis.info.size_bytes,
+                        kind: analysis.info.kind,
+                    },
+                    report: analysis.report,
+                    digest: DigestSource::Ready(analysis.info.sha256),
+                })
+            },
+            |_path, _cancelled, _progress| Ok(None),
+            publish,
+        )
     }
 
-    /// Spawn the production read-only inspector and report analyzer.
+    /// Spawn the production read-only metadata inspector and report analyzer,
+    /// followed by a cancellable streaming SHA-256 pass.
     pub fn spawn_production<P>(publish: P) -> Self
     where
         P: FnMut(AnalysisResult) -> bool + Send + 'static,
     {
-        Self::spawn(
+        Self::spawn_work(
             |path| {
-                let info = image::inspect(path).map_err(|error| error.to_string())?;
+                let metadata = image::inspect_metadata(path).map_err(|error| error.to_string())?;
                 let report = report::analyze_file(path).map_err(|error| error.to_string())?;
-                Ok(Analysis { info, report })
+                Ok(AnalysisWork {
+                    metadata,
+                    report,
+                    digest: DigestSource::Pending,
+                })
+            },
+            |path, cancelled, progress| {
+                furus_core::hash::hash_file_cancellable(path, cancelled, progress)
+                    .map_err(|error| error.to_string())
             },
             publish,
         )
+    }
+
+    fn spawn_work<A, D, P>(analyze: A, digest: D, publish: P) -> Self
+    where
+        A: Fn(&Path) -> Result<AnalysisWork, String> + Send + 'static,
+        D: Fn(&Path, &AtomicBool, &mut dyn FnMut(u64, u64)) -> Result<Option<String>, String>
+            + Send
+            + 'static,
+        P: FnMut(AnalysisResult) -> bool + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        let (finished_tx, finished) = mpsc::channel();
+        let control = Arc::new(WorkerControl::default());
+        let worker_control = Arc::clone(&control);
+        let thread = thread::spawn(move || {
+            worker_loop(
+                receiver,
+                Box::new(analyze),
+                Box::new(digest),
+                Box::new(publish),
+                worker_control,
+            );
+            let _ = finished_tx.send(());
+        });
+        Self {
+            sender,
+            control,
+            thread: Some(thread),
+            finished,
+        }
     }
 
     /// Queue a selection for analysis without blocking the caller.
@@ -99,7 +197,10 @@ impl AnalyzerWorker {
 
     #[must_use]
     pub fn sender(&self) -> AnalyzerSender {
-        AnalyzerSender(self.sender.clone())
+        AnalyzerSender {
+            sender: self.sender.clone(),
+            control: Arc::clone(&self.control),
+        }
     }
 
     /// Request stop and join only after a bounded completion wait.
@@ -110,6 +211,12 @@ impl AnalyzerWorker {
     fn stop_and_join(&mut self) {
         if self.thread.is_none() {
             return;
+        }
+        self.control.stopped.store(true, Ordering::Release);
+        if let Ok(current) = self.control.current_cancel.lock()
+            && let Some((_, cancel)) = current.as_ref()
+        {
+            cancel.store(true, Ordering::Release);
         }
         let _ = self.sender.send(WorkerCommand::Stop);
         if self.finished.recv_timeout(Duration::from_secs(2)).is_ok() {
@@ -129,7 +236,13 @@ impl Drop for AnalyzerWorker {
     }
 }
 
-fn worker_loop(receiver: Receiver<WorkerCommand>, analyze: Analyze, mut publish: Publish) {
+fn worker_loop(
+    receiver: Receiver<WorkerCommand>,
+    analyze: Analyze,
+    digest: Digest,
+    mut publish: Publish,
+    control: Arc<WorkerControl>,
+) {
     while let Ok(WorkerCommand::Analyze { request_id, path }) = receiver.recv() {
         let mut current = (request_id, path);
         loop {
@@ -142,12 +255,96 @@ fn worker_loop(receiver: Receiver<WorkerCommand>, analyze: Analyze, mut publish:
             }
         }
         let (request_id, path) = current;
-        let result = analyze(&path);
+        let work = match analyze(&path) {
+            Ok(work) => work,
+            Err(error) => {
+                if !publish(AnalysisResult {
+                    request_id,
+                    path,
+                    result: Err(error),
+                }) {
+                    break;
+                }
+                continue;
+            }
+        };
         if !publish(AnalysisResult {
             request_id,
-            path,
-            result,
+            path: path.clone(),
+            result: Ok(AnalysisPhase::MetadataReady {
+                metadata: work.metadata,
+                report: work.report,
+            }),
         }) {
+            break;
+        }
+
+        let sha256 = match work.digest {
+            DigestSource::Ready(sha256) => Some(sha256),
+            DigestSource::Pending => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                if let Ok(mut current) = control.current_cancel.lock() {
+                    *current = Some((request_id, Arc::clone(&cancelled)));
+                } else {
+                    cancelled.store(true, Ordering::Release);
+                }
+                if control.latest_request_id.load(Ordering::Acquire) != request_id
+                    || control.stopped.load(Ordering::Acquire)
+                {
+                    cancelled.store(true, Ordering::Release);
+                }
+                let mut last_percent = None;
+                let mut progress_closed = false;
+                let result = digest(&path, &cancelled, &mut |done, total| {
+                    let percent = if total == 0 {
+                        100
+                    } else {
+                        ((u128::from(done) * 100) / u128::from(total)).min(100) as u8
+                    };
+                    if last_percent != Some(percent) {
+                        last_percent = Some(percent);
+                        progress_closed = !publish(AnalysisResult {
+                            request_id,
+                            path: path.clone(),
+                            result: Ok(AnalysisPhase::DigestProgress { percent }),
+                        });
+                        if progress_closed {
+                            cancelled.store(true, Ordering::Release);
+                        }
+                    }
+                });
+                if let Ok(mut current) = control.current_cancel.lock()
+                    && current.as_ref().is_some_and(|(id, _)| *id == request_id)
+                {
+                    *current = None;
+                }
+                if progress_closed {
+                    break;
+                }
+                match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if !publish(AnalysisResult {
+                            request_id,
+                            path,
+                            result: Err(error),
+                        }) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        if let Some(sha256) = sha256
+            && control.latest_request_id.load(Ordering::Acquire) == request_id
+            && !control.stopped.load(Ordering::Acquire)
+            && !publish(AnalysisResult {
+                request_id,
+                path,
+                result: Ok(AnalysisPhase::DigestReady { sha256 }),
+            })
+        {
             break;
         }
     }
@@ -180,10 +377,25 @@ impl AnalysisCoordinator {
         if self.latest_pending.as_ref() != Some(&(result.request_id, result.path.clone())) {
             return false;
         }
-        self.latest_pending = None;
         match result.result {
-            Ok(analysis) => state.apply_image_analysis(analysis.info, analysis.report),
-            Err(error) => state.fail_image_analysis(&result.path, error),
+            Ok(AnalysisPhase::MetadataReady { metadata, report }) => {
+                state.apply_image_metadata(metadata, report);
+            }
+            Ok(AnalysisPhase::DigestProgress { percent }) => {
+                state.update_image_digest_progress(percent);
+            }
+            Ok(AnalysisPhase::DigestReady { sha256 }) => {
+                state.apply_image_digest(sha256);
+                self.latest_pending = None;
+            }
+            Ok(AnalysisPhase::Completed(analysis)) => {
+                state.apply_image_analysis(analysis.info, analysis.report);
+                self.latest_pending = None;
+            }
+            Err(error) => {
+                state.fail_image_analysis(&result.path, error);
+                self.latest_pending = None;
+            }
         }
         true
     }
@@ -194,14 +406,14 @@ impl AnalysisCoordinator {
     }
 }
 
-/// Present the already-computed image digest on demand. Hashing itself happens
-/// during worker analysis, never in this UI action.
+/// Present the completed image digest on demand.
 #[must_use]
 pub fn checksum(state: &GuiState) -> Option<String> {
     state
         .image
         .as_ref()
-        .map(|image| format!("SHA-256: {}", image.image.sha256))
+        .and_then(|image| image.sha256.as_ref())
+        .map(|sha256| format!("SHA-256: {sha256}"))
 }
 
 #[cfg(test)]
@@ -288,7 +500,7 @@ mod tests {
             super::AnalysisResult {
                 request_id,
                 path: path.to_path_buf(),
-                result: value,
+                result: value.map(super::AnalysisPhase::Completed),
             },
         )
     }
@@ -430,6 +642,86 @@ mod tests {
     }
 
     #[test]
+    fn metadata_applies_before_digest_and_plan_waits_for_the_real_sha256() {
+        let fixture = Fixture::new("two-phase.iso");
+        let mut state = GuiState::default();
+        state.select_device(&device(), "not mounted");
+        let mut coordinator = AnalysisCoordinator::default();
+        let request_id = coordinator.begin(&mut state, &fixture.0);
+        let report = ImageReport {
+            kind: "iso".to_string(),
+            is_iso: true,
+            is_windows: true,
+            has_efi: true,
+            has_bios: true,
+            ..ImageReport::default()
+        };
+
+        assert!(coordinator.apply(
+            &mut state,
+            super::AnalysisResult {
+                request_id,
+                path: fixture.0.clone(),
+                result: Ok(super::AnalysisPhase::MetadataReady {
+                    metadata: furus_core::image::ImageMetadata {
+                        path: fixture.0.display().to_string(),
+                        size_bytes: 21,
+                        kind: ImageKind::Iso,
+                    },
+                    report,
+                }),
+            },
+        ));
+        assert_eq!(
+            state.image.as_ref().expect("metadata selected").image.kind,
+            ImageKind::Iso
+        );
+        assert!(state.image_option_enabled());
+        assert_eq!(state.filesystem, Filesystem::Ntfs);
+        assert!(state.image_digest_pending());
+        assert!(state.status_text().contains("computing SHA-256… 0%"));
+        assert!(state.build_plan().is_err(), "no plan before digest");
+
+        let sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(coordinator.apply(
+            &mut state,
+            super::AnalysisResult {
+                request_id,
+                path: fixture.0.clone(),
+                result: Ok(super::AnalysisPhase::DigestReady {
+                    sha256: sha256.to_string(),
+                }),
+            },
+        ));
+        let plan = state.plan_result().expect("real SHA-256 unlocks plan");
+        assert_eq!(plan.image.sha256, sha256);
+    }
+
+    #[test]
+    fn stale_digest_ready_from_a_superseded_request_is_ignored() {
+        let a = Fixture::new("digest-a.iso");
+        let b = Fixture::new("digest-b.iso");
+        let mut state = GuiState::default();
+        let mut coordinator = AnalysisCoordinator::default();
+        let a_id = coordinator.begin(&mut state, &a.0);
+        let b_id = coordinator.begin(&mut state, &b.0);
+        let before = state.clone();
+
+        assert!(!coordinator.apply(
+            &mut state,
+            super::AnalysisResult {
+                request_id: a_id,
+                path: a.0.clone(),
+                result: Ok(super::AnalysisPhase::DigestReady {
+                    sha256: "a".repeat(64),
+                }),
+            },
+        ));
+        assert_eq!(state, before);
+        assert_eq!(coordinator.latest_pending_id(), Some(b_id));
+    }
+
+    #[test]
     fn newer_request_is_applied_and_older_result_is_discarded_in_both_orders() {
         let image_a = Fixture::new("a.img");
         let image_b = Fixture::new("b.img");
@@ -453,7 +745,7 @@ mod tests {
             super::AnalysisResult {
                 request_id: b_id,
                 path: image_b.0.clone(),
-                result: Ok(b)
+                result: Ok(super::AnalysisPhase::Completed(b))
             },
         ));
         let state_after_b = state.clone();
@@ -472,7 +764,7 @@ mod tests {
             super::AnalysisResult {
                 request_id: a_id,
                 path: image_a.0.clone(),
-                result: Ok(a)
+                result: Ok(super::AnalysisPhase::Completed(a))
             },
         ));
         assert_eq!(
@@ -494,14 +786,14 @@ mod tests {
             super::AnalysisResult {
                 request_id: next_id,
                 path: next.0.clone(),
-                result: Ok(analysis(
+                result: Ok(super::AnalysisPhase::Completed(analysis(
                     &next.0,
                     ImageKind::Raw,
                     ImageReport {
                         kind: "raw".to_string(),
                         ..ImageReport::default()
                     },
-                )),
+                ))),
             },
         ));
     }
@@ -541,7 +833,7 @@ mod tests {
                 super::AnalysisResult {
                     request_id: stale_id,
                     path: fixture.0.clone(),
-                    result: Ok(windows()),
+                    result: Ok(super::AnalysisPhase::Completed(windows())),
                 },
             ),
             "an older id for the identical path must be discarded",
@@ -555,7 +847,7 @@ mod tests {
                 super::AnalysisResult {
                     request_id: current_id,
                     path: other.0.clone(),
-                    result: Ok(windows()),
+                    result: Ok(super::AnalysisPhase::Completed(windows())),
                 },
             ),
             "the current id carrying a different path must be discarded",
@@ -568,7 +860,7 @@ mod tests {
             super::AnalysisResult {
                 request_id: current_id,
                 path: fixture.0.clone(),
-                result: Ok(windows()),
+                result: Ok(super::AnalysisPhase::Completed(windows())),
             },
         ));
         assert_eq!(coordinator.latest_pending_id(), None);

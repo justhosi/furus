@@ -346,6 +346,18 @@ pub fn open_image(path: &Path) -> Result<Image> {
     })
 }
 
+/// The path, file length and magic-only container kind needed to populate a
+/// GUI selection before the background digest is available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageMetadata {
+    /// Image path as presented by the caller.
+    pub path: String,
+    /// Regular-file length in bytes.
+    pub size_bytes: u64,
+    /// Container kind (magic-only detection).
+    pub kind: ImageKind,
+}
+
 /// Everything a front end reports about one image before planning.
 ///
 /// This is the platform-agnostic inspection preamble shared by the CLI's
@@ -382,6 +394,19 @@ pub fn detect_file(path: &Path) -> Result<ImageKind> {
     }
     let volume = FileVolume::open(path)?;
     detect(&volume)
+}
+
+/// Read only the regular-file length and magic-only container kind. This is
+/// suitable for populating a GUI selection while the full-file digest runs in
+/// the background.
+pub fn inspect_metadata(path: &Path) -> Result<ImageMetadata> {
+    let size_bytes = file_size(path)?;
+    let kind = detect_file(path)?;
+    Ok(ImageMetadata {
+        path: path.display().to_string(),
+        size_bytes,
+        kind,
+    })
 }
 
 /// Measure, hash and sniff `path` in one pass — the common preamble of
@@ -574,6 +599,21 @@ mod tests {
         assert_eq!(detect_bytes(&[0xAA; 4096]), ImageKind::Raw);
         // `QFI` without the fourth magic byte is not qcow2.
         assert_eq!(detect_bytes(b"QFI"), ImageKind::Raw);
+    }
+
+    #[test]
+    fn inspect_metadata_returns_size_and_kind_without_a_digest() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("metadata-only.iso");
+        let mut bytes = vec![0u8; 0x9000];
+        bytes[0x8001..0x8006].copy_from_slice(b"CD001");
+        std::fs::write(&path, &bytes).expect("the fixture file");
+
+        let metadata = inspect_metadata(&path).expect("metadata inspection");
+
+        assert_eq!(metadata.path, path.display().to_string());
+        assert_eq!(metadata.size_bytes, 0x9000);
+        assert_eq!(metadata.kind, ImageKind::Iso);
     }
 
     #[test]
