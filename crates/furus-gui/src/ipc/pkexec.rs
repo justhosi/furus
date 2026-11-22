@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use furus_proto::{EVENT_STREAM_VERSION, Event, LineError, Outcome, Plan, from_jsonl_line};
+use furus_proto::{
+    EVENT_STREAM_VERSION, Event, HELPER_BIN_PATH, LineError, Outcome, Plan, from_jsonl_line,
+};
 
 use super::{CancelHandle, EventStream, HelperTransport, IpcError, Started};
 
@@ -29,6 +31,7 @@ pub struct PkexecTransport {
     program: PathBuf,
     args_prefix: Vec<std::ffi::OsString>,
     authorization_timeout: Duration,
+    helper_program: PathBuf,
 }
 
 impl PkexecTransport {
@@ -40,6 +43,10 @@ impl PkexecTransport {
             program: PathBuf::from("pkexec"),
             args_prefix: Vec::new(),
             authorization_timeout: DEFAULT_AUTHORIZATION_TIMEOUT,
+            helper_program: resolve_helper_program(
+                std::env::current_exe().ok().as_deref(),
+                Path::new(HELPER_BIN_PATH),
+            ),
         }
     }
 
@@ -77,6 +84,7 @@ impl PkexecTransport {
             program: program.into(),
             args_prefix: args_prefix.into_iter().map(Into::into).collect(),
             authorization_timeout,
+            helper_program: PathBuf::from("furus-helper"),
         }
     }
 }
@@ -85,6 +93,25 @@ impl Default for PkexecTransport {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Pick the helper program `pkexec` should run.
+///
+/// `pkexec` sanitizes `PATH`, so a bare name cannot find an installed helper
+/// under `/usr/libexec`. Prefer the installed path from the service contract;
+/// fall back to a sibling of the running executable (a local build) and, as a
+/// last resort, the bare name used by the test seam.
+fn resolve_helper_program(current_exe: Option<&Path>, installed_path: &Path) -> PathBuf {
+    if installed_path.is_file() {
+        return installed_path.to_path_buf();
+    }
+    if let Some(parent) = current_exe.and_then(Path::parent) {
+        let sibling = parent.join("furus-helper");
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    PathBuf::from("furus-helper")
 }
 
 impl HelperTransport for PkexecTransport {
@@ -96,7 +123,7 @@ impl HelperTransport for PkexecTransport {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args_prefix)
-            .arg("furus-helper")
+            .arg(&self.helper_program)
             .arg("--plan")
             .arg(&plan_file.path)
             .arg("--progress")
@@ -662,7 +689,7 @@ mod tests {
         Options, Outcome, PLAN_VERSION, Plan, Progress, Scheme, Step, Target,
     };
 
-    use super::{PkexecTransport, STDERR_LIMIT};
+    use super::{PkexecTransport, STDERR_LIMIT, resolve_helper_program};
     use crate::ipc::{HelperTransport, IpcError};
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -987,6 +1014,68 @@ mod tests {
         assert!(!dead.exists(), "dead-pid plan is swept");
         assert!(live.exists(), "live-pid plan is preserved");
         let _ = fs::remove_file(live);
+    }
+
+    fn resolver_fixture(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "furus-helper-resolver-{}-{label}-{}",
+            std::process::id(),
+            super::TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn resolver_prefers_installed_helper_over_a_sibling() {
+        let root = resolver_fixture("installed");
+        let bin = root.join("bin");
+        let libexec = root.join("libexec");
+        fs::create_dir_all(&bin).expect("fixture bin directory");
+        fs::create_dir_all(&libexec).expect("fixture libexec directory");
+        let installed = libexec.join("furus-helper");
+        let sibling = bin.join("furus-helper");
+        fs::write(&installed, "installed").expect("installed fixture writes");
+        fs::write(&sibling, "sibling").expect("sibling fixture writes");
+        let current_exe = bin.join("furus-gui");
+
+        let resolved = resolve_helper_program(Some(current_exe.as_path()), installed.as_path());
+
+        assert_eq!(resolved, installed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolver_uses_sibling_next_to_current_exe_when_installed_is_absent() {
+        let root = resolver_fixture("sibling");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("fixture bin directory");
+        let installed = root.join("libexec").join("furus-helper");
+        let sibling = bin.join("furus-helper");
+        fs::write(&sibling, "sibling").expect("sibling fixture writes");
+        let current_exe = bin.join("furus-gui");
+
+        let resolved = resolve_helper_program(Some(current_exe.as_path()), installed.as_path());
+
+        assert_eq!(resolved, sibling);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolver_falls_back_to_bare_name_without_installed_or_sibling() {
+        let root = resolver_fixture("fallback");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("fixture bin directory");
+        let installed = root.join("libexec").join("furus-helper");
+        let current_exe = bin.join("furus-gui");
+
+        assert_eq!(
+            resolve_helper_program(Some(current_exe.as_path()), installed.as_path()),
+            PathBuf::from("furus-helper")
+        );
+        assert_eq!(
+            resolve_helper_program(None, installed.as_path()),
+            PathBuf::from("furus-helper")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
