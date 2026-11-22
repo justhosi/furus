@@ -316,3 +316,143 @@ fn confirm_modal_renders_with_contrast() {
     ui.hide()
         .expect("hide must succeed on the offscreen window");
 }
+
+#[test]
+fn log_drawer_renders_with_contrast() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_platform_once();
+    let window = fresh_window();
+    window.set_size(PhysicalSize::new(
+        CONFIRM_WIDTH as u32,
+        CONFIRM_HEIGHT as u32,
+    ));
+
+    let ui = MainWindow::new().expect("MainWindow must instantiate offscreen");
+    ui.set_locale_model(strings(&["English"]));
+    ui.set_locale_current(SharedString::from("English"));
+    ui.set_device_model(strings(&["/dev/sdb — 8 GB"]));
+    ui.set_device_current(SharedString::from("/dev/sdb — 8 GB"));
+    ui.set_boot_model(strings(&["Standard"]));
+    ui.set_boot_current(SharedString::from("Standard"));
+    ui.set_scheme_model(strings(&["GPT"]));
+    ui.set_scheme_current(SharedString::from("GPT"));
+    ui.set_target_model(strings(&["UEFI"]));
+    ui.set_target_current(SharedString::from("UEFI"));
+    ui.set_fs_model(strings(&["FAT32"]));
+    ui.set_fs_current(SharedString::from("FAT32"));
+    ui.set_cluster_model(strings(&["32 KiB"]));
+    ui.set_cluster_current(SharedString::from("32 KiB"));
+    ui.set_passes_model(strings(&["1 pass"]));
+    ui.set_passes_current(SharedString::from("1 pass"));
+
+    // Both modals closed so the drawer is unobstructed; log closed for the
+    // baseline frame.
+    ui.set_confirm_visible(false);
+    ui.set_checksum_visible(false);
+    ui.set_log_open(false);
+
+    ui.show()
+        .expect("show must succeed on the offscreen window");
+    slint::platform::update_timers_and_animations();
+    ui.window().request_redraw();
+
+    let mut buffer = vec![RgbPixel::default(); CONFIRM_WIDTH * CONFIRM_HEIGHT];
+    let mut redrew = false;
+    window.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, CONFIRM_WIDTH);
+        redrew = true;
+    });
+    assert!(
+        redrew,
+        "expected a pending redraw after show()/request_redraw()"
+    );
+    assert!(
+        buffer.iter().any(|pixel| *pixel != RgbPixel::default()),
+        "expected at least one drawn pixel (non-blank baseline frame)"
+    );
+    let baseline = buffer.clone();
+
+    // Open the log drawer with two distinct lines. Reuse the SAME buffer so
+    // ReusedBuffer semantics update only the dirty region in place, leaving a
+    // faithful before/after pair to diff.
+    ui.set_log_text(SharedString::from("log line alpha\nlog line beta"));
+    ui.set_log_open(true);
+    slint::platform::update_timers_and_animations();
+    ui.window().request_redraw();
+    let mut redrew = false;
+    window.draw_if_needed(|renderer| {
+        renderer.render(&mut buffer, CONFIRM_WIDTH);
+        redrew = true;
+    });
+    assert!(
+        redrew,
+        "expected a pending redraw after opening the log drawer"
+    );
+
+    // Diff against the closed-log baseline to locate the drawer region. This
+    // ties every colour assertion below to the drawer: without `log-open`
+    // the region is byte-identical, so we cannot pass by sampling unrelated
+    // window chrome.
+    let mut min_x = CONFIRM_WIDTH;
+    let mut min_y = CONFIRM_HEIGHT;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut changed = 0usize;
+    for y in 0..CONFIRM_HEIGHT {
+        for x in 0..CONFIRM_WIDTH {
+            let index = y * CONFIRM_WIDTH + x;
+            if buffer[index] != baseline[index] {
+                changed += 1;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    assert!(changed > 0, "opening the log drawer must change the frame");
+    assert!(
+        max_y - min_y >= 100,
+        "the log drawer must occupy vertical space (min-height 120px), got {}px",
+        max_y - min_y
+    );
+
+    // The drawer is a wide horizontal band; the rows through its interior
+    // change across (nearly) the full content width, unlike the single button
+    // whose label swapped from "Show log" to "Hide log". Select only those
+    // near-full-width rows so the colour check covers the drawer itself and
+    // not the buttons shifted below it. Themed background, border and the two
+    // contrasting log-text lines must produce several distinct colours — the
+    // original white-on-white drawer would collapse this band to one colour.
+    let peak_count = (min_y..=max_y)
+        .map(|y| {
+            (min_x..=max_x)
+                .filter(|x| buffer[y * CONFIRM_WIDTH + x] != baseline[y * CONFIRM_WIDTH + x])
+                .count()
+        })
+        .max()
+        .expect("the changed region is non-empty");
+    let threshold = peak_count * 9 / 10;
+    let mut colors = HashSet::new();
+    for y in min_y..=max_y {
+        let row_count = (min_x..=max_x)
+            .filter(|x| buffer[y * CONFIRM_WIDTH + x] != baseline[y * CONFIRM_WIDTH + x])
+            .count();
+        if row_count >= threshold {
+            for x in min_x..=max_x {
+                colors.insert(buffer[y * CONFIRM_WIDTH + x]);
+            }
+        }
+    }
+    assert!(
+        colors.len() >= 3,
+        "the log drawer band must show >= 3 distinct colours (background, border, text), got {}: {:?}",
+        colors.len(),
+        colors
+    );
+
+    ui.hide()
+        .expect("hide must succeed on the offscreen window");
+}
