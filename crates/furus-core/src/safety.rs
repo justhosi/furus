@@ -341,7 +341,58 @@ fn removable_confirmed(target: &Target) -> bool {
     target.serial.as_deref() == Some(typed)
 }
 
-/// Judge one target and return the fail-closed verdict.
+/// Whether a mountpoint is a protected system path that even an
+/// auto-unmount policy must never touch. Matching is boundary-aware:
+/// `/boot/efi`, `/usr/local` and `/var/lib` count, while `/bootable` and
+/// `/homebrew` do not. `/` is the exact root only — treating it as a
+/// prefix would protect every path on the machine.
+///
+/// This lives here (not in `furus-linux`) so both the fast-validation
+/// policy and the later host-unmount step share one definition without
+/// making the pure core crate depend on the OS crate.
+#[must_use]
+pub fn is_protected_mountpoint(path: &str) -> bool {
+    const PROTECTED: [&str; 10] = [
+        "/",
+        "/boot",
+        "/boot/efi",
+        "/home",
+        "/usr",
+        "/var",
+        "/etc",
+        "/opt",
+        "/srv",
+        "/root",
+    ];
+    PROTECTED
+        .iter()
+        .any(|prefix| match path.strip_prefix(prefix) {
+            Some(rest) => rest.is_empty() || rest.starts_with('/'),
+            None => false,
+        })
+}
+
+/// Judge one target with the strict, fail-closed verdict.
+///
+/// This is the verdict every caller that does *not* own an unmount step
+/// must use; it is also the post-unmount re-check. See
+/// [`judge_with_policy`] for the one, caller-scoped relaxation.
+#[must_use]
+pub fn judge(target: &Target) -> SafetyVerdict {
+    judge_with_policy(target, false)
+}
+
+/// Judge one target, optionally allowing a removable, non-system target
+/// mounted at an ordinary (non-protected) path to pass rule 6.
+///
+/// Identical to [`judge`] in rules and order, with exactly one exception:
+/// when `allow_auto_unmount` is true **and** the target is removable,
+/// is not a system disk, and its mountpoint is not a protected system
+/// path, the `Mounted` refusal is skipped because the caller owns the
+/// unmount step. Every other refusal stays unconditional — in
+/// particular a system disk is always refused before mount state is
+/// even considered. Callers must re-check with plain [`judge`] once the
+/// unmount has happened.
 ///
 /// The precedence is documented (and pairwise-tested) on the module
 /// header; here it is spelled as one straight-line early-return chain
@@ -349,7 +400,7 @@ fn removable_confirmed(target: &Target) -> bool {
 /// what is deliberately **not** refused: blank partition tables, zero
 /// image sizes, and everything about transports.
 #[must_use]
-pub fn judge(target: &Target) -> SafetyVerdict {
+pub fn judge_with_policy(target: &Target, allow_auto_unmount: bool) -> SafetyVerdict {
     // 1. Unreadable first: no other fact was gathered honestly.
     if let Some(detail) = target.unreadable.as_deref() {
         return SafetyVerdict::Refuse(Reason::Unreadable {
@@ -372,8 +423,15 @@ pub fn judge(target: &Target) -> SafetyVerdict {
     if target.system_disk {
         return SafetyVerdict::Refuse(Reason::SystemDisk);
     }
-    // 6. Mounted.
-    if let Some(mountpoint) = target.mounted_at.as_deref() {
+    // 6. Mounted. A caller that owns the unmount step may skip this
+    //    refusal for an ordinary mount on removable media — never for a
+    //    system disk or a protected system mountpoint.
+    if let Some(mountpoint) = target.mounted_at.as_deref()
+        && !(allow_auto_unmount
+            && !target.system_disk
+            && target.removable
+            && !is_protected_mountpoint(mountpoint))
+    {
         return SafetyVerdict::Refuse(Reason::Mounted {
             mountpoint: mountpoint.to_owned(),
         });
@@ -419,7 +477,9 @@ mod tests {
     use super::Reason;
     use super::SafetyVerdict;
     use super::Target;
+    use super::is_protected_mountpoint;
     use super::judge;
+    use super::judge_with_policy;
     use crate::fsprobe::FsKind;
 
     /// A clean, removable, unmounted USB stick with the all-clear.
@@ -549,6 +609,201 @@ mod tests {
             let verdict = judged_with(change);
             assert_eq!(verdict, want, "{name} must refuse as stated");
             assert!(!verdict.is_safe(), "{name} cannot be safe");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The auto-unmount policy (one rule, rule 6, and nothing else)
+    // ------------------------------------------------------------------
+
+    /// A removable, non-system stick mounted at an ordinary media path.
+    fn mounted_usb_target() -> Target {
+        let mut target = clean_target();
+        target.mounted_at = Some("/run/media/user/USB".to_owned());
+        target
+    }
+
+    #[test]
+    fn auto_unmount_policy_permits_an_ordinary_mounted_usb_but_judge_does_not() {
+        let target = mounted_usb_target();
+        assert_eq!(
+            judge_with_policy(&target, true),
+            SafetyVerdict::Safe,
+            "the caller that owns the unmount step may proceed"
+        );
+        assert_eq!(
+            judge(&target),
+            SafetyVerdict::Refuse(Reason::Mounted {
+                mountpoint: "/run/media/user/USB".to_owned(),
+            }),
+            "the strict verdict is unchanged for callers that never unmount"
+        );
+    }
+
+    #[test]
+    fn auto_unmount_policy_keeps_every_other_refusal_unconditional() {
+        // Lambda types differ per row, so the closures are boxed for a
+        // shared table type. Every row starts from the policy-eligible
+        // mounted stick: only the `Mounted` refusal may disappear.
+        type Case = (&'static str, Box<dyn FnOnce(&mut Target)>, SafetyVerdict);
+        let cases: Vec<Case> = vec![
+            (
+                "unreadable",
+                Box::new(|t: &mut Target| t.unreadable = Some("I/O error".to_owned())),
+                SafetyVerdict::Refuse(Reason::Unreadable {
+                    detail: "I/O error".to_owned(),
+                }),
+            ),
+            (
+                "zero size",
+                Box::new(|t: &mut Target| t.size_bytes = 0),
+                SafetyVerdict::Refuse(Reason::ZeroSize),
+            ),
+            (
+                "loopback name",
+                Box::new(|t: &mut Target| t.name = "loop3".to_owned()),
+                SafetyVerdict::Refuse(Reason::Loopback),
+            ),
+            (
+                "read only",
+                Box::new(|t: &mut Target| t.read_only = true),
+                SafetyVerdict::Refuse(Reason::ReadOnly),
+            ),
+            (
+                "system disk",
+                Box::new(|t: &mut Target| t.system_disk = true),
+                SafetyVerdict::Refuse(Reason::SystemDisk),
+            ),
+            (
+                "swap",
+                Box::new(|t: &mut Target| t.swap_source = Some("/dev/sdb1".to_owned())),
+                SafetyVerdict::Refuse(Reason::Swap {
+                    source: "/dev/sdb1".to_owned(),
+                }),
+            ),
+            (
+                "holder",
+                Box::new(|t: &mut Target| t.holders = vec!["dm-0".to_owned()]),
+                SafetyVerdict::Refuse(Reason::Holder {
+                    holder: "dm-0".to_owned(),
+                }),
+            ),
+            (
+                "refused filesystem",
+                Box::new(|t: &mut Target| t.filesystems = vec![(None, FsKind::Btrfs)]),
+                SafetyVerdict::Refuse(Reason::RefusedFilesystem {
+                    fs: FsKind::Btrfs,
+                    partition: None,
+                }),
+            ),
+            (
+                "too small",
+                Box::new(|t: &mut Target| t.image_bytes = Some(t.size_bytes + 1)),
+                SafetyVerdict::Refuse(Reason::TooSmall {
+                    device_bytes: 31_103_926_272,
+                    image_bytes: 31_103_926_273,
+                }),
+            ),
+        ];
+        for (name, change, want) in cases {
+            let mut target = mounted_usb_target();
+            change(&mut target);
+            assert_eq!(
+                judge_with_policy(&target, true),
+                want,
+                "{name} stays unconditional under the policy"
+            );
+        }
+
+        // `NotRemovable` is rule 11, so it is reached only when no mount
+        // is present: an unmounted fixed disk is refused exactly as
+        // before, and a mounted one is not rescued by the policy either.
+        let mut fixed = clean_target();
+        fixed.removable = false;
+        assert_eq!(
+            judge_with_policy(&fixed, true),
+            SafetyVerdict::Refuse(Reason::NotRemovable {
+                serial: fixed.serial.clone(),
+            })
+        );
+        let mut mounted_fixed = mounted_usb_target();
+        mounted_fixed.removable = false;
+        assert!(
+            !judge_with_policy(&mounted_fixed, true).is_safe(),
+            "a fixed disk cannot benefit from the auto-unmount policy"
+        );
+    }
+
+    #[test]
+    fn auto_unmount_policy_refuses_every_protected_mountpoint() {
+        for mountpoint in [
+            "/",
+            "/boot",
+            "/boot/efi",
+            "/home",
+            "/usr",
+            "/var",
+            "/etc",
+            "/opt",
+            "/srv",
+            "/root",
+            "/usr/local",
+            "/var/lib",
+        ] {
+            let mut target = mounted_usb_target();
+            target.mounted_at = Some(mountpoint.to_owned());
+            assert_eq!(
+                judge_with_policy(&target, true),
+                SafetyVerdict::Refuse(Reason::Mounted {
+                    mountpoint: mountpoint.to_owned(),
+                }),
+                "{mountpoint} stays protected under the policy"
+            );
+        }
+        // Sister names that merely start with a protected directory are
+        // not protected, so the policy still covers those mounts.
+        for mountpoint in ["/bootable", "/homebrew", "/run/media/user/USB"] {
+            let mut target = mounted_usb_target();
+            target.mounted_at = Some(mountpoint.to_owned());
+            assert_eq!(
+                judge_with_policy(&target, true),
+                SafetyVerdict::Safe,
+                "{mountpoint} is an ordinary mountpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_mountpoint_matching_is_boundary_aware() {
+        for path in [
+            "/",
+            "/boot",
+            "/boot/efi",
+            "/home",
+            "/usr",
+            "/var",
+            "/etc",
+            "/opt",
+            "/srv",
+            "/root",
+            "/boot/efi/one",
+            "/usr/local",
+            "/var/lib",
+            "/home/user",
+        ] {
+            assert!(is_protected_mountpoint(path), "{path} is protected");
+        }
+        for path in [
+            "/bootable",
+            "/homebrew",
+            "/etcetera",
+            "/roots",
+            "/srv2",
+            "/media/usb",
+            "/tmp",
+            "",
+        ] {
+            assert!(!is_protected_mountpoint(path), "{path} is not protected");
         }
     }
 

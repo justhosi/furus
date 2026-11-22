@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use furus_core::hash::hash_file;
 use furus_core::safety::SafetyVerdict;
 use furus_core::safety::Target;
-use furus_core::safety::judge;
+use furus_core::safety::judge_with_policy;
 use furus_core::text::device_text;
 use furus_core::units::human_bytes;
 use furus_linux::Device;
@@ -698,7 +698,11 @@ fn judge_target(plan: &Plan, env: &Env, device: &Device) -> Result<Target, Rejec
             confirmed_serial: plan.options.confirmed_serial.as_deref(),
         },
     );
-    match judge(&inspected.target) {
+    // Fast validation owns the auto-unmount step: an ordinary mount on
+    // removable media is allowed here, and the strict re-check after the
+    // unmount (next slice) will call plain `judge` again. Protected
+    // system mounts and every other reason still refuse above.
+    match judge_with_policy(&inspected.target, true) {
         SafetyVerdict::Safe => Ok(inspected.target),
         SafetyVerdict::Refuse(reason) => Err(reject(reason.code(), reason.to_string())),
     }
@@ -1796,8 +1800,11 @@ mod tests {
     // The independent safety re-check (rule 8)
     // ----------------------------------------------------------------------
 
+    /// Fast validation owns the unmount step, so an ordinary mount on
+    /// removable media is no longer a refusal here (the strict re-check
+    /// after the unmount, in the next slice, still uses plain `judge`).
     #[test]
-    fn mounted_device_is_refused_naming_the_mountpoint() {
+    fn mounted_removable_usb_passes_the_auto_unmount_policy() {
         let fixture = Fixture::new();
         let (plan, mut env, _device) = fixture.good(true);
         env.mountinfo = Some(fixture.write_text(
@@ -1807,23 +1814,42 @@ mod tests {
                 Fixture::mount_line(DISK_DEVNUM, "/media/user/STICK")
             ),
         ));
-        assert_eq!(refused_code(validate(&plan, &env)), "mounted");
-        assert!(
-            refused_message(validate(&plan, &env)).contains("mounted at /media/user/STICK"),
-            "the mountpoint is named: {}",
-            refused_message(validate(&plan, &env))
+        let validated = validate(&plan, &env).expect("an ordinary mount is auto-unmounted");
+        assert_eq!(
+            validated.target.mounted_at.as_deref(),
+            Some("/media/user/STICK"),
+            "the mount is still recorded for the unmount step"
         );
     }
 
     #[test]
-    fn mounted_partition_is_enough_to_refuse() {
+    fn mounted_removable_partition_also_passes_the_auto_unmount_policy() {
         let fixture = Fixture::new();
         let (plan, mut env, _device) = fixture.good(true);
         env.mountinfo = Some(fixture.write_text(
             "mountinfo.tsv",
             &format!("{}\n", Fixture::mount_line(PART_DEVNUM, "/run/media/usb")),
         ));
-        assert_eq!(refused_code(validate(&plan, &env)), "mounted");
+        validate(&plan, &env).expect("an ordinary partition mount is auto-unmounted");
+    }
+
+    /// Paths outside the core's protected list are ordinary mounts, and
+    /// furus-linux does not mark them as system disks either.
+    #[test]
+    fn protected_mountpoints_outside_the_system_prefixes_are_still_refused() {
+        for mountpoint in ["/home", "/etc", "/opt", "/srv", "/root"] {
+            let fixture = Fixture::new();
+            let (plan, mut env, _device) = fixture.good(true);
+            env.mountinfo = Some(fixture.write_text(
+                "mountinfo.tsv",
+                &format!("{}\n", Fixture::mount_line(PART_DEVNUM, mountpoint)),
+            ));
+            assert_eq!(
+                refused_code(validate(&plan, &env)),
+                "mounted",
+                "{mountpoint} is protected even with auto-unmount"
+            );
+        }
     }
 
     #[test]

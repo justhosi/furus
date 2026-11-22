@@ -527,6 +527,14 @@ fn outcome_text(outcome: &Outcome) -> String {
 /// Facts shown in the destructive confirmation dialog: exactly the ones the
 /// user saw on the form, plus an explicit irreversibility warning.
 fn confirmation_facts(facts: &DeviceFacts) -> String {
+    // The helper's fast validation will unmount an ordinary mount before
+    // writing, so say so in the destructive confirmation. The other two
+    // mount states are display facts only and stay untouched.
+    let mounts = if facts.mount_summary.starts_with("mounted at ") {
+        format!("{} (will be unmounted automatically)", facts.mount_summary)
+    } else {
+        facts.mount_summary.clone()
+    };
     format!(
         "Model: {}\n\
          Path: {}\n\
@@ -541,7 +549,7 @@ fn confirmation_facts(facts: &DeviceFacts) -> String {
         facts.serial.as_deref().unwrap_or("no serial"),
         human_size(facts.size_bytes),
         facts.size_bytes,
-        facts.mount_summary,
+        mounts,
     )
 }
 

@@ -440,10 +440,32 @@ fn confirmation_facts_include_every_destructive_warning() {
         "ABC123",
         "32.0 GB",
         "32010928128",
-        "mounted at /media/usb",
+        "mounted at /media/usb (will be unmounted automatically)",
         "DESTROY",
     ] {
         assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+    }
+}
+
+#[test]
+fn confirmation_facts_note_only_actual_mounts() {
+    for mount_summary in ["not mounted", "mount state unknown"] {
+        let facts = DeviceFacts {
+            model: None,
+            path: "/dev/sdz".to_string(),
+            serial: None,
+            size_bytes: 32_010_928_128,
+            mount_summary: mount_summary.to_string(),
+        };
+        let text = confirmation_facts(&facts);
+        assert!(
+            text.contains(&format!("Existing mounts: {mount_summary}\n")),
+            "the state is printed unchanged: {text}"
+        );
+        assert!(
+            !text.contains("will be unmounted automatically"),
+            "no unmount promise for {mount_summary}: {text}"
+        );
     }
 }
 
