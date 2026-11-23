@@ -80,6 +80,13 @@ impl Cancel {
     pub fn is_set(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+
+    /// Borrow the shared flag for cancellable helpers that take an
+    /// `&AtomicBool` directly (e.g. the streamed image digest).
+    #[must_use]
+    pub fn flag(&self) -> &AtomicBool {
+        &self.0
+    }
 }
 
 impl Default for Cancel {

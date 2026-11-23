@@ -1062,6 +1062,75 @@ fn a_failing_unmount_ends_the_run_with_one_done_and_the_right_outcome() {
     }
 }
 
+// -- the streamed digest gate (S35.3) ------------------------------------
+
+#[test]
+fn a_changed_image_fails_before_unmount_with_one_done_and_a_reclaimed_session() {
+    let fixture = Fixture::new();
+    let (good, env, _device) = fixture.good(true);
+    let plan = finalize_only(good);
+    let image_path = PathBuf::from(&plan.image.path);
+    let sessions = tempfile::tempdir().expect("sessions root");
+    let emitter = VecEmitter::new();
+    // A unmount that would refuse if reached: since the expected outcome
+    // is the digest's own failure, reaching it at all fails this test.
+    let registry = Registry::with_unmounter(
+        sessions.path().to_path_buf(),
+        env,
+        Arc::new(FixedAuthorizer(true)),
+        Arc::new(emitter.clone()),
+        Arc::new(StubRunner),
+        Arc::new(FailingUnmounter {
+            refusal: UnmountRefusal {
+                code: "unmount_must_not_run".to_string(),
+                message: "the digest failed first".to_string(),
+                protected_path: true,
+            },
+        }),
+    );
+    // Patch the bytes while the worker is parked after validation but
+    // before its streamed digest: only the new phase can catch this.
+    registry.install_run_pause(Some(Arc::new(move || {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&image_path)
+            .expect("open the fixture image");
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(4096))
+            .expect("seek within the fixture image");
+        std::io::Write::write_all(&mut file, b"tampered").expect("patch the image");
+    })));
+
+    let id = registry
+        .execute("com.example.gui", &execute_json(&plan))
+        .expect("a valid plan is accepted immediately");
+    wait_idle(&registry);
+
+    let completions = wait_completions(&emitter);
+    assert_eq!(completions.len(), 1, "exactly one Done");
+    assert_eq!(completions[0].session, id);
+    match &completions[0].outcome {
+        furus_proto::Outcome::Failed { code, message } => {
+            assert_eq!(code, "image_changed");
+            assert!(message.contains("SHA-256"), "{message}");
+        }
+        other => panic!("the digest refusal is the outcome: {other:?}"),
+    }
+    assert!(
+        emitter.snapshot().iter().any(|event| matches!(
+            event,
+            Event::Log(line) if line.message == "Verifying image SHA-256..."
+        )),
+        "the immediate sign-of-life log reached the transport"
+    );
+    assert_eq!(
+        fs::read_dir(sessions.path())
+            .expect("the sessions root exists")
+            .count(),
+        0,
+        "the failed verification reclaimed the session"
+    );
+}
+
 // -- the Handoff (the one-shot accept bridge) ----------------------------
 
 #[test]

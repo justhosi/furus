@@ -1592,6 +1592,11 @@ fn run_gui(startup_path: Option<PathBuf>) -> Result<(), slint::PlatformError> {
             };
             // Hide the dialog and lock the form before any process starts.
             render(&session.borrow(), &ui);
+            // `render` rewrites these from run state on every pass; set
+            // the message after it so the user sees feedback while the
+            // helper authenticates (pkexec) and streams the image digest.
+            ui.set_step_text(SharedString::from("Authenticating and starting helper…"));
+            ui.set_status_text(SharedString::from("Authenticating and starting helper…"));
             let sender = run_tx.clone();
             let handle = thread::Builder::new()
                 .name("furus-run-worker".to_string())

@@ -326,75 +326,94 @@ fn run(args: &RunArgs) -> i32 {
                     Ok(session) => {
                         // The session exists, so unmount logs carry its id.
                         session_id = session.id().to_string();
-                        // S35.3 inserts streamed digest verification here,
-                        // before any device byte is touched.
-                        let unmounter = unmount::LiveUnmounter;
-                        match unmounter.unmount(
-                            &validated.device,
-                            &env,
+                        // Streamed digest verification (S35.3): a
+                        // cancellable, progress-reporting read that must
+                        // refuse before the host unmount or any device
+                        // byte is touched.
+                        let cancel = exec::Cancel::new();
+                        if let Err(reject) = validate::verify_image_digest(
+                            &validated.plan,
                             sink_for(&mut sink, &mut discard),
                             &session_id,
+                            &cancel,
                         ) {
-                            Err(refusal) => {
-                                drop(session);
-                                let message = refusal.message;
-                                if refusal.protected_path {
-                                    Outcome::Refused {
-                                        code: refusal.code,
-                                        message,
-                                    }
-                                } else {
-                                    Outcome::Failed {
-                                        code: refusal.code,
-                                        message,
-                                    }
+                            drop(session);
+                            if reject.code == exec::CANCELLED_CODE {
+                                Outcome::Cancelled
+                            } else {
+                                Outcome::Failed {
+                                    code: reject.code,
+                                    message: reject.message,
                                 }
                             }
-                            Ok(()) => match validate::recheck_strict(&validated, &env) {
-                                Err(reject) => {
+                        } else {
+                            let unmounter = unmount::LiveUnmounter;
+                            match unmounter.unmount(
+                                &validated.device,
+                                &env,
+                                sink_for(&mut sink, &mut discard),
+                                &session_id,
+                            ) {
+                                Err(refusal) => {
                                     drop(session);
-                                    Outcome::Refused {
-                                        code: reject.code,
-                                        message: reject.message,
-                                    }
-                                }
-                                Ok(()) => match namespace::enter_mount_namespace() {
-                                    Err(err) => {
-                                        // The namespace isolation is the
-                                        // last pre-step gate (S06 part 4):
-                                        // the plan has not run yet, so the
-                                        // run ends here with nothing
-                                        // written — and no session left
-                                        // behind (the drop reclaims the
-                                        // directory and the lock). The
-                                        // stream still ends on exactly one
-                                        // `Done`, carrying this run's session id
-                                        // like the other post-session stops.
-                                        drop(session);
+                                    let message = refusal.message;
+                                    if refusal.protected_path {
+                                        Outcome::Refused {
+                                            code: refusal.code,
+                                            message,
+                                        }
+                                    } else {
                                         Outcome::Failed {
-                                            code: namespace::MOUNT_NAMESPACE_CODE.to_string(),
-                                            message: format!(
-                                                "cannot isolate mounts: {}",
-                                                isolation_message(err)
-                                            ),
+                                            code: refusal.code,
+                                            message,
                                         }
                                     }
-                                    Ok(()) => {
-                                        let cancel = exec::Cancel::new();
-                                        let outcome = runner.run(
-                                            &validated,
-                                            sink_for(&mut sink, &mut discard),
-                                            &cancel,
-                                            &session_id,
-                                        );
-                                        // The session closes (dir + lock
-                                        // removed) before any terminal
-                                        // reporting happens.
+                                }
+                                Ok(()) => match validate::recheck_strict(&validated, &env) {
+                                    Err(reject) => {
                                         drop(session);
-                                        outcome
+                                        Outcome::Refused {
+                                            code: reject.code,
+                                            message: reject.message,
+                                        }
                                     }
+                                    Ok(()) => match namespace::enter_mount_namespace() {
+                                        Err(err) => {
+                                            // The namespace isolation is the
+                                            // last pre-step gate (S06 part 4):
+                                            // the plan has not run yet, so the
+                                            // run ends here with nothing
+                                            // written — and no session left
+                                            // behind (the drop reclaims the
+                                            // directory and the lock). The
+                                            // stream still ends on exactly one
+                                            // `Done`, carrying this run's session id
+                                            // like the other post-session stops.
+                                            drop(session);
+                                            Outcome::Failed {
+                                                code: namespace::MOUNT_NAMESPACE_CODE.to_string(),
+                                                message: format!(
+                                                    "cannot isolate mounts: {}",
+                                                    isolation_message(err)
+                                                ),
+                                            }
+                                        }
+                                        Ok(()) => {
+                                            let outcome = runner.run(
+                                                &validated,
+                                                sink_for(&mut sink, &mut discard),
+                                                &cancel,
+                                                &session_id,
+                                            );
+                                            // The session closes (dir + lock
+                                            // removed) before any terminal
+                                            // reporting happens.
+                                            drop(session);
+                                            outcome
+                                        }
+                                    },
                                 },
-                            },
+                            }
                         }
                     }
                 }

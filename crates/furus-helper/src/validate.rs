@@ -38,7 +38,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
-use furus_core::hash::hash_file;
+use furus_core::hash::hash_file_cancellable;
 use furus_core::safety::SafetyVerdict;
 use furus_core::safety::Target;
 use furus_core::safety::judge_with_policy;
@@ -51,14 +51,22 @@ use furus_linux::mounts::read_swaps;
 use furus_linux::sysfs::Filter;
 use furus_linux::sysfs::enumerate as enumerate_devices;
 use furus_proto::BootloaderMode;
+use furus_proto::Event;
 use furus_proto::Filesystem;
 use furus_proto::ImageKind;
 use furus_proto::Layout;
+use furus_proto::LogLevel;
+use furus_proto::LogLine;
 use furus_proto::PLAN_VERSION;
 use furus_proto::Plan;
+use furus_proto::Progress;
 use furus_proto::Scheme;
 use furus_proto::Step;
 use furus_proto::WriteMode;
+
+use crate::exec::CANCELLED_CODE;
+use crate::exec::Cancel;
+use crate::progress::ProgressSink;
 
 /// One refusal of one rule: a stable code for the machines, one ASCII
 /// sentence for the human. Codes are pinned in tests.
@@ -422,24 +430,24 @@ fn check_size(plan: &Plan, device: &Device) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Rule 6: image regularity, permissions, size and digest — the helper
-/// re-reads the whole image once here so the bytes S17 will stream have
-/// just been seen (the digest cost is the point).
+/// Rule 6's fast half: image existence, regularity, world-writable bit
+/// and recorded size — metadata only, so validation stays off the
+/// multi-gigabyte read path. The digest half lives in
+/// [`verify_image_digest`], which the two entry points run as a
+/// separate, cancellable, streamed phase after the session exists.
 ///
 /// # What this narrows, and what it does not
 ///
-/// The re-read confirms the image contents against the plan's hash at
-/// *check* time; it cannot make the file immutable. [`fs::metadata`]
-/// follows symlinks (rule 6 is about the file the path resolves to),
-/// and the device node is equally re-checked by `lstat` rather than
-/// held. Both the image and the node are re-opened **by path** when
-/// S17 streams, so the bytes may still change between this check and
-/// the write (PLAN §6's "image passed as an open fd" is not
+/// [`fs::metadata`] follows symlinks (rule 6 is about the file the path
+/// resolves to), and the device node is equally re-checked by `lstat`
+/// rather than held. Both the image and the node are re-opened **by
+/// path** when S17 streams, so the bytes may still change between the
+/// checks and the write (PLAN §6's "image passed as an open fd" is not
 /// implemented). The S17 obligations close that gap: open with
 /// `O_NOFOLLOW`, re-verify the size (and ideally the digest) against
 /// the plan after the open, or take the image fd from the front end so
 /// the path is never resolved a second time. Until then the truth is:
-/// this rule narrows the window, it does not close it.
+/// these checks narrow the window, they do not close it.
 fn check_image(plan: &Plan) -> Result<(), Reject> {
     let path = Path::new(&plan.image.path);
     let displayed = device_text(&plan.image.path);
@@ -475,22 +483,79 @@ fn check_image(plan: &Plan) -> Result<(), Reject> {
             ),
         ));
     }
-    let sha256 = hash_file(path).map_err(|source| {
-        reject(
+    Ok(())
+}
+
+/// Rule 6's digest half, split out of fast validation (S35.3): stream
+/// SHA-256 over the whole image, reporting cancellable progress, and
+/// refuse before any unmount or device write if the bytes no longer
+/// match the plan.
+///
+/// The first event is an `Info` log emitted *before* the first read, so
+/// pkexec/D-Bus sees activity immediately instead of timing out over a
+/// 10-25 s silent hash. Progress events are throttled to percent
+/// changes (one per 1% at most) plus one terminal 100% update; `op` is
+/// the fixed tag `"verify_image"` and `step` is 0 because this phase
+/// precedes the plan's step loop. A cancellation or a rejection still
+/// leaves the caller to emit the run's single terminal `Done`.
+pub fn verify_image_digest(
+    plan: &Plan,
+    sink: &mut dyn ProgressSink,
+    session: &str,
+    cancel: &Cancel,
+) -> Result<(), Reject> {
+    // Before any read: a transport-visible sign of life (static ASCII).
+    sink.event(&Event::Log(LogLine {
+        session: session.to_string(),
+        level: LogLevel::Info,
+        message: "Verifying image SHA-256...".to_string(),
+    }));
+
+    let path = Path::new(&plan.image.path);
+    let displayed = device_text(&plan.image.path);
+    let mut last_percent: Option<u8> = None;
+    let hashed = hash_file_cancellable(path, cancel.flag(), |done, total| {
+        let progress = Progress::new(session, 0, "verify_image", done, Some(total));
+        if last_percent != progress.percent {
+            last_percent = progress.percent;
+            sink.event(&Event::Progress(progress));
+        }
+    });
+
+    match hashed {
+        Ok(None) => Err(reject(
+            CANCELLED_CODE,
+            "image verification cancelled - no changes were made",
+        )),
+        Ok(Some(sha256)) => {
+            if sha256 != plan.image.sha256 {
+                return Err(reject(
+                    "image_changed",
+                    format!(
+                        "image {displayed} changed since the plan was built (its \
+                         SHA-256 no longer matches) - rebuild the plan"
+                    ),
+                ));
+            }
+            // Guarantee a terminal 100% milestone: the last chunk
+            // usually reported it already (an empty file reports no
+            // chunk at all), so only emit when no percent reached 100.
+            if last_percent != Some(100) {
+                sink.event(&Event::Progress(Progress::new(
+                    session,
+                    0,
+                    "verify_image",
+                    plan.image.size_bytes,
+                    Some(plan.image.size_bytes),
+                )));
+            }
+            Ok(())
+        }
+        Err(source) => Err(reject(
             "image_unreadable",
             format!("image {displayed} cannot be read ({source}) - rebuild the plan"),
-        )
-    })?;
-    if sha256 != plan.image.sha256 {
-        return Err(reject(
-            "image_changed",
-            format!(
-                "image {displayed} changed since the plan was built (its \
-                 SHA-256 no longer matches) - rebuild the plan"
-            ),
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// Rule 7: step arguments must be legal for this plan's options and
@@ -761,9 +826,11 @@ mod tests {
     use furus_linux::SysfsRoot;
     use furus_proto::BootloaderMode;
     use furus_proto::DeviceRef;
+    use furus_proto::Event;
     use furus_proto::Filesystem;
     use furus_proto::ImageKind;
     use furus_proto::ImageRef;
+    use furus_proto::LogLevel;
     use furus_proto::Options;
     use furus_proto::PLAN_VERSION;
     use furus_proto::Plan;
@@ -778,6 +845,10 @@ mod tests {
     use super::load;
     use super::scheme_tag;
     use super::validate;
+    use super::verify_image_digest;
+    use crate::exec::CANCELLED_CODE;
+    use crate::exec::Cancel;
+    use crate::progress::VecSink;
 
     // ----------------------------------------------------------------------
     // Fixtures: synthetic sysfs tree + sparse scratch images, mirroring
@@ -1406,10 +1477,102 @@ mod tests {
     fn patched_image_bytes_are_refused_as_changed() {
         let fixture = Fixture::new();
         let (plan, env, _device) = fixture.good(true);
-        // Same length, different bytes: the digest guard catches it
-        // (this is the TOCTOU re-read the whole rule exists for).
+        // Same length, different bytes: fast validation (metadata only)
+        // accepts, and the streamed digest half is what catches the
+        // change before any device byte is touched.
         fixture.patch(Path::new(&plan.image.path), 4096, b"vanished");
-        assert_eq!(refused_code(validate(&plan, &env)), "image_changed");
+        validate(&plan, &env).expect("the fast checks see an unchanged shape");
+        let mut sink = VecSink::new();
+        let rejected = verify_image_digest(&plan, &mut sink, "s-verify", &Cancel::new())
+            .expect_err("the digest refuses the patched bytes");
+        assert_eq!(rejected.code, "image_changed");
+        assert!(rejected.message.contains("SHA-256"), "{rejected:?}");
+    }
+
+    #[test]
+    fn digest_verification_logs_before_the_first_read() {
+        let fixture = Fixture::new();
+        let (plan, _env, _device) = fixture.good(true);
+        let mut sink = VecSink::new();
+        verify_image_digest(&plan, &mut sink, "s-verify", &Cancel::new())
+            .expect("a good image verifies");
+        let events = sink.events();
+        assert_eq!(
+            events[0],
+            Event::Log(furus_proto::LogLine {
+                session: "s-verify".to_string(),
+                level: LogLevel::Info,
+                message: "Verifying image SHA-256...".to_string(),
+            }),
+            "the transport sees a sign of life before hashing"
+        );
+        assert!(events.iter().all(|event| match event {
+            Event::Progress(p) => {
+                p.session == "s-verify" && p.op == "verify_image" && p.step == 0
+            }
+            Event::Log(l) => l.session == "s-verify",
+            Event::Done(_) => false,
+        }));
+    }
+
+    #[test]
+    fn digest_progress_is_throttled_and_ends_at_one_hundred_percent() {
+        let fixture = Fixture::new();
+        // 3 MiB = three 1 MiB chunks, so the callback runs three times
+        // but throttling keeps one event per percent change.
+        let len = 3 * 1024 * 1024;
+        let (image, sha) = fixture.image("big.img", len);
+        let plan = signed(fixture.plan_for(&image, len, &sha));
+        let mut sink = VecSink::new();
+        verify_image_digest(&plan, &mut sink, "s-verify", &Cancel::new())
+            .expect("a good image verifies");
+
+        let progresses: Vec<_> = sink
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Progress(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert!(!progresses.is_empty(), "at least the terminal milestone");
+        assert!(progresses.len() <= 100, "one update per percent at most");
+        for (earlier, later) in progresses.iter().zip(progresses.iter().skip(1)) {
+            assert!(later.done >= earlier.done, "progress never rewinds");
+            assert_ne!(later.percent, earlier.percent, "no repeated percent");
+        }
+        let last = progresses.last().expect("at least one progress");
+        assert_eq!(last.done, len);
+        assert_eq!(last.total, Some(len));
+        assert_eq!(last.percent, Some(100));
+    }
+
+    #[test]
+    fn digest_verification_honours_cancellation_before_any_digest_is_published() {
+        let fixture = Fixture::new();
+        let (plan, _env, _device) = fixture.good(true);
+        let cancel = Cancel::new();
+        cancel.set();
+        let mut sink = VecSink::new();
+        let rejected = verify_image_digest(&plan, &mut sink, "s-verify", &cancel)
+            .expect_err("a pre-cancelled verification refuses");
+        assert_eq!(rejected.code, CANCELLED_CODE);
+        assert!(rejected.message.contains("no changes were made"));
+        // The sign-of-life log still arrived, but no progress was emitted.
+        assert_eq!(sink.events().len(), 1, "only the immediate log: {sink:?}");
+        assert!(matches!(sink.events()[0], Event::Log(_)));
+    }
+
+    #[test]
+    fn an_unreadable_image_is_rejected_with_the_same_fast_check_code() {
+        let fixture = Fixture::new();
+        let (mut plan, _env, _device) = fixture.good(true);
+        plan.image.path = fixture.root.join("gone.iso").display().to_string();
+        let mut sink = VecSink::new();
+        let rejected = verify_image_digest(&plan, &mut sink, "s-verify", &Cancel::new())
+            .expect_err("a missing image refuses");
+        assert_eq!(rejected.code, "image_unreadable");
+        assert!(rejected.message.contains("gone.iso"), "{rejected:?}");
     }
 
     #[test]

@@ -412,9 +412,24 @@ impl WorkerRun {
         // recorded, never propagated — see [`SignalSink`]).
         let mut sink = SignalSink::new(emitter.clone());
 
-        // S35.3 inserts streamed digest verification here, before any
-        // device byte is touched.
-        //
+        // Streamed digest verification (S35.3) before any device byte is
+        // touched: it reports through the same sink as the rest of the
+        // run, so the front end sees the sign-of-life log and progress
+        // immediately. A refusal still ends on exactly one `Done` and
+        // reclaims the session via `finish_run`.
+        if let Err(reject) = validate::verify_image_digest(&plan.plan, &mut sink, &id, &cancel) {
+            let outcome = if reject.code == exec::CANCELLED_CODE {
+                Outcome::Cancelled
+            } else {
+                Outcome::Failed {
+                    code: reject.code,
+                    message: reject.message,
+                }
+            };
+            finish_run(session, &id, &mut sink, outcome);
+            return;
+        }
+
         // S35.2b: release this disk's mounts on the HOST namespace
         // before isolating ourselves, then re-check strictly that none
         // remain. Both failures end here with the run's one `Done`.
