@@ -181,6 +181,35 @@ fn start_reports_planner_refusal_without_attempting_any_write() {
     assert!(session.state.device.is_none());
 }
 
+#[test]
+fn start_surfaces_a_manual_label_the_planner_refuses_before_confirmation() {
+    let mut device = fixture_device("sdz");
+    device.size_bytes = 32_010_928_128;
+    let mut session = Session::new(Discovery {
+        devices: vec![device],
+        warning: None,
+    });
+    let image = ImageFile::raw();
+    session
+        .state
+        .select_image(&image.0, false)
+        .expect("inspect fixture");
+    session.state.set_volume_label("FEDORA-KDE-LIVE-2026"); // 20 bytes on fat32
+
+    session.start();
+
+    let note = session
+        .note
+        .as_deref()
+        .expect("START leaves an inline note");
+    assert!(note.contains("Planning refused"), "{note}");
+    assert!(note.contains("fat32"), "{note}");
+    assert!(
+        matches!(session.run.state(), RunState::Idle),
+        "an unstorable label never opens the confirmation gate"
+    );
+}
+
 /// The production seam end to end, minus the picker and the dispatcher
 /// thread: a selection takes its request id *before* the worker can see
 /// it, the worker analyses off-thread and publishes the real

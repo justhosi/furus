@@ -90,6 +90,14 @@ pub struct GuiState {
     pub filesystem: Filesystem,
     pub cluster_bytes: Option<u32>,
     pub volume_label: Option<String>,
+    /// True while the volume label is owned by image analysis: set when
+    /// ISO metadata is applied, cleared when the user edits the field.
+    /// A fresh analysis restores it even when the report has no label
+    /// (then there is simply no label to track).
+    pub label_is_auto: bool,
+    /// The unmodified ISO volume ID from `report.labels.best()`, kept so
+    /// an auto-filled label can be re-sanitized after a filesystem change.
+    pub raw_image_label: Option<String>,
     pub quick_format: bool,
     pub extended_label: bool,
     pub bad_blocks_passes: u8,
@@ -137,14 +145,16 @@ impl GuiState {
         self.target = Target::Uefi;
         self.filesystem = Filesystem::Fat32;
         self.volume_label = None;
+        self.label_is_auto = false;
+        self.raw_image_label = None;
         self.status = format!("Analyzing image '{}'…", path.display());
     }
 
     /// Apply fast image facts before the background digest is available.
     pub fn apply_image_metadata(&mut self, metadata: image::ImageMetadata, report: ImageReport) {
         let is_windows = report.is_windows;
-        let volume_label = report.labels.best().map(str::to_string);
-        self.image = Some(BootSelection {
+        let raw_image_label = report.labels.best().map(str::to_string);
+        let image = BootSelection {
             image: ImageRef {
                 path: metadata.path,
                 size_bytes: metadata.size_bytes,
@@ -157,7 +167,9 @@ impl GuiState {
             digest_progress: Some(0),
             is_windows,
             report,
-        });
+        };
+        let status = format!("{} (computing SHA-256… 0%)", analysis_summary(&image));
+        self.image = Some(image);
         self.image_option = WindowsImageOption::Standard;
         self.bootloader = BootloaderOpt::Auto;
         self.iso_mode = false;
@@ -168,9 +180,12 @@ impl GuiState {
         } else {
             Filesystem::Fat32
         };
-        let image = self.image.as_ref().expect("image was just assigned");
-        self.volume_label = volume_label;
-        self.status = format!("{} (computing SHA-256… 0%)", analysis_summary(image));
+        // Sanitize against the filesystem this analysis just selected, not
+        // the one that happened to be on screen beforehand.
+        self.raw_image_label = raw_image_label;
+        self.volume_label = self.auto_label_for(&self.filesystem);
+        self.label_is_auto = true;
+        self.status = status;
         self.last_error = None;
     }
 
@@ -292,6 +307,47 @@ impl GuiState {
     #[must_use]
     pub fn filesystem_enabled(&self) -> bool {
         self.image_option != WindowsImageOption::WindowsToGo || !self.image_option_enabled()
+    }
+
+    /// Best-effort label for `filesystem` derived from the ISO volume ID.
+    /// An absent or wholly unstorable label means "no label", matching the
+    /// form's empty-entry behaviour.
+    fn auto_label_for(&self, filesystem: &Filesystem) -> Option<String> {
+        self.raw_image_label
+            .as_deref()
+            .map(|raw| furus_core::fs::label::sanitize_label(raw, filesystem.clone()))
+            .filter(|label| !label.is_empty())
+    }
+
+    /// Apply a user-edited volume label. Empty input means "no label", and
+    /// editing ends auto tracking of the analyzer's ISO label.
+    pub fn set_volume_label(&mut self, label: impl Into<String>) {
+        let label = label.into();
+        self.volume_label = (!label.is_empty()).then_some(label);
+        self.label_is_auto = false;
+    }
+
+    /// Select the data filesystem, keeping the volume label storable.
+    ///
+    /// An auto-filled label is always re-derived from the raw ISO volume
+    /// ID for the new filesystem. A manual label is left alone while it
+    /// stays valid; a label the new filesystem cannot store is
+    /// re-sanitized in place. Re-sanitizing a manual label does **not**
+    /// hand tracking back to the analyzer: the user still owns that text
+    /// and may edit it again at any time.
+    pub fn select_filesystem(&mut self, filesystem: Filesystem) {
+        self.filesystem = filesystem;
+        if self.label_is_auto {
+            self.volume_label = self.auto_label_for(&self.filesystem);
+            return;
+        }
+        let Some(label) = self.volume_label.as_deref() else {
+            return;
+        };
+        if furus_core::fs::label::validate_label(label, self.filesystem.clone()).is_err() {
+            let clean = furus_core::fs::label::sanitize_label(label, self.filesystem.clone());
+            self.volume_label = (!clean.is_empty()).then_some(clean);
+        }
     }
 
     /// The most recent status or planner/inspection refusal text.
@@ -435,6 +491,8 @@ impl Default for GuiState {
             filesystem: Filesystem::Fat32,
             cluster_bytes: None,
             volume_label: None,
+            label_is_auto: false,
+            raw_image_label: None,
             quick_format: true,
             extended_label: false,
             bad_blocks_passes: 0,
@@ -543,9 +601,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use furus_core::fs::label::validate_label;
+    use furus_core::image;
     use furus_core::part::TableKind;
     use furus_core::part::plan::{self, DataType, LayoutKind};
     use furus_core::planner::{BootloaderOpt, PlanError};
+    use furus_core::report::{ImageReport, Labels};
     use furus_linux::{Device, Partition, Transport};
     use furus_proto::{
         BootloaderMode, Filesystem, ImageKind, Layout, Scheme, Step, Target, WriteMode,
@@ -634,6 +695,27 @@ mod tests {
         state
             .select_image(&image.0, is_windows)
             .expect("inspect test image");
+        state
+    }
+
+    /// A selected device plus an inspected image whose analyzer report
+    /// carries a chosen ISO volume ID, so `plan()` is immediately live.
+    fn analyzed_state_with_label(image: &ImageFile, is_windows: bool, label: &str) -> GuiState {
+        let info = image::inspect(&image.0).expect("inspect test image");
+        let mut state = GuiState::default();
+        state.select_device(&sample_device(), "not mounted");
+        state.apply_image_analysis(
+            info,
+            ImageReport {
+                kind: "iso".to_string(),
+                is_windows,
+                labels: Labels {
+                    primary: Some(label.to_string()),
+                    ..Labels::default()
+                },
+                ..ImageReport::default()
+            },
+        );
         state
     }
 
@@ -969,5 +1051,125 @@ mod tests {
             furus_core::planner::device_ref(&non_block, false),
             Err(PlanError::Safety(_))
         ));
+    }
+
+    #[test]
+    fn iso_volume_label_is_sanitized_for_fat32_when_analysis_finishes() {
+        let image = ImageFile::iso();
+        let mut state = analyzed_state_with_label(&image, false, "Fedora-KDE-Live-45");
+
+        assert_eq!(state.filesystem, Filesystem::Fat32);
+        assert_eq!(state.raw_image_label.as_deref(), Some("Fedora-KDE-Live-45"));
+        assert_eq!(state.volume_label.as_deref(), Some("FEDORA-KDE-"));
+        assert!(state.label_is_auto, "the analyzer filled the label");
+        validate_label(
+            state.volume_label.as_deref().unwrap_or(""),
+            Filesystem::Fat32,
+        )
+        .expect("auto label is storable on fat32");
+
+        state.build_plan().expect("plan with the sanitized label");
+    }
+
+    #[test]
+    fn switching_from_ntfs_to_fat32_re_sanitizes_the_auto_label() {
+        let image = ImageFile::iso();
+        let mut state = analyzed_state_with_label(&image, true, "Fedora-KDE-Live-45");
+
+        assert_eq!(state.filesystem, Filesystem::Ntfs);
+        assert_eq!(state.volume_label.as_deref(), Some("Fedora-KDE-Live-45"));
+        state.build_plan().expect("18-byte ntfs label plans");
+
+        state.select_filesystem(Filesystem::Fat32);
+        assert_eq!(state.volume_label.as_deref(), Some("FEDORA-KDE-"));
+        assert!(
+            state.label_is_auto,
+            "a filesystem switch keeps auto tracking"
+        );
+        state
+            .build_plan()
+            .expect("plan after the ntfs-to-fat32 clamp");
+    }
+
+    #[test]
+    fn switching_filesystem_re_sanitizes_only_an_invalid_manual_label() {
+        let image = ImageFile::iso();
+        let mut state = analyzed_state_with_label(&image, false, "FEDORA");
+
+        state.set_volume_label("Fedora-KDE-Live-45");
+        assert!(!state.label_is_auto);
+
+        // Still valid on NTFS: a manual label is never shortened for fun.
+        state.select_filesystem(Filesystem::Ntfs);
+        assert_eq!(state.volume_label.as_deref(), Some("Fedora-KDE-Live-45"));
+
+        // Invalid on FAT32: clamp the current text, not the ISO original.
+        state.select_filesystem(Filesystem::Fat32);
+        assert_eq!(state.volume_label.as_deref(), Some("FEDORA-KDE-"));
+        assert!(
+            !state.label_is_auto,
+            "re-sanitizing a manual label keeps it manual"
+        );
+        state
+            .build_plan()
+            .expect("plan after clamping a manual label");
+    }
+
+    #[test]
+    fn manual_label_too_long_for_fat32_is_refused_before_planning() {
+        let image = ImageFile::iso();
+        let mut state = analyzed_state_with_label(&image, false, "FEDORA");
+
+        state.set_volume_label("FEDORA-KDE-LIVE-2026"); // 20 ascii bytes
+        assert_eq!(state.volume_label.as_deref().map(str::len), Some(20));
+        assert!(!state.label_is_auto);
+
+        let error = state
+            .build_plan()
+            .expect_err("fat32 refuses a 20-byte label");
+        assert!(
+            matches!(error, GuiError::Plan(PlanError::Usage(_))),
+            "got {error:?}"
+        );
+        assert!(error.to_string().contains("fat32"), "got {error}");
+        assert_eq!(state.status_text(), error.to_string());
+        assert!(
+            !state.start_enabled(),
+            "START stays disabled while the label is unstorable"
+        );
+    }
+
+    #[test]
+    fn manual_edit_clears_auto_tracking_and_reanalysis_restores_it() {
+        let image = ImageFile::iso();
+        let mut state = analyzed_state_with_label(&image, false, "Fedora-KDE-Live-45");
+        assert!(state.label_is_auto);
+
+        state.set_volume_label("MY-LABEL");
+        assert_eq!(state.volume_label.as_deref(), Some("MY-LABEL"));
+        assert!(!state.label_is_auto);
+
+        state.set_volume_label("");
+        assert_eq!(state.volume_label, None, "empty entry still means no label");
+
+        // A fresh selection drops the stale ISO label before analysis.
+        state.begin_image_analysis(&image.0);
+        assert!(!state.label_is_auto);
+        assert!(state.raw_image_label.is_none());
+        assert!(state.volume_label.is_none());
+
+        let info = image::inspect(&image.0).expect("inspect test image");
+        state.apply_image_analysis(
+            info,
+            ImageReport {
+                labels: Labels {
+                    primary: Some("Fedora-KDE-Live-45".to_string()),
+                    ..Labels::default()
+                },
+                ..ImageReport::default()
+            },
+        );
+        assert!(state.label_is_auto);
+        assert_eq!(state.volume_label.as_deref(), Some("FEDORA-KDE-"));
     }
 }

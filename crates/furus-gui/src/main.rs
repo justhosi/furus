@@ -1475,7 +1475,7 @@ fn run_gui(startup_path: Option<PathBuf>) -> Result<(), slint::PlatformError> {
         ui.on_fs_selected(move |label| {
             if let Some(ui) = weak.upgrade() {
                 let mut guard = session.borrow_mut();
-                guard.state.filesystem = fs_value(&label);
+                guard.state.select_filesystem(fs_value(&label));
                 guard.note = None;
                 drop(guard);
                 render(&session.borrow(), &ui);
@@ -1501,7 +1501,7 @@ fn run_gui(startup_path: Option<PathBuf>) -> Result<(), slint::PlatformError> {
         ui.on_label_edited(move |label| {
             if let Some(ui) = weak.upgrade() {
                 let mut guard = session.borrow_mut();
-                guard.state.volume_label = (!label.is_empty()).then(|| label.to_string());
+                guard.state.set_volume_label(label.to_string());
                 guard.note = None;
                 drop(guard);
                 render(&session.borrow(), &ui);
