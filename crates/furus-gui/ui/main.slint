@@ -118,6 +118,7 @@ export component MainWindow inherits Window {
     callback hash-sha256-toggled();
     callback hash-sha512-toggled();
     callback advanced-visible-toggled();
+    callback copy-log-clicked();
 
     VerticalLayout {
         padding: 12px;
@@ -336,9 +337,18 @@ export component MainWindow inherits Window {
             wrap: word-wrap;
         }
 
-        Button {
-            text: root.log-open ? "Hide log" : "Show log";
-            clicked => { root.log-open = !root.log-open; }
+        HorizontalLayout {
+            spacing: 8px;
+            Button {
+                text: root.log-open ? "Hide log" : "Show log";
+                horizontal-stretch: 1;
+                clicked => { root.log-open = !root.log-open; }
+            }
+            Button {
+                text: "Copy log";
+                enabled: root.log-text != "";
+                clicked => { root.copy-log-clicked(); }
+            }
         }
         if root.log-open : Rectangle {
             min-height: 120px;

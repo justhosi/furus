@@ -56,6 +56,7 @@ use furus_gui::analyzer::{AnalysisCoordinator, AnalysisResult, AnalyzerSender, A
 use furus_gui::checksum::{
     ChecksumCoordinator, ChecksumOutcome, ChecksumResult, ChecksumSender, ChecksumWorker,
 };
+use furus_gui::clipboard::ClipboardOutcome;
 use furus_gui::config_bridge::GuiPrefs;
 use furus_gui::i18n_bridge::LocaleCatalog;
 use furus_gui::ipc::{IpcError, PkexecTransport, open_helper, start_with_fallback};
@@ -1632,6 +1633,53 @@ fn run_gui(startup_path: Option<PathBuf>) -> Result<(), slint::PlatformError> {
             if let Some(ui) = weak.upgrade() {
                 session.borrow_mut().discard();
                 render(&session.borrow(), &ui);
+            }
+        });
+    }
+    {
+        // Copy the formatted log to the clipboard. The helper chain may block
+        // (it writes to a child process and waits for its exit), so the work
+        // runs on a short-lived thread and only the result comes back to the
+        // event loop, matching the picker/analysis/checksum patterns above.
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.on_copy_log_clicked(move || {
+            // Read the same formatted text `render` pushes into `log-text`.
+            let text = log_lines(session.borrow().run.logs()).join("\n");
+            if text.is_empty() {
+                return;
+            }
+            let dispatch_session = session.clone();
+            let dispatch_weak = weak.clone();
+            if thread::Builder::new()
+                .name("furus-clipboard".to_string())
+                .spawn(move || {
+                    let outcome = furus_gui::clipboard::copy_text(&text);
+                    // If the event loop is gone (window already closed) there
+                    // is no status line left to update; drop the publish.
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let mut session = dispatch_session.borrow_mut();
+                        session.note = Some(match outcome {
+                            ClipboardOutcome::Copied => "Copied log to clipboard.".to_string(),
+                            ClipboardOutcome::Unavailable => {
+                                "Could not copy log: install wl-copy, xclip, or xsel.".to_string()
+                            }
+                            ClipboardOutcome::Failed(error) => {
+                                format!("Could not copy log: {error}")
+                            }
+                        });
+                        if let Some(ui) = dispatch_weak.upgrade() {
+                            render(&session, &ui);
+                        }
+                    });
+                })
+                .is_err()
+            {
+                session.borrow_mut().note =
+                    Some("Could not copy log: clipboard thread unavailable".to_string());
+                if let Some(ui) = weak.upgrade() {
+                    render(&session.borrow(), &ui);
+                }
             }
         });
     }
