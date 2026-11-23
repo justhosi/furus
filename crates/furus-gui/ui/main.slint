@@ -79,6 +79,7 @@ export component MainWindow inherits Window {
     in property <bool> confirm-visible: false;
     in property <string> confirm-facts;
     in property <bool> cancel-enabled: false;
+    in property <bool> close-enabled: true;
     in property <string> step-text;
     in property <string> log-text;
     in-out property <bool> log-open: false;
@@ -387,6 +388,7 @@ export component MainWindow inherits Window {
             }
             Button {
                 text: "CLOSE";
+                enabled: root.close-enabled;
                 clicked => { root.close-clicked(); }
             }
         }

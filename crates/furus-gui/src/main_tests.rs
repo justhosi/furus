@@ -392,12 +392,14 @@ fn run_state_drives_progress_and_locked_controls() {
     let mut run = Run::new();
     assert!(run_view(&run).start_enabled);
     assert!(!run_view(&run).locked);
+    assert!(run_view(&run).close_enabled, "Idle allows close");
 
     run.start(&mut gui).expect("START");
     let locked = run_view(&run);
     assert!(locked.locked, "Confirming locks the form");
     assert!(!locked.start_enabled);
     assert!(!locked.cancel_enabled);
+    assert!(!locked.close_enabled, "Confirming blocks close");
 
     run.confirm().expect("confirm");
     // Two samples give a rate and an ETA for the same write step.
@@ -413,6 +415,7 @@ fn run_state_drives_progress_and_locked_controls() {
     assert!(running.locked, "Running locks the form");
     assert!(running.cancel_enabled);
     assert!(!running.start_enabled);
+    assert!(!running.close_enabled, "Running blocks close");
     assert!((running.progress - 0.5).abs() < f32::EPSILON);
     assert!(running.detail.contains("write"), "{}", running.detail);
     assert!(running.detail.contains("50%"), "{}", running.detail);
@@ -424,10 +427,45 @@ fn run_state_drives_progress_and_locked_controls() {
     assert!(!finished.locked, "Finished unlocks the form");
     assert!(finished.start_enabled);
     assert!(!finished.cancel_enabled);
+    assert!(finished.close_enabled, "Finished allows close");
     assert_eq!(
         finished.terminal.as_deref(),
         Some("Completed successfully.")
     );
+}
+
+#[test]
+fn close_enabled_is_true_for_every_finished_outcome() {
+    let outcomes = [
+        Outcome::Ok,
+        Outcome::Cancelled,
+        Outcome::Failed {
+            code: "io".to_string(),
+            message: "disk error".to_string(),
+        },
+        Outcome::Refused {
+            code: "mounted".to_string(),
+            message: "device is mounted".to_string(),
+        },
+    ];
+    for outcome in outcomes {
+        let (mut gui, _image) = planned_gui();
+        let mut run = Run::new();
+        run.start(&mut gui).expect("START");
+        assert!(!run_view(&run).close_enabled, "Confirming blocks close");
+        run.confirm().expect("confirm");
+        assert!(!run_view(&run).close_enabled, "Running blocks close");
+
+        run.apply(&done_event(outcome), Duration::from_secs(1));
+        assert!(
+            matches!(run.state(), RunState::Finished(_)),
+            "the done event must be terminal"
+        );
+        assert!(
+            run_view(&run).close_enabled,
+            "every Finished outcome allows close"
+        );
+    }
 }
 
 #[test]

@@ -522,3 +522,63 @@ fn copy_log_button_renders_cleanly() {
     ui.hide()
         .expect("hide must succeed on the offscreen window");
 }
+
+/// S36.4: toggling the new `close-enabled` property in both directions must
+/// keep the main window rendering cleanly (disabled CLOSE while a write is in
+/// flight, re-enabled once it reaches a terminal state).
+#[test]
+fn close_enabled_toggle_renders_cleanly() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    install_platform_once();
+    let window = fresh_window();
+    window.set_size(PhysicalSize::new(
+        CONFIRM_WIDTH as u32,
+        CONFIRM_HEIGHT as u32,
+    ));
+
+    let ui = MainWindow::new().expect("MainWindow must instantiate offscreen");
+    ui.set_locale_model(strings(&["English"]));
+    ui.set_locale_current(SharedString::from("English"));
+    ui.set_device_model(strings(&["/dev/sdb — 8 GB"]));
+    ui.set_device_current(SharedString::from("/dev/sdb — 8 GB"));
+    ui.set_boot_model(strings(&["Standard"]));
+    ui.set_boot_current(SharedString::from("Standard"));
+    ui.set_scheme_model(strings(&["GPT"]));
+    ui.set_scheme_current(SharedString::from("GPT"));
+    ui.set_target_model(strings(&["UEFI"]));
+    ui.set_target_current(SharedString::from("UEFI"));
+    ui.set_fs_model(strings(&["FAT32"]));
+    ui.set_fs_current(SharedString::from("FAT32"));
+    ui.set_cluster_model(strings(&["32 KiB"]));
+    ui.set_cluster_current(SharedString::from("32 KiB"));
+    ui.set_passes_model(strings(&["1 pass"]));
+    ui.set_passes_current(SharedString::from("1 pass"));
+
+    ui.show()
+        .expect("show must succeed on the offscreen window");
+
+    for enabled in [false, true] {
+        ui.set_close_enabled(enabled);
+        slint::platform::update_timers_and_animations();
+        ui.window().request_redraw();
+        let mut buffer = vec![DrawnPixel(false); CONFIRM_WIDTH * CONFIRM_HEIGHT];
+        let mut redrew = false;
+        window.draw_if_needed(|renderer| {
+            renderer.render(&mut buffer, CONFIRM_WIDTH);
+            redrew = true;
+        });
+        assert!(
+            redrew,
+            "expected a pending redraw for close-enabled={enabled}"
+        );
+        assert!(
+            buffer.iter().any(|pixel| pixel.0),
+            "expected at least one drawn pixel for close-enabled={enabled}"
+        );
+    }
+
+    ui.hide()
+        .expect("hide must succeed on the offscreen window");
+}

@@ -462,6 +462,10 @@ struct RunView {
     locked: bool,
     cancel_enabled: bool,
     start_enabled: bool,
+    /// False while a write is in flight (Confirming/Running); true at Idle and
+    /// for every Finished outcome. Gates the footer CLOSE button and the
+    /// window-manager close request.
+    close_enabled: bool,
     terminal: Option<String>,
 }
 
@@ -473,9 +477,15 @@ fn run_view(run: &Run) -> RunView {
     let mut detail = String::new();
     let mut cancel_enabled = false;
     let mut start_enabled = false;
+    // Conservative default: only Idle and a terminal Finished state allow the
+    // window to close. Any new in-flight state stays close-blocked by default.
+    let mut close_enabled = false;
     let mut terminal = None;
     match run.state() {
-        RunState::Idle => start_enabled = true,
+        RunState::Idle => {
+            start_enabled = true;
+            close_enabled = true;
+        }
         RunState::Confirming => {}
         RunState::Running {
             step,
@@ -503,6 +513,7 @@ fn run_view(run: &Run) -> RunView {
         RunState::Finished(outcome) => {
             progress = 1.0;
             start_enabled = true;
+            close_enabled = true;
             terminal = Some(outcome_text(outcome));
         }
     }
@@ -512,6 +523,7 @@ fn run_view(run: &Run) -> RunView {
         locked,
         cancel_enabled,
         start_enabled,
+        close_enabled,
         terminal,
     }
 }
@@ -1131,6 +1143,7 @@ fn render(session: &Session, ui: &MainWindow) {
     ui.set_form_enabled(!run_view.locked);
     ui.set_cancel_enabled(run_view.cancel_enabled);
     ui.set_start_enabled(state.start_enabled() && run_view.start_enabled);
+    ui.set_close_enabled(run_view.close_enabled);
 
     let confirming = matches!(session.run.state(), RunState::Confirming);
     ui.set_confirm_visible(confirming);
@@ -1762,9 +1775,40 @@ fn run_gui(startup_path: Option<PathBuf>) -> Result<(), slint::PlatformError> {
             }
         });
     }
-    ui.on_close_clicked(|| {
-        let _ = slint::quit_event_loop();
-    });
+    {
+        let session = session.clone();
+        ui.on_close_clicked(move || {
+            // Read the flag under a short borrow, then release it before any
+            // quit path so no guard is held across the event loop shutdown.
+            let close_enabled = run_view(&session.borrow().run).close_enabled;
+            if close_enabled {
+                let _ = slint::quit_event_loop();
+            }
+        });
+    }
+    {
+        // The window manager's X button bypasses the CLOSE callback. Refuse a
+        // close while a write is in flight and surface the reason in the status
+        // bar, mirroring the disabled footer button.
+        let session = session.clone();
+        let weak = ui.as_weak();
+        ui.window().on_close_requested(move || {
+            let Some(ui) = weak.upgrade() else {
+                return slint::CloseRequestResponse::HideWindow;
+            };
+            let close_enabled = run_view(&session.borrow().run).close_enabled;
+            if close_enabled {
+                slint::CloseRequestResponse::HideWindow
+            } else {
+                session.borrow_mut().note = Some(
+                    "Write in progress — click CANCEL first or wait for it to finish before closing."
+                        .to_string(),
+                );
+                render(&session.borrow(), &ui);
+                slint::CloseRequestResponse::KeepWindowShown
+            }
+        });
+    }
 
     if let Some(path) = startup_path {
         session.borrow_mut().select_image(path, &analyzer_sender);
