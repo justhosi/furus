@@ -1959,3 +1959,16 @@ with `sha256sum -c SHA256SUMS` (OK); the `.deb` step is skipped only because
 (`grub4dos_boots_to_its_prompt_in_qemu`). End-to-end live-hardware behavior
 still needs a real display and Polkit session; the unchecked manual sign-off
 checklist is in `docs/handoffs/HANDOFF-S35.md`. No push, no tag.
+
+**Post-S35 resolution of `RUSTSEC-2026-0592` (lockfile-only).** After S35 the
+user asked for `cargo update -p url` to pick up the patched `url` release and
+clear the advisory that had been deferred at S35. This bumped `url`
+**2.5.8 → 2.5.9** in `Cargo.lock` plus the transitive `form_urlencoded`
+**1.2.2 → 1.2.3**; no new crates, no `Cargo.toml` or source change. (A real
+`cargo update` also tried to re-point one unrelated `bindgen → syn` edge from
+`syn 3.0.9` to `2.0.119`; that drift was reverted so the lockfile diff contains
+only the two intended version/checksum bumps — the minimal lock is accepted by
+`cargo metadata --locked`.) `cargo deny check advisories` now passes, `cargo xtask
+ci` is fully green including the cargo-deny gate, and `cargo-audit` remains
+skipped only because it is not installed (pre-existing). The historical S35
+deferral record above is kept for provenance.

@@ -38,8 +38,10 @@ given. Publication/tagging is left entirely to the manual maintainer /
 
 Guardrails still in force: preserve `unsafe_code = "deny"` and crate-level
 `#![forbid(unsafe_code)]`; no new `.unwrap()`/`.expect()` in production code;
-no dependency / `Cargo.lock` / `Cargo.toml` change (the user explicitly deferred
-`RUSTSEC-2026-0592`); do not rename `furus-linux`, `org.furuslinux.*`,
+no dependency / `Cargo.lock` / `Cargo.toml` change during S35 (the user
+explicitly deferred `RUSTSEC-2026-0592`; that deferral was superseded after S35
+by the lockfile-only `url` bump — see the resolution note below); do not rename
+`furus-linux`, `org.furuslinux.*`,
 `/run/furus-linux` or the `$XDG_*_HOME/furus-linux` paths. The untracked
 `./build/` directory is user-owned and was left completely untouched (not
 staged, not deleted, not written into). The `dist` gate used only its default
@@ -231,14 +233,16 @@ All commands run with `export PATH="$HOME/.cargo/bin:$PATH"`; full logs are in
   budgets OK"**: furus **1,810,488** / 3,000,000, furus-helper **2,143,520** /
   2,500,000, furus-gui **12,790,920** / 14,000,000, total **16,744,928 B**.
   No baseline write in this slice.
-- `cargo xtask ci` → **exit 1 at the final `cargo deny` gate only** — this is
-  the user-deferred advisory, not a regression. Every earlier ci gate passed:
-  `fmt`, `clippy`, `test`, `assets --check`, `parity --check`, `contract --check`
-  ("contract: all identifiers match the single source of truth") and `size`.
-  `cargo deny check` reports **advisories FAILED, bans ok, licenses ok, sources
-  ok** on `RUSTSEC-2026-0592` (`url` 2.5.8 via pinned Slint 1.19 / i-slint-
-  compiler 1.19 and webbrowser 1.2.7). Per the user's explicit decision this
-  advisory is deferred; no dependency/`Cargo.lock`/`Cargo.toml` change was made.
+- `cargo xtask ci` → **exit 1 at the final `cargo deny` gate only at S35** —
+  this was the user-deferred advisory, not a regression (resolved after S35 by
+  the lockfile-only `url` bump; see the resolution note below). Every earlier
+  ci gate passed: `fmt`, `clippy`, `test`, `assets --check`, `parity --check`,
+  `contract --check` ("contract: all identifiers match the single source of
+  truth") and `size`. `cargo deny check` reported **advisories FAILED, bans ok,
+  licenses ok, sources ok** on `RUSTSEC-2026-0592` (`url` 2.5.8 via pinned Slint
+  1.19 / i-slint-compiler 1.19 and webbrowser 1.2.7). Per the user's explicit
+  decision the advisory was deferred during S35; no
+  dependency/`Cargo.lock`/`Cargo.toml` change was made at that time.
 - `git diff --check` → **exit 0**, clean.
 
 ### Test counts — progression
@@ -261,14 +265,29 @@ all within budget and within the committed allowance. Do NOT run
 
 ### Unchanged / advisory notes (not S35 regressions)
 
-- `RUSTSEC-2026-0592` — cargo-deny advisories failure, **deferred by the user**;
-  the one known failing gate. No dependency change was made.
+- `RUSTSEC-2026-0592` — cargo-deny advisories failure, **deferred by the user
+  during S35**; the one known failing gate at that time. Resolved after S35 by
+  the lockfile-only `url` bump (see the resolution note below), so it is no
+  longer a failing gate. No source or manifest change was made.
 - `qa` privileged `tier1/pipeline-loop` skip and one QEMU `grldr` ignore —
   environmental / caller-supplied-resource, pre-existing.
 - `.deb` — skipped because `dpkg-deb` is not installed (environmental).
 - duplicate `zbus`/`zbus_macros` lock warnings — pre-existing.
 - rustdoc was not re-run in this final gate, carrying forward the pre-existing
   S33 situation; out of scope for S35.
+
+### Post-S35 resolution — `RUSTSEC-2026-0592` (lockfile-only)
+
+After S35 the user asked for `cargo update -p url` to take the patched release
+and clear the advisory that S35 had deferred. `Cargo.lock` now records `url`
+**2.5.8 → 2.5.9** and the transitive `form_urlencoded` **1.2.2 → 1.2.3** (no new
+crates, no `Cargo.toml`/source change). A real `cargo update` also re-pointed an
+unrelated `bindgen → syn` edge (`syn 3.0.9 → 2.0.119`); that drift was reverted,
+leaving only the two intended version/checksum bumps, and the minimal lock is
+accepted by `cargo metadata --locked`. `cargo deny check advisories` passes and
+`cargo xtask ci` is fully green including the cargo-deny gate; `cargo-audit`
+stays skipped only because it is not installed (pre-existing). This section
+records current status without rewriting the historical S35 deferral above.
 
 ## Manual live-hardware sign-off checklist — maintainer BEFORE Publisher sign-off
 
