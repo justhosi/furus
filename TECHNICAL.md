@@ -1696,3 +1696,266 @@ unrelated: `cargo-audit` not installed, the privileged loop-device/throughput
 QA tier, and duplicate-`zbus` lock warnings. As with S33, end-to-end desktop
 behavior still needs a real display and Polkit session; the manual sign-off
 checklist is in `docs/handoffs/HANDOFF-S34.md`.
+
+## S35 — Real helper write pipeline, safe auto-unmount, streamed verification
+
+S35 closes the gap between the GUI/handoff layer and the real write engine.
+After S34 the helper still stubbed its write step: it validated the plan and
+managed the session, namespace and event stream, but `CurrentExecutor` only
+emitted synthetic progress. S35 makes the privileged helper actually execute
+the CLI-equivalent `furus_core::pipeline::run`, lets it safely unmount a
+removable target in the host namespace first, and verifies the image digest in
+a cancellable, progress-reporting stream so the GUI shows activity immediately
+instead of going dark for a 10-25 s silent hash. It is a four-commit code
+change (`94728b2`, `d7765f`, `8c3038d`, `0fc6f08`) plus this documentation-only
+slice. No version, tag, packaging contract or release workflow changes. All
+work is local on `main`; `v0.1.1` was tagged and published earlier and S35
+creates or moves no tags and pushes nothing. Publication is left entirely to
+manual maintainer / Publisher sign-off. The work was delivered one slice at a
+time with coder then independent reviewer; this final slice changes only three
+documentation files and leaves them uncommitted for the reviewer, touching no
+source file, `size-baseline.json` (except the S35.2b helper refresh described
+below), Cargo file, or packaging file.
+
+### S35.1 — real helper write pipeline (`94728b2`)
+
+New file `crates/furus-helper/src/pipeline.rs` is where all real-run logic
+lives. Previously the helper's "run" step was a stub (`exec::CurrentExecutor`)
+that emitted canned events. S35 introduces two seams so production runs real
+code while hermetic fixtures still run stubs.
+
+**`HelperReporter` (implements `furus_core::pipeline::Reporter`).** It wraps a
+`&mut dyn ProgressSink` plus a borrowed `session` id and a mutable `step`
+index. It maps all five `furus_core::pipeline::Event` variants onto the two
+proto event kinds, every one tagged with the session id and sanitized through
+`furus_core::text::device_text` before it reaches the transport:
+
+- `StepStarted { index, total, step }` records `self.step = index` (so every
+  following `Progress` sample belongs to that plan step, including the
+  `verify`/`badblocks` pseudo-steps of a write) and emits an `Info` log
+  `step {index+1}/{total}: {step}`;
+- `StepFinished { index, step, millis }` emits an `Info` log with the elapsed
+  milliseconds;
+- `Progress { step, done, total, .. }` emits proto `Event::Progress` built with
+  `Progress::new(session, self.step, device_text(step), done, total)`;
+- `Message { level, text }` emits proto `Event::Log` with the level parsed via
+  `LogLevel::parse(&device_text(level))` and a fallback to `Info`;
+- `Finished { millis }` emits a final `Info` log `run finished in {millis} ms`.
+
+`device_text` trims then maps every control/non-ASCII byte, so a hostile device
+label or step string cannot inject newlines or control codes into the JSONL /
+D-Bus stream.
+
+**`outcome_from_core_error`.** A `class_of` helper classifies any
+`furus_core::error::CoreError` (recursing through `CoreError::Step` so a step
+wrapper never changes the class of what it wraps) into `Cancelled`,
+`NotImplemented`, `InvalidInput`, `Io`, `Verify` or `Other`, and the mapping to
+the terminal helper `Outcome` mirrors the CLI's exit mapping with the two
+user-fault classes softened to refusals:
+
+- `Cancelled` → `Outcome::Cancelled`;
+- `NotImplemented` → `Refused { code: "not_implemented", … }`;
+- `InvalidInput` → `Refused { code: INVALID_PLAN_CODE, … }`;
+- `Io` → `Failed { code: "io", … }`;
+- `Verify` → `Failed { code: "verify", … }`;
+- every other class → `Failed { code: "other", … }`.
+
+The message is the full `Display` of the *outer* error (after `device_text`),
+so a step prefix is never lost.
+
+**`PlanRunner` / `RealRunner`.** `PlanRunner: Send + Sync` is the single seam
+both entry points call: `run(&validated, &mut sink, &cancel, &session) ->
+Outcome`. `RealRunner` is the production implementation. It reuses the CLI's
+geometry derivation verbatim — `opener_table_kind(plan)` plus the private
+`table_kind(scheme)` and `layout_kind(layout)` helpers — so the helper and
+`furus-cli` cannot disagree about partition table/layout for the same plan; a
+disagreement across steps returns `Refused { code: INVALID_PLAN_CODE }` rather
+than guessing. It opens the device with `DeviceOpener::new(..., self.sysfs.clone())`
+(reusing the sysfs root the validation env already discovered, so there is no
+second enumeration), then calls `furus_core::pipeline::run(plan, &opener,
+&options, &mut HelperReporter::new(..), &|| cancel.is_set())`. `RunOptions` is
+built by `run_options(plan)` to be CLI-equivalent: `verify` and `badblocks`
+come from `plan.options.verify` / `plan.options.bad_blocks`, while
+`retries: 3`, `retry_delay: Duration::from_secs(5)` and `reset_usb: false` are
+the reference policy (the helper exposes no USB-reset flag). Cancellation is a
+cooperative probe — the closure returns `cancel.is_set()` — never a forced
+thread kill.
+
+**Wiring.** `Registry::with_runner` injects a runner into the D-Bus worker;
+production (`main.rs` argv path and the D-Bus `Registry::new`/default path)
+uses `RealRunner`. `exec::CurrentExecutor` is now **test-only** (`#[cfg(test)]`):
+it is retained solely as the stub executor that hermetic fixtures wrap, so
+existing argv/wire assertions stay byte-for-byte valid. D-Bus fixtures inject a
+`StubRunner` through `Registry::with_runner`; they never touch a real device.
+`RealRunner` is what makes the helper's `Done` outcome reflect an actual wipe /
+partition / format / write / bootloader run rather than a simulated one.
+
+### S35.2a — safe auto-unmount policy (`d7765f`)
+
+`crates/furus-core/src/safety.rs` gains two pure, root-free helpers.
+
+**`is_protected_mountpoint(path: &str) -> bool`** is the single shared
+definition of "a system path auto-unmount must never touch", used by both the
+fast-validation policy and the later host-unmount step (kept in `furus-core`,
+not `furus-linux`, so the pure core crate does not depend on the OS crate). The
+protected list is boundary-aware: `/`, `/boot`, `/boot/efi`, `/home`, `/usr`,
+`/var`, `/etc`, `/opt`, `/srv`, `/root`. Matching uses `strip_prefix` and
+accepts only an exact match or a match followed by `/`, so `/boot/efi` and
+`/usr/local` are protected while `/bootable` and `/homebrew` are not; `/` is
+the exact root only, so it does not protect every path on the machine by
+prefix.
+
+**`judge_with_policy(target, allow_auto_unmount)`** is the policy-aware
+verdict. Plain `judge(target)` now just delegates to
+`judge_with_policy(target, false)` — strict and fail-closed — and that is the
+verdict every caller without an unmount step uses, including the post-unmount
+re-check. `judge_with_policy` has exactly one relaxation: at rule 6
+(`Reason::Mounted`) the refusal is skipped when `allow_auto_unmount` is true
+**and** the target is removable, is not a system disk, and its mountpoint is
+not a protected system path. Every other refusal — unreadable, zero size,
+loopback, read-only, system disk, active swap, and all later rules — stays
+unconditional and in the same order; a system disk is still refused before
+mount state is even considered. The helper's fast validation calls the policy
+with `true` (it owns the unmount step), and the GUI appends the display-only
+annotation `" (will be unmounted automatically)"` to the mounted-device reason
+text so the user knows what will happen. The annotation changes no verdict and
+does not weaken any other refusal; the caller must re-check with plain `judge`
+after the unmount, which S35.2b does.
+
+### S35.2b — host-namespace unmount and strict re-check (`8c3038d`)
+
+New file `crates/furus-helper/src/unmount.rs` implements the host-namespace
+unmount that makes S35.2a's relaxation safe.
+
+**`Unmounter` / `LiveUnmounter`.** `Unmounter: Send + Sync` is the seam;
+`LiveUnmounter` is production. Given the validated device and the validation
+env, it derives the device number via `furus_linux::mounts::dev_number` for the
+disk **and every partition**, scans all mount entries whose device matches any
+of those numbers, deduplicates them by path, and sorts **deepest-first**
+(deterministically: depth descending, then path length descending) so a mount
+nested under another is released before its parent. Before unmounting anything
+it checks every candidate path with `is_protected_mountpoint` and fails closed
+with code `protected_mount` and an ASCII guided message
+("refusing to unmount … it is a protected system path - unmount it manually
+and rebuild the plan") — this guard runs BEFORE any unmount call, so a single
+protected path in the set aborts the whole step with nothing unmounted. Each
+unmount goes through `MountOps::unmount(path, false)` — `detach = false`
+_always_, never `MNT_DETACH`, so the kernel does not leave a process holding a
+vanished mount. An `EBUSY` result is turned into an ASCII guided message
+(name the busy mount, ask the user to close apps holding it and rebuild the
+plan) rather than a raw errno, and every successful unmount emits an `Info`
+log tagged with the run's session id. D-Bus fixtures stay hermetic through
+`NoopUnmounter` (does nothing) and `FailingUnmounter` (can be told to fail a
+target with `EBUSY` by kind or raw errno or to succeed), injected via
+`Registry::with_unmounter`.
+
+**Strict re-check.** After the unmount, `validate::recheck_strict(validated,
+env)` re-reads `mountinfo` from scratch and applies plain `judge` (i.e.
+`judge_with_policy(..., false)`), so any mount that survived — including a
+protected path that was skipped or a fresh mount that appeared — is refused
+before the run proceeds. S35.2a's relaxation is therefore temporary and scoped
+to fast validation only.
+
+**Ordering in both entry points** (argv `run` in `main.rs` and the D-Bus
+`WorkerRun::run` in `dbus.rs`) is now pinned and tested:
+
+1. fast `validate::validate` (policy `true`, metadata-only image checks),
+2. the streamed digest slot added in S35.3 (see below),
+3. host-namespace unmount via the `Unmounter`,
+4. strict `recheck_strict`,
+5. `namespace::enter_mount_namespace`,
+6. `runner.run` (real pipeline in production).
+
+`size-baseline.json` was refreshed in this slice **for the helper only**:
+`furus-helper` 2,126,752 → 2,140,384 B (the `unmount.rs` addition), with no
+change to `furus` or `furus-gui`. This was the **last** baseline write in S35;
+S35.1 had already refreshed the helper baseline earlier in the slice
+(1,406,392 → 2,126,752 B).
+
+### S35.3 — streamed image verification with immediate feedback (`0fc6f08`)
+
+`validate::check_image` is now only the four fast metadata checks: read
+`fs::metadata` (image exists / readable), regular file, world-writable bit not
+set, and recorded size matches. It never reads image bytes, so fast validation
+stays off the multi-gigabyte path.
+
+New `validate::verify_image_digest(plan, sink, session, cancel)` is rule 6's
+digest half, split out of fast validation. It reuses
+`furus_core::hash::hash_file_cancellable`, which streams in 1 MiB chunks and
+probes cancellation between reads. Its event behaviour is deliberately tuned
+for a pkexec/D-Bus transport:
+
+- the **first** event is an `Info` log `Verifying image SHA-256...` emitted
+  before the first read, so the GUI sees activity immediately rather than
+  timing out over a silent hash;
+- progress is throttled to percent changes (at most one `Progress` per 1%) via
+  a `last_percent` guard, with `op` fixed to `"verify_image"` and `step` 0
+  because this phase precedes the plan's step loop; a terminal 100% sample is
+  emitted explicitly if the last chunk did not already reach it;
+- outcomes: cancellation → reject with `exec::CANCELLED_CODE`, SHA mismatch →
+  `image_changed`, I/O error → `image_unreadable`. The caller (both entry
+  points) maps `CANCELLED_CODE` to `Outcome::Cancelled` and any other reject to
+  `Failed`, and runs this phase **before** the host unmount or any device byte
+  is touched. A rejection still leaves the caller to emit the run's single
+  terminal `Done`.
+
+`exec::Cancel::flag()` now exposes the shared `&AtomicBool` inside the
+`Arc<AtomicBool>` so the hash helper can be cancelled by the same cancellation
+object the runner probes via `cancel.is_set()`. On the GUI side,
+`ui.on_confirm_clicked` calls `render(...)` first (to hide the dialog and lock
+the form) and then sets both `step_text` and `status_text` to
+`"Authenticating and starting helper…"` before spawning the worker thread —
+`render` rewrites those fields from run state on every pass, so the message is
+set after it, giving the user feedback while pkexec authenticates and the
+digest streams.
+
+### Known residual and reviewer nit
+
+**TOCTOU window (unchanged).** Both the image and the device node are reopened
+by path when S17 streams the write, so bytes can change between digest
+verification and the write; PLAN §6's "image passed as an open fd" is not
+implemented. The four fast checks plus the streamed digest narrow the window
+but do not close it. Closing it is an S17 obligation (open with `O_NOFOLLOW`,
+re-verify size/digest after open, or take the image fd from the front end) and
+is explicitly out of scope here.
+
+**Reviewer nit (non-blocking).** The `dbus.rs` module header and
+`WorkerRun` field comments carried over from S35.2b still describe only the
+unmount + strict re-check before the namespace, without naming the inserted
+digest phase. The implementation-site comments in `main.rs` / `dbus.rs` and
+the ordering tests do pin the digest-before-unmount sequence, so the behaviour
+is correct and the mismatch is comment-only; it did not block review.
+
+### Test counts, size and gate
+
+The workspace listing count progressed 1921 (final S34) → 1935 (S35.1) →
+1941 (S35.2a) → 1952 (S35.2b) → **1957** (S35.3). Final
+`cargo test --workspace` is **1928 passed / 0 failed / 29 ignored = 1957**;
+`cargo test --workspace -- --list | grep -cE ': test$'` is **1957**.
+`cargo test -p furus-helper` is **142 passed / 3 ignored** in the unit target
+plus **11 passed** in the integration target.
+
+Final release binary sizes: furus **1,810,488 B** (budget 3,000,000),
+furus-helper **2,143,520 B** (budget 2,500,000), furus-gui **12,790,920 B**
+(budget 14,000,000), total 16,744,928 B. `size-baseline.json` was last updated
+in S35.2b for the helper only (2,126,752 → 2,140,384 B); the current helper
+size (2,143,520 B) and the unchanged furus/gui sizes drift within the committed
+allowance, so no further baseline write was made.
+
+The final gate is green except for the one user-deferred advisory. `cargo fmt
+--all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, the
+workspace suite, the listing count, `cargo test -p furus-helper`, `cargo xtask
+qa`, `cargo xtask dist`, `cargo xtask size` and `git diff --check` all pass.
+`cargo xtask ci` passes fmt, clippy, test, assets `--check`, parity `--check`,
+contract `--check` and size, then fails **only** at `cargo deny check` on
+`RUSTSEC-2026-0592` (`url` 2.5.8 via pinned Slint 1.19); bans, licenses and
+sources are ok. Per the user's explicit decision this advisory is deferred and
+no dependency, `Cargo.lock` or `Cargo.toml` change was made. `dist` emits
+`furus-0.1.1-x86_64-unknown-linux-gnu.tar.gz`, 8,238,850 B, SHA256
+`03fe9a6907d8beb08ad99e62b279939677a2d88d26c89941c2fc27c565dad00a`, verified
+with `sha256sum -c SHA256SUMS` (OK); the `.deb` step is skipped only because
+`dpkg-deb` is not installed. `qa` reports one pre-existing privileged skip
+(`tier1/pipeline-loop`) and one caller-supplied-`grldr` QEMU ignore
+(`grub4dos_boots_to_its_prompt_in_qemu`). End-to-end live-hardware behavior
+still needs a real display and Polkit session; the unchecked manual sign-off
+checklist is in `docs/handoffs/HANDOFF-S35.md`. No push, no tag.
