@@ -1972,3 +1972,201 @@ only the two intended version/checksum bumps — the minimal lock is accepted by
 ci` is fully green including the cargo-deny gate, and `cargo-audit` remains
 skipped only because it is not installed (pre-existing). The historical S35
 deferral record above is kept for provenance.
+
+## S36 — volume-label safety and log UX
+
+S36 closes a destructive-failure hole and three desktop usability gaps. Before
+this slice an unstorable volume label (for example the 18-byte ISO volume ID
+`Fedora-KDE-Live-45` on FAT32, whose field holds 11 bytes) survived planning
+and helper validation, so `wipe` and `mkpart` erased the USB stick before
+`mkfs` refused the label; the GUI copied that raw ISO label into the form
+without clamping it to the selected filesystem; the log drawer offered no way
+to copy its text out; and the window could be closed mid-write before the
+helper cancelled or finished. S36 is four reviewed code commits plus this
+documentation-only slice:
+
+| Commit | Slice | Subject |
+|---|---|---|
+| `b1316ea` | S36.1 | `fix(core,helper): validate volume labels before destructive steps` |
+| `b09b3d7` | S36.2 | `fix(gui): sanitize volume labels for each filesystem` |
+| `cadf9bf` | S36.3 | `feat(gui): add Copy log to clipboard` |
+| `78b8f07` | S36.4 | `fix(gui): guard window close during active writes` |
+
+All four carry `Reviewed-by: reviewer`. The final documentation commit is
+**pending reviewer** and deliberately left uncommitted. No source file, Cargo
+file, packaging file or `size-baseline.json` was touched in this final slice.
+All work is local on `main`; no tag was created or moved and nothing was
+pushed. Publication is left entirely to manual maintainer / `Publisher`
+sign-off. The untracked, user-owned `./build/` directory was never staged,
+read into these docs, or touched; `dist` used only its default
+`target/dist/<triple>` out-dir.
+
+### S36.1 — one shared label rule in `furus-core`, enforced before destructive steps (`b1316ea`)
+
+New module `crates/furus-core/src/fs/label.rs`, re-exported from
+`furus_core::fs::label`, is the single source of truth. Both `planner::build`
+and `furus-helper::validate` call it; `furus-cli` and `furus-gui` inherit the
+same rule through the planner. The rules are taken from the repository's
+actual on-disk encoders rather than the rough sketch in the PLAN:
+
+- **FAT32** — at most 11 ASCII bytes; controls (`< 0x20` and DEL `0x7F`),
+  non-ASCII bytes and the Windows-forbidden bytes `" * / : < > ? \ |` are
+  refused, matching `fs/fat32/bpb.rs` / `volume.rs`.
+- **exFAT** — at most 11 UTF-16 code units, counted with `encode_utf16()`;
+  controls, DEL and the same forbidden characters are refused. The exFAT
+  encoder itself tolerates DEL, but the shared rule rejects it so one
+  printable-ASCII rule applies wherever it is meaningful.
+- **ext2/ext3/ext4** — at most 16 **ASCII** bytes, no NUL. The PLAN said "16
+  UTF-8 bytes", but `fs::ext::Options::with_label` checks `is_ascii()` and the
+  on-disk `s_volume_name` is 16 bytes, so the shared rule is the stricter
+  on-disk-grounded one: multibyte UTF-8 is refused, not silently mangled by
+  `mke2fs`.
+- **NTFS** — at most 32 UTF-16 units and no NUL, matching `mkntfs -L` and the
+  format's 32-unit ceiling.
+- **UDF** — at most 126 UTF-8 bytes and no NUL. The PLAN's "30 bytes" is
+  stale; `fs::udf::Options::with_label` measures `mkudffs` at 126 bytes.
+
+An empty label means "no label" for every filesystem and is always accepted
+(UDF stores the empty string verbatim, which is still valid). Every refusal is
+a `CoreError::InvalidInput` naming the ceiling or the offending character, so
+callers never lose the reason.
+
+`sanitize_label(raw, fs)` is the matching best-effort cleanup: drop characters
+the target cannot store, trim leading/trailing whitespace, uppercase ASCII for
+FAT32, then truncate on the correct boundary — a UTF-8 character boundary for
+FAT32/ext/UDF, a whole UTF-16 unit boundary for exFAT/NTFS so a surrogate pair
+is never split. Its pinned invariant is
+`validate_label(&sanitize_label(raw, fs), fs).is_ok()` for **any** input,
+including a string made entirely of rejected characters (the result is then
+empty = no label). `Fedora-KDE-Live-45` sanitizes to `FEDORA-KDE-` on FAT32.
+
+**Data flow and pre-flight enforcement.** `planner::build` validates every
+`Step::Mkfs { filesystem, label: Some(..) }` in the *built* step list before
+returning a `Plan`, mapping a refusal to `PlanError::Usage`. Iterating built
+steps rather than raw options is deliberate: a Windows To Go plan overrides
+the requested filesystem to NTFS, and the override's 32-unit ceiling must be
+the one enforced (a 40-byte label legal on UDF is refused there). Because the
+plan is sealed only after this check, no plan can authorise wipe/mkpart and
+leave mkfs as the first failure. Independently, `furus-helper::validate` now
+calls the same validator in `check_steps` and rejects with the distinct code
+`invalid_label` **before** touching or unmounting the device; the old private
+`label_ok` (32 printable ASCII characters) was deleted, removing a second,
+divergent rule. The validator's error text is carried through verbatim, so the
+helper message names the real ceiling (e.g. 11 vs 18 bytes).
+
+### S36.2 — auto-sanitized GUI labels (`b09b3d7`)
+
+`GuiState` gains `label_is_auto: bool` and `raw_image_label: Option<String>`.
+`begin_image_analysis` clears both; `apply_image_analysis` keeps the raw ISO
+volume ID from `report.labels.best()` in `raw_image_label` and sets
+`volume_label` through `furus_core::fs::label::sanitize_label` against the
+filesystem that analysis just selected (NTFS for Windows payloads, FAT32
+otherwise) — not against whatever was on screen beforehand. The raw 18-byte
+ID is kept so an auto-filled label can be re-derived later.
+
+`set_volume_label` maps empty input to "no label" and clears `label_is_auto`.
+`select_filesystem` always re-derives an auto label from the raw ISO ID for
+the new filesystem; a manual label is left alone while it remains valid and
+is re-sanitized in place only when the new filesystem cannot store it, without
+handing ownership back to the analyzer. Because `GuiState::plan()` calls
+`planner::build`, a manually typed overlong label is refused as
+`PlanError::Usage` before any confirmation dialog or destructive action, the
+error is reflected in `status_text()`, and START stays disabled. Tests pin
+`Fedora-KDE-Live-45` → `FEDORA-KDE-` on FAT32, the NTFS→FAT32 clamp, manual
+label clamping, and refusal of a 20-byte manual label on FAT32.
+
+### S36.3 — Copy log to clipboard (`cadf9bf`)
+
+New Slint-free, display-server-free module `crates/furus-gui/src/clipboard.rs`
+(exported from `lib.rs`, zero new crates) defines
+`ClipboardOutcome { Copied, Unavailable, Failed(String) }` and a private
+`ClipboardBackend` trait so the fallback chain is unit-testable without a
+display server. `WAYLAND_DISPLAY` selects the order: Wayland →
+`wl-copy`, `xclip -selection clipboard`, `xsel --clipboard --input`;
+otherwise → `xclip`, `xsel`, `wl-copy`. `NotFound` maps to `Unavailable` and
+tries the next backend, `Copied` short-circuits, a real `Failed` stops the
+chain and is returned, and an exhausted chain is `Unavailable`. Empty text
+returns `Failed("no text to copy")` without launching anything. Failure
+strings are sanitized to short ASCII (≤120 chars) before reaching a status
+line.
+
+Pipe hygiene is the reason for a dedicated module instead of
+`Command::output()`: `wl-copy` / `xclip` daemonize and their clipboard-owner
+process inherits the spawned descriptors, so draining stdout or stderr to EOF
+can block forever. Each helper is spawned with stdin piped, **stdout
+`Stdio::null()`**, and stderr piped but **never read/drained**; the text is
+written to stdin, stdin is dropped so the helper sees EOF, and only the
+spawned process's exit status is awaited on a short-lived background thread
+which the caller joins. The UI thread therefore never blocks on a clipboard
+owner.
+
+`ui/main.slint` puts **Copy log** beside **Show log / Hide log** in a
+`HorizontalLayout` with `spacing: 8px;` — the existing toggle keeps
+`horizontal-stretch: 1`, and Copy log is `enabled: root.log-text != ""` and
+fires `copy-log-clicked()`. `on_copy_log_clicked` in `main.rs` reads the same
+formatted `log_lines(...)` text the drawer renders, returns early if empty,
+and runs `copy_text` on a short-lived `"furus-clipboard"` thread. The result
+is posted back with `slint::invoke_from_event_loop` and sets `session.note` to
+exactly `Copied log to clipboard.`, `Could not copy log: install wl-copy,
+xclip, or xsel.` (unavailable), or `Could not copy log: {err}` (failure), then
+re-renders. A thread-spawn failure sets `Could not copy log: clipboard thread
+unavailable`. If the event loop is already gone, the publish is dropped.
+`render_smoke.rs` covers the new button rendering cleanly.
+
+### S36.4 — close guard during active writes (`78b8f07`)
+
+`ui/main.slint` declares `in property <bool> close-enabled: true;` and binds
+it to the footer `CLOSE` button's `enabled`. `RunView` gains
+`close_enabled`, defaulting to `false` conservatively: it is `true` only in
+`RunState::Idle` and `RunState::Finished(_)` (every outcome — Ok, Cancelled,
+Failed, Refused) and stays `false` for `Confirming` and `Running`, i.e. from
+CONFIRM AND WRITE until the helper reaches a terminal state. `render` pushes
+it with `ui.set_close_enabled(...)`; `on_close_clicked` re-reads it under a
+short borrow and ignores the click when false (releasing the borrow before
+any quit path).
+
+The window manager's `X` button bypasses that callback, so
+`ui.window().on_close_requested(...)` is registered too: when closing is
+disabled it sets `session.note` to exactly **"Write in progress — click CANCEL
+first or wait for it to finish before closing."**, re-renders, and returns
+`slint::CloseRequestResponse::KeepWindowShown`; otherwise it returns
+`HideWindow`. Tests cover `run_view` in Idle, Confirming, Running, and every
+Finished outcome, and `render_smoke` toggles `set_close_enabled(false/true)`.
+The checksum modal's own CLOSE (`on_checksum_close_clicked` →
+`close_checksum()`) is intentionally a separate control and is not gated by
+this write-in-progress flag.
+
+### Test counts, sizes, baseline and final gate
+
+Workspace listing count / total: **1957** (final S35) → **1970** (S36.1, +13)
+→ **1976** (S36.2, +6) → **1988** (S36.3, +12) → **1990** (S36.4, +2). Final
+`cargo test --workspace` is **1961 passed / 0 failed / 29 ignored = 1990**
+over 30 result lines, and `cargo test --workspace -- --list | grep -cE ':
+test$'` is **1990**. `cargo test -p furus-helper` is **142 passed / 3 ignored**
+plus **11 passed** in the integration target; `cargo test -p furus-gui` is
+**112 lib + 17 bin + 1 helper_wire + 5 render_smoke = 135**.
+
+Final release binary sizes: furus **1,813,160 B** / 3,000,000, furus-helper
+**2,145,712 B** / 2,500,000, furus-gui **12,808,072 B** / 14,000,000, total
+**16,766,944 B**; `cargo xtask size` reports within committed baseline
+allowance and all budgets OK. `size-baseline.json` was written **only** in
+S36.1 (furus-helper 2,140,384 → 2,145,712 B for the shared label code); no
+later S36 slice wrote it. The furus and furus-gui sizes drift within the
+committed allowance, so no further baseline write was made — do **not** run
+`--write-baseline`.
+
+The final gate is fully green (logs in `/tmp/opencode/s36/`): `cargo fmt
+--all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+both per-crate test runs, the workspace suite and listing count, `cargo xtask
+qa`, `cargo xtask dist`, `cargo xtask size`, `cargo xtask ci` ("ci: all gates
+passed") and `git diff --check` all exit 0. `qa` reports only the pre-existing
+privileged `tier1/pipeline-loop` skip and one caller-supplied-`grldr` QEMU
+ignore (`grub4dos_boots_to_its_prompt_in_qemu`); `ci` skips only `cargo-audit`
+because it is not installed (pre-existing). `dist` emits
+`target/dist/x86_64-unknown-linux-gnu/furus-0.1.1-x86_64-unknown-linux-gnu.tar.gz`
+(8,247,623 B), SHA256
+`4522d3d13431a3fa000348df6d6aeef84f1a0556cfc3ba72bf49dc30617d551c`, verified
+with `sha256sum -c SHA256SUMS` (OK); `.deb` is skipped only because
+`dpkg-deb` is absent. End-to-end desktop behavior still needs a real display
+and removable device; the unchecked manual sign-off checklist is in
+`docs/handoffs/HANDOFF-S36.md`. No push, no tag.
