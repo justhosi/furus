@@ -45,6 +45,7 @@ use crate::error::Result;
 pub mod exfat;
 pub mod ext;
 pub mod fat32;
+pub mod label;
 pub mod ntfs;
 pub mod udf;
 

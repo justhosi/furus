@@ -32,6 +32,8 @@
 use std::fmt;
 use std::path::Path;
 
+use crate::fs::label;
+
 use furus_proto::BootloaderMode;
 use furus_proto::DeviceRef;
 use furus_proto::Filesystem;
@@ -523,6 +525,22 @@ pub fn build(device: DeviceRef, image: ImageRef, options: &Options) -> Result<Pl
         ));
     }
     let steps = steps(Path::new(&image.path), &image.kind, options);
+    // Pre-flight label validation: the builders' output is the single
+    // input to the helper, so refuse an unstorable label here — before
+    // a sealed plan can authorise wipe/mkpart and leave mkfs as the
+    // first step to notice. Iterating the built steps (not the raw
+    // options) also covers the Windows-bootloader -> Ntfs override.
+    for step in &steps {
+        if let Step::Mkfs {
+            filesystem,
+            label: Some(label),
+            ..
+        } = step
+            && let Err(err) = label::validate_label(label, filesystem.clone())
+        {
+            return Err(PlanError::Usage(err.to_string()));
+        }
+    }
     // A Windows To Go plan records NTFS whatever `--filesystem` said
     // (see `steps`): options and the mkfs step agree.
     let filesystem = if options.bootloader == BootloaderOpt::Windows {
@@ -575,6 +593,7 @@ mod tests {
 
     use super::BootloaderOpt;
     use super::Options;
+    use super::PlanError;
     use super::build;
     use super::device_ref;
     use super::steps;
@@ -987,6 +1006,51 @@ mod tests {
             })
             .expect("the plan carries a mkfs step");
         assert_eq!(mkfs, Filesystem::Ntfs);
+    }
+
+    #[test]
+    fn build_refuses_an_overlong_fat32_label_before_sealing() {
+        // The 18-byte `Fedora-KDE-Live-45` cannot fit FAT32's 11-byte
+        // field. `build` must refuse it before returning a Plan, so no
+        // plan can authorise wipe/mkpart and only fail later at mkfs.
+        let mut options = test_options(false);
+        options.filesystem = Filesystem::Fat32;
+        options.label = Some("Fedora-KDE-Live-45".to_string());
+        let refused = build(test_device(), test_image(ImageKind::Iso), &options)
+            .expect_err("an 18-byte FAT32 label refuses before a plan is sealed");
+        assert!(
+            matches!(refused, PlanError::Usage(_)),
+            "a bad label is a usage error: {refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(message.contains("11"), "the ceiling is named: {message}");
+        assert!(
+            message.contains("18"),
+            "the actual length is named: {message}"
+        );
+        assert!(
+            message.contains("fat32"),
+            "the filesystem is named: {message}"
+        );
+    }
+
+    #[test]
+    fn build_refuses_a_label_the_overridden_filesystem_cannot_store() {
+        // A Windows To Go plan formats NTFS whatever `--filesystem`
+        // said. A 40-byte label is legal for UDF (126 bytes) but not
+        // for NTFS (32 units), so this refusal proves the *built*
+        // step's filesystem is validated, not the raw options.
+        let mut options = test_options(false);
+        options.bootloader = BootloaderOpt::Windows;
+        options.filesystem = Filesystem::Udf;
+        options.label = Some("R".repeat(40));
+        let refused = build(test_device(), test_image(ImageKind::Wim), &options)
+            .expect_err("the ntfs override still enforces its own 32-unit ceiling");
+        assert!(matches!(refused, PlanError::Usage(_)));
+        assert!(
+            refused.to_string().contains("ntfs"),
+            "the overridden filesystem is the one validated: {refused}"
+        );
     }
 
     #[test]

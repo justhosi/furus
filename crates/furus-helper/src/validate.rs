@@ -656,19 +656,16 @@ fn check_steps(plan: &Plan) -> Result<(), Reject> {
                 }
             }
             Step::Mkfs {
+                filesystem,
                 label,
                 cluster_bytes,
                 ..
             } => {
-                if label.as_deref().is_some_and(|label| !label_ok(label)) {
-                    return Err(reject(
-                        "invalid_step",
-                        format!(
-                            "step {number} has a volume label the filesystem \
-                             rules refuse (at most 32 printable ASCII \
-                             characters) - rebuild the plan"
-                        ),
-                    ));
+                if let Some(label) = label.as_deref()
+                    && let Err(err) =
+                        furus_core::fs::label::validate_label(label, filesystem.clone())
+                {
+                    return Err(reject("invalid_label", err.to_string()));
                 }
                 if let Some(cluster) = cluster_bytes
                     && !cluster_ok(*cluster)
@@ -801,12 +798,6 @@ fn scheme_tag(scheme: &Scheme) -> &'static str {
         Scheme::Mbr => "mbr",
         Scheme::Gpt => "gpt",
     }
-}
-
-/// Volume label rule (PLAN §6 rule 7): at most 32 characters, all
-/// printable ASCII (`0x20..=0x7E`).
-fn label_ok(label: &str) -> bool {
-    label.chars().count() <= 32 && label.chars().all(|c| (' '..='~').contains(&c))
 }
 
 /// Cluster size rule: a power of two in `512..=1048576` bytes.
@@ -1894,10 +1885,16 @@ mod tests {
         let fixture = Fixture::new();
         let (mut plan, env, _device) = fixture.good(true);
         if let Step::Mkfs { label, .. } = &mut plan.steps[3] {
-            *label = Some("x".repeat(33));
+            *label = Some("Fedora-KDE-Live-45".to_string());
         }
         plan = signed(plan);
-        assert_eq!(refused_code(validate(&plan, &env)), "invalid_step");
+        let refused = validate(&plan, &env).expect_err("18 bytes cannot fit FAT32's 11-byte field");
+        assert_eq!(refused.code, "invalid_label");
+        assert!(
+            refused.message.contains("11"),
+            "the shared validator's ceiling is carried through: {}",
+            refused.message
+        );
     }
 
     #[test]
@@ -1911,22 +1908,33 @@ mod tests {
             plan = signed(plan);
             assert_eq!(
                 refused_code(validate(&plan, &env)),
-                "invalid_step",
+                "invalid_label",
                 "label {hostiled:?}"
             );
         }
     }
 
     #[test]
-    fn label_of_32_chars_is_accepted() {
+    fn label_of_32_units_is_accepted_on_ntfs() {
+        // The old 32-printable-char rule is now per-filesystem: 32
+        // UTF-16 units are exactly NTFS's ceiling (FAT32 allows only
+        // 11 ASCII bytes, so the same label is refused there).
         let fixture = Fixture::new();
         let (mut plan, env, _device) = fixture.good(true);
-        if let Step::Mkfs { label, .. } = &mut plan.steps[3] {
-            *label = Some("R".repeat(32));
+        let label = "R".repeat(32);
+        if let Step::Mkfs {
+            filesystem,
+            label: slot,
+            ..
+        } = &mut plan.steps[3]
+        {
+            *filesystem = Filesystem::Ntfs;
+            *slot = Some(label.clone());
         }
-        plan.options.label = Some("R".repeat(32));
+        plan.options.filesystem = Filesystem::Ntfs;
+        plan.options.label = Some(label);
         plan = signed(plan);
-        validate(&plan, &env).expect("32 printable chars stay valid");
+        validate(&plan, &env).expect("32 UTF-16 units stay valid on NTFS");
     }
 
     #[test]
